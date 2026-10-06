@@ -1,0 +1,31 @@
+.stat-label{min-height:44px;line-height:1.6}.stat-value{margin-top:3px}.secondary-metrics{display:flex;gap:22px;border:1px solid #dfe7ef;border-radius:9px;background:#fff;padding:17px 20px;margin:-10px 0 25px}.secondary-metrics>div{flex:1;display:flex;align-items:center;gap:9px;border-right:1px solid #e3eaf1;padding-right:20px;color:#6a87a6;font-size:13px}.secondary-metrics>div:last-child{border:0;padding:0}.secondary-metrics strong{margin-left:auto;font-size:23px;color:#44607e;font-weight:500;white-space:nowrap}.secondary-metrics small{font-size:12px;color:#7e97b1;margin-left:4px;font-weight:400}.detail-status{margin-bottom:27px}.detail-status label{font-size:14px;color:#6583a3;display:flex;flex-direction:column;gap:10px}.detail-status .app-select{width:100%}.detail-extra{margin-top:24px;display:flex;flex-direction:column;gap:11px;font-size:13px;line-height:1.9;color:#6b88a6}.detail-memo{white-space:pre-wrap;word-break:break-word}.schema-details{margin:25px 0;color:#597694;font-size:14px;line-height:1.8}.schema-details>summary{cursor:pointer;padding:10px 0}.schema-details>div{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:14px;font-size:12px}.schema-details>div>span{display:flex;gap:8px;align-items:baseline;padding:6px;border-bottom:1px solid #e8edf3}.schema-details code{font-size:11px;min-width:15px;color:#859db6}.table-person>span.avatar{border-width:2px}.page-subtitle{max-width:600px}.record-dialog{max-height:92dvh}.form-grid .app-select [data-slot=select-value]{white-space:normal;text-align:left;line-height:1.5}.rank-person strong{word-break:keep-all}.stat-icon{margin-left:auto}.info-box{display:block}.info-box svg{display:inline-block;vertical-align:middle;margin-right:5px}.rank-total{font-variant-numeric:tabular-nums}
+@media(max-width:1100px){.secondary-metrics{gap:14px;padding:14px 16px}.secondary-metrics>div{font-size:12px;padding-right:14px;gap:6px}.secondary-metrics svg{width:15px}}
+@media(max-width:767px){.stat-label{min-height:38px;font-size:12px}.secondary-metrics{display:flex;flex-wrap:wrap;gap:0;padding:3px 16px;margin:-5px 0 22px}.secondary-metrics>div{width:100%;flex:auto;min-height:49px;gap:11px;border-right:0;border-bottom:1px solid #e8edf3;padding-right:0;font-size:13px}.secondary-metrics>div:last-child{border-bottom:0}.secondary-metrics strong{font-size:21px}.schema-details>div{grid-template-columns:1fr}.page-heading{gap:12px}.page-heading h1{flex-wrap:wrap;gap:6px;font-size:23px}.heading-month{font-size:11px}.full-ranking h2{font-size:15px}.detail-sheet{width:100vw!important}.demo-notice{font-size:11px}.profile-bio{font-size:14px}.sidebar-month p{font-size:12px}}
+@media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+
+.app-form .checkbox-label{display:flex;flex-direction:row;align-items:flex-start;line-height:1.8;font-size:12px;gap:9px}.checkbox-label [data-slot=checkbox]{margin-top:3px;flex-shrink:0}
+
+/* Display the supplied company logo at its original aspect ratio. */
+.insup-logo{display:block;max-width:100%;height:auto;object-fit:contain;background:#fff;border-radius:9px;flex-shrink:0}
+.brand-block{padding:22px 27px 24px!important}
+.brand{gap:16px;width:100%;letter-spacing:normal;text-align:left}
+.brand .insup-logo{width:108px}
+.brand-node{font-size:14px;letter-spacing:2px}
+.brand-block .workspace-label{margin-top:15px;font-size:9px;letter-spacing:1.1px}
+.login-brand{display:flex;flex-direction:column;align-items:center;gap:16px;margin-bottom:26px;letter-spacing:normal}
+.login-brand .insup-logo{width:170px;border-radius:14px}
+.login-brand small{margin:0;font-size:13px;letter-spacing:4px}
+.profile-cover{height:124px;gap:18px}
+.profile-cover .insup-logo{width:84px}
+.profile-cover>strong{font-size:14px;letter-spacing:3px}
+.topbar-leading{display:flex;align-items:center;gap:13px;min-width:0}
+.mobile-brand{display:none}
+@media(max-width:767px){
+ .mobile-brand{display:block;flex-shrink:0}
+ .mobile-brand .insup-logo{width:40px;border-radius:0}
+ .topbar-leading{gap:10px}
+ .topbar .breadcrumbs{font-size:12px}
+ .login-page{padding-top:30px;padding-bottom:30px}
+ .login-brand .insup-logo{width:145px}
+ .login-brand{gap:12px;margin-bottom:24px}
+}
