@@ -8,6 +8,7 @@ var NODE = Object.freeze({
   kpiTab: '2期目月間KPI・KGI',
   destinationKey: 'NODE_DESTINATION_ID',
   verificationKey: 'NODE_VERIFICATION_ID',
+  probeKey: 'NODE_COPY_PROBE',
   playersTab: '_NODE_players',
   operationsTab: '_NODE_operations',
   recordKey: 'NODE_RECORD_ID',
@@ -22,13 +23,14 @@ var NODE = Object.freeze({
   stageStatuses: ['提案候補','提案完了（面談日確定待ち）','面談確定(面談実施待ち）','面談実施（合否待ち）','合格（シフト入力待ち）','合格（シフト入力待ち）','稼働予定日確定（稼働開始待ち）','稼働開始'],
   inputColumns: [1,2,3,4,6,7,8,9,10,11,12,13,17,21,22,23,24,25,26],
   mappedHeaders: {
-    1:['面談実施','面談実施日'],2:['会社名'],3:['候補者氏名（スペースなし）','氏名'],4:['担当'],6:['担当ポジ'],7:['ステータス'],8:['提案完了日'],
-    9:['C面談予約獲得日','C面談予約獲得日（アポ獲得日）'],10:['C面談予定日'],11:['C面談予定開始時刻'],12:['ヨミ確度'],13:['メモ'],
-    17:['C面談実施日','C面談実施日、実施したら入力'],21:['クライアント側オファー日＝合格日'],22:['候補者承諾日＝マッチ日'],23:['稼働開始予定日'],24:['稼働開始日'],25:['離脱予定日'],26:['離脱日']
+    1:['面談実施','面談実施日'],2:['会社名'],3:['候補者氏名（スペースなし）','氏名','候補者氏名\nスペースいれない'],4:['担当'],6:['担当ポジ','項目\n担当ポジ\n(アポインター/D/FS)'],7:['ステータス'],8:['提案完了日'],
+    9:['C面談予約獲得日','C面談予約獲得日（アポ獲得日）'],10:['C面談予定日','C面談予定日 （予定がわかったら入力）'],11:['C面談予定開始時刻'],12:['ヨミ確度','ヨミ確度\nA:95％\nB:70％\nC:50％\nD:10％'],13:['メモ'],
+    17:['C面談実施日','C面談実施日、実施したら入力','C面談実施日\n（実施したら入力）'],21:['クライアント側オファー日＝合格日'],22:['候補者承諾日＝マッチ日'],23:['稼働開始予定日'],24:['稼働開始日'],25:['離脱予定日'],26:['離脱日']
   },
   playerHeaders: ['id','name','team','color','target','bio','sheetNames','role','active'],
   operationHeaders: ['operationId','actorId','action','payloadHash','result','committedAt'],
   seedNames: ['越前祐美','鈴木楓','櫻庭奈々','髙田侑弥','佐藤光','倉島颯汰','佐々木駿'],
+  seedSheetNames: [['越前','越前祐美'],['鈴木','鈴木楓'],['櫻庭','櫻庭奈々'],['高田','髙田侑弥'],['佐藤','佐藤光'],['倉島','倉島颯汰'],['佐々木駿']],
   seedColors: ['mint','blue','amber','violet','rose','cyan','blue']
 });
 
@@ -129,6 +131,7 @@ function nodeHandle_(request) {
     var operationId = shortText_(request.operationId, 128, true);
     if (!/^[A-Za-z0-9_-]{16,128}$/.test(operationId)) fail_('BAD_REQUEST', '保存操作のIDが必要です。');
     var payload = request.payload || {};
+    guardProbeBusinessMutation_(store,user,action,payload);
     var payloadHash = hash_(stableJson_({ action: action, payload: payload }));
     var previous = operation_(store, operationId);
     if (previous) {
@@ -374,9 +377,9 @@ function blankBusinessRow_(store) {
   return Math.max(store.headerRow + 1, store.values.length + 1);
 }
 function metadataCreate_(sheetId, row, key, value) { return { createDeveloperMetadata: { developerMetadata: { metadataKey: key, metadataValue: value, visibility: 'DOCUMENT', location: { dimensionRange: { sheetId: sheetId, dimension: 'ROWS', startIndex: row - 1, endIndex: row } } } } }; }
-function newPlan_(store, record) {
+function newPlan_(store, record, actorId, authenticatedId) {
   if (record) return { row: record.row, record: record, recordId: record.recordId, patches: {}, requests: [], result: {} };
-  var row = blankBusinessRow_(store), id = Utilities.getUuid();
+  var reserved=takeProbeRow_(store,actorId,authenticatedId),row=reserved?reserved.row:blankBusinessRow_(store),id=reserved?reserved.recordId:Utilities.getUuid();
   return { row: row, recordId: id, patches: {}, requests: [metadataCreate_(store.matching.getSheetId(), row, NODE.recordKey, id)], result: {} };
 }
 function setPatch_(plan, column, value) { if (NODE.inputColumns.indexOf(column) < 0) fail_('PROTECTED_COLUMN', 'この列は書き込めません。'); plan.patches[column] = value; }
@@ -411,7 +414,7 @@ function planActivity_(store, user, activity) {
   if (existing && si > 0 && existing.values[1] && String(existing.values[1]) !== company) fail_('CONFLICT', '対象の提案と会社名が一致しません。');
   if(activity.memo!==undefined&&typeof activity.memo!=='string')fail_('VALIDATION','メモは文字列で指定してください。');
   var position = choice_(activity.position, NODE.positions), memo = activity.memo===undefined?undefined:shortText_(activity.memo, 500, false), source = shortText_(activity.source, 100, false);
-  var plan = newPlan_(store, existing);
+  var plan = newPlan_(store, existing, ownerId, user.id);
   if (!existing) {
     setPatch_(plan, 1, dayDate_(si === 0 ? date : interview)); setPatch_(plan, 2, company); setPatch_(plan, 3, name); setPatch_(plan, 4, owner.sheetNames[0]); setPatch_(plan, 6, position);
   } else if (si === 1 && !existing.values[1]) setPatch_(plan, 2, company);
@@ -543,7 +546,7 @@ function setupNode() {
     var playerSheet = book.insertSheet(NODE.playersTab), operationSheet = book.insertSheet(NODE.operationsTab);
     var credentials = [], rows = [NODE.playerHeaders];
     rows.push(['ADMIN','insup 管理者','NODE','blue',20,'',JSON.stringify([]),'admin',true]);
-    NODE.seedNames.forEach(function (name, i) { rows.push(['ND-' + ('00' + (i + 1)).slice(-3),name,'NODE',NODE.seedColors[i],20,'',JSON.stringify([name]),'player',true]); });
+    NODE.seedNames.forEach(function (name, i) { rows.push(['ND-' + ('00' + (i + 1)).slice(-3),name,'NODE',NODE.seedColors[i],20,'',JSON.stringify(NODE.seedSheetNames[i]),'player',true]); });
     props_().setProperty(NODE.pepperKey, random256_());
     rows.slice(1).forEach(function (row) { var password = random256_(); props_().setProperty('NODE_AUTH_' + row[0],JSON.stringify(makeAuth_(password))); credentials.push({ id:row[0],name:row[1],password:password }); });
     playerSheet.getRange(1,1,rows.length,NODE.playerHeaders.length).setValues(rows);
@@ -602,17 +605,68 @@ function enableNodeWritesForCopy() {
   if (answer!==ui.Button.YES) return;
   return withLock_(function () { var store=readStore_();if(!store.schemaCompatible)fail_('SCHEMA_MISMATCH','入力対象19列の見出しと順序を確認してください。');if(store.book.getSpreadsheetTimeZone()!=='Asia/Tokyo')fail_('TIMEZONE','複製シートのタイムゾーンをAsia/Tokyoにしてください。');config.writesEnabled=true;props_().setProperty(NODE.configKey,JSON.stringify(config)); });
 }
+function probeReservation_(store,actorId,allowExpired) {
+  var raw=props_().getProperty(NODE.probeKey);if(!raw)return null;
+  var probe;try{probe=JSON.parse(raw);}catch(_){fail_('COPY_PROBE_INVALID','検証行の割当を所有者が確認してください。');}
+  if(probe.actorId!==actorId)return null;
+  if(store.config.purpose!=='verification'||probe.spreadsheetId!==store.config.spreadsheetId||probe.spreadsheetId!==props_().getProperty(NODE.verificationKey)||probe.spreadsheetId===NODE.originalId||probe.spreadsheetId===props_().getProperty(NODE.destinationKey)||probe.ownerEmail!==store.config.ownerEmail||probe.matchingSheetId!==store.matching.getSheetId()||!Number.isInteger(probe.originalMaxRows)||!Array.isArray(probe.rows)||probe.rows.length!==2||probe.rows.some(function(row,i){return row!==probe.originalMaxRows+i+1;})||!probe.recordIds||!Number.isFinite(probe.expiresAt))fail_('COPY_PROBE_INVALID','検証行の割当が接続先と一致しません。');
+  if(!allowExpired&&probe.expiresAt<=Date.now())fail_('COPY_PROBE_EXPIRED','検証行の割当が期限切れです。所有者が検証コピーを確認してください。');
+  return probe;
+}
+function guardProbeBusinessMutation_(store,user,action,payload) {
+  if(action!=='saveActivity'&&action!=='updateStatus')return;
+  var activity=payload.activity||{},recordId=action==='saveActivity'?activity.recordId:payload.recordId,record=recordId?findRecord_(store,recordId):null;
+  var targetId=record?record.playerId:action==='saveActivity'?activity.playerId:null;
+  var probe=probeReservation_(store,user.id,false),targetProbe=targetId&&targetId!==user.id?probeReservation_(store,targetId,false):null;
+  if(targetProbe)fail_('FORBIDDEN','検証行へ保存できるのは検証専用アカウント本人だけです。');
+  if(!probe)return;
+  if(recordId&&(!record||probe.rows.indexOf(record.row)<0||probe.recordIds[record.row]!==record.recordId))fail_('CONFLICT','検証専用アカウントは割り当てられた行だけ更新できます。');
+  if(action==='saveActivity'&&activity.playerId!==user.id)fail_('FORBIDDEN','検証専用アカウント本人の実績だけ保存できます。');
+}
+function reserveCopyProbeRows_(actorId) {
+  var owner=requireOwner_();
+  return withLock_(function(){
+    var store=readStore_();
+    if(store.config.purpose!=='verification'||!writesEnabled_(store.config)||store.config.spreadsheetId!==props_().getProperty(NODE.verificationKey)||store.config.spreadsheetId===props_().getProperty(NODE.destinationKey))fail_('COPY_VERIFICATION_REQUIRED','登録済みの検証用コピーだけに検証行を追加できます。');
+    var actor=store.players.find(function(p){return p.id===actorId&&p.active&&p.role==='player'&&p.team==='検証用'&&/^連携検証[a-f0-9]{12}$/i.test(p.name);});
+    if(!actor)fail_('FORBIDDEN','検証専用アカウントだけに行を割り当てます。');
+    if(props_().getProperty(NODE.probeKey))fail_('COPY_PROBE_PENDING','前の検証行の記録が残っています。所有者が確認してください。');
+    var end=store.matching.getMaxRows(),probe={spreadsheetId:store.config.spreadsheetId,actorId:actorId,ownerEmail:owner,matchingSheetId:store.matching.getSheetId(),originalMaxRows:end,rows:[end+1,end+2],recordIds:{},expiresAt:Date.now()+30*60000};
+    props_().setProperty(NODE.probeKey,JSON.stringify(probe));
+    // Only newly appended verification-copy rows lose inherited validation. Existing cells are untouched.
+    sheetsBatch_(store.config.spreadsheetId,[{appendDimension:{sheetId:store.matching.getSheetId(),dimension:'ROWS',length:2}},{setDataValidation:{range:{sheetId:store.matching.getSheetId(),startRowIndex:end,endRowIndex:end+2,startColumnIndex:0,endColumnIndex:26}}}]);
+    return probe;
+  });
+}
+function takeProbeRow_(store,actorId,authenticatedId) {
+  var probe=probeReservation_(store,actorId,false);if(!probe)return null;
+  if(authenticatedId!==actorId)fail_('FORBIDDEN','検証行へ保存できるのは検証専用アカウント本人だけです。');
+  var ids=metadataMap_(store.matching,NODE.recordKey);
+  for(var i=0;i<probe.rows.length;i++){
+    var row=probe.rows[i];if(row>store.matching.getMaxRows())fail_('COPY_PROBE_INVALID','検証行の追加が完了していません。');
+    var range=store.matching.getRange(row,1,1,26),values=range.getValues()[0],formulas=range.getFormulas()[0];
+    if(values.some(function(value){return value!==''&&value!=null;})||formulas.some(Boolean)){
+      if(!probe.recordIds[row]||!ids[row]||ids[row].value!==probe.recordIds[row])fail_('CONFLICT','検証行が別の内容で更新されています。上書きしません。');
+      continue;
+    }
+    if(ids[row]&&ids[row].value!==probe.recordIds[row])fail_('CONFLICT','検証行の管理IDが異なります。');
+    var recordId=probe.recordIds[row]||Utilities.getUuid();probe.recordIds[row]=recordId;props_().setProperty(NODE.probeKey,JSON.stringify(probe));
+    return {row:row,recordId:recordId};
+  }
+  fail_('COPY_PROBE_EXHAUSTED','検証専用の2行は使用済みです。');
+}
 /** Real copy-only API integration probe; never creates a test candidate on the original. */
 function verifyNodeCopyIntegration() {
   var owner=requireOwner_(),config=config_(),ui=SpreadsheetApp.getUi();
   if(config.purpose!=='verification'||config.spreadsheetId!==props_().getProperty(NODE.verificationKey)||config.spreadsheetId===props_().getProperty(NODE.destinationKey)||!writesEnabled_(config))fail_('COPY_VERIFICATION_REQUIRED','書き込みを有効にした独立した検証用コピーで検証してください。');
-  if(ui.alert('複製シートで実検証','検証専用アカウントでログイン・面談・提案・数式拒否・読み戻しを確認します。検証の入力セルは後で消去し、履歴と無効化したアカウントは残します。対象は複製です。',ui.ButtonSet.YES_NO)!==ui.Button.YES)return;
+  if(ui.alert('複製シートで実検証','検証コピーの末尾に新規2行を追加し、その2行だけ入力制限を外してログイン・保存・数式拒否・読み戻しを確認します。既存セルは変更せず、終了時にテスト内容を消去します。空の2行とアプリの検証履歴はコピーに残します。',ui.ButtonSet.YES_NO)!==ui.Button.YES)return;
   props_().deleteProperty('NODE_COPY_PROOF');
-  var adminToken=random256_(),testToken='',testId='',suffix=Utilities.getUuid().replace(/-/g,'').slice(0,12),failure=null;
+  var adminToken=random256_(),testToken='',testId='',suffix=Utilities.getUuid().replace(/-/g,'').slice(0,12),failure=null,cleanupConfirmed=false;
   props_().setProperty(sessionKey_(adminToken),JSON.stringify({id:'ADMIN',expiresAt:Date.now()+30*60000}));
   try{
     var created=nodeHandle_({version:1,action:'createPlayer',token:adminToken,operationId:'copy-probe-player-'+suffix,payload:{name:'連携検証'+suffix,team:'検証用',target:1,sheetNames:['連携検証'+suffix]}});
     testId=created.credentials.id;
+    reserveCopyProbeRows_(testId);
     var loggedIn=nodeHandle_({version:1,action:'login',payload:{id:testId,password:created.credentials.password}});
     testToken=loggedIn.token;
     if(loggedIn.snapshot.self.playerId!==testId||loggedIn.snapshot.self.role!=='player')fail_('COPY_VERIFICATION_FAILED','検証ログインに失敗しました。');
@@ -632,10 +686,11 @@ function verifyNodeCopyIntegration() {
     if(!refused||store.matching.getRange(record.row,7).getFormula()!=='=1')fail_('COPY_VERIFICATION_FAILED','数式保護の確認に失敗しました。');
   }catch(error){failure=error;}
   finally{
-    try{if(testId)cleanupCopyProbe_(testId);}catch(cleanupError){failure=cleanupError;}
+    try{if(testId){cleanupCopyProbe_(testId);cleanupConfirmed=true;}}catch(cleanupError){failure=cleanupError;}
     if(testToken)props_().deleteProperty(sessionKey_(testToken));props_().deleteProperty(sessionKey_(adminToken));if(testId)props_().deleteProperty('NODE_AUTH_'+testId);
   }
   if(failure)throw failure;
+  if(!cleanupConfirmed||props_().getProperty(NODE.probeKey))fail_('COPY_VERIFICATION_FAILED','検証用の入力セルと管理IDの後始末を確認できませんでした。');
   var finalStore=readStore_();
   if(finalStore.records.some(function(r){return r.playerId===testId;})||finalStore.players.some(function(p){return p.id===testId&&p.active;}))fail_('COPY_VERIFICATION_FAILED','検証データの後始末を確認してください。');
   var proof=makeCopyProof_(config.spreadsheetId,schemaHash_(finalStore.matching),owner);props_().setProperty('NODE_COPY_PROOF',JSON.stringify(proof));
@@ -643,13 +698,37 @@ function verifyNodeCopyIntegration() {
   return {verified:true,copyId:config.spreadsheetId,verifiedAt:proof.verifiedAt};
 }
 function cleanupCopyProbe_(testId) {
+  requireOwner_();
+  return withLock_(function(){
   var store=readStore_();if(store.config.purpose!=='verification'||store.config.spreadsheetId!==props_().getProperty(NODE.verificationKey)||store.config.spreadsheetId===NODE.originalId||store.config.spreadsheetId===props_().getProperty(NODE.destinationKey))fail_('COPY_VERIFICATION_REQUIRED','後始末は別の検証用コピーだけで実行します。');
-  var requests=[],rows=store.records.filter(function(r){return r.playerId===testId;}).map(function(r){return r.row;});
+  var probe=probeReservation_(store,testId,true),requests=[],rows=[];
+  if(probe){
+    var ids=metadataMap_(store.matching,NODE.recordKey);
+    probe.rows.forEach(function(row){
+      var expected=probe.recordIds[row];
+      if(expected){
+        if(!ids[row]||ids[row].value!==expected||Object.keys(ids).filter(function(key){return ids[key].value===expected;}).length!==1)fail_('CONFLICT','割り当てた検証行の管理IDが削除・移動されています。予約を保持して後始末を停止しました。');
+        rows.push(row);
+      }else if(ids[row])fail_('CONFLICT','検証行の管理IDが更新されています。後始末を停止しました。');
+    });
+  }
   rows.forEach(function(row){NODE.inputColumns.forEach(function(column){requests.push({updateCells:{range:{sheetId:store.matching.getSheetId(),startRowIndex:row-1,endRowIndex:row,startColumnIndex:column-1,endColumnIndex:column},rows:[{values:[{}]}],fields:'userEnteredValue'}});});});
   [NODE.recordKey,NODE.sourceKey].forEach(function(key){store.matching.createDeveloperMetadataFinder().withKey(key).find().forEach(function(item){var row=item.getLocation().getRow();if(row&&rows.indexOf(row.getRow())>=0)requests.push({deleteDeveloperMetadata:{dataFilter:{developerMetadataLookup:{metadataId:item.getId()}}}});});});
   var player=store.players.find(function(p){return p.id===testId;});
   if(player)requests.push(rowUpdateRequest_(store.playerSheet.getSheetId(),player.row,[player.id,player.name,player.team,player.color,player.target,player.bio,JSON.stringify(player.sheetNames),player.role,false]));
   sheetsBatch_(store.config.spreadsheetId,requests);SpreadsheetApp.flush();
+  if(probe){
+    // Check raw cells and metadata: inactive actors are intentionally absent from readStore().records.
+    var remainingIds=metadataMap_(store.matching,NODE.recordKey),remainingSources=metadataMap_(store.matching,NODE.sourceKey),expectedIds=Object.keys(probe.recordIds).map(function(row){return probe.recordIds[row];});
+    probe.rows.forEach(function(row){
+      if(row>store.matching.getMaxRows())fail_('CONFLICT','検証行が移動または削除されています。予約を保持して確認を停止しました。');
+      var range=store.matching.getRange(row,1,1,26),values=range.getValues()[0],formulas=range.getFormulas()[0];
+      if(NODE.inputColumns.some(function(column){return values[column-1]!==''&&values[column-1]!=null||!!formulas[column-1];})||remainingIds[row]||remainingSources[row])fail_('CONFLICT','検証用の入力値・数式・管理IDが残っています。予約を保持して確認を停止しました。');
+    });
+    if(Object.keys(remainingIds).some(function(row){return expectedIds.indexOf(remainingIds[row].value)>=0;}))fail_('CONFLICT','検証用の管理IDが別の行に残っています。予約を保持して確認を停止しました。');
+    props_().deleteProperty(NODE.probeKey);
+  }
+  });
 }
 /** The migration source is permanently read-only, including any previously deployed menu entry. */
 function enableNodeOriginalAfterVerifiedCopy() { fail_('PROTECTED_SOURCE','移行元の原本への書き込みは有効にできません。新しい管理シートを使用してください。'); }

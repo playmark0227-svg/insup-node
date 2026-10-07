@@ -89,6 +89,8 @@ class MockRange {
       for (let c = 0; c < this.columns; c++) {
         const column = this.column + c - 1;
         const value = matrix[r][c];
+        const rule = this.sheet.validations[`${index + 1},${column + 1}`];
+        if (present(value) && rule?.strict && rule.condition?.type === "ONE_OF_LIST" && !rule.condition.values.some(option => option.userEnteredValue === value)) throw new Error("Strict dropdown rejected test value");
         this.sheet.values[index][column] = clone(value);
         this.sheet.formulas[index][column] = formula || (typeof value === "string" && value.startsWith("=")) ? value : "";
       }
@@ -114,7 +116,7 @@ class MockRange {
 
 class MockSheet {
   constructor(spreadsheet, { id, name, values = [], formulas = [] }) {
-    Object.assign(this, { spreadsheet, id, name, values: clone(values), formulas: clone(formulas), protections: [], hidden: false });
+    Object.assign(this, { spreadsheet, id, name, values: clone(values), formulas: clone(formulas), validations: {}, maxRows: Math.max(1000, values.length), protections: [], hidden: false });
     formulas.forEach((row, r) => row.forEach((formula, c) => {
       if (formula) { this.values[r] ??= []; this.values[r][c] ??= formula; }
     }));
@@ -126,11 +128,11 @@ class MockSheet {
   createDeveloperMetadataFinder() { return new MockMetadataFinder(this.spreadsheet, this); }
   addDeveloperMetadata(key, value, visibility) { this.spreadsheet.metadata.push(new MockMetadata(this.spreadsheet, this, null, key, String(value), visibility)); return this; }
   getLastRow() {
-    const rows = this.values.map((row, index) => row.some(present) || this.formulas[index]?.some(present) ? index + 1 : 0);
+    const rows = Array.from(this.values, (row, index) => row?.some(present) || this.formulas[index]?.some(present) ? index + 1 : 0);
     return Math.max(0, ...rows);
   }
   getLastColumn() { return Math.max(0, ...this.values.map(row => row.reduce((last, value, index) => present(value) ? index + 1 : last, 0)), ...this.formulas.map(row => row.length)); }
-  getMaxRows() { return Math.max(1000, this.values.length); }
+  getMaxRows() { return Math.max(this.maxRows, this.values.length); }
   getMaxColumns() { return Math.max(26, this.getLastColumn()); }
   getDataRange() { return this.getRange(1, 1, Math.max(1, this.getLastRow()), Math.max(1, this.getLastColumn())); }
   getRange(row, column, rows = 1, columns = 1) {
@@ -182,7 +184,7 @@ class MockSpreadsheet {
   getSpreadsheetTimeZone() { return "Asia/Tokyo"; }
   setSpreadsheetTimeZone() { return this; }
   batchUpdate(body) {
-    const saved = this.sheets.map(sheet => ({ sheet, values: clone(sheet.values), formulas: clone(sheet.formulas) }));
+    const saved = this.sheets.map(sheet => ({ sheet, values: clone(sheet.values), formulas: clone(sheet.formulas), validations: clone(sheet.validations), maxRows: sheet.maxRows }));
     const oldMetadata = this.metadata.map(item => ({ item, value: item.value, row: item.row }));
     const initialWrites = this.writes.length;
     const initialMetadataId = this.nextMetadataId;
@@ -228,6 +230,21 @@ class MockSpreadsheet {
           }));
           matched.forEach(item => { if (input.developerMetadata.metadataValue !== undefined) item.value = input.developerMetadata.metadataValue; });
           replies.push({ updateDeveloperMetadata: { developerMetadata: matched.map(item => ({ metadataId: item.id, metadataValue: item.value })) } });
+        } else if (request.appendDimension) {
+          const input = request.appendDimension, sheet = this.getSheetById(input.sheetId), previous = sheet.getMaxRows();
+          assert.equal(input.dimension, "ROWS");
+          sheet.maxRows = previous + input.length;
+          for (let row = previous + 1; row <= sheet.maxRows; row++) for (let column = 1; column <= sheet.getMaxColumns(); column++) {
+            const inherited = sheet.validations[`${previous},${column}`];
+            if (inherited) sheet.validations[`${row},${column}`] = clone(inherited);
+          }
+          replies.push({});
+        } else if (request.setDataValidation) {
+          const { range, rule } = request.setDataValidation, sheet = this.getSheetById(range.sheetId);
+          for (let row = range.startRowIndex + 1; row <= range.endRowIndex; row++) for (let column = range.startColumnIndex + 1; column <= range.endColumnIndex; column++) {
+            if (rule) sheet.validations[`${row},${column}`] = clone(rule); else delete sheet.validations[`${row},${column}`];
+          }
+          replies.push({});
         } else if (request.deleteDeveloperMetadata) {
           const lookup = request.deleteDeveloperMetadata.dataFilter?.developerMetadataLookup;
           assert.ok(Number.isInteger(lookup?.metadataId));
@@ -239,7 +256,7 @@ class MockSpreadsheet {
       }
       return { status: 200, body: JSON.stringify({ spreadsheetId: this.id, replies }) };
     } catch (error) {
-      saved.forEach(({ sheet, values, formulas }) => Object.assign(sheet, { values, formulas }));
+      saved.forEach(({ sheet, values, formulas, validations, maxRows }) => Object.assign(sheet, { values, formulas, validations, maxRows }));
       this.metadata = oldMetadata.map(({ item, value, row }) => Object.assign(item, { value, row }));
       this.nextMetadataId = initialMetadataId;
       this.writes.splice(initialWrites);
@@ -1184,6 +1201,7 @@ test("the complete verification-copy probe logs in, writes and reads back, refus
   assert.deepEqual(business.values.slice(0, originalValues.length), originalValues);
   assert.deepEqual(business.formulas.slice(0, originalFormulas.length), originalFormulas);
   assert.ok(business.values.slice(originalValues.length).every(row => row.every(value => value === "")));
+  assert.equal(harness.properties.NODE_COPY_PROBE, undefined);
   assert.deepEqual(harness.spreadsheet.metadata.map(item => item.id), originalMetadata);
   assert.ok(harness.spreadsheet.getSheetByName("_NODE_players").values.slice(1).filter(row => String(row[1]).startsWith("連携検証")).every(row => row[8] === false));
   assert.equal(harness.logs.length, 0);
@@ -1214,4 +1232,226 @@ test("header and timezone warnings refer to the connected management sheet witho
   assert.ok(snapshot.warnings.some(message => message.includes("接続先スプレッドシートのタイムゾーンがAsia/Tokyoではない")));
   assert.ok(!snapshot.warnings.some(message => message.includes("原本の列") || message.includes("複製側")));
   assert.deepEqual(harness.writes, []); assert.deepEqual(harness.apiCalls, []);
+});
+
+test("the 19 exact live-observed input headers accept their existing annotations without changing sheet cells", () => {
+  const { harness, player } = signedInFixture();
+  const observed = {
+    1: "面談実施", 2: "会社名", 3: "候補者氏名\nスペースいれない", 4: "担当\n\n",
+    6: "項目\n担当ポジ\n(アポインター/D/FS)", 7: "ステータス\n\n", 8: "提案完了日",
+    9: "C面談予約獲得日\n（アポ獲得日）", 10: "C面談予定日 （予定がわかったら入力）", 11: "C面談予定開始時刻",
+    12: "ヨミ確度\nA:95％\nB:70％\nC:50％\nD:10％", 13: "メモ", 17: "C面談実施日\n（実施したら入力）",
+    21: "クライアント側オファー日=合格日", 22: "候補者承諾日=マッチ日\n", 23: "稼働開始\n予定日", 24: "稼働開始日", 25: "離脱予定日", 26: "離脱日",
+  };
+  const sheet = harness.spreadsheet.getSheetById(MATCHING_SHEET_ID), header = [...MATCHING_HEADERS];
+  for (const [column, value] of Object.entries(observed)) header[Number(column) - 1] = value;
+  sheet.values[0] = header;
+  const beforeValues = clone(sheet.values), beforeFormulas = clone(sheet.formulas);
+  assert.equal(harness.context.NODE_TESTS.mappedHeadersMatch(header), true);
+  assert.equal(harness.context.NODE_TESTS.resolveBusinessTabs(harness.spreadsheet).matchingSheetId, MATCHING_SHEET_ID);
+  const snapshot = assertSuccess(request(harness, "snapshot", {}, { token: player.token }));
+  assert.equal(snapshot.writesEnabled, true);
+  assert.deepEqual(snapshot.activities, player.snapshot.activities);
+  for (const column of [3, 6, 10, 12, 17]) {
+    const changed = [...header]; changed[column - 1] += "未確認の説明";
+    assert.equal(harness.context.NODE_TESTS.mappedHeadersMatch(changed), false);
+  }
+  const swapped = [...header]; [swapped[9], swapped[16]] = [swapped[16], swapped[9]];
+  assert.equal(harness.context.NODE_TESTS.mappedHeadersMatch(swapped), false);
+  assert.deepEqual(sheet.values, beforeValues); assert.deepEqual(sheet.formulas, beforeFormulas);
+  assert.deepEqual(harness.writes, []); assert.deepEqual(harness.apiCalls, []);
+});
+
+
+test("realistic strict dropdowns stay unchanged while probe writes use only two newly appended copy rows", () => {
+  const { harness } = signedInFixture(), sheet = harness.spreadsheet.getSheetById(MATCHING_SHEET_ID), oldMax = sheet.getMaxRows();
+  const rule = { strict: true, condition: { type: "ONE_OF_LIST", values: [{ userEnteredValue: "担当一" }, { userEnteredValue: "担当二" }] } };
+  for (let row = 2; row <= oldMax; row++) sheet.validations[`${row},4`] = clone(rule);
+  const beforeRules = clone(sheet.validations), beforeValues = clone(sheet.values), beforeFormulas = clone(sheet.formulas);
+  assert.equal(harness.context.verifyNodeCopyIntegration().verified, true);
+  assert.deepEqual(sheet.validations, beforeRules);
+  assert.deepEqual(sheet.values.slice(0, beforeValues.length), beforeValues);
+  assert.deepEqual(sheet.formulas.slice(0, beforeFormulas.length), beforeFormulas);
+  const businessWrites = harness.writes.filter(write => write.sheetId === MATCHING_SHEET_ID);
+  assert.ok(businessWrites.length > 0 && businessWrites.every(write => [oldMax + 1, oldMax + 2].includes(write.row)));
+  const validationWrites = harness.apiCalls.flatMap(call => call.body.requests).filter(request => request.setDataValidation);
+  assert.equal(validationWrites.length, 1);
+  assert.equal(validationWrites[0].setDataValidation.range.startRowIndex, oldMax);
+  assert.equal(validationWrites[0].setDataValidation.range.endRowIndex, oldMax + 2);
+  assert.equal(sheet.getMaxRows(), oldMax + 2);
+  assert.equal(harness.properties.NODE_COPY_PROBE, undefined);
+});
+
+function reserveFixture() {
+  const fixture = signedInFixture(), { harness, admin } = fixture;
+  const created = assertSuccess(mutate(harness, admin.token, "createPlayer", { name: "連携検証abcdef123456", team: "検証用", target: 1, sheetNames: ["連携検証abcdef123456"] }));
+  const reservation = harness.context.reserveCopyProbeRows_(created.credentials.id);
+  const player = assertSuccess(request(harness, "login", created.credentials));
+  harness.writes.length = 0; harness.apiCalls.length = 0;
+  return { ...fixture, probePlayer: player, reservation };
+}
+
+test("probe row allocation requires the owner and a dedicated actor in the registered verification copy", () => {
+  const { harness } = signedInFixture();
+  assert.throws(() => harness.context.reserveCopyProbeRows_("ND-001"), error => error.nodeCode === "FORBIDDEN");
+  harness.context.Session.getActiveUser = () => ({ getEmail: () => "different@example.test" });
+  assert.throws(() => harness.context.reserveCopyProbeRows_("ND-001"), error => error.nodeCode === "FORBIDDEN");
+  const production = destinationAuthorizedFixture();
+  assert.throws(() => production.harness.context.reserveCopyProbeRows_("ND-001"), error => error.nodeCode === "COPY_VERIFICATION_REQUIRED");
+  assert.deepEqual(harness.apiCalls, []); assert.deepEqual(production.harness.apiCalls, []);
+});
+
+test("client-supplied row numbers cannot select probe rows or change a production write destination", () => {
+  const { harness, player } = destinationAuthorizedFixture();
+  assertSuccess(mutate(harness, player.token, "saveActivity", { activity: newCandidate({ row: 999, rowIndex: 998, probeRow: 999 }) }));
+  assert.ok(harness.writes.filter(write => write.sheetId === MATCHING_SHEET_ID).every(write => write.row !== 999));
+  assert.equal(harness.properties.NODE_COPY_PROBE, undefined);
+});
+
+test("expired reserved rows refuse new probe writes, then owner cleanup removes allocation and disables actor", () => {
+  const { harness, probePlayer } = reserveFixture();
+  harness.clock.milliseconds += 30 * 60000 + 1;
+  const error = assertFailure(mutate(harness, probePlayer.token, "saveActivity", { activity: newCandidate({ playerId: probePlayer.snapshot.self.playerId }) }));
+  assert.equal(error.code, "COPY_PROBE_EXPIRED"); assert.deepEqual(harness.apiCalls, []);
+  harness.context.cleanupCopyProbe_(probePlayer.snapshot.self.playerId);
+  assert.equal(harness.properties.NODE_COPY_PROBE, undefined);
+  assert.equal(harness.spreadsheet.getSheetByName("_NODE_players").values.find(row => row[0] === probePlayer.snapshot.self.playerId)[8], false);
+  assert.ok(harness.writes.every(write => write.sheetId !== MATCHING_SHEET_ID));
+});
+
+test("cleanup never removes pre-existing rows associated with a probe actor", () => {
+  const { harness, probePlayer, reservation } = reserveFixture(), sheet = harness.spreadsheet.getSheetById(MATCHING_SHEET_ID);
+  const actor = harness.spreadsheet.getSheetByName("_NODE_players").values.find(row => row[0] === probePlayer.snapshot.self.playerId);
+  // Simulate a pre-existing matching alias; cleanup must use only reserved IDs, not all actor-owned rows.
+  const existing = sheet.getRange(2, 1, 1, 26).getValues()[0]; existing[3] = actor[1]; sheet.getRange(2, 1, 1, 26).setValues([existing]);
+  harness.writes.length = 0;
+  const saved = assertSuccess(mutate(harness, probePlayer.token, "saveActivity", { activity: newCandidate({ playerId: actor[0] }) }));
+  assert.ok(saved.snapshot.activities.some(activity => activity.candidateName === "新規本人候補"));
+  harness.context.cleanupCopyProbe_(actor[0]);
+  assert.deepEqual(sheet.getRange(2, 1, 1, 26).getValues()[0], existing);
+  assert.ok(harness.writes.filter(write => write.sheetId === MATCHING_SHEET_ID).every(write => reservation.rows.includes(write.row)));
+});
+
+
+test("even an admin cannot impersonate the reserved probe actor to use its two rows", () => {
+  const { harness, admin, probePlayer } = reserveFixture();
+  const error = assertFailure(mutate(harness, admin.token, "saveActivity", { activity: newCandidate({ playerId: probePlayer.snapshot.self.playerId }) }));
+  assert.equal(error.code, "FORBIDDEN"); assert.deepEqual(harness.apiCalls, []);
+});
+
+test("a probe reservation cannot move to another file, tab, or application purpose", () => {
+  const { harness, probePlayer } = reserveFixture();
+  const original = JSON.parse(harness.properties.NODE_COPY_PROBE), actorId = probePlayer.snapshot.self.playerId;
+  for (const patch of [{ spreadsheetId: "wrong-copy" }, { matchingSheetId: KPI_SHEET_ID }, { ownerEmail: "different-owner@example.test" }]) {
+    harness.properties.NODE_COPY_PROBE = JSON.stringify({ ...original, ...patch });
+    assert.equal(assertFailure(mutate(harness, probePlayer.token, "saveActivity", { activity: newCandidate({ playerId: actorId }) })).code, "COPY_PROBE_INVALID");
+  }
+  assert.deepEqual(harness.apiCalls, []);
+});
+
+test("new player masters seed strict-dropdown names first and verification copies preserve that order for new D writes", () => {
+  const expected = [["越前", "越前祐美"], ["鈴木", "鈴木楓"], ["櫻庭", "櫻庭奈々"], ["高田", "髙田侑弥"], ["佐藤", "佐藤光"], ["倉島", "倉島颯汰"], ["佐々木駿"]];
+  const destinationId = "test-new-management-spreadsheet", copyId = "test-new-verification-spreadsheet";
+  const harness = createHarness({ spreadsheetId: destinationId, sheets: [
+    { id: 34567, name: "2期目マッチングDB", values: [MATCHING_HEADERS] },
+    { id: 89012, name: "2期目月間KPI・KGI", values: [["KPI"]] },
+  ] });
+  let promptText = destinationId, credentials;
+  harness.context.SpreadsheetApp.getUi = () => ({ ButtonSet: { OK_CANCEL: "OK_CANCEL" }, Button: { OK: "OK" }, prompt: () => ({ getSelectedButton: () => "OK", getResponseText: () => promptText }) });
+  harness.context.showCredentials_ = value => { credentials = value; };
+  harness.context.setupNode();
+  const masters = harness.spreadsheet.getSheetByName("_NODE_players").values.slice(2);
+  assert.deepEqual(masters.map(row => JSON.parse(row[6])), expected);
+  const destinationValues = clone(harness.spreadsheet.getSheetById(34567).values);
+  const copy = destinationBook(harness, { id: copyId });
+  harness.context.SpreadsheetApp.openById = id => {
+    if (id === destinationId) return harness.spreadsheet;
+    assert.equal(id, copyId); return copy;
+  };
+  harness.context.UrlFetchApp.fetch = (url, options) => {
+    assert.equal(url, `https://sheets.googleapis.com/v4/spreadsheets/${copyId}:batchUpdate`);
+    const body = JSON.parse(options.payload); harness.apiCalls.push({ url, body: clone(body) });
+    const response = copy.batchUpdate(body); return { getResponseCode: () => response.status };
+  };
+  promptText = copyId;
+  harness.context.setupNodeVerificationCopy();
+  assert.deepEqual(copy.getSheetByName("_NODE_players").values.slice(2).map(row => JSON.parse(row[6])), expected);
+  harness.properties.NODE_CONFIG = JSON.stringify({ ...JSON.parse(harness.properties.NODE_CONFIG), writesEnabled: true });
+  const matching = copy.getSheetById(1234);
+  const validation = { strict: true, condition: { type: "ONE_OF_LIST", values: expected.map(names => ({ userEnteredValue: names[0] })) } };
+  for (let row = 2; row <= 20; row++) matching.validations[`${row},4`] = clone(validation);
+  for (let i = 0; i < 7; i++) {
+    const id = `ND-00${i + 1}`, login = assertSuccess(request(harness, "login", { id, password: credentials.find(item => item.id === id).password }));
+    const candidateName = `架空候補者${i + 1}`;
+    assertSuccess(mutate(harness, login.token, "saveActivity", { activity: newCandidate({ playerId: id, candidateName }) }));
+    assert.equal(matching.values.find(row => row[2] === candidateName)[3], expected[i][0]);
+  }
+  assert.deepEqual(harness.spreadsheet.getSheetById(34567).values, destinationValues);
+  assert.deepEqual(masters.map(row => JSON.parse(row[6])), expected);
+});
+
+test("copy verification refuses proof and retains reservation when assigned record metadata disappears or moves", () => {
+  for (const change of ["deleted", "moved"]) {
+    const { harness } = signedInFixture(), cleanup = harness.context.cleanupCopyProbe_;
+    let reserved;
+    harness.context.cleanupCopyProbe_ = id => {
+      reserved = JSON.parse(harness.properties.NODE_COPY_PROBE);
+      if (change === "deleted") harness.spreadsheet.metadata = harness.spreadsheet.metadata.filter(item => !(item.key === "NODE_RECORD_ID" && reserved.rows.includes(item.row)));
+      else harness.spreadsheet.metadata.filter(item => item.key === "NODE_RECORD_ID" && reserved.rows.includes(item.row)).forEach(item => { item.row += 10; });
+      return cleanup(id);
+    };
+    assert.throws(() => harness.context.verifyNodeCopyIntegration(), error => error.nodeCode === "CONFLICT");
+    assert.ok(harness.properties.NODE_COPY_PROBE, "The failed cleanup retains its allocation for owner review");
+    assert.equal(harness.properties.NODE_COPY_PROOF, undefined);
+    assert.ok(reserved.rows.some(row => harness.spreadsheet.getSheetById(MATCHING_SHEET_ID).getRange(row, 3).getValue() !== ""));
+    const actor = harness.spreadsheet.getSheetByName("_NODE_players").values.find(row => row[0] === reserved.actorId);
+    assert.equal(actor[8], true, "Missing IDs stop cleanup before actor deactivation can hide remaining rows");
+    assert.equal(harness.locks.held, false);
+  }
+});
+
+test("cleanup checks raw values, formulas, and source metadata after clearing before it can discard a reservation or issue proof", () => {
+  for (const leftover of ["value", "formula", "sourceMetadata"]) {
+    const { harness } = signedInFixture(), fetch = harness.context.UrlFetchApp.fetch;
+    harness.context.UrlFetchApp.fetch = (url, options) => {
+      const response = fetch(url, options), body = JSON.parse(options.payload);
+      if (body.requests.some(request => request.deleteDeveloperMetadata)) {
+        const reserved = JSON.parse(harness.properties.NODE_COPY_PROBE), sheet = harness.spreadsheet.getSheetById(MATCHING_SHEET_ID), row = reserved.rows[0];
+        if (leftover === "value") sheet.values[row - 1][12] = "後始末を確認できない値";
+        if (leftover === "formula") { sheet.formulas[row - 1][12] = "=1"; sheet.values[row - 1][12] = ""; }
+        if (leftover === "sourceMetadata") sheet.getRange(row, 1, 1, 26).addDeveloperMetadata("NODE_SOURCE", "残存メタデータ");
+      }
+      return response;
+    };
+    assert.throws(() => harness.context.verifyNodeCopyIntegration(), error => error.nodeCode === "CONFLICT");
+    assert.ok(harness.properties.NODE_COPY_PROBE);
+    assert.equal(harness.properties.NODE_COPY_PROOF, undefined, "An inactive actor must not hide raw leftover cells or metadata from verification");
+  }
+});
+
+test("an expired verification actor cannot update an existing reserved status or add its next activity stage", () => {
+  const { harness, probePlayer } = reserveFixture(), id = probePlayer.snapshot.self.playerId;
+  const saved = assertSuccess(mutate(harness, probePlayer.token, "saveActivity", { activity: newCandidate({ playerId: id }) }));
+  const record = saved.snapshot.activities.find(activity => activity.playerId === id);
+  harness.clock.milliseconds += 30 * 60000 + 1;
+  const before = clone(harness.spreadsheet.getSheetById(MATCHING_SHEET_ID).values);
+  harness.apiCalls.length = 0; harness.writes.length = 0;
+  assert.equal(assertFailure(mutate(harness, probePlayer.token, "updateStatus", { recordId: record.recordId, rowVersion: record.rowVersion, status: "辞退（本人希望）" })).code, "COPY_PROBE_EXPIRED");
+  assert.equal(assertFailure(mutate(harness, probePlayer.token, "saveActivity", { activity: { ...record, stage: "提案", company: "架空検証会社", date: "2026-10-07" } })).code, "COPY_PROBE_EXPIRED");
+  assert.deepEqual(harness.spreadsheet.getSheetById(MATCHING_SHEET_ID).values, before);
+  assert.deepEqual(harness.apiCalls, []); assert.deepEqual(harness.writes, []);
+  assert.ok(harness.properties.NODE_COPY_PROBE);
+});
+
+test("an unexpired probe actor still cannot update an existing record outside its reserved row and record IDs", () => {
+  const { harness, probePlayer } = reserveFixture(), id = probePlayer.snapshot.self.playerId;
+  const master = harness.spreadsheet.getSheetByName("_NODE_players").values.find(row => row[0] === id);
+  harness.spreadsheet.getSheetById(MATCHING_SHEET_ID).values[1][3] = master[1];
+  const ownSnapshot = assertSuccess(request(harness, "snapshot", {}, { token: probePlayer.token }));
+  const existing = ownSnapshot.activities.find(activity => activity.playerId === id && activity.stage === "提案");
+  assert.ok(existing);
+  harness.apiCalls.length = 0; harness.writes.length = 0;
+  assert.equal(assertFailure(mutate(harness, probePlayer.token, "updateStatus", { recordId: existing.recordId, rowVersion: existing.rowVersion, status: "辞退（本人希望）" })).code, "CONFLICT");
+  assert.equal(assertFailure(mutate(harness, probePlayer.token, "saveActivity", { activity: { ...existing, stage: "クライアント面談", date: "2026-10-07" } })).code, "CONFLICT");
+  assert.deepEqual(harness.apiCalls, []); assert.deepEqual(harness.writes, []);
 });
