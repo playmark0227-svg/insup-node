@@ -221,15 +221,32 @@ function table_(sheet, headers) {
   return values;
 }
 function metadataMap_(sheet, key) {
-  var map = {};
-  sheet.createDeveloperMetadataFinder().withKey(key).find().forEach(function (item) {
-    var location = item.getLocation(), range = location.getRow();
-    if (!range) return;
-    var row = range.getRow(), value = item.getValue();
+  var map = {}, response, sheetId = sheet.getSheetId();
+  // A single Sheets API read avoids remote getters for every metadata entry.
+  try {
+    response = Sheets.Spreadsheets.DeveloperMetadata.search({ dataFilters: [{ developerMetadataLookup: { metadataKey: key, locationType: 'ROW' } }] }, sheet.getParent().getId());
+  } catch (_) { fail_('SHEET_READ_FAILED', '行の管理IDを取得できませんでした。入力を残したまま再試行してください。'); }
+  if (!response || (response.matchedDeveloperMetadata !== undefined && !Array.isArray(response.matchedDeveloperMetadata))) fail_('SHEET_READ_FAILED', '行の管理IDの応答を確認できませんでした。');
+  (response.matchedDeveloperMetadata || []).forEach(function (match) {
+    var item = match.developerMetadata, range = item && item.location && item.location.dimensionRange;
+    if (!item || item.metadataKey !== key || !range || range.sheetId !== sheetId || range.dimension !== 'ROWS') return;
+    var start = range.startIndex == null ? 0 : range.startIndex;
+    if (!Number.isInteger(start) || start < 0 || range.endIndex !== start + 1 || !Number.isInteger(item.metadataId) || item.metadataId <= 0) fail_('SHEET_READ_FAILED', '行の管理IDの位置を確認できませんでした。');
+    var row = start + 1;
     if (map[row]) fail_('METADATA_CONFLICT', '同じ行に重複した管理IDがあります。管理者が確認してください。');
-    map[row] = { value: value, metadataId: item.getId() };
+    map[row] = { value: item.metadataValue == null ? null : item.metadataValue, metadataId: item.metadataId };
   });
   return map;
+}
+function sheetRowCount_(sheet) {
+  var response;
+  // REST writes can leave SpreadsheetApp.getMaxRows() stale during this execution.
+  try { response = Sheets.Spreadsheets.get(sheet.getParent().getId(), { fields: 'sheets(properties(sheetId,gridProperties(rowCount)))' }); }
+  catch (_) { fail_('SHEET_READ_FAILED', 'シートの現在の行数を取得できませんでした。入力を残したまま再試行してください。'); }
+  var found = response && Array.isArray(response.sheets) && response.sheets.find(function (item) { return item.properties && item.properties.sheetId === sheet.getSheetId(); });
+  var count = found && found.properties.gridProperties && found.properties.gridProperties.rowCount;
+  if (!Number.isInteger(count) || count < 1) fail_('SHEET_READ_FAILED', 'シートの現在の行数を確認できませんでした。');
+  return count;
 }
 function readStore_() {
   var config = config_(), book = SpreadsheetApp.openById(config.spreadsheetId);
@@ -498,12 +515,13 @@ function commit_(store, user, action, operationId, payloadHash, plan) {
       var currentRange = businessSheet.getRange(currentRow, 1, 1, 26), currentValues = currentRange.getValues()[0], currentFormulas = currentRange.getFormulas()[0], currentSources = metadataMap_(businessSheet, NODE.sourceKey);
       if (rowVersion_(plan.recordId, currentValues, currentFormulas, currentSources[currentRow] ? currentSources[currentRow].value : '') !== plan.record.version || currentRow !== plan.row) fail_('CONFLICT', '対象行が更新・並べ替えされています。同期してから再入力してください。');
     }
-    if (plan.row > businessSheet.getMaxRows()) requests.push({ appendDimension: { sheetId: businessSheet.getSheetId(), dimension: 'ROWS', length: plan.row - businessSheet.getMaxRows() } });
+    var maxRows = sheetRowCount_(businessSheet);
+    if (plan.row > maxRows) requests.push({ appendDimension: { sheetId: businessSheet.getSheetId(), dimension: 'ROWS', length: plan.row - maxRows } });
     Object.keys(plan.patches).forEach(function (columnText) {
       var column = Number(columnText);
       if (NODE.inputColumns.indexOf(column) < 0) fail_('PROTECTED_COLUMN', 'この列は書き込めません。');
-      if (plan.row <= businessSheet.getMaxRows() && businessSheet.getRange(plan.row, column).getFormula()) fail_('FORMULA_PROTECTED', '入力先に数式があります。元の数式は上書きしません。');
-      if (!plan.record && plan.row <= businessSheet.getMaxRows() && businessSheet.getRange(plan.row, column).getValue() !== '') fail_('CONFLICT', '入力先が更新されています。同期してください。');
+      if (plan.row <= maxRows && businessSheet.getRange(plan.row, column).getFormula()) fail_('FORMULA_PROTECTED', '入力先に数式があります。元の数式は上書きしません。');
+      if (!plan.record && plan.row <= maxRows && businessSheet.getRange(plan.row, column).getValue() !== '') fail_('CONFLICT', '入力先が更新されています。同期してください。');
       var value = plan.patches[column];
       requests.push({ updateCells: { range: { sheetId: businessSheet.getSheetId(), startRowIndex: plan.row - 1, endRowIndex: plan.row, startColumnIndex: column - 1, endColumnIndex: column }, rows: [{ values: [cell_(value)] }], fields: value instanceof Date ? 'userEnteredValue,userEnteredFormat.numberFormat' : 'userEnteredValue' } });
     });
@@ -519,6 +537,7 @@ function sheetsBatch_(spreadsheetId, requests) {
   if (!requests.length) return;
   var response = UrlFetchApp.fetch('https://sheets.googleapis.com/v4/spreadsheets/' + encodeURIComponent(spreadsheetId) + ':batchUpdate', { method: 'post', contentType: 'application/json', headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, payload: JSON.stringify({ requests: requests }), muteHttpExceptions: true });
   if (response.getResponseCode() < 200 || response.getResponseCode() >= 300) fail_('SHEET_WRITE_FAILED', 'シートへの保存を完了できませんでした。同じ操作IDのまま再試行してください。');
+  SpreadsheetApp.flush();
 }
 
 /* Owner-only editor/menu setup. Never reachable through the web-app action dispatch. */
@@ -631,7 +650,7 @@ function reserveCopyProbeRows_(actorId) {
     var actor=store.players.find(function(p){return p.id===actorId&&p.active&&p.role==='player'&&p.team==='検証用'&&/^連携検証[a-f0-9]{12}$/i.test(p.name);});
     if(!actor)fail_('FORBIDDEN','検証専用アカウントだけに行を割り当てます。');
     if(props_().getProperty(NODE.probeKey))fail_('COPY_PROBE_PENDING','前の検証行の記録が残っています。所有者が確認してください。');
-    var end=store.matching.getMaxRows(),probe={spreadsheetId:store.config.spreadsheetId,actorId:actorId,ownerEmail:owner,matchingSheetId:store.matching.getSheetId(),originalMaxRows:end,rows:[end+1,end+2],recordIds:{},expiresAt:Date.now()+30*60000};
+    var end=sheetRowCount_(store.matching),probe={spreadsheetId:store.config.spreadsheetId,actorId:actorId,ownerEmail:owner,matchingSheetId:store.matching.getSheetId(),originalMaxRows:end,rows:[end+1,end+2],recordIds:{},expiresAt:Date.now()+30*60000};
     props_().setProperty(NODE.probeKey,JSON.stringify(probe));
     // Only newly appended verification-copy rows lose inherited validation. Existing cells are untouched.
     sheetsBatch_(store.config.spreadsheetId,[{appendDimension:{sheetId:store.matching.getSheetId(),dimension:'ROWS',length:2}},{setDataValidation:{range:{sheetId:store.matching.getSheetId(),startRowIndex:end,endRowIndex:end+2,startColumnIndex:0,endColumnIndex:26}}}]);
@@ -641,9 +660,9 @@ function reserveCopyProbeRows_(actorId) {
 function takeProbeRow_(store,actorId,authenticatedId) {
   var probe=probeReservation_(store,actorId,false);if(!probe)return null;
   if(authenticatedId!==actorId)fail_('FORBIDDEN','検証行へ保存できるのは検証専用アカウント本人だけです。');
-  var ids=metadataMap_(store.matching,NODE.recordKey);
+  var ids=metadataMap_(store.matching,NODE.recordKey),maxRows=sheetRowCount_(store.matching);
   for(var i=0;i<probe.rows.length;i++){
-    var row=probe.rows[i];if(row>store.matching.getMaxRows())fail_('COPY_PROBE_INVALID','検証行の追加が完了していません。');
+    var row=probe.rows[i];if(row>maxRows)fail_('COPY_PROBE_INVALID','検証行の追加が完了していません。');
     var range=store.matching.getRange(row,1,1,26),values=range.getValues()[0],formulas=range.getFormulas()[0];
     if(values.some(function(value){return value!==''&&value!=null;})||formulas.some(Boolean)){
       if(!probe.recordIds[row]||!ids[row]||ids[row].value!==probe.recordIds[row])fail_('CONFLICT','検証行が別の内容で更新されています。上書きしません。');
@@ -713,15 +732,15 @@ function cleanupCopyProbe_(testId) {
     });
   }
   rows.forEach(function(row){NODE.inputColumns.forEach(function(column){requests.push({updateCells:{range:{sheetId:store.matching.getSheetId(),startRowIndex:row-1,endRowIndex:row,startColumnIndex:column-1,endColumnIndex:column},rows:[{values:[{}]}],fields:'userEnteredValue'}});});});
-  [NODE.recordKey,NODE.sourceKey].forEach(function(key){store.matching.createDeveloperMetadataFinder().withKey(key).find().forEach(function(item){var row=item.getLocation().getRow();if(row&&rows.indexOf(row.getRow())>=0)requests.push({deleteDeveloperMetadata:{dataFilter:{developerMetadataLookup:{metadataId:item.getId()}}}});});});
+  [NODE.recordKey,NODE.sourceKey].forEach(function(key){var metadata=metadataMap_(store.matching,key);rows.forEach(function(row){if(metadata[row])requests.push({deleteDeveloperMetadata:{dataFilter:{developerMetadataLookup:{metadataId:metadata[row].metadataId}}}});});});
   var player=store.players.find(function(p){return p.id===testId;});
   if(player)requests.push(rowUpdateRequest_(store.playerSheet.getSheetId(),player.row,[player.id,player.name,player.team,player.color,player.target,player.bio,JSON.stringify(player.sheetNames),player.role,false]));
   sheetsBatch_(store.config.spreadsheetId,requests);SpreadsheetApp.flush();
   if(probe){
     // Check raw cells and metadata: inactive actors are intentionally absent from readStore().records.
-    var remainingIds=metadataMap_(store.matching,NODE.recordKey),remainingSources=metadataMap_(store.matching,NODE.sourceKey),expectedIds=Object.keys(probe.recordIds).map(function(row){return probe.recordIds[row];});
+    var remainingIds=metadataMap_(store.matching,NODE.recordKey),remainingSources=metadataMap_(store.matching,NODE.sourceKey),maxRows=sheetRowCount_(store.matching),expectedIds=Object.keys(probe.recordIds).map(function(row){return probe.recordIds[row];});
     probe.rows.forEach(function(row){
-      if(row>store.matching.getMaxRows())fail_('CONFLICT','検証行が移動または削除されています。予約を保持して確認を停止しました。');
+      if(row>maxRows)fail_('CONFLICT','検証行が移動または削除されています。予約を保持して確認を停止しました。');
       var range=store.matching.getRange(row,1,1,26),values=range.getValues()[0],formulas=range.getFormulas()[0];
       if(NODE.inputColumns.some(function(column){return values[column-1]!==''&&values[column-1]!=null||!!formulas[column-1];})||remainingIds[row]||remainingSources[row])fail_('CONFLICT','検証用の入力値・数式・管理IDが残っています。予約を保持して確認を停止しました。');
     });

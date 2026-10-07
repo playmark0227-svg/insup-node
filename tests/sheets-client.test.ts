@@ -92,7 +92,7 @@ test("the business date follows Japan at the UTC month boundary",()=>{
 });
 
 test("lost or invalid write responses keep the operation payload while definitive rejections permit correction",()=>{
-  for(const code of ["NETWORK","HTTP","NOT_JSON","INTERNAL","API","SHEET_WRITE_FAILED","INVALID_RESPONSE"])
+  for(const code of ["NETWORK","HTTP","NOT_JSON","INTERNAL","API","SHEET_WRITE_FAILED","SHEET_READ_FAILED","INVALID_RESPONSE"])
     assert.equal(isUncertainWrite(new SheetApiError(code,"response lost")),true);
   for(const code of ["CONFLICT","SCHEMA_MISMATCH","UNAUTHENTICATED","VALIDATION","READ_ONLY"])
     assert.equal(isUncertainWrite(new SheetApiError(code,"rejected")),false);

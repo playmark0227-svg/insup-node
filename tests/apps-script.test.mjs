@@ -231,7 +231,7 @@ class MockSpreadsheet {
           matched.forEach(item => { if (input.developerMetadata.metadataValue !== undefined) item.value = input.developerMetadata.metadataValue; });
           replies.push({ updateDeveloperMetadata: { developerMetadata: matched.map(item => ({ metadataId: item.id, metadataValue: item.value })) } });
         } else if (request.appendDimension) {
-          const input = request.appendDimension, sheet = this.getSheetById(input.sheetId), previous = sheet.getMaxRows();
+          const input = request.appendDimension, sheet = this.getSheetById(input.sheetId), previous = Math.max(sheet.maxRows, sheet.values.length);
           assert.equal(input.dimension, "ROWS");
           sheet.maxRows = previous + input.length;
           for (let row = previous + 1; row <= sheet.maxRows; row++) for (let column = 1; column <= sheet.getMaxColumns(); column++) {
@@ -279,6 +279,8 @@ export function createHarness({ spreadsheetId = "test-spreadsheet", sheets = [],
   }
   const logs = [];
   const apiCalls = [];
+  const metadataReads = [];
+  const sheetReads = [];
   const locks = { held: false, calls: 0, available: true };
   const propertyApi = {
     getProperty: key => propertyStore[key] ?? null,
@@ -294,6 +296,21 @@ export function createHarness({ spreadsheetId = "test-spreadsheet", sheets = [],
     NODE_TESTS: {},
     Logger: { log: (...args) => logs.push(args) },
     ScriptApp: { getOAuthToken: () => "test-oauth-token" },
+    Sheets: { Spreadsheets: { get: (id, options) => {
+      sheetReads.push({ spreadsheetId: id, options: clone(options) });
+      const book = context.SpreadsheetApp.openById(id);
+      return { sheets: book.getSheets().map(sheet => ({ properties: { sheetId: sheet.id, gridProperties: { rowCount: Math.max(sheet.maxRows, sheet.values.length) } } })) };
+    }, DeveloperMetadata: { search: (body, id) => {
+      metadataReads.push({ spreadsheetId: id, body: clone(body) });
+      const book = context.SpreadsheetApp.openById(id);
+      return { matchedDeveloperMetadata: book.metadata.filter(item => body.dataFilters.some(filter => {
+        const lookup = filter.developerMetadataLookup;
+        return item.key === lookup.metadataKey && (lookup.locationType !== "ROW" || item.row);
+      })).map(item => ({ developerMetadata: {
+        metadataId: item.id, metadataKey: item.key, metadataValue: item.value, visibility: item.visibility,
+        location: item.row ? { locationType: "ROW", dimensionRange: { sheetId: item.sheet.id, dimension: "ROWS", startIndex: item.row - 1, endIndex: item.row } } : { locationType: "SHEET", sheetId: item.sheet.id },
+      } })) };
+    } } } },
     UrlFetchApp: { fetch: (url, options) => {
       assert.equal(url, `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`, "The API must target the configured spreadsheet batchUpdate endpoint");
       const body = JSON.parse(options.payload);
@@ -351,7 +368,7 @@ export function createHarness({ spreadsheetId = "test-spreadsheet", sheets = [],
   });
   vm.runInContext(code ?? readFileSync(CODE_PATH, "utf8"), context, { filename: CODE_PATH, timeout: 5000 });
   return {
-    context, spreadsheet, writes, apiCalls, properties: propertyStore, logs, locks, clock,
+    context, spreadsheet, writes, apiCalls, metadataReads, sheetReads, properties: propertyStore, logs, locks, clock,
     json(body) {
       const output = context.doPost({ postData: { contents: JSON.stringify(body), type: "text/plain" }, parameter: {}, parameters: {} });
       return JSON.parse(output.getContent());
@@ -448,6 +465,46 @@ function signedInFixture(options = {}) {
   harness.apiCalls.length = 0;
   return { harness, records, player, admin };
 }
+
+test("row metadata uses one bulk read for 214 entries without remote per-entry getters", () => {
+  const harness = baseHarness(), sheet = harness.spreadsheet.getSheetById(MATCHING_SHEET_ID);
+  for (let row = 2; row <= 215; row++) sheet.getRange(row, 1, 1, 26).addDeveloperMetadata("NODE_RECORD_ID", `record-${row}`);
+  sheet.createDeveloperMetadataFinder = () => { throw new Error("Per-entry metadata reads must not be used"); };
+  for (const item of harness.spreadsheet.metadata) {
+    item.getLocation = item.getValue = item.getId = () => { throw new Error("Remote getter must not be used"); };
+  }
+  const result = harness.context.metadataMap_(sheet, "NODE_RECORD_ID");
+  assert.equal(Object.keys(result).length, 214);
+  assert.equal(result[215].value, "record-215");
+  assert.equal(result[215].metadataId, harness.spreadsheet.metadata.at(-1).id);
+  assert.deepEqual(harness.metadataReads, [{ spreadsheetId: SPREADSHEET_ID, body: { dataFilters: [{ developerMetadataLookup: { metadataKey: "NODE_RECORD_ID", locationType: "ROW" } }] } }]);
+  assert.deepEqual(harness.apiCalls, []);
+  harness.spreadsheet.metadata[0].row = 300;
+  const refreshed = harness.context.metadataMap_(sheet, "NODE_RECORD_ID");
+  assert.equal(refreshed[2], undefined);
+  assert.equal(refreshed[300].value, "record-2", "Row moves must be reread instead of cached");
+});
+
+test("bulk metadata handles first row and sheet zero, ignores other locations, and rejects duplicates", () => {
+  const harness = createHarness({ sheets: [{ id: 0, name: "target" }, { id: 99, name: "other" }] });
+  const sheet = harness.spreadsheet.getSheetById(0);
+  const item = { metadataId: 1, metadataKey: "NODE_RECORD_ID", metadataValue: "first", location: { dimensionRange: { sheetId: 0, dimension: "ROWS", endIndex: 1 } } };
+  const entries = [item, { ...item, metadataId: 2, location: { dimensionRange: { sheetId: 99, dimension: "ROWS", endIndex: 1 } } }, { ...item, metadataId: 3, location: { sheetId: 0 } }, { ...item, metadataId: 4, metadataKey: "NODE_SOURCE" }];
+  harness.context.Sheets.Spreadsheets.DeveloperMetadata.search = () => ({ matchedDeveloperMetadata: entries.map(developerMetadata => ({ developerMetadata })) });
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.context.metadataMap_(sheet, "NODE_RECORD_ID"))), { 1: { value: "first", metadataId: 1 } });
+  entries.push({ ...item, metadataId: 5 });
+  assert.throws(() => harness.context.metadataMap_(sheet, "NODE_RECORD_ID"), error => error.nodeCode === "METADATA_CONFLICT");
+});
+
+test("metadata lookup failure blocks business writes without treating an unreadable map as empty", () => {
+  const { harness, player } = signedInFixture();
+  harness.context.Sheets.Spreadsheets.DeveloperMetadata.search = () => { throw new Error("private upstream details"); };
+  const error = assertFailure(mutate(harness, player.token, "saveActivity", { activity: newCandidate() }));
+  assert.equal(error.code, "SHEET_READ_FAILED");
+  assert.ok(!error.message.includes("private upstream details"));
+  assert.deepEqual(harness.writes, []);
+  assert.deepEqual(harness.apiCalls, []);
+});
 
 function newCandidate(overrides = {}) {
   return { id: "client-ignored-id", playerId: "ND-001", candidateId: "", candidateName: "新規本人候補", source: "本人入力の紹介元", company: "", position: "FS", stage: "候補者面談", date: "2026-10-07", status: "提案候補", memo: "本人入力メモ", ...overrides };
@@ -1265,6 +1322,7 @@ test("the 19 exact live-observed input headers accept their existing annotations
 
 test("realistic strict dropdowns stay unchanged while probe writes use only two newly appended copy rows", () => {
   const { harness } = signedInFixture(), sheet = harness.spreadsheet.getSheetById(MATCHING_SHEET_ID), oldMax = sheet.getMaxRows();
+  sheet.createDeveloperMetadataFinder = () => { throw new Error("Probe cleanup must also use bulk metadata reads"); };
   const rule = { strict: true, condition: { type: "ONE_OF_LIST", values: [{ userEnteredValue: "担当一" }, { userEnteredValue: "担当二" }] } };
   for (let row = 2; row <= oldMax; row++) sheet.validations[`${row},4`] = clone(rule);
   const beforeRules = clone(sheet.validations), beforeValues = clone(sheet.values), beforeFormulas = clone(sheet.formulas);
@@ -1282,6 +1340,47 @@ test("realistic strict dropdowns stay unchanged while probe writes use only two 
   assert.equal(harness.properties.NODE_COPY_PROBE, undefined);
 });
 
+test("copy verification succeeds with stale SpreadsheetApp row counts without appending extra rows or skipping cleanup", () => {
+  const { harness } = signedInFixture(), sheet = harness.spreadsheet.getSheetById(MATCHING_SHEET_ID), oldMax = sheet.getMaxRows();
+  const beforeValues = clone(sheet.values), beforeFormulas = clone(sheet.formulas), fetch = harness.context.UrlFetchApp.fetch;
+  const flushedBatches = [];
+  let pendingBatch;
+  // Model the live failure: REST has appended rows, but getMaxRows stays cached even after flush.
+  sheet.getMaxRows = () => oldMax;
+  harness.context.UrlFetchApp.fetch = (url, options) => {
+    const response = fetch(url, options);
+    pendingBatch = JSON.parse(options.payload);
+    return response;
+  };
+  harness.context.SpreadsheetApp.flush = () => { if (pendingBatch) { flushedBatches.push(pendingBatch); pendingBatch = null; } };
+  assert.equal(harness.context.verifyNodeCopyIntegration().verified, true);
+  assert.equal(sheet.maxRows, oldMax + 2);
+  const additions = harness.apiCalls.flatMap(call => call.body.requests).filter(request => request.appendDimension);
+  assert.deepEqual(additions.map(request => request.appendDimension.length), [2]);
+  assert.deepEqual(sheet.values.slice(0, beforeValues.length), beforeValues);
+  assert.deepEqual(sheet.formulas.slice(0, beforeFormulas.length), beforeFormulas);
+  assert.ok(harness.writes.filter(write => write.sheetId === MATCHING_SHEET_ID).every(write => [oldMax + 1, oldMax + 2].includes(write.row)));
+  for (const row of [oldMax + 1, oldMax + 2]) {
+    assert.ok(sheet.getRange(row, 1, 1, 26).getValues()[0].every(value => value === ""));
+    assert.ok(sheet.getRange(row, 1, 1, 26).getFormulas()[0].every(value => value === ""));
+  }
+  assert.ok(flushedBatches.some(body => body.requests.some(request => request.appendDimension)));
+  assert.ok(flushedBatches.some(body => body.requests.some(request => request.updateCells?.rows?.some(row => row.values?.some(cell => cell.userEnteredValue?.formulaValue === "=1")))));
+  assert.equal(flushedBatches.length, harness.apiCalls.length, "Every successful REST batch must be followed by flush");
+  assert.equal(harness.properties.NODE_COPY_PROBE, undefined);
+  assert.ok(harness.sheetReads.every(read => read.spreadsheetId === SPREADSHEET_ID && read.options.fields === "sheets(properties(sheetId,gridProperties(rowCount)))"));
+});
+
+test("a fresh row-count read failure prevents adding verification rows and preserves the reservation state", () => {
+  const { harness, admin } = signedInFixture();
+  const created = assertSuccess(mutate(harness, admin.token, "createPlayer", { name: "連携検証abcdef123456", team: "検証用", target: 1, sheetNames: ["連携検証abcdef123456"] }));
+  harness.apiCalls.length = 0; harness.writes.length = 0;
+  harness.context.Sheets.Spreadsheets.get = () => { throw new Error("private upstream details"); };
+  assert.throws(() => harness.context.reserveCopyProbeRows_(created.credentials.id), error => error.nodeCode === "SHEET_READ_FAILED" && !error.message.includes("private upstream details"));
+  assert.deepEqual(harness.apiCalls, []); assert.deepEqual(harness.writes, []);
+  assert.equal(harness.properties.NODE_COPY_PROBE, undefined);
+});
+
 function reserveFixture() {
   const fixture = signedInFixture(), { harness, admin } = fixture;
   const created = assertSuccess(mutate(harness, admin.token, "createPlayer", { name: "連携検証abcdef123456", team: "検証用", target: 1, sheetNames: ["連携検証abcdef123456"] }));
@@ -1290,6 +1389,15 @@ function reserveFixture() {
   harness.writes.length = 0; harness.apiCalls.length = 0;
   return { ...fixture, probePlayer: player, reservation };
 }
+
+test("a missing appended row in the live API refuses probe writes even when SpreadsheetApp reports it exists", () => {
+  const { harness, probePlayer, reservation } = reserveFixture();
+  harness.context.Sheets.Spreadsheets.get = () => ({ sheets: [{ properties: { sheetId: MATCHING_SHEET_ID, gridProperties: { rowCount: reservation.originalMaxRows } } }] });
+  const result = mutate(harness, probePlayer.token, "saveActivity", { activity: newCandidate({ playerId: probePlayer.snapshot.self.playerId }) });
+  assert.equal(assertFailure(result).code, "COPY_PROBE_INVALID");
+  assert.deepEqual(harness.apiCalls, []); assert.deepEqual(harness.writes, []);
+  assert.deepEqual(JSON.parse(harness.properties.NODE_COPY_PROBE).recordIds, {});
+});
 
 test("probe row allocation requires the owner and a dedicated actor in the registered verification copy", () => {
   const { harness } = signedInFixture();

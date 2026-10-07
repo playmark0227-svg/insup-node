@@ -29,7 +29,7 @@ export class SheetApiError extends Error {
 
 // A committed write may still have lost its response. Reuse its payload and ID.
 export function isUncertainWrite(error: unknown): boolean {
-  return !(error instanceof SheetApiError) || ["NETWORK", "HTTP", "NOT_JSON", "INTERNAL", "API", "SHEET_WRITE_FAILED", "INVALID_RESPONSE"].includes(error.code);
+  return !(error instanceof SheetApiError) || ["NETWORK", "HTTP", "NOT_JSON", "INTERNAL", "API", "SHEET_WRITE_FAILED", "SHEET_READ_FAILED", "INVALID_RESPONSE"].includes(error.code);
 }
 
 // Credentials go only to a deployed Apps Script endpoint, never to a URL query.
