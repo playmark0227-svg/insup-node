@@ -45,6 +45,40 @@ test("a player snapshot rejects another player's private activity and missing se
   assert.throws(()=>assertSnapshot({...snapshot,players:[{...player,target:0}]}));
 });
 
+const destination = {
+  title: "テスト管理シート",
+  matchingUrl: "https://docs.google.com/spreadsheets/d/test-destination-id/edit#gid=34567",
+  kpiUrl: "https://docs.google.com/spreadsheets/d/test-destination-id/edit#gid=89012",
+};
+
+test("an admin snapshot accepts actual destination links after copied tab IDs change",()=>{
+  const admin = {...snapshot,self:{playerId:"ADMIN",role:"admin"},destination};
+  assert.doesNotThrow(()=>assertSnapshot(admin));
+  assert.doesNotThrow(()=>assertSnapshot({...admin,destination:{...destination,
+    matchingUrl:destination.matchingUrl.replace("#gid=","?gid="),
+    kpiUrl:destination.kpiUrl.replace("#gid=","?gid=")+"#gid=89012",
+  }}));
+});
+
+test("a player snapshot rejects destination information even when the Google links are valid",()=>{
+  assert.throws(()=>assertSnapshot({...snapshot,destination}),{code:"INVALID_RESPONSE"});
+});
+
+test("destination links reject external hosts, credentials, unsafe schemes, and non-sheet URLs",()=>{
+  const admin = {...snapshot,self:{playerId:"ADMIN",role:"admin"}};
+  for(const value of [
+    "https://evil.example/spreadsheets/d/test-destination-id/edit#gid=34567",
+    destination.matchingUrl.replace("docs.google.com","docs.google.com.evil.example"),
+    destination.matchingUrl.replace("https:","http:"),
+    destination.matchingUrl.replace("https://","https://user:password@"),
+    "javascript:alert(1)",
+    "https://docs.google.com/document/d/test-document-id/edit#gid=34567",
+  ]) {
+    for(const field of ["matchingUrl","kpiUrl"])
+      assert.throws(()=>assertSnapshot({...admin,destination:{...destination,[field]:value}}),{code:"INVALID_RESPONSE"});
+  }
+});
+
 test("ranking totals use authenticated aggregates while private details can remain empty",()=>{
   const counts={"2026-10":{"ND-001":{"提案":4},"ND-002":{"提案":7}}};
   assert.equal(liveCount(counts,"2026-10","提案","ND-002"),7);

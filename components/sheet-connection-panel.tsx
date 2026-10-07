@@ -2,10 +2,12 @@ import { useState } from "react";
 import { FileSpreadsheet, RefreshCw, CheckCircle2, Clock3 } from "lucide-react";
 import { Input } from "./ui/input";
 import { inputColumns } from "../lib/sheets-schema";
+import type { SheetDestination } from "../lib/sheets-client";
 
 type Props = {
   endpoint: string; mode: "live" | "demo"; busy: boolean; error: string;
   connected: boolean; syncedAt?: string; writesEnabled?: boolean; warnings: string[];
+  destination?: SheetDestination;
   onConnect: (value: string) => Promise<void>; onRefresh: () => Promise<void>;
   onDemo?: () => void;
 };
@@ -17,7 +19,7 @@ export function SheetConnectionPanel(props: Props) {
     <section className="card connection-main">
       <span className="connection-symbol"><FileSpreadsheet size={30}/></span>
       <h2>Googleスプレッドシート連携</h2>
-      <p>元シートの入力列から実績を取得し、画面から活動を登録します。</p>
+      <p>新しい管理用シートから実績を取得し、画面から活動を登録します。</p>
       <span className="connection-status">{props.connected ? <CheckCircle2 size={15}/> : <Clock3 size={15}/>}
         {props.connected ? (props.writesEnabled ? "読み書き接続" : "読み取り接続") : props.endpoint ? "ログイン待ち" : "Google側の設定待ち"}
       </span>
@@ -37,20 +39,20 @@ export function SheetConnectionPanel(props: Props) {
       <details className="connection-help">
         <summary>管理者向けの初期設定</summary>
         <ol>
-          <li>元シートの複製で連携コードを設定し、読み取りと保存を確認します。</li>
+          <li>新しい保存先へデータをコピーし、値・数式・書式を照合します。</li>
           <li>Google側の初期設定で管理者・プレイヤーのログイン情報を発行します。</li>
-          <li>連携用URLを上の欄に入力します。動作確認後に原本への書き込みを有効にします。</li>
+          <li>別の検証用シートで動作を確認し、新しい保存先を有効にして連携用URLを入力します。</li>
         </ol>
         <div className="sheet-links"><a href={`${import.meta.env.BASE_URL}apps-script/SETUP.md`} target="_blank" rel="noreferrer">設定手順</a><a href={`${import.meta.env.BASE_URL}apps-script/Code.gs`} download>Google側の連携コード</a></div>
       </details>
       <details className="schema-details"><summary>対応する入力項目（19項目）</summary><div>{inputColumns.map(c=><span key={c.column}><code>{c.column}</code>{c.label}</span>)}</div></details>
-      <div className="sheet-links"><a href="https://docs.google.com/spreadsheets/d/1AnyvEoUtgUSTnuuJjIjA80XGHw_DaL9fSUoNCrYZ36s/edit?gid=286330650#gid=286330650" target="_blank" rel="noreferrer">マッチングDBを開く</a><a href="https://docs.google.com/spreadsheets/d/1AnyvEoUtgUSTnuuJjIjA80XGHw_DaL9fSUoNCrYZ36s/edit?gid=2007683505#gid=2007683505" target="_blank" rel="noreferrer">KPI・KGIを開く</a></div>
+      {props.destination && <div className="sheet-links"><p className="panel-note">保存先：{props.destination.title}</p><a href={props.destination.matchingUrl} target="_blank" rel="noreferrer">保存先のマッチングDBを開く</a><a href={props.destination.kpiUrl} target="_blank" rel="noreferrer">保存先のKPI・KGIを開く</a></div>}
       {props.onDemo && <button className="text-button" disabled={props.busy} onClick={props.onDemo}>サンプル画面を確認</button>}
     </section>
     <section className="card rule-card"><h2>集計と保存</h2>
       <div className="rule-item"><strong>候補者面談</strong><p>同日・同担当・同候補者の面談は1件として集計します。</p></div>
       <div className="rule-item"><strong>提案とマッチ</strong><p>各工程の日付と提案行で集計します。マッチはV列の候補者承諾日です。</p></div>
-      <div className="rule-item"><strong>元シートの数式</strong><p>入力列だけを更新します。KPIタブと数式が入っているセルには書き込みません。</p></div>
+      <div className="rule-item"><strong>移行した数式の保持</strong><p>新しい管理用シートの入力列だけを更新します。KPIタブと数式が入っているセルは保持します。</p></div>
       <div className="rule-item"><strong>プレイヤーの明細</strong><p>ログインした本人の明細を取得します。ランキングは件数と表示名を共有します。</p></div>
       <p className="panel-note">C面談実施はQ列、稼働開始実績はX列から集計します。元KPIが参照するN列・W列との違いは、元シートの数式を保ったまま表示します。</p>
     </section>

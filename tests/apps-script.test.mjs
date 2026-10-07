@@ -106,7 +106,7 @@ class MockRange {
   setBackground() { return this; }
   setWrap() { return this; }
   protect() {
-    const protection = { range: this, setDescription() { return this; }, setWarningOnly() { return this; } };
+    const protection = { range: this, setDescription() { return this; }, setWarningOnly() { return this; }, addEditor() { return this; }, getEditors() { return []; }, canDomainEdit() { return false; } };
     this.sheet.protections.push(protection);
     return protection;
   }
@@ -168,6 +168,7 @@ class MockSpreadsheet {
     this.writes.push({ sheetId: operation.sheet.id, sheetName: operation.sheet.name, row: operation.range?.row, column: operation.range?.column, rows: operation.range?.rows, columns: operation.range?.columns, values: clone(operation.values), formula: operation.formula, deletion: operation.deletion });
   }
   getId() { return this.id; }
+  getName() { return "test management spreadsheet"; }
   getDeveloperMetadata() { return this.metadata; }
   createDeveloperMetadataFinder() { return new MockMetadataFinder(this); }
   getSheets() { return this.sheets; }
@@ -227,6 +228,11 @@ class MockSpreadsheet {
           }));
           matched.forEach(item => { if (input.developerMetadata.metadataValue !== undefined) item.value = input.developerMetadata.metadataValue; });
           replies.push({ updateDeveloperMetadata: { developerMetadata: matched.map(item => ({ metadataId: item.id, metadataValue: item.value })) } });
+        } else if (request.deleteDeveloperMetadata) {
+          const lookup = request.deleteDeveloperMetadata.dataFilter?.developerMetadataLookup;
+          assert.ok(Number.isInteger(lookup?.metadataId));
+          this.metadata = this.metadata.filter(item => item.id !== lookup.metadataId);
+          replies.push({});
         } else {
           throw new Error(`Unsupported mock Sheets request: ${Object.keys(request).join(",")}`);
         }
@@ -352,7 +358,9 @@ const PLAYER_HEADERS = ["id", "name", "team", "color", "target", "bio", "sheetNa
 
 function configProperties(overrides = {}) {
   return {
-    NODE_CONFIG: JSON.stringify({ spreadsheetId: SPREADSHEET_ID, matchingSheetId: MATCHING_SHEET_ID, kpiSheetId: KPI_SHEET_ID, writesEnabled: true, ownerEmail: "owner@example.test", ...overrides }),
+    NODE_DESTINATION_ID: "test-destination",
+    NODE_VERIFICATION_ID: SPREADSHEET_ID,
+    NODE_CONFIG: JSON.stringify({ spreadsheetId: SPREADSHEET_ID, matchingSheetId: MATCHING_SHEET_ID, kpiSheetId: KPI_SHEET_ID, purpose: "verification", writesEnabled: true, ownerEmail: "owner@example.test", ...overrides }),
   };
 }
 
@@ -790,7 +798,7 @@ test("profile updates preserve role and aliases so renamed profiles keep existin
   assert.deepEqual(saved.snapshot.activities, before);
 });
 
-test("an original spreadsheet ID cannot enable writes without copy verification and owner authorization", () => {
+test("the migration source is permanently read-only even if its configuration requests writes", () => {
   const originalId = "1AnyvEoUtgUSTnuuJjIjA80XGHw_DaL9fSUoNCrYZ36s";
   const { harness, player } = signedInFixture({ spreadsheetId: originalId, properties: configProperties({ spreadsheetId: originalId, writesEnabled: true }) });
   assert.equal(player.snapshot.writesEnabled, false);
@@ -830,48 +838,59 @@ function resignProof(harness, proof) {
   return { ...body, signature: harness.context.hmac_(harness.context.stableJson_(body), harness.properties.NODE_PEPPER) };
 }
 
-function originalAuthorizedFixture() {
-  const originalId = "1AnyvEoUtgUSTnuuJjIjA80XGHw_DaL9fSUoNCrYZ36s";
-  const fixture = signedInFixture({ spreadsheetId: originalId, properties: configProperties({ spreadsheetId: originalId, writesEnabled: true }) });
+function destinationAuthorizedFixture() {
+  const destinationId = "test-destination";
+  const fixture = signedInFixture({ spreadsheetId: destinationId, properties: configProperties({ spreadsheetId: destinationId, purpose: "production", writesEnabled: true }) });
   const { harness } = fixture;
   const { proof } = copyProofFixture(harness);
   const authorizedAt = new Date(harness.clock.milliseconds).toISOString();
   const config = {
-    ...JSON.parse(harness.properties.NODE_CONFIG), originalWriteVerified: true, verifiedCopyId: proof.copyId, originalAuthorizedAt: authorizedAt,
-    originalAuthorizationSeal: harness.context.NODE_TESTS.originalAuthorization(proof, "owner@example.test", authorizedAt),
+    ...JSON.parse(harness.properties.NODE_CONFIG), verifiedCopyId: proof.copyId, destinationAuthorizedAt: authorizedAt,
+    destinationAuthorizationSeal: harness.context.NODE_TESTS.destinationAuthorization(proof, "owner@example.test", authorizedAt),
   };
   harness.properties.NODE_COPY_PROOF = JSON.stringify(proof);
   harness.properties.NODE_CONFIG = JSON.stringify(config);
   return { ...fixture, proof, config };
 }
 
-test("copy verification proof requires a valid signature, owner, sheet IDs, checks, and recent verification", () => {
+function destinationBook(harness, { id = "test-destination", matchingId = 1234, kpiId = 5678 } = {}) {
+  return new MockSpreadsheet(id, [
+    { id: matchingId, name: "2期目マッチングDB", values: [MATCHING_HEADERS] },
+    { id: kpiId, name: "2期目月間KPI・KGI", values: [["KPI"]] },
+  ], harness.writes);
+}
+
+test("copy proof binds the registered destination, a different verification file, owner, and recent checks", () => {
   const { harness } = signedInFixture();
   const { proof } = copyProofFixture(harness);
   const valid = candidate => harness.context.NODE_TESTS.validCopyProof(candidate, "owner@example.test");
   assert.equal(valid(proof), true);
   for (const candidate of [null, {}, { ...proof, signature: "forged-signature" }, { ...proof, schemaHash: "tampered-schema" }]) assert.equal(valid(candidate), false);
   const invalidFields = [
-    { copyId: proof.originalId }, { originalId: "different-original" }, { matchingSheetId: KPI_SHEET_ID }, { kpiSheetId: MATCHING_SHEET_ID },
+    { copyId: harness.context.NODE.originalId }, { copyId: proof.destinationId }, { destinationId: "different-destination" },
+    { matchingSheetId: KPI_SHEET_ID }, { kpiSheetId: MATCHING_SHEET_ID },
     { ownerEmail: "other-owner@example.test" }, { checks: proof.checks.filter(check => check !== "cleanup") }, { verifiedAt: "invalid-date" },
     { verifiedAt: new Date(harness.clock.milliseconds + 1).toISOString() }, { verifiedAt: new Date(harness.clock.milliseconds - 7 * 86400000 - 1).toISOString() },
   ];
   for (const fields of invalidFields) assert.equal(valid(resignProof(harness, { ...proof, ...fields })), false, JSON.stringify(fields));
   assert.equal(harness.context.NODE_TESTS.validCopyProof(proof, "other-owner@example.test"), false);
-  assert.deepEqual(harness.apiCalls, [], "Proof validation must not write or run probes on original data");
+  assert.deepEqual(harness.apiCalls, []);
 });
 
-test("original migration readiness requires proof for the configured copy and an identical original header", () => {
+test("destination readiness resolves copied tab names despite changed gids and requires identical headers", () => {
   const { harness } = signedInFixture();
-  const { proof, sheet } = copyProofFixture(harness);
+  const { proof } = copyProofFixture(harness);
+  const book = destinationBook(harness);
   const config = JSON.parse(harness.properties.NODE_CONFIG);
-  const ready = (overrides = {}, candidate = proof, target = sheet, owner = "owner@example.test") => harness.context.NODE_TESTS.verifyOriginalReadiness({ ...config, ...overrides }, candidate, target, owner);
+  const ready = (overrides = {}, candidate = proof, target = book, owner = "owner@example.test") => harness.context.NODE_TESTS.verifyDestinationReadiness({ ...config, ...overrides }, candidate, target, owner);
   assert.equal(ready(), true);
-  for (const fields of [{ spreadsheetId: "different-copy" }, { spreadsheetId: proof.originalId }, { matchingSheetId: KPI_SHEET_ID }, { kpiSheetId: MATCHING_SHEET_ID }]) assert.throws(() => ready(fields));
+  assert.equal(harness.context.NODE_TESTS.resolveBusinessTabs(book).matchingSheetId, 1234);
+  assert.equal(harness.context.NODE_TESTS.resolveBusinessTabs(book).kpiSheetId, 5678);
+  for (const fields of [{ purpose: "production" }, { spreadsheetId: "different-copy" }, { spreadsheetId: proof.destinationId }, { matchingSheetId: KPI_SHEET_ID }, { kpiSheetId: MATCHING_SHEET_ID }]) assert.throws(() => ready(fields));
   assert.throws(() => ready({}, null));
-  assert.throws(() => ready({}, proof, sheet, "other-owner@example.test"));
-  assert.throws(() => ready({}, proof, harness.spreadsheet.getSheetById(KPI_SHEET_ID)));
-  const oldHeader = sheet.values[0][12];
+  assert.throws(() => ready({}, proof, book, "other-owner@example.test"));
+  assert.throws(() => ready({}, proof, destinationBook(harness, { id: "unregistered-destination" })));
+  const sheet = book.getSheetById(1234), oldHeader = sheet.values[0][12];
   sheet.values[0][12] = "メモ列の変更";
   assert.throws(() => ready());
   sheet.values[0][12] = oldHeader;
@@ -879,14 +898,14 @@ test("original migration readiness requires proof for the configured copy and an
   assert.deepEqual(harness.apiCalls, []);
 });
 
-test("original writes require both signed copy proof and a signed owner migration authorization", () => {
-  const { harness, player, config, proof } = originalAuthorizedFixture();
+test("production writes require registered destination and signed owner authorization after separate-copy verification", () => {
+  const { harness, player, config, proof } = destinationAuthorizedFixture();
   const enabled = candidate => harness.context.NODE_TESTS.writesEnabled(candidate);
   assert.equal(enabled(config), true);
   for (const fields of [
-    { writesEnabled: false }, { originalWriteVerified: false }, { originalAuthorizedAt: "" }, { originalAuthorizedAt: "invalid-date" },
-    { originalAuthorizationSeal: "forged" }, { verifiedCopyId: "unverified-copy" }, { ownerEmail: "other-owner@example.test" },
-    { originalAuthorizedAt: new Date(Date.parse(proof.verifiedAt) + 7 * 86400000 + 1).toISOString() },
+    { writesEnabled: false }, { purpose: "unknown" }, { spreadsheetId: "another-file" }, { destinationAuthorizedAt: "" }, { destinationAuthorizedAt: "invalid-date" },
+    { destinationAuthorizationSeal: "forged" }, { verifiedCopyId: "unverified-copy" }, { ownerEmail: "other-owner@example.test" },
+    { destinationAuthorizedAt: new Date(Date.parse(proof.verifiedAt) + 7 * 86400000 + 1).toISOString() },
   ]) assert.equal(enabled({ ...config, ...fields }), false, JSON.stringify(fields));
   for (const storedProof of [null, "not-json", JSON.stringify({ ...proof, signature: "forged" })]) {
     if (storedProof === null) delete harness.properties.NODE_COPY_PROOF; else harness.properties.NODE_COPY_PROOF = storedProof;
@@ -896,19 +915,45 @@ test("original writes require both signed copy proof and a signed owner migratio
   const saved = assertSuccess(mutate(harness, player.token, "saveActivity", { activity: newCandidate() }));
   assert.equal(saved.snapshot.writesEnabled, true);
   assert.ok(saved.snapshot.activities.some(activity => activity.candidateName === "新規本人候補"));
-  assert.equal(harness.apiCalls.length, 1, "Only the authorized application mutation runs in the mock; no original-sheet probe is executed");
+  assert.equal(harness.apiCalls.length, 1);
 });
 
-test("a completed original migration stays authorized after the copy-proof migration window expires", () => {
-  const { harness, config } = originalAuthorizedFixture();
+test("a completed destination activation stays authorized after the initial proof window expires", () => {
+  const { harness, config } = destinationAuthorizedFixture();
   harness.clock.milliseconds += 8 * 86400000;
-  assert.equal(harness.context.NODE_TESTS.validCopyProof(JSON.parse(harness.properties.NODE_COPY_PROOF), config.ownerEmail), false, "Expired proofs cannot authorize new migrations");
-  assert.equal(harness.context.NODE_TESTS.writesEnabled(config), true, "An owner-authorized production connection must not unexpectedly stop one week later");
+  assert.equal(harness.context.NODE_TESTS.validCopyProof(JSON.parse(harness.properties.NODE_COPY_PROOF), config.ownerEmail), false);
+  assert.equal(harness.context.NODE_TESTS.writesEnabled(config), true);
 });
 
-test("web requests cannot call owner-only verification or original-migration setup functions", () => {
+test("all original write paths remain blocked even with forged legacy migration configuration", () => {
+  const { harness, config } = destinationAuthorizedFixture();
+  const originalId = harness.context.NODE.originalId;
+  const source = destinationBook(harness, { id: originalId });
+  assert.equal(harness.context.NODE_TESTS.writesEnabled({ ...config, spreadsheetId: originalId, originalWriteVerified: true, originalAuthorizationSeal: "legacy-seal" }), false);
+  assert.throws(() => harness.context.enableNodeOriginalAfterVerifiedCopy(), error => error.nodeCode === "PROTECTED_SOURCE");
+  assert.throws(() => harness.context.sheetsBatch_(originalId, [{ appendCells: {} }]), error => error.nodeCode === "PROTECTED_SOURCE");
+  assert.throws(() => harness.context.syncRowIds_(source, source.getSheetById(1234)), error => error.nodeCode === "PROTECTED_SOURCE");
+  assert.throws(() => harness.context.protectAppSheet_(source.getSheetById(1234), "owner@example.test"), error => error.nodeCode === "PROTECTED_SOURCE");
+  harness.context.SpreadsheetApp.getActiveSpreadsheet = () => source;
+  assert.throws(() => harness.context.setupNode(), error => error.nodeCode === "PROTECTED_SOURCE");
+  assert.equal(source.getSheets().length, 2);
+  assert.deepEqual(source.metadata, []);
+  assert.deepEqual(harness.apiCalls, []);
+  assert.deepEqual(harness.writes, []);
+});
+
+test("production destination cannot be used for test data or copy-probe cleanup", () => {
+  const { harness } = destinationAuthorizedFixture();
+  assert.throws(() => harness.context.enableNodeWritesForCopy(), error => error.nodeCode === "WRITES_DISABLED");
+  assert.throws(() => harness.context.verifyNodeCopyIntegration(), error => error.nodeCode === "COPY_VERIFICATION_REQUIRED");
+  assert.throws(() => harness.context.cleanupCopyProbe_("ND-001"), error => error.nodeCode === "COPY_VERIFICATION_REQUIRED");
+  assert.deepEqual(harness.apiCalls, []);
+  assert.deepEqual(harness.writes, []);
+});
+
+test("web requests cannot invoke any owner setup or verification functions", () => {
   const { harness, admin } = signedInFixture();
-  for (const action of ["verifyNodeCopyIntegration", "enableNodeOriginalAfterVerifiedCopy", "setupNode", "enableNodeWritesForCopy", "rotateNodePassword"]) assertFailure(request(harness, action, {}, { token: admin.token, operationId: randomUUID() }));
+  for (const action of ["verifyNodeCopyIntegration", "enableNodeOriginalAfterVerifiedCopy", "enableNodeDestinationAfterVerifiedCopy", "setupNode", "setupNodeVerificationCopy", "enableNodeWritesForCopy", "rotateNodePassword"]) assertFailure(request(harness, action, {}, { token: admin.token, operationId: randomUUID() }));
   assert.deepEqual(harness.apiCalls, []);
 });
 
@@ -971,7 +1016,7 @@ test("explicitly supported observed header annotations preserve data visibility 
   assertSuccess(mutate(harness, player.token, "saveActivity", { activity: newCandidate() }));
 });
 
-test("owner cannot enable copy writes or authorize original migration with incompatible mapped headers", () => {
+test("owner cannot enable verification writes or authorize destination with incompatible mapped headers", () => {
   const { harness } = signedInFixture();
   const sheet = harness.spreadsheet.getSheetById(MATCHING_SHEET_ID);
   sheet.values[0][16] = "C面談実施日未知の説明";
@@ -980,7 +1025,8 @@ test("owner cannot enable copy writes or authorize original migration with incom
   assert.throws(() => harness.context.enableNodeWritesForCopy(), error => error.nodeCode === "SCHEMA_MISMATCH");
   assert.equal(JSON.parse(harness.properties.NODE_CONFIG).writesEnabled, false);
   const { proof } = copyProofFixture(harness);
-  assert.throws(() => harness.context.NODE_TESTS.verifyOriginalReadiness(config, proof, sheet, "owner@example.test"), error => error.nodeCode === "SCHEMA_MISMATCH", "A signed schema hash alone cannot approve an unsupported mapped header");
+  const target = destinationBook(harness); target.getSheetById(1234).values[0][16] = "C面談実施日未知の説明";
+  assert.throws(() => harness.context.NODE_TESTS.verifyDestinationReadiness(config, proof, target, "owner@example.test"), error => error.nodeCode === "SCHEMA_MISMATCH", "A signed schema hash alone cannot approve an unsupported mapped header");
   assert.deepEqual(harness.apiCalls, []);
 });
 
@@ -1040,4 +1086,132 @@ test("known accounts retain separate rate limits and successful login clears onl
   assert.ok(harness.properties[`NODE_RATE_${harness.context.NODE_TESTS.hash("ND-001")}`]);
   assert.equal(harness.properties[`NODE_RATE_${harness.context.NODE_TESTS.hash("ND-002")}`], undefined);
   assert.ok(harness.properties.NODE_RATE_UNKNOWN);
+});
+
+
+test("only authenticated admins receive the current destination URLs, using actual configured copied gids", () => {
+  const { harness, player, admin } = signedInFixture();
+  const sheet = harness.spreadsheet.getSheetById(MATCHING_SHEET_ID), kpi = harness.spreadsheet.getSheetById(KPI_SHEET_ID);
+  sheet.id = 34567; kpi.id = 89012;
+  harness.properties.NODE_CONFIG = JSON.stringify({ ...JSON.parse(harness.properties.NODE_CONFIG), matchingSheetId: sheet.id, kpiSheetId: kpi.id });
+  const administrator = assertSuccess(request(harness, "snapshot", {}, { token: admin.token }));
+  assert.deepEqual(administrator.destination, { title: "test management spreadsheet", matchingUrl: `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/edit#gid=34567`, kpiUrl: `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/edit#gid=89012` });
+  const personal = assertSuccess(request(harness, "snapshot", {}, { token: player.token }));
+  assert.equal(Object.hasOwn(personal, "destination"), false);
+  assert.equal(JSON.stringify(personal).includes(SPREADSHEET_ID), false);
+  const publicHealth = assertSuccess(request(harness, "health"));
+  assert.deepEqual(Object.keys(publicHealth).sort(), ["configured", "protocol", "writesEnabled"]);
+  assert.equal(JSON.stringify(publicHealth).includes(SPREADSHEET_ID), false);
+});
+
+test("new destination setup preserves every business value and formula while resolving copied gids", () => {
+  const copiedRows = [MATCHING_HEADERS, ["2026/10/01", "移行した会社", "移行した候補者", "越前祐美"]];
+  const harness = createHarness({ spreadsheetId: "new-private-destination-id", sheets: [
+    { id: 34567, name: "2期目マッチングDB", values: copiedRows, formulas: [[], ["", "", "", "", "=ROW()"]] },
+    { id: 89012, name: "2期目月間KPI・KGI", values: [["KPI", "表示値"]], formulas: [["", "=COUNTA('2期目マッチングDB'!C:C)"]] },
+  ] });
+  const business = harness.spreadsheet.getSheets().map(sheet => ({ sheet, values: clone(sheet.values), formulas: clone(sheet.formulas) }));
+  harness.context.SpreadsheetApp.getUi = () => ({ ButtonSet: { OK_CANCEL: "OK_CANCEL" }, Button: { OK: "OK" }, prompt: () => ({ getSelectedButton: () => "OK", getResponseText: () => "new-private-destination-id" }) });
+  harness.context.showCredentials_ = () => {};
+  harness.context.setupNode();
+  const config = JSON.parse(harness.properties.NODE_CONFIG);
+  assert.equal(harness.properties.NODE_DESTINATION_ID, "new-private-destination-id");
+  assert.equal(config.matchingSheetId, 34567); assert.equal(config.kpiSheetId, 89012);
+  assert.equal(config.purpose, "production"); assert.equal(config.writesEnabled, false);
+  business.forEach(({ sheet, values, formulas }) => { assert.deepEqual(sheet.values, values); assert.deepEqual(sheet.formulas, formulas); });
+  assert.ok(harness.writes.every(write => write.sheetName.startsWith("_NODE_")));
+  assert.ok(harness.apiCalls.flatMap(call => call.body.requests).every(request => Object.hasOwn(request, "createDeveloperMetadata")));
+  assert.equal(harness.spreadsheet.metadata.length, 1);
+});
+
+test("wrong copied tab name or any mismatched mapped header stops destination setup before adding tabs or metadata", () => {
+  for (const variant of ["tab", "header"]) {
+    const header = [...MATCHING_HEADERS]; if (variant === "header") header[16] = "未確認列";
+    const harness = createHarness({ spreadsheetId: "new-private-destination-id", sheets: [
+      { id: 34567, name: variant === "tab" ? "2期目マッチングDB のコピー" : "2期目マッチングDB", values: [header] },
+      { id: 89012, name: "2期目月間KPI・KGI", values: [["KPI"]] },
+    ] });
+    assert.throws(() => harness.context.setupNode(), error => error.nodeCode === "SCHEMA_MISMATCH");
+    assert.equal(harness.spreadsheet.getSheets().length, 2);
+    assert.deepEqual(harness.apiCalls, []); assert.deepEqual(harness.writes, []);
+    assert.equal(harness.properties.NODE_DESTINATION_ID, undefined);
+  }
+});
+
+
+test("verified activation changes only destination configuration and missing row metadata, never migrated business data", () => {
+  const { harness } = signedInFixture();
+  const { proof } = copyProofFixture(harness);
+  harness.properties.NODE_COPY_PROOF = JSON.stringify(proof);
+  const destination = destinationBook(harness), matching = destination.getSheetById(1234);
+  matching.values.push(["2026/10/01", "そのまま移行した会社", "そのまま移行した候補者", "担当一"]);
+  matching.formulas.push([], ["", "", "", "", "=ROW()+100"]);
+  const playerSheet = destination.insertSheet("_NODE_players");
+  playerSheet.values = clone(harness.spreadsheet.getSheetByName("_NODE_players").values);
+  playerSheet.values[2][5] = "移行先側のプロフィールを保持";
+  const ledger = destination.insertSheet("_NODE_operations");
+  ledger.values = clone(harness.spreadsheet.getSheetByName("_NODE_operations").values);
+  const before = destination.getSheets().map(sheet => ({ sheet, values: clone(sheet.values), formulas: clone(sheet.formulas) }));
+  harness.context.SpreadsheetApp.openById = id => { assert.equal(id, "test-destination"); return destination; };
+  harness.context.SpreadsheetApp.getUi = () => ({ ButtonSet: { OK_CANCEL: "OK_CANCEL" }, Button: { OK: "OK" }, alert() {}, prompt: () => ({ getSelectedButton: () => "OK", getResponseText: () => "test-destination" }) });
+  harness.context.UrlFetchApp.fetch = (url, options) => {
+    assert.equal(url, "https://sheets.googleapis.com/v4/spreadsheets/test-destination:batchUpdate");
+    const body = JSON.parse(options.payload); harness.apiCalls.push({ url, body: clone(body) });
+    const response = destination.batchUpdate(body); return { getResponseCode: () => response.status };
+  };
+  const result = harness.context.enableNodeDestinationAfterVerifiedCopy();
+  assert.equal(result.writesEnabled, true);
+  const config = JSON.parse(harness.properties.NODE_CONFIG);
+  assert.equal(config.spreadsheetId, "test-destination"); assert.equal(config.purpose, "production");
+  assert.equal(config.matchingSheetId, 1234); assert.equal(config.kpiSheetId, 5678);
+  assert.equal(harness.context.NODE_TESTS.writesEnabled(config), true);
+  before.forEach(({ sheet, values, formulas }) => { assert.deepEqual(sheet.values, values); assert.deepEqual(sheet.formulas, formulas); });
+  assert.deepEqual(harness.writes, []);
+  assert.ok(harness.apiCalls.flatMap(call => call.body.requests).every(request => Object.hasOwn(request, "createDeveloperMetadata")));
+  assert.equal(destination.metadata.length, 1);
+  assert.equal(Object.keys(harness.properties).some(key => key.startsWith("NODE_SESSION_")), false);
+});
+
+test("the complete verification-copy probe logs in, writes and reads back, refuses formulas, cleans up, and seals proof", () => {
+  const { harness } = signedInFixture();
+  const business = harness.spreadsheet.getSheetById(MATCHING_SHEET_ID);
+  const originalValues = clone(business.values), originalFormulas = clone(business.formulas), originalMetadata = harness.spreadsheet.metadata.map(item => item.id);
+  const result = harness.context.verifyNodeCopyIntegration();
+  assert.equal(result.verified, true);
+  const proof = JSON.parse(harness.properties.NODE_COPY_PROOF);
+  assert.equal(proof.destinationId, "test-destination");
+  assert.equal(harness.context.NODE_TESTS.validCopyProof(proof, "owner@example.test"), true);
+  assert.deepEqual(business.values.slice(0, originalValues.length), originalValues);
+  assert.deepEqual(business.formulas.slice(0, originalFormulas.length), originalFormulas);
+  assert.ok(business.values.slice(originalValues.length).every(row => row.every(value => value === "")));
+  assert.deepEqual(harness.spreadsheet.metadata.map(item => item.id), originalMetadata);
+  assert.ok(harness.spreadsheet.getSheetByName("_NODE_players").values.slice(1).filter(row => String(row[1]).startsWith("連携検証")).every(row => row[8] === false));
+  assert.equal(harness.logs.length, 0);
+  assert.ok(harness.apiCalls.every(call => call.url.includes(`/spreadsheets/${SPREADSHEET_ID}:batchUpdate`)));
+});
+
+
+test("connection guidance distinguishes the new management sheet, verification copy, and permanently read-only source", () => {
+  const production = destinationAuthorizedFixture();
+  const actual = assertSuccess(request(production.harness, "snapshot", {}, { token: production.player.token }));
+  assert.ok(actual.warnings.includes("現在の接続先は登録済みの新しい管理シートです。"));
+  assert.ok(!actual.warnings.some(message => message.includes("検証用") || message.includes("保存先は原本")));
+  const verification = signedInFixture();
+  assert.ok(verification.player.snapshot.warnings.includes("現在の接続先は独立した検証用コピーです。"));
+  const originalId = production.harness.context.NODE.originalId;
+  const source = signedInFixture({ spreadsheetId: originalId, properties: configProperties({ spreadsheetId: originalId }) });
+  assert.ok(source.player.snapshot.warnings.includes("現在の接続先は移行元の原本です。書き込みはできません。"));
+  assert.equal(source.player.snapshot.writesEnabled, false);
+});
+
+test("header and timezone warnings refer to the connected management sheet without suggesting source edits", () => {
+  const { harness, player } = destinationAuthorizedFixture();
+  harness.spreadsheet.getSheetById(MATCHING_SHEET_ID).values[0][16] = "未確認列";
+  harness.spreadsheet.getSpreadsheetTimeZone = () => "Etc/UTC";
+  const snapshot = assertSuccess(request(harness, "snapshot", {}, { token: player.token }));
+  assert.equal(snapshot.writesEnabled, false);
+  assert.ok(snapshot.warnings.some(message => message.includes("管理者が接続先の列を確認")));
+  assert.ok(snapshot.warnings.some(message => message.includes("接続先スプレッドシートのタイムゾーンがAsia/Tokyoではない")));
+  assert.ok(!snapshot.warnings.some(message => message.includes("原本の列") || message.includes("複製側")));
+  assert.deepEqual(harness.writes, []); assert.deepEqual(harness.apiCalls, []);
 });

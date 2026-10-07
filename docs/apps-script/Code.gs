@@ -4,6 +4,10 @@ var NODE = Object.freeze({
   originalId: '1AnyvEoUtgUSTnuuJjIjA80XGHw_DaL9fSUoNCrYZ36s',
   matchingSheetId: 286330650,
   kpiSheetId: 2007683505,
+  matchingTab: '2期目マッチングDB',
+  kpiTab: '2期目月間KPI・KGI',
+  destinationKey: 'NODE_DESTINATION_ID',
+  verificationKey: 'NODE_VERIFICATION_ID',
   playersTab: '_NODE_players',
   operationsTab: '_NODE_operations',
   recordKey: 'NODE_RECORD_ID',
@@ -51,34 +55,52 @@ function config_() {
   return config;
 }
 function writesEnabled_(config) {
-  if (config.writesEnabled !== true) return false;
-  if (config.spreadsheetId !== NODE.originalId) return true;
+  var destinationId=props_().getProperty(NODE.destinationKey),verificationId=props_().getProperty(NODE.verificationKey);
+  if (config.writesEnabled !== true || config.spreadsheetId === NODE.originalId || !destinationId || destinationId===NODE.originalId) return false;
+  if (config.purpose==='verification') return config.spreadsheetId===verificationId && verificationId!==destinationId;
+  if (config.purpose!=='production'||config.spreadsheetId!==destinationId) return false;
   var proof=copyProof_();
-  if(config.originalWriteVerified!==true||!config.originalAuthorizedAt||!proof||config.verifiedCopyId!==proof.copyId||!validCopyProof_(proof,config.ownerEmail,Date.parse(config.originalAuthorizedAt)))return false;
-  return constantEqual_(config.originalAuthorizationSeal,originalAuthorization_(proof,config.ownerEmail,config.originalAuthorizedAt));
+  if(!config.destinationAuthorizedAt||!proof||config.verifiedCopyId!==proof.copyId||!validCopyProof_(proof,config.ownerEmail,Date.parse(config.destinationAuthorizedAt)))return false;
+  return constantEqual_(config.destinationAuthorizationSeal,destinationAuthorization_(proof,config.ownerEmail,config.destinationAuthorizedAt));
 }
 function copyProof_() { var raw=props_().getProperty('NODE_COPY_PROOF');try{return raw?JSON.parse(raw):null;}catch(_){return null;} }
 function makeCopyProof_(copyId,schemaHash,ownerEmail) {
-  var proof={copyId:copyId,originalId:NODE.originalId,matchingSheetId:NODE.matchingSheetId,kpiSheetId:NODE.kpiSheetId,schemaHash:schemaHash,verifiedAt:new Date().toISOString(),ownerEmail:ownerEmail,checks:['login','saveActivity','readBack','interviewDedupe','formulaProtection','cleanup']};
+  var config=config_();
+  var proof={copyId:copyId,destinationId:props_().getProperty(NODE.destinationKey),matchingSheetId:Number(config.matchingSheetId),kpiSheetId:Number(config.kpiSheetId),schemaHash:schemaHash,verifiedAt:new Date().toISOString(),ownerEmail:ownerEmail,checks:['login','saveActivity','readBack','interviewDedupe','formulaProtection','cleanup']};
   proof.signature=hmac_(stableJson_(proof),props_().getProperty(NODE.pepperKey));return proof;
 }
 function validCopyProof_(proof,ownerEmail,referenceTime) {
-  if(!proof||proof.copyId===NODE.originalId||!proof.copyId||proof.originalId!==NODE.originalId||proof.matchingSheetId!==NODE.matchingSheetId||proof.kpiSheetId!==NODE.kpiSheetId||proof.ownerEmail!==ownerEmail||!proof.schemaHash)return false;
+  var destinationId=props_().getProperty(NODE.destinationKey),verificationId=props_().getProperty(NODE.verificationKey);
+  if(!proof||!destinationId||destinationId===NODE.originalId||!verificationId||verificationId===NODE.originalId||verificationId===destinationId||proof.copyId!==verificationId||proof.destinationId!==destinationId||!Number.isInteger(proof.matchingSheetId)||!Number.isInteger(proof.kpiSheetId)||proof.matchingSheetId===proof.kpiSheetId||proof.ownerEmail!==ownerEmail||!proof.schemaHash)return false;
   if(!Array.isArray(proof.checks)||['login','saveActivity','readBack','interviewDedupe','formulaProtection','cleanup'].some(function(check){return proof.checks.indexOf(check)<0;}))return false;
   var age=(referenceTime===undefined?Date.now():referenceTime)-Date.parse(proof.verifiedAt);if(!isFinite(age)||age<0||age>7*86400000)return false;
   var signature=proof.signature,body=Object.assign({},proof);delete body.signature;
   return constantEqual_(signature,hmac_(stableJson_(body),props_().getProperty(NODE.pepperKey)));
 }
-function originalAuthorization_(proof,ownerEmail,authorizedAt) { return hmac_(stableJson_({originalId:NODE.originalId,proofSignature:proof.signature,ownerEmail:ownerEmail,authorizedAt:authorizedAt}),props_().getProperty(NODE.pepperKey)); }
+function destinationAuthorization_(proof,ownerEmail,authorizedAt) { return hmac_(stableJson_({destinationId:props_().getProperty(NODE.destinationKey),proofSignature:proof.signature,ownerEmail:ownerEmail,authorizedAt:authorizedAt}),props_().getProperty(NODE.pepperKey)); }
 function schemaHash_(sheet) {
   var rows=sheet.getRange(1,1,Math.min(40,Math.max(1,sheet.getLastRow())),26).getValues(),header=detectHeader_(rows);
   return hash_(stableJson_(rows[header-1].map(normalizeHeader_)));
 }
-function verifyOriginalReadiness_(config,proof,originalSheet,ownerEmail) {
-  if(config.spreadsheetId===NODE.originalId||!validCopyProof_(proof,ownerEmail)||proof.copyId!==config.spreadsheetId||Number(config.matchingSheetId)!==proof.matchingSheetId||Number(config.kpiSheetId)!==proof.kpiSheetId)fail_('COPY_VERIFICATION_REQUIRED','同じプロジェクトの複製シートでログイン・保存・読み戻しの検証を完了してください。');
-  var rows=originalSheet.getRange(1,1,Math.min(40,Math.max(1,originalSheet.getLastRow())),26).getValues(),header=detectHeader_(rows);
-  if(originalSheet.getSheetId()!==NODE.matchingSheetId||!mappedHeadersMatch_(rows[header-1])||schemaHash_(originalSheet)!==proof.schemaHash)fail_('SCHEMA_MISMATCH','検証した複製と原本のヘッダーが一致しません。再確認してください。');
+function verifyDestinationReadiness_(config,proof,destination,ownerEmail) {
+  assertManagedBook_(destination);
+  if(destination.getId()!==props_().getProperty(NODE.destinationKey)||config.purpose!=='verification'||!validCopyProof_(proof,ownerEmail)||proof.copyId!==config.spreadsheetId||Number(config.matchingSheetId)!==proof.matchingSheetId||Number(config.kpiSheetId)!==proof.kpiSheetId)fail_('COPY_VERIFICATION_REQUIRED','別の検証用コピーでログイン・保存・読み戻しを完了してください。');
+  var tabs=resolveBusinessTabs_(destination);
+  if(schemaHash_(tabs.matching)!==proof.schemaHash)fail_('SCHEMA_MISMATCH','検証用コピーと新しい管理シートのヘッダーが一致しません。');
   return true;
+}
+function assertManagedBook_(book) {
+  var id=typeof book==='string'?book:book.getId();
+  if(id===NODE.originalId)fail_('PROTECTED_SOURCE','移行元の原本には一切書き込みません。');
+  if(id!==props_().getProperty(NODE.destinationKey)&&id!==props_().getProperty(NODE.verificationKey))fail_('UNAPPROVED_DESTINATION','登録済みの新しい管理シートまたは検証用コピーだけを更新できます。');
+  return id;
+}
+function resolveBusinessTabs_(book) {
+  var matching=book.getSheetByName(NODE.matchingTab),kpi=book.getSheetByName(NODE.kpiTab);
+  if(!matching||!kpi||matching.getSheetId()===kpi.getSheetId())fail_('SCHEMA_MISMATCH','2期目マッチングDB と 2期目月間KPI・KGI を元のタブ名のまま移してください。');
+  var rows=matching.getRange(1,1,Math.min(40,Math.max(1,matching.getLastRow())),26).getValues(),header=detectHeader_(rows);
+  if(!mappedHeadersMatch_(rows[header-1]))fail_('SCHEMA_MISMATCH','移行後の入力対象19列の見出しまたは順序が一致しません。セルは変更せず中止しました。');
+  return {matching:matching,kpi:kpi,matchingSheetId:matching.getSheetId(),kpiSheetId:kpi.getSheetId()};
 }
 function health_() {
   var config;
@@ -103,7 +125,7 @@ function nodeHandle_(request) {
     user = activeActor_(store, user);
     if (action === 'snapshot') return buildSnapshot_(store, user);
     if (!store.schemaCompatible) fail_('SCHEMA_MISMATCH','入力対象19列の見出しまたは順序が一致しません。管理者が実際の列を確認してください。');
-    if (!writesEnabled_(store.config)) fail_('WRITES_DISABLED', '現在は読み取り専用です。管理者による複製シートの書き込み設定が必要です。');
+    if (!writesEnabled_(store.config)) fail_('WRITES_DISABLED', '現在は読み取り専用です。管理者による接続先の書き込み設定が必要です。');
     var operationId = shortText_(request.operationId, 128, true);
     if (!/^[A-Za-z0-9_-]{16,128}$/.test(operationId)) fail_('BAD_REQUEST', '保存操作のIDが必要です。');
     var payload = request.payload || {};
@@ -187,7 +209,7 @@ function detectHeader_(rows) {
     var r = rows[i] || [], a = normalizeHeader_(r[0]), b = normalizeHeader_(r[1]), c = normalizeHeader_(r[2]), d = normalizeHeader_(r[3]);
     if (a.indexOf('面談実施') >= 0 && b.indexOf('会社名') >= 0 && c.indexOf('氏名') >= 0 && (d === '担当' || d === '担当者')) return i + 1;
   }
-  fail_('SCHEMA_MISMATCH', '面談実施・会社名・氏名・担当のヘッダーが見つかりません。原本の列構成を確認してください。');
+  fail_('SCHEMA_MISMATCH', '面談実施・会社名・氏名・担当のヘッダーが見つかりません。接続先の列構成を確認してください。');
 }
 function table_(sheet, headers) {
   if (!sheet) fail_('NOT_CONFIGURED', 'アプリ用の管理タブがありません。');
@@ -209,7 +231,8 @@ function metadataMap_(sheet, key) {
 function readStore_() {
   var config = config_(), book = SpreadsheetApp.openById(config.spreadsheetId);
   var matching = book.getSheets().find(function (sheet) { return sheet.getSheetId() === Number(config.matchingSheetId); });
-  if (!matching || matching.getSheetId() === Number(config.kpiSheetId)) fail_('SCHEMA_MISMATCH', 'マッチングDBのタブを確認してください。');
+  var kpi=book.getSheetByName(NODE.kpiTab);
+  if (!matching || matching.getName()!==NODE.matchingTab || !kpi || kpi.getSheetId()!==Number(config.kpiSheetId) || matching.getSheetId() === Number(config.kpiSheetId)) fail_('SCHEMA_MISMATCH', 'マッチングDBとKPIのタブ名・管理IDを確認してください。');
   var playerSheet = book.getSheetByName(NODE.playersTab), operationSheet = book.getSheetByName(NODE.operationsTab);
   var playerRows = table_(playerSheet, NODE.playerHeaders);
   var players = playerRows.slice(1).map(function (r, i) {
@@ -246,13 +269,16 @@ function readStore_() {
     records.push({ row: n + 1, recordId: recordId, playerId: owner, candidateId: candidateId_(owner, name), name: name, values: row, formulas: formulas[n], dates: dates, source: source, sourceMetadataId: sources[n + 1] && sources[n + 1].metadataId, version: rowVersion_(recordId, row, formulas[n], source) });
   }
   if (unknown) warnings.push('担当者IDに対応しない行が' + unknown + '行あります。管理者が別名の対応表を確認してください。');
-  if(!schemaCompatible)warnings.push('入力対象19列の見出しまたは順序が未確認です。実績は表示せず、書き込みを停止しています。管理者が原本の列を確認してください。');
+  if(!schemaCompatible)warnings.push('入力対象19列の見出しまたは順序が未確認です。実績は表示せず、書き込みを停止しています。管理者が接続先の列を確認してください。');
   if (missingIds) warnings.push('管理IDのない行が' + missingIds + '行あります。管理者がメニューから行IDの同期を実行してください。');
   if (invalidDates) warnings.push('「停止」など日付以外の値は実績集計から除外しています。');
   warnings.push('C面談実施はQ列で集計します。元KPIのN列との関係は未確認です。KPIタブは書き込みません。');
   warnings.push('紹介元の保存列が未確認のため、アプリの行メタデータに保存します。E列には書き込みません。');
-  if (book.getSpreadsheetTimeZone() !== 'Asia/Tokyo') warnings.push('シートのタイムゾーンを複製側でAsia/Tokyoに設定してから書き込みを有効にしてください。');
-  warnings.push(config.spreadsheetId===NODE.originalId?'現在の保存先は原本です。':'現在の保存先は検証用の複製シートです。');
+  if (book.getSpreadsheetTimeZone() !== 'Asia/Tokyo') warnings.push('接続先スプレッドシートのタイムゾーンがAsia/Tokyoではないため、書き込みを停止しています。管理者が設定を確認してください。');
+  if(config.spreadsheetId===NODE.originalId)warnings.push('現在の接続先は移行元の原本です。書き込みはできません。');
+  else if(config.purpose==='production'&&config.spreadsheetId===props_().getProperty(NODE.destinationKey))warnings.push('現在の接続先は登録済みの新しい管理シートです。');
+  else if(config.purpose==='verification'&&config.spreadsheetId===props_().getProperty(NODE.verificationKey))warnings.push('現在の接続先は独立した検証用コピーです。');
+  else warnings.push('接続先の用途を確認できません。管理者が設定を確認してください。');
   return { config: config, book: book, matching: matching, playerSheet: playerSheet, operationSheet: operationSheet, players: players, values: values, formulas: formulas, headerRow: headerRow, schemaCompatible:schemaCompatible,records: records, warnings: warnings };
 }
 function day_(value) {
@@ -313,7 +339,12 @@ function countActivities_(activities, players) {
 function publicPlayer_(player) { return { id: player.id, name: player.name, team: player.team, color: player.color, target: player.target, bio: player.bio, sheetNames: player.sheetNames.slice() }; }
 function buildSnapshot_(store, user) {
   var all = activities_(store);
-  return { self: { playerId: user.id, role: user.role }, players: store.players.filter(function (p) { return p.active && p.role === 'player'; }).map(publicPlayer_), activities: all.filter(function (a) { return user.role === 'admin' || a.playerId === user.id; }), counts: countActivities_(all, store.players), syncedAt: new Date().toISOString(), warnings: store.warnings.slice(), writesEnabled: store.schemaCompatible&&writesEnabled_(store.config) && store.book.getSpreadsheetTimeZone() === 'Asia/Tokyo' };
+  var snapshot={ self: { playerId: user.id, role: user.role }, players: store.players.filter(function (p) { return p.active && p.role === 'player'; }).map(publicPlayer_), activities: all.filter(function (a) { return user.role === 'admin' || a.playerId === user.id; }), counts: countActivities_(all, store.players), syncedAt: new Date().toISOString(), warnings: store.warnings.slice(), writesEnabled: store.schemaCompatible&&writesEnabled_(store.config) && store.book.getSpreadsheetTimeZone() === 'Asia/Tokyo' };
+  if(user.role==='admin'){
+    var prefix='https://docs.google.com/spreadsheets/d/'+encodeURIComponent(store.config.spreadsheetId)+'/edit#gid=';
+    snapshot.destination={title:store.book.getName(),matchingUrl:prefix+Number(store.config.matchingSheetId),kpiUrl:prefix+Number(store.config.kpiSheetId)};
+  }
+  return snapshot;
 }
 
 /* All business writes are planned, revalidated, then applied in ONE Sheets atomic batch. */
@@ -453,7 +484,7 @@ function cell_(value) {
 function rowUpdateRequest_(sheetId, row, cells) { return { updateCells: { range: { sheetId: sheetId, startRowIndex: row - 1, endRowIndex: row, startColumnIndex: 0, endColumnIndex: cells.length }, rows: [{ values: cells.map(cell_) }], fields: 'userEnteredValue' } }; }
 function commit_(store, user, action, operationId, payloadHash, plan) {
   if(!store.schemaCompatible)fail_('SCHEMA_MISMATCH','入力対象19列の見出しが一致しません。');
-  if (store.book.getSpreadsheetTimeZone() !== 'Asia/Tokyo') fail_('TIMEZONE', '複製シートのタイムゾーンをAsia/Tokyoに設定してください。');
+  if (store.book.getSpreadsheetTimeZone() !== 'Asia/Tokyo') fail_('TIMEZONE', '接続先スプレッドシートのタイムゾーンがAsia/Tokyoであることを確認してください。');
   var requests = [], businessSheet = store.matching;
   if (plan.row) {
     if (businessSheet.getSheetId() !== Number(store.config.matchingSheetId) || businessSheet.getSheetId() === Number(store.config.kpiSheetId)) fail_('PROTECTED_SHEET', 'このタブは書き込めません。');
@@ -481,13 +512,14 @@ function commit_(store, user, action, operationId, payloadHash, plan) {
   SpreadsheetApp.flush();
 }
 function sheetsBatch_(spreadsheetId, requests) {
+  assertManagedBook_(spreadsheetId);
   if (!requests.length) return;
   var response = UrlFetchApp.fetch('https://sheets.googleapis.com/v4/spreadsheets/' + encodeURIComponent(spreadsheetId) + ':batchUpdate', { method: 'post', contentType: 'application/json', headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, payload: JSON.stringify({ requests: requests }), muteHttpExceptions: true });
   if (response.getResponseCode() < 200 || response.getResponseCode() >= 300) fail_('SHEET_WRITE_FAILED', 'シートへの保存を完了できませんでした。同じ操作IDのまま再試行してください。');
 }
 
 /* Owner-only editor/menu setup. Never reachable through the web-app action dispatch. */
-function onOpen() { SpreadsheetApp.getUi().createMenu('NODE連携').addItem('初期設定（読み取り専用）','setupNode').addItem('行IDを同期','syncNodeRowIds').addItem('複製シートの書き込みを有効化','enableNodeWritesForCopy').addItem('複製でログイン・保存を実検証','verifyNodeCopyIntegration').addItem('検証後に原本の保存を有効化','enableNodeOriginalAfterVerifiedCopy').addItem('書き込みを停止','disableNodeWrites').addItem('パスワードを再発行','rotateNodePassword').addToUi(); }
+function onOpen() { SpreadsheetApp.getUi().createMenu('NODE連携').addItem('新しい管理シートの初期設定','setupNode').addItem('別の検証用コピーを設定','setupNodeVerificationCopy').addItem('検証用コピーの書き込みを有効化','enableNodeWritesForCopy').addItem('検証用コピーで実検証','verifyNodeCopyIntegration').addItem('検証後に新しい管理シートを有効化','enableNodeDestinationAfterVerifiedCopy').addItem('行IDを同期','syncNodeRowIds').addItem('書き込みを停止','disableNodeWrites').addItem('パスワードを再発行','rotateNodePassword').addToUi(); }
 function requireOwner_() {
   var active = Session.getActiveUser().getEmail(), effective = Session.getEffectiveUser().getEmail();
   if (!active || !effective || active !== effective) fail_('FORBIDDEN', 'スクリプト所有者がエディターまたはシートから実行してください。');
@@ -497,13 +529,17 @@ function requireOwner_() {
 }
 function setupNode() {
   var owner = requireOwner_(), ui = SpreadsheetApp.getUi(), book = SpreadsheetApp.getActiveSpreadsheet();
-  if (!book) fail_('NOT_CONFIGURED', '対象の複製シートに紐付いたスクリプトで実行してください。');
+  if (!book) fail_('NOT_CONFIGURED', '新しい管理シートに紐付いたスクリプトで実行してください。');
+  if(book.getId()===NODE.originalId)fail_('PROTECTED_SOURCE','移行元の原本には初期設定も管理タブの追加も行いません。');
+  var tabs=resolveBusinessTabs_(book),registered=props_().getProperty(NODE.destinationKey);
+  if(registered&&registered!==book.getId())fail_('UNAPPROVED_DESTINATION','登録済みの新しい管理シートと異なります。保存先は変更していません。');
+  var answer=ui.prompt('新しい管理シートの登録','このファイルを今後の保存先として登録します。移した業務セルの値・数式・書式は変更せず、アプリ用の管理タブと行管理IDのみ追加します。このファイルのIDを入力してください。',ui.ButtonSet.OK_CANCEL);
+  if(answer.getSelectedButton()!==ui.Button.OK||answer.getResponseText().trim()!==book.getId())return;
   return withLock_(function () {
     if (props_().getProperty(NODE.configKey)) fail_('ALREADY_CONFIGURED', '初期設定済みです。再設定は不要です。');
-    var matching = book.getSheets().find(function (sheet) { return sheet.getSheetId() === NODE.matchingSheetId; });
-    if (!matching) fail_('SCHEMA_MISMATCH', '指定のマッチングDBタブがありません。');
-    detectHeader_(matching.getRange(1,1,Math.min(40,Math.max(1,matching.getLastRow())),26).getValues());
     if (book.getSheetByName(NODE.playersTab) || book.getSheetByName(NODE.operationsTab)) fail_('ALREADY_CONFIGURED', '管理タブが存在します。内容を確認してから設定してください。');
+    props_().setProperty(NODE.destinationKey,book.getId());
+    assertManagedBook_(book);
     var playerSheet = book.insertSheet(NODE.playersTab), operationSheet = book.insertSheet(NODE.operationsTab);
     var credentials = [], rows = [NODE.playerHeaders];
     rows.push(['ADMIN','insup 管理者','NODE','blue',20,'',JSON.stringify([]),'admin',true]);
@@ -513,15 +549,38 @@ function setupNode() {
     playerSheet.getRange(1,1,rows.length,NODE.playerHeaders.length).setValues(rows);
     operationSheet.getRange(1,1,1,NODE.operationHeaders.length).setValues([NODE.operationHeaders]);
     // Only app-owned sheets and metadata are added; original business values, formulas and timezone stay unchanged.
-    var config = { spreadsheetId:book.getId(),matchingSheetId:NODE.matchingSheetId,kpiSheetId:NODE.kpiSheetId,writesEnabled:false,ownerEmail:owner };
-    syncRowIds_(book, matching);
+    var config = { spreadsheetId:book.getId(),matchingSheetId:tabs.matchingSheetId,kpiSheetId:tabs.kpiSheetId,purpose:'production',writesEnabled:false,ownerEmail:owner };
+    syncRowIds_(book, tabs.matching);
     props_().setProperty(NODE.configKey,JSON.stringify(config));
     protectAppSheet_(playerSheet,owner); protectAppSheet_(operationSheet,owner);
     showCredentials_(credentials,'初期ログイン情報（この画面を閉じる前に控えてください）');
     return { configured:true,writesEnabled:false };
   });
 }
+function setupNodeVerificationCopy() {
+  var owner=requireOwner_(),ui=SpreadsheetApp.getUi(),current=config_(),destinationId=props_().getProperty(NODE.destinationKey);
+  if(current.purpose==='verification')fail_('ALREADY_CONFIGURED','検証用コピーを設定済みです。');
+  if(writesEnabled_(current))fail_('WRITES_DISABLED','管理シートの書き込みを停止してから検証してください。');
+  var answer=ui.prompt('別の検証用コピーを設定','業務データの独立した検証用コピーのファイルIDを入力してください。元原本と今後の管理シートは指定できません。',ui.ButtonSet.OK_CANCEL);
+  if(answer.getSelectedButton()!==ui.Button.OK)return;
+  var id=answer.getResponseText().trim();
+  if(!/^[A-Za-z0-9_-]{20,}$/.test(id)||id===NODE.originalId||id===destinationId)fail_('COPY_VERIFICATION_REQUIRED','独立した検証用コピーのIDが必要です。');
+  return withLock_(function(){
+    var source=readStore_(),copy=SpreadsheetApp.openById(id),tabs=resolveBusinessTabs_(copy),destination=SpreadsheetApp.openById(destinationId),destinationTabs=resolveBusinessTabs_(destination);
+    if(schemaHash_(tabs.matching)!==schemaHash_(destinationTabs.matching))fail_('SCHEMA_MISMATCH','新しい管理シートと検証用コピーのヘッダーが一致しません。');
+    if(copy.getSheetByName(NODE.playersTab)||copy.getSheetByName(NODE.operationsTab))fail_('ALREADY_CONFIGURED','検証用コピーに管理タブがあります。初期設定前の独立したコピーを使用してください。');
+    props_().setProperty(NODE.verificationKey,id);assertManagedBook_(copy);
+    var playerSheet=copy.insertSheet(NODE.playersTab),operationSheet=copy.insertSheet(NODE.operationsTab),rows=[NODE.playerHeaders];
+    source.players.filter(function(p){return p.active;}).forEach(function(p){rows.push([p.id,p.name,p.team,p.color,p.target,p.bio,JSON.stringify(p.sheetNames),p.role,p.active]);});
+    playerSheet.getRange(1,1,rows.length,NODE.playerHeaders.length).setValues(rows);operationSheet.getRange(1,1,1,NODE.operationHeaders.length).setValues([NODE.operationHeaders]);
+    protectAppSheet_(playerSheet,owner);protectAppSheet_(operationSheet,owner);syncRowIds_(copy,tabs.matching);
+    props_().setProperty(NODE.configKey,JSON.stringify({spreadsheetId:id,matchingSheetId:tabs.matchingSheetId,kpiSheetId:tabs.kpiSheetId,purpose:'verification',writesEnabled:false,ownerEmail:owner}));
+    props_().deleteProperty('NODE_COPY_PROOF');clearAllSessions_();
+    return {configured:true,writesEnabled:false,purpose:'verification'};
+  });
+}
 function protectAppSheet_(sheet, owner) {
+  assertManagedBook_(sheet.getParent());
   var protection = sheet.protect().setDescription('NODEアプリ管理用');
   protection.addEditor(owner);
   var editors = protection.getEditors().filter(function (user) { return user.getEmail() !== owner; });
@@ -529,6 +588,8 @@ function protectAppSheet_(sheet, owner) {
   if (protection.canDomainEdit()) protection.setDomainEdit(false);
 }
 function syncRowIds_(book, matching) {
+  assertManagedBook_(book);
+  var tabs=resolveBusinessTabs_(book);if(tabs.matching.getSheetId()!==matching.getSheetId())fail_('SCHEMA_MISMATCH','行管理IDの対象タブが異なります。');
   var rows = matching.getRange(1,1,Math.max(1,matching.getLastRow()),26).getValues(), header = detectHeader_(rows), existing = metadataMap_(matching,NODE.recordKey), requests = [];
   for (var i = header; i < rows.length; i++) if (normalizeName_(rows[i][2]) && !existing[i + 1] && normalizeHeader_(rows[i][2]).indexOf('氏名') < 0) requests.push(metadataCreate_(matching.getSheetId(),i+1,NODE.recordKey,Utilities.getUuid()));
   for (var start = 0; start < requests.length; start += 400) sheetsBatch_(book.getId(),requests.slice(start,start+400));
@@ -536,7 +597,7 @@ function syncRowIds_(book, matching) {
 function syncNodeRowIds() { requireOwner_(); return withLock_(function () { var store=readStore_();syncRowIds_(store.book,store.matching);return {synced:true}; }); }
 function enableNodeWritesForCopy() {
   requireOwner_(); var ui=SpreadsheetApp.getUi(),config=config_();
-  if (config.spreadsheetId===NODE.originalId) fail_('WRITES_DISABLED','原本への書き込みは有効にできません。複製シートで検証してください。');
+  if (config.spreadsheetId===NODE.originalId||config.purpose!=='verification'||config.spreadsheetId!==props_().getProperty(NODE.verificationKey)||config.spreadsheetId===props_().getProperty(NODE.destinationKey)) fail_('WRITES_DISABLED','別の検証用コピーだけを書き込み可能にできます。');
   var answer=ui.alert('複製シートへの書き込み','バックアップを確保し、入力列・保護範囲・日付・担当者の別名を確認しましたか？ N列は未確認のため変更しません。',ui.ButtonSet.YES_NO);
   if (answer!==ui.Button.YES) return;
   return withLock_(function () { var store=readStore_();if(!store.schemaCompatible)fail_('SCHEMA_MISMATCH','入力対象19列の見出しと順序を確認してください。');if(store.book.getSpreadsheetTimeZone()!=='Asia/Tokyo')fail_('TIMEZONE','複製シートのタイムゾーンをAsia/Tokyoにしてください。');config.writesEnabled=true;props_().setProperty(NODE.configKey,JSON.stringify(config)); });
@@ -544,7 +605,7 @@ function enableNodeWritesForCopy() {
 /** Real copy-only API integration probe; never creates a test candidate on the original. */
 function verifyNodeCopyIntegration() {
   var owner=requireOwner_(),config=config_(),ui=SpreadsheetApp.getUi();
-  if(config.spreadsheetId===NODE.originalId||!writesEnabled_(config))fail_('COPY_VERIFICATION_REQUIRED','書き込みを有効にした独立した複製シートで検証してください。');
+  if(config.purpose!=='verification'||config.spreadsheetId!==props_().getProperty(NODE.verificationKey)||config.spreadsheetId===props_().getProperty(NODE.destinationKey)||!writesEnabled_(config))fail_('COPY_VERIFICATION_REQUIRED','書き込みを有効にした独立した検証用コピーで検証してください。');
   if(ui.alert('複製シートで実検証','検証専用アカウントでログイン・面談・提案・数式拒否・読み戻しを確認します。検証の入力セルは後で消去し、履歴と無効化したアカウントは残します。対象は複製です。',ui.ButtonSet.YES_NO)!==ui.Button.YES)return;
   props_().deleteProperty('NODE_COPY_PROOF');
   var adminToken=random256_(),testToken='',testId='',suffix=Utilities.getUuid().replace(/-/g,'').slice(0,12),failure=null;
@@ -578,11 +639,11 @@ function verifyNodeCopyIntegration() {
   var finalStore=readStore_();
   if(finalStore.records.some(function(r){return r.playerId===testId;})||finalStore.players.some(function(p){return p.id===testId&&p.active;}))fail_('COPY_VERIFICATION_FAILED','検証データの後始末を確認してください。');
   var proof=makeCopyProof_(config.spreadsheetId,schemaHash_(finalStore.matching),owner);props_().setProperty('NODE_COPY_PROOF',JSON.stringify(proof));
-  ui.alert('複製の実検証が完了しました。原本の業務セルには書き込んでいません。検証証明は7日間有効です。');
+  ui.alert('別のコピーで実検証が完了しました。原本と新しい管理シートの業務セルは変更していません。検証証明は7日間有効です。');
   return {verified:true,copyId:config.spreadsheetId,verifiedAt:proof.verifiedAt};
 }
 function cleanupCopyProbe_(testId) {
-  var store=readStore_();if(store.config.spreadsheetId===NODE.originalId)fail_('COPY_VERIFICATION_REQUIRED','原本で検証の後始末は実行しません。');
+  var store=readStore_();if(store.config.purpose!=='verification'||store.config.spreadsheetId!==props_().getProperty(NODE.verificationKey)||store.config.spreadsheetId===NODE.originalId||store.config.spreadsheetId===props_().getProperty(NODE.destinationKey))fail_('COPY_VERIFICATION_REQUIRED','後始末は別の検証用コピーだけで実行します。');
   var requests=[],rows=store.records.filter(function(r){return r.playerId===testId;}).map(function(r){return r.row;});
   rows.forEach(function(row){NODE.inputColumns.forEach(function(column){requests.push({updateCells:{range:{sheetId:store.matching.getSheetId(),startRowIndex:row-1,endRowIndex:row,startColumnIndex:column-1,endColumnIndex:column},rows:[{values:[{}]}],fields:'userEnteredValue'}});});});
   [NODE.recordKey,NODE.sourceKey].forEach(function(key){store.matching.createDeveloperMetadataFinder().withKey(key).find().forEach(function(item){var row=item.getLocation().getRow();if(row&&rows.indexOf(row.getRow())>=0)requests.push({deleteDeveloperMetadata:{dataFilter:{developerMetadataLookup:{metadataId:item.getId()}}}});});});
@@ -590,25 +651,26 @@ function cleanupCopyProbe_(testId) {
   if(player)requests.push(rowUpdateRequest_(store.playerSheet.getSheetId(),player.row,[player.id,player.name,player.team,player.color,player.target,player.bio,JSON.stringify(player.sheetNames),player.role,false]));
   sheetsBatch_(store.config.spreadsheetId,requests);SpreadsheetApp.flush();
 }
-function enableNodeOriginalAfterVerifiedCopy() {
-  var owner=requireOwner_(),ui=SpreadsheetApp.getUi(),config=config_(),proof=copyProof_(),original=SpreadsheetApp.openById(NODE.originalId),matching=original.getSheets().find(function(sheet){return sheet.getSheetId()===NODE.matchingSheetId;});
-  if(!matching||original.getSpreadsheetTimeZone()!=='Asia/Tokyo')fail_('SCHEMA_MISMATCH','原本のタブとタイムゾーンを確認してください。設定は変更しません。');
-  verifyOriginalReadiness_(config,proof,matching,owner);
-  var answer=ui.prompt('検証後の原本保存を有効化','独立したバックアップと複製での業務確認を完了し、元KPIのN/Q差分を把握した場合だけ、原本のファイルIDを入力してください。原本にはテスト行を作りません。',ui.ButtonSet.OK_CANCEL);
-  if(answer.getSelectedButton()!==ui.Button.OK||answer.getResponseText().trim()!==NODE.originalId)return;
+/** The migration source is permanently read-only, including any previously deployed menu entry. */
+function enableNodeOriginalAfterVerifiedCopy() { fail_('PROTECTED_SOURCE','移行元の原本への書き込みは有効にできません。新しい管理シートを使用してください。'); }
+function clearAllSessions_() { Object.keys(props_().getProperties()).forEach(function(key){if(key.indexOf('NODE_SESSION_')===0)props_().deleteProperty(key);}); }
+function enableNodeDestinationAfterVerifiedCopy() {
+  var owner=requireOwner_(),ui=SpreadsheetApp.getUi(),config=config_(),proof=copyProof_(),destinationId=props_().getProperty(NODE.destinationKey);
+  assertManagedBook_(destinationId);
+  var destination=SpreadsheetApp.openById(destinationId),tabs=resolveBusinessTabs_(destination);
+  if(destination.getSpreadsheetTimeZone()!=='Asia/Tokyo')fail_('TIMEZONE','新しい管理シートのタイムゾーンを確認してください。設定は変更していません。');
+  verifyDestinationReadiness_(config,proof,destination,owner);
+  var answer=ui.prompt('新しい管理シートを有効化','移した値・数式・書式を確認し、この新しい管理シートを今後の保存先にする場合だけ、登録済みのファイルIDを入力してください。テストの業務行は作成しません。',ui.ButtonSet.OK_CANCEL);
+  if(answer.getSelectedButton()!==ui.Button.OK||answer.getResponseText().trim()!==destinationId)return;
   return withLock_(function(){
-    var current=config_();verifyOriginalReadiness_(current,copyProof_(),matching,owner);
-    var copy=readStore_();
-    if(original.getSheetByName(NODE.playersTab)||original.getSheetByName(NODE.operationsTab))fail_('ALREADY_CONFIGURED','原本に管理タブがあります。別プロジェクトとの重複を管理者が確認してください。');
-    var playerSheet=original.insertSheet(NODE.playersTab),operationSheet=original.insertSheet(NODE.operationsTab),rows=[NODE.playerHeaders];
-    copy.players.filter(function(p){return p.active;}).forEach(function(p){rows.push([p.id,p.name,p.team,p.color,p.target,p.bio,JSON.stringify(p.sheetNames),p.role,p.active]);});
-    playerSheet.getRange(1,1,rows.length,NODE.playerHeaders.length).setValues(rows);operationSheet.getRange(1,1,1,NODE.operationHeaders.length).setValues([NODE.operationHeaders]);
-    protectAppSheet_(playerSheet,owner);protectAppSheet_(operationSheet,owner);syncRowIds_(original,matching);
-    var authorizedAt=new Date().toISOString(),next=Object.assign({},current,{spreadsheetId:NODE.originalId,writesEnabled:true,originalWriteVerified:true,verifiedCopyId:proof.copyId,originalAuthorizedAt:authorizedAt,originalAuthorizationSeal:originalAuthorization_(proof,owner,authorizedAt)});
-    props_().setProperty(NODE.configKey,JSON.stringify(next));
-    Object.keys(props_().getProperties()).forEach(function(key){if(key.indexOf('NODE_SESSION_')===0)props_().deleteProperty(key);});
-    ui.alert('原本の保存を有効化しました。原本の業務テスト行・値・数式は作成していません。画面を再ログインして同期してください。');
-    return {configured:true,writesEnabled:true};
+    var current=config_(),currentProof=copyProof_();verifyDestinationReadiness_(current,currentProof,destination,owner);
+    // Setup already created these app-owned tabs. Do not replace the destination's business or profile data with test-copy data.
+    table_(destination.getSheetByName(NODE.playersTab),NODE.playerHeaders);table_(destination.getSheetByName(NODE.operationsTab),NODE.operationHeaders);
+    syncRowIds_(destination,tabs.matching);
+    var authorizedAt=new Date().toISOString(),next={spreadsheetId:destinationId,matchingSheetId:tabs.matchingSheetId,kpiSheetId:tabs.kpiSheetId,purpose:'production',writesEnabled:true,ownerEmail:owner,verifiedCopyId:currentProof.copyId,destinationAuthorizedAt:authorizedAt,destinationAuthorizationSeal:destinationAuthorization_(currentProof,owner,authorizedAt)};
+    props_().setProperty(NODE.configKey,JSON.stringify(next));clearAllSessions_();
+    ui.alert('新しい管理シートを保存先として有効化しました。移した業務セルの値・数式・書式は変更していません。アプリへ再ログインしてください。');
+    return {configured:true,writesEnabled:true,purpose:'production'};
   });
 }
 function disableNodeWrites() { requireOwner_(); return withLock_(function () { var config=config_();config.writesEnabled=false;props_().setProperty(NODE.configKey,JSON.stringify(config)); }); }
@@ -624,4 +686,4 @@ function showCredentials_(credentials,title) {
   SpreadsheetApp.getUi().showModalDialog(HtmlService.createHtmlOutput(html).setWidth(850).setHeight(500),title);
 }
 
-if (typeof NODE_TESTS !== 'undefined') Object.assign(NODE_TESTS,{constants:NODE,handle:nodeHandle_,hash:hash_,passwordHash:passwordHash_,makeAuth:makeAuth_,day:day_,dayDate:dayDate_,candidateId:candidateId_,detectHeader:detectHeader_,countActivities:countActivities_,rowVersion:rowVersion_,readStore:readStore_,snapshot:buildSnapshot_,activities:activities_,writesEnabled:writesEnabled_,makeCopyProof:makeCopyProof_,validCopyProof:validCopyProof_,verifyOriginalReadiness:verifyOriginalReadiness_,originalAuthorization:originalAuthorization_,mappedHeadersMatch:mappedHeadersMatch_});
+if (typeof NODE_TESTS !== 'undefined') Object.assign(NODE_TESTS,{constants:NODE,handle:nodeHandle_,hash:hash_,passwordHash:passwordHash_,makeAuth:makeAuth_,day:day_,dayDate:dayDate_,candidateId:candidateId_,detectHeader:detectHeader_,countActivities:countActivities_,rowVersion:rowVersion_,readStore:readStore_,snapshot:buildSnapshot_,activities:activities_,writesEnabled:writesEnabled_,makeCopyProof:makeCopyProof_,validCopyProof:validCopyProof_,verifyDestinationReadiness:verifyDestinationReadiness_,destinationAuthorization:destinationAuthorization_,resolveBusinessTabs:resolveBusinessTabs_,assertManagedBook:assertManagedBook_,mappedHeadersMatch:mappedHeadersMatch_});

@@ -2,6 +2,7 @@ import type { Activity, Metric, Player } from "./node-data";
 
 export type SheetPlayer = Player & { sheetNames?: string[] };
 export type Counts = Record<string, Record<string, Partial<Record<Metric, number>>>>;
+export type SheetDestination = { title: string; matchingUrl: string; kpiUrl: string };
 export type SheetSnapshot = {
   self: { playerId: string; role: "admin" | "player" };
   players: SheetPlayer[];
@@ -10,6 +11,7 @@ export type SheetSnapshot = {
   syncedAt: string;
   warnings: string[];
   writesEnabled: boolean;
+  destination?: SheetDestination;
 };
 export type MutationResult = {
   snapshot: SheetSnapshot;
@@ -91,6 +93,10 @@ export function assertSnapshot(value: unknown): asserts value is SheetSnapshot {
   }
   if (s.self.role === "player" && (!s.players.some(p => p.id === s.self.playerId) || s.activities.some(a => a.playerId !== s.self.playerId))) {
     throw new SheetApiError("INVALID_RESPONSE", "本人のデータを確認できませんでした。再ログインしてください。");
+  }
+  if (s.destination && (s.self.role !== "admin" || typeof s.destination.title !== "string" ||
+      ![s.destination.matchingUrl, s.destination.kpiUrl].every(url => typeof url === "string" && /^https:\/\/docs\.google\.com\/spreadsheets\/d\/[A-Za-z0-9_-]+\/edit(?:\?gid=\d+(?:#gid=\d+)?|#gid=\d+)$/.test(url)))) {
+    throw new SheetApiError("INVALID_RESPONSE", "保存先の情報を確認できませんでした。管理者で再ログインしてください。");
   }
 }
 

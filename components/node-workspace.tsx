@@ -133,7 +133,7 @@ export default function NodeWorkspace(){
    else{const id=`ND-${String(Math.max(0,...players.map(p=>Number(p.id.slice(3))||0))+1).padStart(3,"0")}`;setPlayers(prev=>[...prev,{id,...payload,color:"mint",bio:""}]);toast.success(`IDを発行しました：${id}`);}
   }))setPlayerDialog(false);
  };
- const connectProps={endpoint:sheet.endpoint,mode:sheet.mode,busy:sheet.busy,error:sheet.error,connected:!!sheet.snapshot,syncedAt:sheet.snapshot?.syncedAt,writesEnabled:sheet.snapshot?.writesEnabled,warnings:sheet.snapshot?.warnings||[],onConnect:async(value:string)=>{await sheet.connect(value);setSetupOpen(false);setLogin(true);setPassword("");},onRefresh:sheet.refresh};
+ const connectProps={endpoint:sheet.endpoint,mode:sheet.mode,busy:sheet.busy,error:sheet.error,connected:!!sheet.snapshot,destination:sheet.snapshot?.destination,syncedAt:sheet.snapshot?.syncedAt,writesEnabled:sheet.snapshot?.writesEnabled,warnings:sheet.snapshot?.warnings||[],onConnect:async(value:string)=>{await sheet.connect(value);setSetupOpen(false);setLogin(true);setPassword("");},onRefresh:sheet.refresh};
  const stateRef=useRef({players,activities,period});stateRef.current={players,activities,period};
  useEffect(()=>{
   const context=(document as Document & {modelContext?:{registerTool:(tool:unknown,options:unknown)=>Promise<void>|void}}).modelContext;
