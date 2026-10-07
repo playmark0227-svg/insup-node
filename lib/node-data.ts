@@ -2,7 +2,7 @@ export const stages = ["候補者面談", "提案", "C面談予約", "クライ�
 export type Stage = typeof stages[number];
 export type Metric = Stage | "紹介人数";
 export type Player = { id: string; name: string; team: string; color: string; target: number; bio: string };
-export type Activity = { id: string; recordId?: string; playerId: string; candidateId: string; candidateName: string; source: string; company: string; position: string; stage: Stage; date: string; status?: string; probability?: string; interviewScheduledDate?: string; clientInterviewScheduledTime?: string; offerScheduledDate?: string; memo?: string };
+export type Activity = { id: string; recordId?: string; rowVersion?: string; playerId: string; candidateId: string; candidateName: string; source: string; company: string; position: string; stage: Stage; date: string; status?: string; probability?: string; interviewScheduledDate?: string; clientInterviewScheduledTime?: string; offerScheduledDate?: string; memo?: string };
 export const positions = ["アポインター", "FS", "ディレクション", "コールシステム", "コンサル", "その他"];
 export const statuses = ["提案候補", "提案なし", "提案完了（面談日確定待ち）", "面談確定(面談実施待ち）", "面談実施（合否待ち）", "合格（シフト入力待ち）", "稼働予定日確定（稼働開始待ち）", "稼働開始", "落選（面談後）", "落選（面談前）", "辞退（音信不通）", "辞退（他決）", "辞退（本人希望）", "案件枠埋まり", "合格後離脱", "稼働後離脱", "C面談リスケ", "C面談ブッチ"];
 export const statusForStage: Record<Stage,string> = {"候補者面談":"提案候補","提案":"提案完了（面談日確定待ち）","C面談予約":"面談確定(面談実施待ち）","クライアント面談":"面談実施（合否待ち）","内定":"合格（シフト入力待ち）","内定承諾":"合格（シフト入力待ち）","稼働開始予定":"稼働予定日確定（稼働開始待ち）","稼働開始":"稼働開始"};
@@ -31,8 +31,8 @@ export function makeDemoActivities(): Activity[] {
 }
 export function inPeriod(a:Activity,period:string){return period==="all"||(period.length===10?a.date===period:a.date.startsWith(period));}
 export function metricCount(activities:Activity[],playerId:string|null,stage:Metric,period:string){return new Set(activities.filter(a=>(!playerId||a.playerId===playerId)&&a.stage===(stage==="紹介人数"?"提案":stage)&&inPeriod(a,period)).map(a=>stage==="候補者面談"?`${a.date}|${a.playerId}|${a.candidateName.replace(/\s/g,"")}`:stage==="紹介人数"?a.candidateId:(a.recordId||`${a.candidateId}|${a.company}`))).size;}
-export function rankPlayers(players:Player[],activities:Activity[],stage:Metric,period:string){
- const ranked=players.map(player=>({...player,count:metricCount(activities,player.id,stage,period),rank:0})).sort((a,b)=>b.count-a.count||a.id.localeCompare(b.id));
+export function rankPlayers(players:Player[],activities:Activity[],stage:Metric,period:string,counter?:(id:string)=>number){
+ const ranked=players.map(player=>({...player,count:counter?counter(player.id):metricCount(activities,player.id,stage,period),rank:0})).sort((a,b)=>b.count-a.count||a.id.localeCompare(b.id));
  ranked.forEach((r,i)=>{r.rank=i&&r.count===ranked[i-1].count?ranked[i-1].rank:i+1;}); return ranked;
 }
 export function latestPlacements(activities:Activity[],playerId:string|null){

@@ -7,6 +7,7 @@
     "node": ">=22.13.0"
   },
   "scripts": {
+    "test": "node --experimental-strip-types --test tests/apps-script.test.mjs tests/sheets-client.test.ts",
     "dev": "vite --host 127.0.0.1 --port 5173",
     "build": "tsc --noEmit && vite build && node scripts/finalize-pages.mjs",
     "preview": "vite preview --host 127.0.0.1 --port 4173"
