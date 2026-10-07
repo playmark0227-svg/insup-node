@@ -12,6 +12,8 @@ GitHub Pagesの画面から呼び出す、所有者実行のApps Script Webア�
 4. 新しい管理用ファイルの「拡張機能 → Apps Script」で `Code.gs` を保存します。「プロジェクトの設定」でマニフェスト表示を有効にし、`appsscript.json` を保存します。スプレッドシートのタイムゾーンは `Asia/Tokyo` が必要です。コードは移行元・移行先いずれの設定も自動変更しません。
 5. 所有者アカウントで `setupNode` を実行します。Googleが表示するスコープを確認して承認し、確認ダイアログへ **新しい管理用ファイル自身のID** を入力します。Sheets REST APIが無効のエラーになる場合は、関連するGoogle Cloudプロジェクトで **Google Sheets API** を有効にします。
 
+マニフェストに指定する権限は、シートの読み書き（`spreadsheets`）、Sheets REST APIの呼び出し（`script.external_request`）、初期ログイン情報などのダイアログ表示（`script.container.ui`）、実行者メールアドレスの確認（`userinfo.email`）の4種類です。`script.container.ui` は [Google公式のshowModalDialog仕様](https://developers.google.com/apps-script/reference/base/ui#showModalDialog(Object,String))で必要とされる権限です。既存プロジェクトへ追加した場合は、所有者が次回実行時にGoogleの再承認を行ってください。
+
 新しい保存先IDは Script Properties の `NODE_DESTINATION_ID` に登録します。公開ソースやフロントエンドへIDを埋め込む必要はありません。初期登録後は別のファイルを自動的に保存先へ変えません。
 
 初期設定は `_NODE_players` と `_NODE_operations` の2つのアプリ専用タブを追加し、既存の候補者行へROW DeveloperMetadataの管理IDを追加します。移した業務セルの値・数式・書式は変更しません。アプリ専用タブは所有者以外の編集を保護します。この時点ではアプリからの保存は無効です。
