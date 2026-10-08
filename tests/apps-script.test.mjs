@@ -927,6 +927,182 @@ function destinationAuthorizedFixture() {
   return { ...fixture, proof, config };
 }
 
+function bulkPasswordFixture() {
+  const fixture = destinationAuthorizedFixture(), { harness } = fixture;
+  const players = harness.spreadsheet.getSheetByName("_NODE_players");
+  for (let i = 3; i <= 7; i++) players.getRange(players.getLastRow() + 1, 1, 1, 9).setValues([[`ND-00${i}`,`担当${i}`,"NODE","blue",20,"",JSON.stringify([`担当${i}`]),"player",true]]);
+  players.getRange(players.getLastRow() + 1, 1, 1, 9).setValues([["ND-099","停止済み","NODE","blue",20,"","[]","player",false]]);
+  const ids = ["ADMIN",...Array.from({length:7},(_,i) => `ND-00${i+1}`)];
+  for (const id of ids) harness.properties[`NODE_AUTH_${id}`] = JSON.stringify(harness.context.makeAuth_(`old-${id}`));
+  harness.properties.NODE_AUTH_ND_IGNORED = "unrelated-auth";
+  harness.properties.NODE_SESSION_inactive = JSON.stringify({id:"ND-099",expiresAt:Date.now()+60_000});
+  const shown = [];
+  harness.context.showCredentials_ = credentials => { assert.equal(harness.locks.held,false); shown.push(clone(credentials)); };
+  harness.writes.length = 0; harness.apiCalls.length = 0;
+  return {...fixture,ids,players,shown};
+}
+
+test("bulk password menu registration and cancellation change no credentials, sessions, or sheets", () => {
+  for (const answer of ["NO","CLOSE",undefined]) {
+    const { harness, ids, shown } = bulkPasswordFixture(), before = clone(harness.properties), items = [];
+    const menu = {addItem(name,action){items.push([name,action]);return this;},addToUi(){return this;}};
+    harness.context.SpreadsheetApp.getUi = () => ({createMenu:()=>menu,ButtonSet:{YES_NO:"YES_NO"},Button:{YES:"YES"},alert:(_title,message)=>{
+      assert.equal(harness.locks.held,false); assert.equal(harness.locks.calls,2);
+      ids.forEach(id => assert.ok(message.includes(id)));
+      assert.ok(message.includes("旧パスワード") && message.includes("ログインセッション"));
+      assert.deepEqual(harness.properties,before); return answer;
+    }});
+    harness.context.onOpen();
+    assert.ok(items.some(([name,action]) => name === "全員のパスワードを再発行" && action === "rotateAllNodePasswords"));
+    assert.equal(harness.context.rotateAllNodePasswords().rotated,0);
+    assert.deepEqual(harness.properties,before); assert.deepEqual(shown,[]);
+    assert.deepEqual(harness.writes,[]); assert.deepEqual(harness.apiCalls,[]);
+  }
+});
+
+test("bulk password rotation updates all eight active accounts and revokes their sessions without touching business or configuration", () => {
+  const { harness, ids, shown, player, admin } = bulkPasswordFixture();
+  const before = clone(harness.properties), sheets = clone(harness.spreadsheet.sheets.map(sheet => ({values:sheet.values,formulas:sheet.formulas,validations:sheet.validations})));
+  const propertyApi = harness.context.PropertiesService.getScriptProperties(), setProperties = propertyApi.setProperties;
+  const batches = [];
+  propertyApi.setProperties = function(values,deleteAll){assert.equal(harness.locks.held,true);assert.equal(deleteAll,false);batches.push(clone(values));return setProperties.call(this,values,deleteAll);};
+  assert.equal(harness.context.rotateAllNodePasswords().rotated,8);
+  assert.equal(shown.length,1); assert.deepEqual(shown[0].map(row => row.id),ids);
+  assert.equal(new Set(shown[0].map(row => row.password)).size,8);
+  assert.equal(batches.length,2);
+  assert.ok(Object.keys(batches[0]).every(key => key.startsWith("NODE_SESSION_")));
+  assert.deepEqual(Object.keys(batches[1]),ids.flatMap(id => [`NODE_AUTH_${id}`,`NODE_RATE_${harness.context.hash_(id)}`]));
+  for (const key of Object.keys(before)) {
+    if (ids.some(id => key === `NODE_AUTH_${id}`)) { assert.notEqual(harness.properties[key],before[key]); continue; }
+    if (key.startsWith("NODE_SESSION_") && ids.includes(JSON.parse(before[key]).id)) { assert.equal(JSON.parse(harness.properties[key]).expiresAt,0); continue; }
+    assert.equal(harness.properties[key],before[key],key);
+  }
+  assert.deepEqual(harness.spreadsheet.sheets.map(sheet => ({values:sheet.values,formulas:sheet.formulas,validations:sheet.validations})),sheets);
+  assert.deepEqual(harness.writes,[]); assert.deepEqual(harness.apiCalls,[]);
+  assert.equal(assertFailure(request(harness,"snapshot",{},{token:player.token})).code,"UNAUTHENTICATED");
+  assert.equal(assertFailure(request(harness,"snapshot",{},{token:admin.token})).code,"UNAUTHENTICATED");
+  for (const credential of shown[0]) {
+    assert.equal(assertFailure(request(harness,"login",{id:credential.id,password:`old-${credential.id}`})).code,"INVALID_CREDENTIALS");
+    assert.equal(assertSuccess(request(harness,"login",credential)).snapshot.self.playerId,credential.id);
+    assert.ok(!JSON.stringify(harness.properties).includes(credential.password));
+    assert.ok(!JSON.stringify(harness.logs).includes(credential.password));
+  }
+});
+
+test("bulk rotation refuses non-owner, original, verification, and a changed destination before credential writes", () => {
+  for (const condition of ["owner","original","verification","destination"]) {
+    const { harness } = bulkPasswordFixture();
+    if (condition === "owner") harness.context.Session.getActiveUser = () => ({getEmail:()=>"different@example.test"});
+    else {
+      const config = JSON.parse(harness.properties.NODE_CONFIG);
+      if (condition === "original") config.spreadsheetId = harness.context.NODE.originalId;
+      if (condition === "verification") config.purpose = "verification";
+      if (condition === "destination") harness.properties.NODE_DESTINATION_ID = "another-destination";
+      harness.properties.NODE_CONFIG = JSON.stringify(config);
+    }
+    const before = clone(harness.properties);
+    harness.context.SpreadsheetApp.getUi = () => { throw new Error("Invalid target must not reach confirmation"); };
+    assert.throws(() => harness.context.rotateAllNodePasswords(),error => ["FORBIDDEN","PROTECTED_SOURCE","PRODUCTION_REQUIRED","UNAPPROVED_DESTINATION"].includes(error.nodeCode));
+    assert.deepEqual(harness.properties,before); assert.deepEqual(harness.writes,[]); assert.deepEqual(harness.apiCalls,[]);
+  }
+});
+
+test("bulk rotation rechecks the owner, destination, and entire active roster after confirmation", () => {
+  for (const change of ["owner","destination","name","active","new-player"]) {
+    const { harness, players, shown } = bulkPasswordFixture();
+    const original = clone(harness.properties);
+    harness.context.SpreadsheetApp.getUi = () => ({ButtonSet:{YES_NO:"YES_NO"},Button:{YES:"YES"},alert:()=>{
+      assert.equal(harness.locks.held,false);
+      if (change === "owner") harness.context.Session.getActiveUser = () => ({getEmail:()=>"different@example.test"});
+      if (change === "destination") harness.properties.NODE_DESTINATION_ID = "changed-destination";
+      if (change === "name") players.values[2][1] = "変更後の名前";
+      if (change === "active") players.values[2][8] = false;
+      if (change === "new-player") players.values.push(["ND-011","追加担当","NODE","blue",20,"","[]","player",true]);
+      return "YES";
+    }});
+    assert.throws(() => harness.context.rotateAllNodePasswords(),error => ["CONFLICT","FORBIDDEN","UNAPPROVED_DESTINATION"].includes(error.nodeCode));
+    Object.keys(original).filter(key => key.startsWith("NODE_AUTH_") || key.startsWith("NODE_SESSION_")).forEach(key => assert.equal(harness.properties[key],original[key]));
+    assert.deepEqual(shown,[]); assert.equal(harness.locks.held,false);
+  }
+});
+
+test("bulk rotation restores previous hashes after partial auth failure while keeping sessions revoked", () => {
+  const { harness, ids, shown } = bulkPasswordFixture();
+  delete harness.properties["NODE_AUTH_ND-002"];
+  const rateKey = `NODE_RATE_${harness.context.hash_("ADMIN")}`;
+  harness.properties[rateKey] = JSON.stringify({start:harness.clock.milliseconds,failures:5});
+  const before = clone(harness.properties), api = harness.context.PropertiesService.getScriptProperties(), setProperties = api.setProperties;
+  let authBatches = 0;
+  api.setProperties = function(values,deleteAll){
+    assert.equal(deleteAll,false);
+    if(Object.keys(values).some(key => key.startsWith("NODE_AUTH_")) && ++authBatches === 1){
+      Object.entries(values).slice(0,6).forEach(([key,value]) => harness.properties[key]=value);
+      throw new Error("simulated partial update");
+    }
+    return setProperties.call(this,values,deleteAll);
+  };
+  assert.throws(() => harness.context.rotateAllNodePasswords(),error => error.nodeCode === "PASSWORD_ROTATION_FAILED");
+  ids.forEach(id => assert.equal(harness.properties[`NODE_AUTH_${id}`],before[`NODE_AUTH_${id}`]));
+  ids.forEach(id => {const key=`NODE_RATE_${harness.context.hash_(id)}`;assert.equal(harness.properties[key],before[key]);});
+  Object.keys(before).filter(key => key.startsWith("NODE_SESSION_") && ids.includes(JSON.parse(before[key]).id)).forEach(key => assert.equal(JSON.parse(harness.properties[key]).expiresAt,0));
+  assert.deepEqual(shown,[]); assert.equal(harness.locks.held,false);
+  assert.deepEqual(harness.writes,[]); assert.deepEqual(harness.apiCalls,[]);
+});
+
+test("bulk rotation verifies an ambiguous completed auth update instead of issuing a second password set", () => {
+  const { harness, shown } = bulkPasswordFixture(), api = harness.context.PropertiesService.getScriptProperties(), setProperties = api.setProperties;
+  let authBatches = 0;
+  api.setProperties = function(values,deleteAll){const result=setProperties.call(this,values,deleteAll);if(Object.keys(values).some(key => key.startsWith("NODE_AUTH_"))){authBatches++;throw new Error("response lost after commit");}return result;};
+  assert.equal(harness.context.rotateAllNodePasswords().rotated,8);
+  assert.equal(authBatches,1); assert.equal(shown.length,1);
+});
+
+test("bulk rotation stops before auth changes if session revocation cannot be confirmed", () => {
+  const { harness, ids, shown } = bulkPasswordFixture(), before = clone(harness.properties), api = harness.context.PropertiesService.getScriptProperties();
+  api.setProperties = () => {throw new Error("property write unavailable");};
+  assert.throws(() => harness.context.rotateAllNodePasswords(),error => error.nodeCode === "PASSWORD_ROTATION_FAILED");
+  ids.forEach(id => assert.equal(harness.properties[`NODE_AUTH_${id}`],before[`NODE_AUTH_${id}`]));
+  assert.deepEqual(shown,[]); assert.equal(harness.locks.held,false);
+});
+
+test("bulk rotation clears only target account failure counters so fresh passwords work immediately", () => {
+  const { harness, ids, shown } = bulkPasswordFixture();
+  ids.forEach(id => harness.properties[`NODE_RATE_${harness.context.hash_(id)}`] = JSON.stringify({start:harness.clock.milliseconds,failures:5}));
+  const otherRate = `NODE_RATE_${harness.context.hash_("ND-099")}`;
+  harness.properties[otherRate] = JSON.stringify({start:harness.clock.milliseconds,failures:5});
+  harness.properties.NODE_RATE_UNKNOWN = JSON.stringify({start:harness.clock.milliseconds,failures:4});
+  const global = harness.properties.NODE_LOGIN_RATE, unknown = harness.properties.NODE_RATE_UNKNOWN, other = harness.properties[otherRate];
+  assert.equal(harness.context.rotateAllNodePasswords().rotated,8);
+  ids.forEach(id => assert.equal(JSON.parse(harness.properties[`NODE_RATE_${harness.context.hash_(id)}`]).failures,0));
+  assert.equal(harness.properties.NODE_LOGIN_RATE,global);
+  assert.equal(harness.properties.NODE_RATE_UNKNOWN,unknown); assert.equal(harness.properties[otherRate],other);
+  shown[0].forEach(credential => assert.equal(assertSuccess(request(harness,"login",credential)).snapshot.self.playerId,credential.id));
+});
+
+test("bulk rotation never reports success when partial credential writes cannot be restored", () => {
+  const { harness, shown } = bulkPasswordFixture(), api = harness.context.PropertiesService.getScriptProperties(), setProperties = api.setProperties;
+  let authBatches = 0;
+  api.setProperties = function(values,deleteAll){
+    if(Object.keys(values).some(key => key.startsWith("NODE_AUTH_"))){
+      if(++authBatches === 1){const [key,value]=Object.entries(values)[0];harness.properties[key]=value;}
+      throw new Error("unavailable");
+    }
+    return setProperties.call(this,values,deleteAll);
+  };
+  assert.throws(() => harness.context.rotateAllNodePasswords(),error => error.nodeCode === "PASSWORD_ROTATION_INCOMPLETE");
+  assert.deepEqual(shown,[]); assert.equal(harness.locks.held,false);
+  assert.deepEqual(harness.writes,[]); assert.deepEqual(harness.apiCalls,[]);
+});
+
+test("bulk rotation distinguishes committed credentials from a failed credentials dialog without exposing passwords", () => {
+  const { harness, ids } = bulkPasswordFixture(), before = clone(harness.properties);
+  harness.context.showCredentials_ = () => {throw new Error("dialog unavailable");};
+  assert.throws(() => harness.context.rotateAllNodePasswords(),error => error.nodeCode === "PASSWORD_DISPLAY_FAILED" && error.message.includes("再発行は完了しました") && !error.message.includes("dialog unavailable"));
+  ids.forEach(id => assert.notEqual(harness.properties[`NODE_AUTH_${id}`],before[`NODE_AUTH_${id}`]));
+  Object.keys(before).filter(key => key.startsWith("NODE_SESSION_") && ids.includes(JSON.parse(before[key]).id)).forEach(key => assert.equal(JSON.parse(harness.properties[key]).expiresAt,0));
+  assert.deepEqual(harness.logs,[]); assert.equal(harness.locks.held,false);
+});
+
 function destinationBook(harness, { id = "test-destination", matchingId = 1234, kpiId = 5678 } = {}) {
   return new MockSpreadsheet(id, [
     { id: matchingId, name: "2期目マッチングDB", values: [MATCHING_HEADERS] },
@@ -1027,7 +1203,7 @@ test("production destination cannot be used for test data or copy-probe cleanup"
 
 test("web requests cannot invoke any owner setup or verification functions", () => {
   const { harness, admin } = signedInFixture();
-  for (const action of ["verifyNodeCopyIntegration", "enableNodeOriginalAfterVerifiedCopy", "enableNodeDestinationAfterVerifiedCopy", "setupNode", "setupNodeVerificationCopy", "enableNodeWritesForCopy", "rotateNodePassword"]) assertFailure(request(harness, action, {}, { token: admin.token, operationId: randomUUID() }));
+  for (const action of ["verifyNodeCopyIntegration", "enableNodeOriginalAfterVerifiedCopy", "enableNodeDestinationAfterVerifiedCopy", "setupNode", "setupNodeVerificationCopy", "enableNodeWritesForCopy", "rotateNodePassword", "rotateAllNodePasswords"]) assertFailure(request(harness, action, {}, { token: admin.token, operationId: randomUUID() }));
   assert.deepEqual(harness.apiCalls, []);
 });
 

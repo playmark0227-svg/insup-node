@@ -541,7 +541,7 @@ function sheetsBatch_(spreadsheetId, requests) {
 }
 
 /* Owner-only editor/menu setup. Never reachable through the web-app action dispatch. */
-function onOpen() { SpreadsheetApp.getUi().createMenu('NODE連携').addItem('新しい管理シートの初期設定','setupNode').addItem('別の検証用コピーを設定','setupNodeVerificationCopy').addItem('検証用コピーの書き込みを有効化','enableNodeWritesForCopy').addItem('検証用コピーで実検証','verifyNodeCopyIntegration').addItem('検証後に新しい管理シートを有効化','enableNodeDestinationAfterVerifiedCopy').addItem('行IDを同期','syncNodeRowIds').addItem('書き込みを停止','disableNodeWrites').addItem('パスワードを再発行','rotateNodePassword').addToUi(); }
+function onOpen() { SpreadsheetApp.getUi().createMenu('NODE連携').addItem('新しい管理シートの初期設定','setupNode').addItem('別の検証用コピーを設定','setupNodeVerificationCopy').addItem('検証用コピーの書き込みを有効化','enableNodeWritesForCopy').addItem('検証用コピーで実検証','verifyNodeCopyIntegration').addItem('検証後に新しい管理シートを有効化','enableNodeDestinationAfterVerifiedCopy').addItem('行IDを同期','syncNodeRowIds').addItem('書き込みを停止','disableNodeWrites').addItem('パスワードを再発行','rotateNodePassword').addItem('全員のパスワードを再発行','rotateAllNodePasswords').addToUi(); }
 function requireOwner_() {
   var active = Session.getActiveUser().getEmail(), effective = Session.getEffectiveUser().getEmail();
   if (!active || !effective || active !== effective) fail_('FORBIDDEN', 'スクリプト所有者がエディターまたはシートから実行してください。');
@@ -777,6 +777,50 @@ function rotateNodePassword() {
   if(answer.getSelectedButton()!==ui.Button.OK)return;
   var id=answer.getResponseText().trim().toUpperCase();
   return withLock_(function () { var store=readStore_(),player=store.players.find(function(p){return p.id===id&&p.active;});if(!player)fail_('VALIDATION','対象IDがありません。');var password=random256_();props_().setProperty('NODE_AUTH_'+id,JSON.stringify(makeAuth_(password)));var all=props_().getProperties();Object.keys(all).forEach(function(key){if(key.indexOf('NODE_SESSION_')===0&&JSON.parse(all[key]).id===id)props_().deleteProperty(key);});showCredentials_([{id:id,name:player.name,password:password}],'再発行したログイン情報'); });
+}
+function allPasswordRotationTarget_() {
+  var owner=requireOwner_(),config=config_(),destinationId=props_().getProperty(NODE.destinationKey);
+  assertManagedBook_(config.spreadsheetId);
+  if(config.purpose!=='production'||config.spreadsheetId!==destinationId)fail_('PRODUCTION_REQUIRED','全員の再発行は登録済みの新しい管理シートで実行してください。');
+  var store=readStore_(),players=store.players.filter(function(p){return p.active&&(p.role==='admin'||p.role==='player');}).map(function(p){return {id:p.id,name:p.name,role:p.role};}).sort(function(a,b){return a.id.localeCompare(b.id);});
+  if(!players.length||players.some(function(p){return !/^(ADMIN|ND-\d{3,})$/.test(p.id)||store.players.filter(function(other){return other.id===p.id;}).length!==1;}))fail_('SCHEMA_MISMATCH','再発行対象のIDと有効な名簿を確認してください。');
+  return {ownerEmail:owner,destinationId:destinationId,matchingSheetId:config.matchingSheetId,kpiSheetId:config.kpiSheetId,players:players};
+}
+function rotationPropertiesMatch_(expected) {
+  try { var current=props_().getProperties();return Object.keys(expected).every(function(key){return current[key]===expected[key];}); }
+  catch(_){return false;}
+}
+function setRotationProperties_(updates) {
+  if(!Object.keys(updates).length)return true;
+  // PropertiesService has no documented multi-key transaction guarantee. Verify even after an ambiguous error.
+  try { props_().setProperties(updates,false); } catch(_){}
+  return rotationPropertiesMatch_(updates);
+}
+/** Owner-only menu action. The confirmation is deliberately outside ScriptLock. */
+function rotateAllNodePasswords() {
+  var preview=allPasswordRotationTarget_(),ui=SpreadsheetApp.getUi();
+  var message=preview.players.map(function(p){return p.id+'  '+p.name;}).join('\n')+'\n\n上記'+preview.players.length+'名の旧パスワードと現在のログインセッションをすべて無効にします。\n新しいパスワードは次の画面に一度だけ表示します。控える準備ができたら「はい」を押してください。';
+  if(ui.alert('全員のパスワードを再発行',message,ui.ButtonSet.YES_NO)!==ui.Button.YES)return {rotated:0};
+  var credentials=withLock_(function(){
+    var current=allPasswordRotationTarget_();
+    if(stableJson_(current)!==stableJson_(preview))fail_('CONFLICT','確認中に所有者・保存先・対象名簿が変わりました。何も変更せず停止しました。もう一度確認してください。');
+    var before=props_().getProperties(),updates={},previous={},expired={},credentials=[],ids=current.players.map(function(p){return p.id;});
+    current.players.forEach(function(p){var password=random256_(),key='NODE_AUTH_'+p.id,rateKey='NODE_RATE_'+hash_(p.id);updates[key]=JSON.stringify(makeAuth_(password));previous[key]=before[key];updates[rateKey]=JSON.stringify({start:Date.now(),failures:0});previous[rateKey]=before[rateKey];credentials.push({id:p.id,name:p.name,password:password});});
+    Object.keys(before).forEach(function(key){if(key.indexOf('NODE_SESSION_')!==0)return;var session;try{session=JSON.parse(before[key]);}catch(_){return;}if(session&&ids.indexOf(session.id)>=0)expired[key]=JSON.stringify({id:session.id,expiresAt:0});});
+    // Revoke existing sessions first, while the lock excludes every login and authenticated API request.
+    if(!setRotationProperties_(expired))fail_('PASSWORD_ROTATION_FAILED','ログインセッションの失効を確認できなかったため、パスワードは変更していません。所有者がもう一度実行してください。');
+    if(!setRotationProperties_(updates)){
+      var restore={};Object.keys(previous).forEach(function(key){if(previous[key]!==undefined)restore[key]=previous[key];});
+      setRotationProperties_(restore);
+      Object.keys(previous).forEach(function(key){if(previous[key]===undefined){try{props_().deleteProperty(key);}catch(_){}}});
+      if(!rotationPropertiesMatch_(previous))fail_('PASSWORD_ROTATION_INCOMPLETE','認証設定の復元を確認できませんでした。所有者が全員の再発行をもう一度実行してください。');
+      fail_('PASSWORD_ROTATION_FAILED','再発行を完了できなかったため旧パスワードへ戻しました。既存のログインセッションは失効しています。所有者がもう一度実行してください。');
+    }
+    return credentials;
+  });
+  try { showCredentials_(credentials,'全員の新しいログイン情報（閉じる前に控えてください）'); }
+  catch(_) { fail_('PASSWORD_DISPLAY_FAILED','再発行は完了しましたが一覧を表示できませんでした。所有者が「全員のパスワードを再発行」をもう一度実行し、新しい一覧を控えてください。'); }
+  return {rotated:credentials.length};
 }
 function escapeHtml_(text) { return String(text).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
 function showCredentials_(credentials,title) {
