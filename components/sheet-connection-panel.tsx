@@ -52,9 +52,9 @@ export function SheetConnectionPanel(props: Props) {
     <section className="card rule-card"><h2>集計と保存</h2>
       <div className="rule-item"><strong>候補者面談</strong><p>同日・同担当・同候補者の面談は1件として集計します。</p></div>
       <div className="rule-item"><strong>提案とマッチ</strong><p>各工程の日付と提案行で集計します。マッチはV列の候補者承諾日です。</p></div>
-      <div className="rule-item"><strong>移行した数式の保持</strong><p>新しい管理用シートの入力列だけを更新します。KPIタブと数式が入っているセルは保持します。</p></div>
+      <div className="rule-item"><strong>DBと月間KPIへの反映</strong><p>成果を登録すると「2期目マッチングDB」に保存され、「2期目月間KPI・KGI」の集計式に反映されます。</p></div>
       <div className="rule-item"><strong>プレイヤーの明細</strong><p>ログインした本人の明細を取得します。ランキングは件数と表示名を共有します。</p></div>
-      <p className="panel-note">C面談実施はQ列、稼働開始実績はX列から集計します。元KPIが参照するN列・W列との違いは、元シートの数式を保ったまま表示します。</p>
+      <p className="panel-note">C面談実施はQ列、稼働開始実績はX列の日付で集計します。</p>
     </section>
   </div>;
 }
