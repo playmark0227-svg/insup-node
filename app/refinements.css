@@ -36,6 +36,13 @@
 .login-card>form label{display:block;margin:15px 0 8px;font-size:13px}
 .login-card .form-error{margin-top:18px}
 .login-card>.text-button{display:block;margin:20px auto 0}
+.login-spinner{flex-shrink:0;animation:login-spin 1s linear infinite}
+.login-progress{display:grid;gap:14px;margin:25px 0;padding:19px;border-radius:10px;background:#f0f7ff;color:#164e91;font-size:13px}
+.login-progress>span{display:flex;align-items:center;gap:10px}
+.login-recovery>.primary-button{width:100%;margin-top:20px}
+.login-card>p.form-error:not(.eyebrow){color:#b75e54}
+@keyframes login-spin{to{transform:rotate(360deg)}}
+@media(prefers-reduced-motion:reduce){.login-spinner{animation:none}}
 .app-form button:disabled,.primary-button:disabled,.secondary-button:disabled,.text-button:disabled{opacity:.55;cursor:wait}
 @media(max-width:767px){.setup-page{padding:22px 16px}.sync-error,.sync-warning{padding:12px 20px}.connection-help ol{padding-left:19px}}
 .mobile-brand{display:none}

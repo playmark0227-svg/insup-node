@@ -47,11 +47,11 @@ class MockRange {
   getNumRows() { return this.rows; }
   getNumColumns() { return this.columns; }
   getSheet() { return this.sheet; }
-  getValues() { return this.matrix(this.sheet.values); }
+  getValues() { this.sheet.spreadsheet.beforeRead(this, "getValues"); return this.matrix(this.sheet.values); }
   getDisplayValues() { return this.getValues().map(row => row.map(value => String(value ?? ""))); }
   getValue() { return this.getValues()[0][0]; }
   getDisplayValue() { return this.getDisplayValues()[0][0]; }
-  getFormulas() { return this.matrix(this.sheet.formulas); }
+  getFormulas() { this.sheet.spreadsheet.beforeRead(this, "getFormulas"); return this.matrix(this.sheet.formulas); }
   getFormula() { return this.getFormulas()[0][0]; }
   getDeveloperMetadata() { return this.createDeveloperMetadataFinder().find(); }
   createDeveloperMetadataFinder() { return new MockMetadataFinder(this.sheet.spreadsheet, this.sheet, this); }
@@ -163,7 +163,12 @@ class MockSheet {
 
 class MockSpreadsheet {
   constructor(id, sheets, writes) {
-    this.id = id; this.sheets = sheets.map(sheet => new MockSheet(this, sheet)); this.writes = writes; this.failure = null; this.metadata = []; this.nextMetadataId = 1;
+    this.id = id; this.sheets = sheets.map(sheet => new MockSheet(this, sheet)); this.writes = writes; this.reads = []; this.failure = null; this.metadata = []; this.nextMetadataId = 1;
+  }
+  beforeRead(range, method) {
+    const read = { method, sheetId: range.sheet.id, row: range.row, column: range.column, rows: range.rows, columns: range.columns };
+    this.reads.push(read);
+    this.readObserver?.(read);
   }
   beforeWrite(operation) {
     if (this.failure?.(operation)) throw new Error("Injected spreadsheet write failure");
@@ -561,6 +566,171 @@ test("login rejects wrong credentials without exposing user existence or credent
   assert.deepEqual(wrong, missing);
   assert.ok(!JSON.stringify(wrong).includes("NODE_AUTH"));
   assert.ok(!JSON.stringify(wrong).includes("salt"));
+});
+
+test("session-only login reads only fresh account rows and bad passwords never open a spreadsheet", () => {
+  const harness = baseHarness();
+  harness.properties.NODE_PEPPER = "test-pepper";
+  harness.properties["NODE_AUTH_ND-001"] = JSON.stringify(harness.context.makeAuth_("test-password"));
+  const opening = harness.context.SpreadsheetApp.openById;
+  harness.context.SpreadsheetApp.openById = () => { throw new Error("Bad passwords must not access Sheets"); };
+  assert.equal(assertFailure(request(harness, "login", { id: "ND-001", password: "wrong" })).code, "INVALID_CREDENTIALS");
+  assert.equal(assertFailure(request(harness, "login", { id: "UNKNOWN", password: "wrong" })).code, "INVALID_CREDENTIALS");
+  harness.context.SpreadsheetApp.openById = opening;
+  const propertyApi = harness.context.PropertiesService.getScriptProperties(), setProperty = propertyApi.setProperty;
+  propertyApi.setProperty = function(key, value) {
+    if (key === "NODE_LOGIN_RATE" || key.startsWith("NODE_SESSION_")) assert.equal(harness.locks.held, true, "Rate increments and session issuance keep their write lock");
+    return setProperty.call(this, key, value);
+  };
+  harness.spreadsheet.readObserver = read => {
+    assert.equal(read.sheetId, 8001, "Authentication must not load matching/KPI/operations data");
+    assert.equal(harness.locks.held, true, "Fresh account validation and session issuance remain atomic");
+  };
+  const result = assertSuccess(request(harness, "login", { id: "nd-001", password: "test-password", sessionOnly: true, role: "admin" }));
+  assert.deepEqual(Object.keys(result), ["token"]);
+  assert.match(result.token, /^[A-Za-z0-9_-]{43}$/);
+  assert.equal(JSON.parse(harness.properties[harness.context.sessionKey_(result.token)]).id, "ND-001");
+  assert.equal(harness.spreadsheet.reads.length, 1);
+  assert.deepEqual(harness.metadataReads, []);
+  assert.deepEqual(harness.writes, []);
+  const account = harness.spreadsheet.getSheetByName("_NODE_players").values.find(row => row[0] === "ND-001");
+  account[8] = false;
+  assert.equal(assertFailure(request(harness, "login", { id: "ND-001", password: "test-password", sessionOnly: true })).code, "INVALID_CREDENTIALS");
+  assert.equal(Object.keys(harness.properties).filter(key => key.startsWith("NODE_SESSION_")).length, 1, "Disabled accounts do not allocate another token");
+});
+
+test("a session-only login survives a later data read failure and the same token can retry", () => {
+  const harness = baseHarness();
+  seedMatchingRows(harness);
+  harness.properties.NODE_PEPPER = "test-pepper";
+  harness.properties["NODE_AUTH_ND-001"] = JSON.stringify(harness.context.makeAuth_("test-password"));
+  const login = assertSuccess(request(harness, "login", { id: "ND-001", password: "test-password", sessionOnly: true }));
+  const lookup = harness.context.Sheets.Spreadsheets.DeveloperMetadata.search;
+  harness.context.Sheets.Spreadsheets.DeveloperMetadata.search = () => { throw new Error("Temporary Sheets outage"); };
+  assert.equal(assertFailure(request(harness, "snapshot", {}, { token: login.token })).code, "SHEET_READ_FAILED");
+  assert.ok(harness.properties[harness.context.sessionKey_(login.token)], "A transport/data failure does not revoke a valid session");
+  harness.context.Sheets.Spreadsheets.DeveloperMetadata.search = lookup;
+  assert.equal(assertSuccess(request(harness, "snapshot", {}, { token: login.token })).self.role, "player");
+});
+
+test("legacy login deletes its unreturned token if its data read fails", () => {
+  const harness = baseHarness();
+  harness.properties.NODE_PEPPER = "test-pepper";
+  harness.properties["NODE_AUTH_ND-001"] = JSON.stringify(harness.context.makeAuth_("test-password"));
+  harness.context.Sheets.Spreadsheets.DeveloperMetadata.search = () => { throw new Error("Temporary Sheets outage"); };
+  assert.equal(assertFailure(request(harness, "login", { id: "ND-001", password: "test-password" })).code, "SHEET_READ_FAILED");
+  assert.equal(Object.keys(harness.properties).some(key => key.startsWith("NODE_SESSION_")), false);
+});
+
+test("legacy login releases its lock before business reads and snapshots do not wait for a writer", () => {
+  const harness = baseHarness();
+  seedMatchingRows(harness);
+  let businessReads = 0;
+  harness.spreadsheet.readObserver = read => {
+    if (read.sheetId === MATCHING_SHEET_ID) {
+      businessReads++;
+      assert.equal(harness.locks.held, false, "The large business read must never serialize player logins");
+    }
+  };
+  const player = authenticate(harness);
+  assert.ok(player.snapshot.activities.length > 0, "The existing token+snapshot contract is retained");
+  assert.ok(businessReads > 0);
+  const before = harness.locks.calls;
+  harness.locks.available = false;
+  assertSuccess(request(harness, "snapshot", {}, { token: player.token }));
+  assert.equal(harness.locks.calls, before, "An independent read does not acquire the script-wide write lock");
+  assert.equal(assertFailure(mutate(harness, player.token, "saveActivity", { activity: newCandidate() })).code, "BUSY");
+  assert.deepEqual(harness.writes, []);
+});
+
+test("read-only snapshots trim formula-only template rows without changing activities or revisions", () => {
+  const { harness, player } = signedInFixture();
+  const sheet = harness.spreadsheet.getSheetById(MATCHING_SHEET_ID);
+  sheet.values[214] = clone(sheet.values[1]);
+  sheet.values[214][2] = "最終候補";
+  sheet.formulas[214] = clone(sheet.formulas[1]);
+  sheet.getRange(215, 1, 1, 26).addDeveloperMetadata("NODE_RECORD_ID", "ROW-LAST");
+  sheet.getRange(215, 1, 1, 26).addDeveloperMetadata("NODE_SOURCE", "最終紹介元");
+  sheet.values[215] = clone(sheet.values[1]);
+  sheet.values[215][2] = "未知担当候補";
+  sheet.values[215][3] = "未知担当";
+  for (let index = 216; index < 3948; index++) {
+    sheet.values[index] = Array(26).fill("");
+    sheet.formulas[index] = Array(26).fill("");
+    sheet.formulas[index][13] = '=IF(C' + (index + 1) + '="","",1)';
+  }
+  const fullStore = harness.context.readStore_();
+  const expected = JSON.parse(JSON.stringify(harness.context.buildSnapshot_(fullStore, { id: "ND-001", role: "player" })));
+  harness.spreadsheet.reads.length = 0;
+  harness.metadataReads.length = 0;
+  const result = assertSuccess(request(harness, "snapshot", {}, { token: player.token }));
+  assert.deepEqual(result, expected);
+  assert.ok(result.activities.some(activity => activity.recordId === "ROW-LAST"));
+  assert.ok(result.warnings.some(warning => warning.includes("対応しない行が1行")), "The last unknown-owner row is still included in schema/account warnings");
+  assert.equal(activityFor(result).rowVersion, activityFor(player.snapshot).rowVersion);
+  const reads = harness.spreadsheet.reads.filter(read => read.sheetId === MATCHING_SHEET_ID);
+  assert.deepEqual(reads.map(({ method, rows, columns }) => [method, rows, columns]), [["getValues", 3948, 4], ["getValues", 216, 26], ["getFormulas", 216, 26]]);
+  const cells = reads.reduce((sum, read) => sum + read.rows * read.columns, 0);
+  assert.ok(cells < 3948 * 26 * 2 * 0.14, "The realistic formula-heavy sheet reads at least 86% fewer cells");
+  assert.equal(harness.metadataReads.length, 1, "Record IDs and source metadata are fetched in one request");
+  assert.deepEqual(harness.metadataReads[0].body.dataFilters.map(filter => filter.developerMetadataLookup.metadataKey), ["NODE_RECORD_ID", "NODE_SOURCE"]);
+});
+
+test("unlocked snapshots fail closed if a session or account permissions change during the read", () => {
+  for (const change of ["revoked", "expired", "disabled", "role", "aliases", "destination"]) {
+    const { harness, player, admin } = signedInFixture();
+    const token = change === "role" ? admin.token : player.token;
+    let changed = false;
+    harness.spreadsheet.readObserver = read => {
+      if (changed || read.sheetId !== MATCHING_SHEET_ID) return;
+      changed = true;
+      const account = harness.spreadsheet.getSheetByName("_NODE_players").values.find(row => row[0] === (change === "role" ? "ADMIN" : "ND-001"));
+      if (change === "revoked") delete harness.properties[harness.context.sessionKey_(token)];
+      if (change === "expired") harness.clock.milliseconds += 6 * 3600 * 1000 + 1;
+      if (change === "disabled") account[8] = false;
+      if (change === "role") account[7] = "player";
+      if (change === "aliases") account[6] = JSON.stringify(["担当二"]);
+      if (change === "destination") harness.properties.NODE_CONFIG = JSON.stringify({ ...JSON.parse(harness.properties.NODE_CONFIG), spreadsheetId: "another-file" });
+    };
+    const error = assertFailure(request(harness, "snapshot", {}, { token }));
+    assert.equal(error.code, ["revoked", "expired", "disabled"].includes(change) ? "UNAUTHENTICATED" : "BUSY", change);
+    assert.deepEqual(harness.writes, []);
+    assert.deepEqual(harness.apiCalls, []);
+  }
+});
+
+test("final authorization follows snapshot aggregation and its last spreadsheet reads", () => {
+  for (const change of ["revoked", "role"]) {
+    const { harness, admin } = signedInFixture();
+    const getName = harness.spreadsheet.getName;
+    harness.spreadsheet.getName = () => {
+      if (change === "revoked") delete harness.properties[harness.context.sessionKey_(admin.token)];
+      else harness.spreadsheet.getSheetByName("_NODE_players").values.find(row => row[0] === "ADMIN")[7] = "player";
+      return getName();
+    };
+    const error = assertFailure(request(harness, "snapshot", {}, { token: admin.token }));
+    assert.equal(error.code, change === "revoked" ? "UNAUTHENTICATED" : "BUSY");
+  }
+});
+
+test("session cleanup scans properties at most once a minute and expired tokens remain invalid immediately", () => {
+  const harness = baseHarness(), propertyApi = harness.context.PropertiesService.getScriptProperties();
+  const getProperties = propertyApi.getProperties;
+  let scans = 0;
+  propertyApi.getProperties = () => { scans++; return getProperties(); };
+  authenticate(harness);
+  const now = harness.clock.milliseconds;
+  const expiredToken = "E".repeat(43);
+  harness.properties[harness.context.sessionKey_(expiredToken)] = JSON.stringify({ id: "ND-001", expiresAt: now - 1 });
+  authenticate(harness, "ND-002");
+  assert.equal(scans, 1);
+  assert.equal(assertFailure(request(harness, "snapshot", {}, { token: expiredToken })).code, "UNAUTHENTICATED");
+  const secondExpired = "F".repeat(43);
+  harness.properties[harness.context.sessionKey_(secondExpired)] = JSON.stringify({ id: "ND-001", expiresAt: now - 1 });
+  harness.clock.milliseconds += 60000;
+  authenticate(harness);
+  assert.equal(scans, 2);
+  assert.equal(harness.properties[harness.context.sessionKey_(secondExpired)], undefined);
 });
 
 test("player snapshots and login data contain only that player's private activities; rankings include public counts", () => {

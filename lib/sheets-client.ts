@@ -29,7 +29,7 @@ export class SheetApiError extends Error {
 
 // A committed write may still have lost its response. Reuse its payload and ID.
 export function isUncertainWrite(error: unknown): boolean {
-  return !(error instanceof SheetApiError) || ["NETWORK", "HTTP", "NOT_JSON", "INTERNAL", "API", "SHEET_WRITE_FAILED", "SHEET_READ_FAILED", "INVALID_RESPONSE"].includes(error.code);
+  return !(error instanceof SheetApiError) || ["NETWORK", "TIMEOUT", "HTTP", "NOT_JSON", "INTERNAL", "API", "SHEET_WRITE_FAILED", "SHEET_READ_FAILED", "INVALID_RESPONSE"].includes(error.code);
 }
 
 // Credentials go only to a deployed Apps Script endpoint, never to a URL query.
@@ -57,13 +57,58 @@ function recoverableContentUrl(response: Response): string | null {
   return response.url;
 }
 
-function waitForContent(signal: AbortSignal): Promise<void> {
+function waitForRetry(signal: AbortSignal, milliseconds: number): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal.aborted) { reject(signal.reason); return; }
     const abort = () => { clearTimeout(timer); reject(signal.reason); };
-    const timer = setTimeout(() => { signal.removeEventListener("abort", abort); resolve(); }, 3_000);
+    const timer = setTimeout(() => { signal.removeEventListener("abort", abort); resolve(); }, milliseconds);
     signal.addEventListener("abort", abort, { once: true });
   });
+}
+
+const temporaryHttpStatuses = new Set([408, 502, 503, 504]);
+
+async function recoverContent(url: string, signal: AbortSignal): Promise<{ response: Response; body?: string }> {
+  // This URL identifies an already-generated result. Reading it again does not
+  // repeat authentication or a write, and it must stay in memory only.
+  const delays = [700, 1_500];
+  for (let attempt = 0; attempt < delays.length; attempt++) {
+    await waitForRetry(signal, delays[attempt]);
+    signal.throwIfAborted();
+    try {
+      const response = await fetch(url, { method: "GET", credentials: "omit", cache: "no-store", redirect: "error", signal });
+      if (attempt === 0 && (response.status === 404 || temporaryHttpStatuses.has(response.status))) continue;
+      // A stream interruption may occur after successful response headers.
+      // It is still safe to recover this generated result with the final GET.
+      const body = response.ok ? await response.text() : undefined;
+      return { response, body };
+    } catch (error) {
+      signal.throwIfAborted();
+      if (attempt > 0) throw error;
+    }
+  }
+  throw new SheetApiError("NETWORK", "Googleからの応答を取得できませんでした。");
+}
+
+function connectionError(action: string, timedOut: boolean): SheetApiError {
+  if (timedOut) {
+    const message = action === "login"
+      ? "ログインの応答が45秒以内に届きませんでした。IDとパスワードはそのままで、もう一度ログインしてください。"
+      : action === "snapshot" || action === "health"
+        ? "Googleからのデータ取得が45秒以内に完了しませんでした。通信状態を確認して再取得してください。"
+        : "Googleの応答が45秒以内に届きませんでした。保存結果を確認できないため、同じ内容で再試行してください。";
+    return new SheetApiError("TIMEOUT", message);
+  }
+  const message = action === "login"
+    ? "ログインの通信が途中で切れました。通信状態を確認し、同じIDとパスワードでもう一度ログインしてください。"
+    : action === "snapshot" || action === "health"
+      ? "Googleからデータを取得できませんでした。通信状態を確認して再取得してください。"
+      : "Googleとの応答を確認できませんでした。入力は残っています。接続を確認し、同じ内容で再試行してください。";
+  return new SheetApiError("NETWORK", message);
+}
+
+function isCallerTimeout(signal?: AbortSignal): boolean {
+  return !!signal?.aborted && signal.reason?.name === "TimeoutError";
 }
 
 export async function sheetRequest<T>(
@@ -75,41 +120,74 @@ export async function sheetRequest<T>(
   const target = validateEndpoint(endpoint);
   const timeout = AbortSignal.timeout(45_000);
   const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
-  let response: Response;
-  try {
-    response = await fetch(target, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
-      credentials: "omit",
-      cache: "no-store",
-      redirect: "follow",
-      signal,
-      body: JSON.stringify({ version: 1, action, payload, token: options.token, operationId: options.operationId }),
-    });
-    const contentUrl = recoverableContentUrl(response);
-    if (contentUrl) {
-      // Retry only Google's already-generated result, never the operation POST.
-      // Keep this temporary URL in memory only; it must not be logged or persisted.
-      await waitForContent(signal);
+  const readOnly = action === "snapshot" || action === "health";
+  const body = JSON.stringify({ version: 1, action, payload, token: options.token, operationId: options.operationId });
+  for (let attempt = 0; attempt < (readOnly ? 2 : 1); attempt++) {
+    let recoveringResult = false;
+    try {
       signal.throwIfAborted();
-      response = await fetch(contentUrl, { method: "GET", credentials: "omit", cache: "no-store", redirect: "error", signal });
+      let recoveredBody: string | undefined;
+      let response = await fetch(target, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        credentials: "omit",
+        cache: "no-store",
+        redirect: "follow",
+        signal,
+        body,
+      });
+      const contentUrl = recoverableContentUrl(response);
+      if (contentUrl) {
+        recoveringResult = true;
+        const recovered = await recoverContent(contentUrl, signal);
+        response = recovered.response;
+        recoveredBody = recovered.body;
+      }
+      if (!response.ok) {
+        if (readOnly && attempt === 0 && !recoveringResult && temporaryHttpStatuses.has(response.status)) {
+          await waitForRetry(signal, 750);
+          continue;
+        }
+        throw new SheetApiError("HTTP", `Googleからの応答を確認できませんでした（${response.status}）。`);
+      }
+      // Body streaming can fail after fetch resolves; it shares the same deadline
+      // and recovery policy as the initial connection.
+      const responseBody = recoveredBody ?? await response.text();
+      signal.throwIfAborted();
+      let envelope: { ok?: boolean; data?: T; error?: { code?: string; message?: string } };
+      try { envelope = JSON.parse(responseBody); }
+      catch {
+        throw new SheetApiError("NOT_JSON", "連携用の応答が返りませんでした。Google側のウェブアプリ公開設定とURLを確認してください。");
+      }
+      if (envelope?.ok !== true) {
+        throw new SheetApiError(envelope?.error?.code || "API", envelope?.error?.message || "スプレッドシートへの操作に失敗しました。");
+      }
+      if (!Object.hasOwn(envelope, "data")) throw new SheetApiError("INVALID_RESPONSE", "連携先から正しいデータを取得できませんでした。");
+      return envelope.data as T;
+    } catch (error) {
+      if (options.signal?.aborted) {
+        if (isCallerTimeout(options.signal)) throw connectionError(action, true);
+        throw error;
+      }
+      if (timeout.aborted) throw connectionError(action, true);
+      if (error instanceof SheetApiError) throw error;
+      // Only data reads may replay the POST after a transient connection failure.
+      // Login creates a session; writes can commit before their response is lost.
+      if (readOnly && attempt === 0 && !recoveringResult) {
+        try { await waitForRetry(signal, 750); }
+        catch (waitError) {
+          if (options.signal?.aborted) {
+            if (isCallerTimeout(options.signal)) throw connectionError(action, true);
+            throw waitError;
+          }
+          throw connectionError(action, timeout.aborted);
+        }
+        continue;
+      }
+      throw connectionError(action, false);
     }
-  } catch (error) {
-    if (options.signal?.aborted) throw error;
-    throw new SheetApiError("NETWORK", "Googleとの応答を確認できませんでした。入力は残っています。接続を確認し、同じ内容で再試行してください。");
   }
-  if (!response.ok) throw new SheetApiError("HTTP", `Googleからの応答を確認できませんでした（${response.status}）。`);
-  const body = await response.text();
-  let envelope: { ok?: boolean; data?: T; error?: { code?: string; message?: string } };
-  try { envelope = JSON.parse(body); }
-  catch {
-    throw new SheetApiError("NOT_JSON", "連携用の応答が返りませんでした。Google側のウェブアプリ公開設定とURLを確認してください。");
-  }
-  if (envelope.ok !== true) {
-    throw new SheetApiError(envelope.error?.code || "API", envelope.error?.message || "スプレッドシートへの操作に失敗しました。");
-  }
-  if (!Object.hasOwn(envelope, "data")) throw new SheetApiError("INVALID_RESPONSE", "連携先から正しいデータを取得できませんでした。");
-  return envelope.data as T;
+  throw connectionError(action, timeout.aborted);
 }
 
 export function assertSnapshot(value: unknown): asserts value is SheetSnapshot {

@@ -9,6 +9,7 @@ const contentUrl = "https://script.googleusercontent.com/macros/echo?user_conten
 function contentResponse(status = 404, url = contentUrl, redirected = true) {
   return Object.defineProperties(new Response("<html>Not found</html>", {status}), {url:{value:url},redirected:{value:redirected}});
 }
+async function flushMicrotasks() { for (let i = 0; i < 6; i++) await Promise.resolve(); }
 
 test("credentials cannot be sent to a non-deployed, non-Google or query-bearing URL",()=>{
   for(const value of ["http://script.google.com/macros/s/AKfycb_TEST_DEPLOYMENT_1234567890/exec", "https://evil.example/exec", endpoint+"?password=secret", endpoint.replace("/exec","/dev"), endpoint.replace("script.google.com","script.google.com.evil.example")]) {
@@ -30,7 +31,7 @@ test("POST carries the token and operation id only in the body, never a query or
   assert.deepEqual(await sheetRequest(endpoint,"updateStatus",{status:"稼働開始"},{token:"test-token",operationId:"same-operation"}),{saved:true});
 });
 
-for (const action of ["snapshot", "saveActivity"]) test(`${action} recovers a redirected result 404 with one delayed GET and no repeated POST`, async t => {
+for (const action of ["snapshot", "login", "saveActivity"]) test(`${action} recovers a redirected result 404 after 700ms with no repeated POST`, async t => {
   t.mock.timers.enable({apis:["setTimeout"]});
   const calls: {url:string;init?:RequestInit}[] = [];
   t.mock.method(globalThis,"fetch",async (url:string|URL|Request, init?:RequestInit) => {
@@ -38,8 +39,8 @@ for (const action of ["snapshot", "saveActivity"]) test(`${action} recovers a re
     return calls.length === 1 ? contentResponse() : new Response(JSON.stringify({ok:true,data:{recovered:true}}));
   });
   const pending = sheetRequest(endpoint,action,{password:"test-password"},{token:"test-token",operationId:"same-operation"});
-  await Promise.resolve();
-  t.mock.timers.tick(2_999); await Promise.resolve();
+  await flushMicrotasks();
+  t.mock.timers.tick(699); await flushMicrotasks();
   assert.equal(calls.length,1);
   t.mock.timers.tick(1);
   assert.deepEqual(await pending,{recovered:true});
@@ -50,6 +51,33 @@ for (const action of ["snapshot", "saveActivity"]) test(`${action} recovers a re
   assert.equal(calls[1].init?.credentials,"omit"); assert.equal(calls[1].init?.cache,"no-store"); assert.equal(calls[1].init?.redirect,"error");
   assert.equal(calls[1].init?.body,undefined); assert.equal(calls[1].init?.headers,undefined);
   assert.ok(!calls[1].url.includes("test-token") && !calls[1].url.includes("test-password"));
+});
+
+for (const action of ["login", "saveActivity"]) for (const firstFailure of ["404", "503", "network", "body"]) test(`${action} result ${firstFailure} permits one final GET without replaying its POST`, async t => {
+  t.mock.timers.enable({apis:["setTimeout"]});
+  const calls: {url:string;init?:RequestInit}[] = [];
+  t.mock.method(globalThis,"fetch",async (url:string|URL|Request, init?:RequestInit) => {
+    calls.push({url:String(url),init});
+    if (calls.length === 1) return contentResponse();
+    if (calls.length === 2) {
+      if (firstFailure === "network") throw new TypeError("result unavailable");
+      if (firstFailure === "body") {
+        const response = new Response("");
+        Object.defineProperty(response,"text",{value:async () => { throw new TypeError("result body interrupted"); }});
+        return response;
+      }
+      return new Response("Not ready", {status:Number(firstFailure)});
+    }
+    return new Response(JSON.stringify({ok:true,data:{recovered:true}}));
+  });
+  const pending = sheetRequest(endpoint,action,{password:"private-test-password"});
+  await flushMicrotasks(); t.mock.timers.tick(700); await flushMicrotasks();
+  assert.equal(calls.length,2);
+  t.mock.timers.tick(1_499); await flushMicrotasks(); assert.equal(calls.length,2);
+  t.mock.timers.tick(1); assert.deepEqual(await pending,{recovered:true});
+  assert.equal(calls.length,3);
+  assert.deepEqual(calls.map(call => call.init?.method),["POST","GET","GET"]);
+  assert.ok(calls.slice(1).every(call => call.url === contentUrl && call.init?.body === undefined && call.init?.signal === calls[0].init?.signal));
 });
 
 test("result recovery refuses other hosts, paths, credentials, keys, and non-redirected or non-404 responses", async t => {
@@ -71,7 +99,7 @@ test("result recovery refuses other hosts, paths, credentials, keys, and non-red
   }
 });
 
-test("a failed result GET stops after one attempt and preserves uncertain-write handling", async t => {
+test("failed result GETs stop after two attempts and preserve uncertain-write handling", async t => {
   t.mock.timers.enable({apis:["setTimeout"]});
   let mode = "404", calls = 0;
   t.mock.method(globalThis,"fetch",async () => {
@@ -84,8 +112,10 @@ test("a failed result GET stops after one attempt and preserves uncertain-write 
     mode = failure; calls = 0;
     const pending = sheetRequest(endpoint,"saveActivity",{},{token:"test-token",operationId:"same-operation"});
     const checked = assert.rejects(pending,(error: unknown) => error instanceof SheetApiError && error.code === code && isUncertainWrite(error) && !error.message.includes("test-result-key"));
-    await Promise.resolve(); t.mock.timers.tick(3_000); await checked;
-    assert.equal(calls,2);
+    await flushMicrotasks(); t.mock.timers.tick(700); await flushMicrotasks();
+    if (failure !== "html") t.mock.timers.tick(1_500);
+    await checked;
+    assert.equal(calls,failure === "html" ? 2 : 3);
   }
 });
 
@@ -98,18 +128,180 @@ test("cancellation and the original 45-second deadline stop delayed recovery bef
   const cancelled = sheetRequest(endpoint,"snapshot",{},{signal:caller.signal});
   const cancelledCheck = assert.rejects(cancelled,{name:"AbortError"});
   await Promise.resolve(); caller.abort(); await cancelledCheck;
-  t.mock.timers.tick(3_000); assert.equal(calls,1); assert.equal(timeoutCalls,1);
+  t.mock.timers.tick(700); assert.equal(calls,1); assert.equal(timeoutCalls,1);
   const timedOut = sheetRequest(endpoint,"saveActivity");
-  const timeoutCheck = assert.rejects(timedOut,{code:"NETWORK"});
+  const timeoutCheck = assert.rejects(timedOut,{code:"TIMEOUT"});
   await Promise.resolve(); deadline.abort(new DOMException("Deadline expired","TimeoutError")); await timeoutCheck;
-  t.mock.timers.tick(3_000); assert.equal(calls,2); assert.equal(timeoutCalls,2);
+  t.mock.timers.tick(700); assert.equal(calls,2); assert.equal(timeoutCalls,2);
 });
 
-test("an initial network failure has no result URL and never retries a POST", async t => {
+test("an initial login or write network failure never retries its POST", async t => {
   let calls = 0;
   t.mock.method(globalThis,"fetch",async () => { calls++; throw new TypeError("offline"); });
-  await assert.rejects(() => sheetRequest(endpoint,"saveActivity",{},{token:"test-token",operationId:"same-operation"}),{code:"NETWORK"});
+  for (const action of ["login","saveActivity","updateStatus","resetPassword","logout","unknown-action"]) {
+    const before = calls;
+    await assert.rejects(() => sheetRequest(endpoint,action,{},{token:"test-token",operationId:"same-operation"}),{code:"NETWORK"});
+    assert.equal(calls,before + 1);
+  }
+});
+
+test("temporary HTTP failures cannot replay a login or write", async t => {
+  let calls = 0;
+  t.mock.method(globalThis,"fetch",async () => { calls++; return new Response("temporarily unavailable",{status:503}); });
+  for (const action of ["login","saveActivity","updateStatus","resetPassword","logout"]) {
+    const before = calls;
+    await assert.rejects(() => sheetRequest(endpoint,action),{code:"HTTP"});
+    assert.equal(calls,before + 1);
+  }
+});
+
+for (const action of ["snapshot","health"]) test(`${action} retries an interrupted read once with the same total deadline`, async t => {
+  t.mock.timers.enable({apis:["setTimeout"]});
+  const deadline = new AbortController();
+  let timeoutCalls = 0;
+  t.mock.method(AbortSignal,"timeout",(milliseconds:number) => { timeoutCalls++; assert.equal(milliseconds,45_000); return deadline.signal; });
+  const calls: {url:string;init?:RequestInit}[] = [];
+  t.mock.method(globalThis,"fetch",async (url:string|URL|Request, init?:RequestInit) => {
+    calls.push({url:String(url),init});
+    if (calls.length === 1) throw new TypeError("transient network interruption");
+    return new Response(JSON.stringify({ok:true,data:snapshot}));
+  });
+  const pending = sheetRequest(endpoint,action,{},{token:"test-token"});
+  await flushMicrotasks(); t.mock.timers.tick(749); await flushMicrotasks(); assert.equal(calls.length,1);
+  t.mock.timers.tick(1); assert.deepEqual(await pending,snapshot);
+  assert.equal(calls.length,2); assert.equal(timeoutCalls,1);
+  assert.equal(calls[1].init?.signal,calls[0].init?.signal);
+  assert.equal(calls[1].init?.body,calls[0].init?.body);
+});
+
+test("data reads retry only temporary HTTP failures and stop after one retry", async t => {
+  t.mock.timers.enable({apis:["setTimeout"]});
+  let currentStatus = 503, calls = 0;
+  t.mock.method(globalThis,"fetch",async () => { calls++; return new Response("unavailable",{status:currentStatus}); });
+  for (const httpStatus of [408,502,503,504]) {
+    currentStatus = httpStatus; const before = calls;
+    const pending = sheetRequest(endpoint,"snapshot");
+    const checked = assert.rejects(pending,{code:"HTTP"});
+    await flushMicrotasks(); t.mock.timers.tick(750); await checked;
+    assert.equal(calls,before + 2);
+  }
+  for (const httpStatus of [401,403,404,429,500]) {
+    currentStatus = httpStatus; const before = calls;
+    await assert.rejects(() => sheetRequest(endpoint,"snapshot"),{code:"HTTP"});
+    assert.equal(calls,before + 1);
+  }
+});
+
+test("a data-read retry stops immediately on cancellation or the original deadline", async t => {
+  t.mock.timers.enable({apis:["setTimeout"]});
+  const deadline = new AbortController(), caller = new AbortController();
+  let calls = 0;
+  t.mock.method(AbortSignal,"timeout",() => deadline.signal);
+  t.mock.method(globalThis,"fetch",async () => { calls++; throw new TypeError("offline"); });
+  const cancelled = sheetRequest(endpoint,"snapshot",{},{signal:caller.signal});
+  const cancelledCheck = assert.rejects(cancelled,{name:"AbortError"});
+  await flushMicrotasks(); caller.abort(); await cancelledCheck;
+  t.mock.timers.tick(750); assert.equal(calls,1);
+  const timedOut = sheetRequest(endpoint,"snapshot");
+  const timeoutCheck = assert.rejects(timedOut,{code:"TIMEOUT"});
+  await flushMicrotasks(); deadline.abort(new DOMException("Deadline expired","TimeoutError")); await timeoutCheck;
+  t.mock.timers.tick(750); assert.equal(calls,2);
+});
+
+test("a caller's login deadline is an actionable timeout rather than a user cancellation", async t => {
+  const caller = new AbortController();
+  let calls = 0;
+  t.mock.method(globalThis,"fetch",async (_url:string|URL|Request, init?:RequestInit) => {
+    calls++;
+    return new Promise<Response>((_resolve,reject) => init?.signal?.addEventListener("abort",() => reject(init.signal?.reason),{once:true}));
+  });
+  const pending = sheetRequest(endpoint,"login",{},{signal:caller.signal});
+  const checked = assert.rejects(pending,(error: unknown) => error instanceof SheetApiError && error.code === "TIMEOUT" && error.message.includes("45秒") && error.message.includes("ログイン"));
+  await flushMicrotasks(); caller.abort(new DOMException("Login deadline expired","TimeoutError"));
+  await checked; assert.equal(calls,1);
+});
+
+test("a shared login deadline also caps the following snapshot request", async t => {
+  const caller = new AbortController();
+  let calls = 0, timeoutCalls = 0;
+  t.mock.method(AbortSignal,"timeout",(milliseconds:number) => { timeoutCalls++; assert.equal(milliseconds,45_000); return new AbortController().signal; });
+  t.mock.method(globalThis,"fetch",async (_url:string|URL|Request, init?:RequestInit) => {
+    calls++;
+    if (calls === 1) return new Response(JSON.stringify({ok:true,data:{token:"test-token"}}));
+    return new Promise<Response>((_resolve,reject) => init?.signal?.addEventListener("abort",() => reject(init.signal?.reason),{once:true}));
+  });
+  const auth = await sheetRequest<{token:string}>(endpoint,"login",{},{signal:caller.signal});
+  const pending = sheetRequest(endpoint,"snapshot",{},{signal:caller.signal,token:auth.token});
+  const checked = assert.rejects(pending,(error: unknown) => error instanceof SheetApiError && error.code === "TIMEOUT" && error.message.includes("データ取得") && error.message.includes("45秒"));
+  await flushMicrotasks(); caller.abort(new DOMException("Shared deadline expired","TimeoutError"));
+  await checked; assert.equal(calls,2); assert.equal(timeoutCalls,2);
+});
+
+test("a caller deadline during read-retry waiting stops recovery and remains a timeout", async t => {
+  t.mock.timers.enable({apis:["setTimeout"]});
+  const caller = new AbortController();
+  let calls = 0;
+  t.mock.method(globalThis,"fetch",async () => { calls++; throw new TypeError("offline"); });
+  const pending = sheetRequest(endpoint,"snapshot",{},{signal:caller.signal});
+  const checked = assert.rejects(pending,{code:"TIMEOUT"});
+  await flushMicrotasks(); caller.abort(new DOMException("Shared deadline expired","TimeoutError"));
+  await checked; t.mock.timers.tick(750); assert.equal(calls,1);
+});
+
+test("an expired caller deadline prevents any network request", async t => {
+  const caller = new AbortController();
+  caller.abort(new DOMException("Shared deadline expired","TimeoutError"));
+  let calls = 0;
+  t.mock.method(globalThis,"fetch",async () => { calls++; return new Response("{}"); });
+  await assert.rejects(() => sheetRequest(endpoint,"snapshot",{},{signal:caller.signal}),{code:"TIMEOUT"});
+  assert.equal(calls,0);
+});
+
+test("body-stream failures use the same recovery policy and actionable errors", async t => {
+  t.mock.timers.enable({apis:["setTimeout"]});
+  let calls = 0;
+  t.mock.method(globalThis,"fetch",async () => {
+    calls++;
+    if (calls % 2 === 0) return new Response(JSON.stringify({ok:true,data:snapshot}));
+    const response = new Response("");
+    Object.defineProperty(response,"text",{value:async () => { throw new TypeError("body stream interrupted"); }});
+    return response;
+  });
+  const pending = sheetRequest(endpoint,"snapshot");
+  await flushMicrotasks(); t.mock.timers.tick(750); assert.deepEqual(await pending,snapshot);
+  assert.equal(calls,2);
+  for (const action of ["login","saveActivity"]) {
+    calls = 0;
+    await assert.rejects(() => sheetRequest(endpoint,action), (error: unknown) => error instanceof SheetApiError && error.code === "NETWORK" && (action === "login" ? error.message.includes("ログイン") : isUncertainWrite(error)));
+    assert.equal(calls,1);
+  }
+});
+
+test("a body-stream deadline is a timeout and cannot replay a login or write", async t => {
+  const deadline = new AbortController();
+  let calls = 0;
+  t.mock.method(AbortSignal,"timeout",() => deadline.signal);
+  t.mock.method(globalThis,"fetch",async () => {
+    calls++;
+    const response = new Response("");
+    Object.defineProperty(response,"text",{value:async () => { deadline.abort(new DOMException("Deadline expired","TimeoutError")); throw deadline.signal.reason; }});
+    return response;
+  });
+  await assert.rejects(() => sheetRequest(endpoint,"login"), (error: unknown) => error instanceof SheetApiError && error.code === "TIMEOUT" && error.message.includes("45秒") && error.message.includes("ログイン"));
   assert.equal(calls,1);
+});
+
+test("definitive API errors and invalid data never trigger an automatic read retry", async t => {
+  let calls = 0, body = "null";
+  t.mock.method(globalThis,"fetch",async () => { calls++; return new Response(body); });
+  for (const code of ["UNAUTHENTICATED","INVALID_CREDENTIALS","RATE_LIMITED","VALIDATION"]) {
+    body = JSON.stringify({ok:false,error:{code,message:"definitive rejection"}});
+    const before = calls;
+    await assert.rejects(() => sheetRequest(endpoint,"snapshot"),{code});
+    assert.equal(calls,before + 1);
+  }
+  body = "null";
+  await assert.rejects(() => sheetRequest(endpoint,"snapshot"),{code:"API"});
 });
 
 test("an HTML Google sign-in page is an actionable error, never successful data",async t=>{
@@ -178,7 +370,7 @@ test("the business date follows Japan at the UTC month boundary",()=>{
 });
 
 test("lost or invalid write responses keep the operation payload while definitive rejections permit correction",()=>{
-  for(const code of ["NETWORK","HTTP","NOT_JSON","INTERNAL","API","SHEET_WRITE_FAILED","SHEET_READ_FAILED","INVALID_RESPONSE"])
+  for(const code of ["NETWORK","TIMEOUT","HTTP","NOT_JSON","INTERNAL","API","SHEET_WRITE_FAILED","SHEET_READ_FAILED","INVALID_RESPONSE"])
     assert.equal(isUncertainWrite(new SheetApiError(code,"response lost")),true);
   for(const code of ["CONFLICT","SCHEMA_MISMATCH","UNAUTHENTICATED","VALIDATION","READ_ONLY"])
     assert.equal(isUncertainWrite(new SheetApiError(code,"rejected")),false);

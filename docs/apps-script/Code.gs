@@ -118,14 +118,18 @@ function nodeHandle_(request) {
   if (!request || typeof request !== 'object' || Array.isArray(request) || request.version !== 1 || typeof request.action !== 'string') fail_('BAD_REQUEST', 'APIバージョンと操作を確認してください。');
   var action = request.action;
   if (action === 'health') return health_();
-  if (action === 'login') return withLock_(function () { return login_(request.payload || {}); });
+  if (action === 'login') return login_(request.payload || {});
   if (['snapshot','logout','saveActivity','updateStatus','updateProfile','createPlayer'].indexOf(action) < 0) fail_('BAD_REQUEST', '対応していない操作です。');
+  if (action === 'snapshot') {
+    authenticate_(request.token);
+    var snapshotStore = readStore_({ readOnly: true });
+    return authenticatedSnapshot_(snapshotStore, request.token);
+  }
   return withLock_(function () {
     var user = authenticate_(request.token);
     if (action === 'logout') { props_().deleteProperty(sessionKey_(request.token)); return { loggedOut: true }; }
     var store = readStore_();
     user = activeActor_(store, user);
-    if (action === 'snapshot') return buildSnapshot_(store, user);
     if (!store.schemaCompatible) fail_('SCHEMA_MISMATCH','入力対象19列の見出しまたは順序が一致しません。管理者が実際の列を確認してください。');
     if (!writesEnabled_(store.config)) fail_('WRITES_DISABLED', '現在は読み取り専用です。管理者による接続先の書き込み設定が必要です。');
     var operationId = shortText_(request.operationId, 128, true);
@@ -173,7 +177,17 @@ function activeActor_(store, session) {
   return { id: player.id, role: player.role };
 }
 function login_(payload) {
-  config_();
+  // Only rate counters, account checks and token issuance share the write lock.
+  // Fetching the business table afterwards must not queue every player's login.
+  var issued = withLock_(function () { return issueSession_(payload); });
+  if (payload.sessionOnly === true) return { token: issued.token };
+  try {
+    var store = readStore_({ readOnly: true }, issued.accountStore);
+    return { token: issued.token, snapshot: authenticatedSnapshot_(store, issued.token) };
+  } catch (error) { props_().deleteProperty(sessionKey_(issued.token)); throw error; }
+}
+function issueSession_(payload) {
+  var config = config_();
   var id = typeof payload.id === 'string' && payload.id.length <= 30 ? payload.id.trim().toUpperCase() : '';
   var password = typeof payload.password === 'string' && payload.password.length <= 200 ? payload.password : '';
   var raw = id ? props_().getProperty('NODE_AUTH_' + id) : null;
@@ -187,20 +201,38 @@ function login_(payload) {
   globalRate.attempts++; props_().setProperty('NODE_LOGIN_RATE', JSON.stringify(globalRate));
   var auth = raw ? JSON.parse(raw) : { salt: 'unavailable', hash: '' };
   var valid = constantEqual_(passwordHash_(password, auth.salt), auth.hash);
-  var store = readStore_(), actor = store.players.find(function (p) { return p.id === id && p.active; });
-  if (!valid || !actor) { rate.failures++; props_().setProperty(rateKey, JSON.stringify(rate)); fail_('INVALID_CREDENTIALS', 'IDまたはパスワードを確認してください。'); }
+  if (!valid) { rate.failures++; props_().setProperty(rateKey, JSON.stringify(rate)); fail_('INVALID_CREDENTIALS', 'IDまたはパスワードを確認してください。'); }
+  var store = readAccountStore_(config), actor = store.players.find(function (p) { return p.id === id && p.active; });
+  if (!actor) { rate.failures++; props_().setProperty(rateKey, JSON.stringify(rate)); fail_('INVALID_CREDENTIALS', 'IDまたはパスワードを確認してください。'); }
   props_().deleteProperty(rateKey);
   cleanupSessions_();
-  var token = random256_(), user = { id: actor.id, role: actor.role };
-  props_().setProperty(sessionKey_(token), JSON.stringify({ id: id, expiresAt: now + NODE.sessionHours * 60 * 60 * 1000 }));
-  try { return { token: token, snapshot: buildSnapshot_(store, user) }; }
-  catch (error) { props_().deleteProperty(sessionKey_(token)); throw error; }
+  var token = random256_();
+  props_().setProperty(sessionKey_(token), JSON.stringify({ id: id, expiresAt: Date.now() + NODE.sessionHours * 60 * 60 * 1000 }));
+  return { token: token, accountStore: store };
 }
 function cleanupSessions_() {
-  var all = props_().getProperties(), now = Date.now();
+  var now = Date.now(), last = Number(props_().getProperty('NODE_CLEANUP_AT'));
+  if (isFinite(last) && last <= now && now - last < 60000) return;
+  var all = props_().getProperties();
   Object.keys(all).forEach(function (key) {
     if (key.indexOf('NODE_SESSION_') === 0) { try { if (JSON.parse(all[key]).expiresAt <= now) props_().deleteProperty(key); } catch (_) { props_().deleteProperty(key); } }
   });
+  props_().setProperty('NODE_CLEANUP_AT', String(now));
+}
+function snapshotActor_(store, token) {
+  var players = readPlayers_(store.playerSheet), actor = activeActor_({ players: players }, authenticate_(token));
+  function access(players) { return players.map(function (p) { return [p.id, p.role, p.active, p.sheetNames]; }); }
+  // A direct sheet edit can occur while the unlocked read is in flight. Never
+  // return records mapped through an obsolete owner/role configuration.
+  if (stableJson_(config_()) !== stableJson_(store.config) || stableJson_(access(players)) !== stableJson_(access(store.players))) fail_('BUSY', '管理設定が更新されました。実績を再取得してください。');
+  return actor;
+}
+function authenticatedSnapshot_(store, token) {
+  var snapshot = buildSnapshot_(store, activeActor_(store, authenticate_(token)));
+  // Aggregate computation and even book-title/timezone reads precede the final
+  // authorization check, so a revocation during those reads cannot leak data.
+  snapshotActor_(store, token);
+  return snapshot;
 }
 
 /* Only the four observed header columns identify the business table. No guessed column writes. */
@@ -221,22 +253,26 @@ function table_(sheet, headers) {
   return values;
 }
 function metadataMap_(sheet, key) {
-  var map = {}, response, sheetId = sheet.getSheetId();
+  return metadataMaps_(sheet, [key])[key];
+}
+function metadataMaps_(sheet, keys) {
+  var maps = {}, response, sheetId = sheet.getSheetId();
+  keys.forEach(function (key) { maps[key] = {}; });
   // A single Sheets API read avoids remote getters for every metadata entry.
   try {
-    response = Sheets.Spreadsheets.DeveloperMetadata.search({ dataFilters: [{ developerMetadataLookup: { metadataKey: key, locationType: 'ROW' } }] }, sheet.getParent().getId());
+    response = Sheets.Spreadsheets.DeveloperMetadata.search({ dataFilters: keys.map(function (key) { return { developerMetadataLookup: { metadataKey: key, locationType: 'ROW' } }; }) }, sheet.getParent().getId());
   } catch (_) { fail_('SHEET_READ_FAILED', '行の管理IDを取得できませんでした。入力を残したまま再試行してください。'); }
   if (!response || (response.matchedDeveloperMetadata !== undefined && !Array.isArray(response.matchedDeveloperMetadata))) fail_('SHEET_READ_FAILED', '行の管理IDの応答を確認できませんでした。');
   (response.matchedDeveloperMetadata || []).forEach(function (match) {
     var item = match.developerMetadata, range = item && item.location && item.location.dimensionRange;
-    if (!item || item.metadataKey !== key || !range || range.sheetId !== sheetId || range.dimension !== 'ROWS') return;
+    if (!item || keys.indexOf(item.metadataKey) < 0 || !range || range.sheetId !== sheetId || range.dimension !== 'ROWS') return;
     var start = range.startIndex == null ? 0 : range.startIndex;
     if (!Number.isInteger(start) || start < 0 || range.endIndex !== start + 1 || !Number.isInteger(item.metadataId) || item.metadataId <= 0) fail_('SHEET_READ_FAILED', '行の管理IDの位置を確認できませんでした。');
-    var row = start + 1;
+    var row = start + 1, map = maps[item.metadataKey];
     if (map[row]) fail_('METADATA_CONFLICT', '同じ行に重複した管理IDがあります。管理者が確認してください。');
     map[row] = { value: item.metadataValue == null ? null : item.metadataValue, metadataId: item.metadataId };
   });
-  return map;
+  return maps;
 }
 function sheetRowCount_(sheet) {
   var response;
@@ -248,20 +284,26 @@ function sheetRowCount_(sheet) {
   if (!Number.isInteger(count) || count < 1) fail_('SHEET_READ_FAILED', 'シートの現在の行数を確認できませんでした。');
   return count;
 }
-function readStore_() {
-  var config = config_(), book = SpreadsheetApp.openById(config.spreadsheetId);
-  var matching = book.getSheets().find(function (sheet) { return sheet.getSheetId() === Number(config.matchingSheetId); });
-  var kpi=book.getSheetByName(NODE.kpiTab);
-  if (!matching || matching.getName()!==NODE.matchingTab || !kpi || kpi.getSheetId()!==Number(config.kpiSheetId) || matching.getSheetId() === Number(config.kpiSheetId)) fail_('SCHEMA_MISMATCH', 'マッチングDBとKPIのタブ名・管理IDを確認してください。');
-  var playerSheet = book.getSheetByName(NODE.playersTab), operationSheet = book.getSheetByName(NODE.operationsTab);
+function readPlayers_(playerSheet) {
   var playerRows = table_(playerSheet, NODE.playerHeaders);
-  var players = playerRows.slice(1).map(function (r, i) {
+  return playerRows.slice(1).map(function (r, i) {
     if (!r[0]) return null;
     var aliases;
     try { aliases = JSON.parse(String(r[6] || '[]')); } catch (_) { fail_('SCHEMA_MISMATCH', '担当者名の対応表を確認してください。'); }
     if (!Array.isArray(aliases) || aliases.some(function (v) { return typeof v !== 'string'; }) || ['admin','player'].indexOf(String(r[7])) < 0) fail_('SCHEMA_MISMATCH', 'プレイヤーの設定を確認してください。');
     return { id: String(r[0]), name: String(r[1]), team: String(r[2]), color: String(r[3]), target: Number(r[4]), bio: String(r[5] || ''), sheetNames: aliases, role: String(r[7]), active: r[8] === true || String(r[8]).toLowerCase() === 'true', row: i + 2 };
   }).filter(Boolean);
+}
+function readAccountStore_(config) {
+  config = config || config_();
+  var book = SpreadsheetApp.openById(config.spreadsheetId), playerSheet = book.getSheetByName(NODE.playersTab);
+  return { config: config, book: book, playerSheet: playerSheet, players: readPlayers_(playerSheet) };
+}
+function readStore_(options, accountStore) {
+  var accounts = accountStore || readAccountStore_(), config = accounts.config, book = accounts.book, playerSheet = accounts.playerSheet, players = accounts.players;
+  var matching = book.getSheetByName(NODE.matchingTab), kpi = book.getSheetByName(NODE.kpiTab);
+  if (!matching || matching.getSheetId() !== Number(config.matchingSheetId) || !kpi || kpi.getSheetId() !== Number(config.kpiSheetId) || matching.getSheetId() === Number(config.kpiSheetId)) fail_('SCHEMA_MISMATCH', 'マッチングDBとKPIのタブ名・管理IDを確認してください。');
+  var operationSheet = book.getSheetByName(NODE.operationsTab);
   var aliases = {};
   players.filter(function (p) { return p.active && p.role === 'player'; }).forEach(function (p) {
     p.sheetNames.forEach(function (name) {
@@ -272,8 +314,19 @@ function readStore_() {
   });
   var length = Math.max(1, matching.getLastRow());
   if (length > 50000) fail_('DATA_LIMIT', 'データ量の確認が必要です。管理者に連絡してください。');
+  if (options && options.readOnly) {
+    // Formula-filled template rows make getLastRow much larger than the actual
+    // candidate table. A:D is enough to retain every named/unknown-owner row.
+    // Mutations still load the full grid for blank-row and formula protection.
+    var identityRows = matching.getRange(1, 1, length, 4).getValues(), lastCandidate = detectHeader_(identityRows);
+    for (var i = identityRows.length - 1; i >= lastCandidate; i--) {
+      if (normalizeName_(identityRows[i][2])) { lastCandidate = i + 1; break; }
+    }
+    length = lastCandidate;
+  }
   var range = matching.getRange(1, 1, length, 26), values = range.getValues(), formulas = range.getFormulas();
-  var headerRow = detectHeader_(values),schemaCompatible=mappedHeadersMatch_(values[headerRow-1]), ids = metadataMap_(matching, NODE.recordKey), sources = metadataMap_(matching, NODE.sourceKey), records = [], warnings = [];
+  var headerRow = detectHeader_(values),schemaCompatible=mappedHeadersMatch_(values[headerRow-1]);
+  var metadata = metadataMaps_(matching, [NODE.recordKey, NODE.sourceKey]), ids = metadata[NODE.recordKey], sources = metadata[NODE.sourceKey], records = [], warnings = [];
   var unknown = 0, missingIds = 0, invalidDates = 0, seenIds = {};
   for (var n = headerRow; n < values.length; n++) {
     var row = values[n], name = normalizeName_(row[2]);
