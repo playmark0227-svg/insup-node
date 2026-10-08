@@ -646,6 +646,75 @@ test("a saved activity and its idempotency record commit once, and retries do no
   assert.ok(!rowWithCandidate(harness, "改竄候補"));
 });
 
+test("all six KPI stages round-trip into one proposal row and count only their recorded dates", () => {
+  const harness = baseHarness();
+  const matching = harness.spreadsheet.getSheetById(MATCHING_SHEET_ID);
+  const template = Array(26).fill("");
+  PROTECTED_COLUMNS.forEach(column => template[column - 1] = `=ROW()+${column}`);
+  matching.getRange(2, 1, 1, 26).setValues([template]);
+  const protectedFormulas = clone(matching.formulas[1]);
+  const kpiBefore = clone(harness.spreadsheet.getSheetById(KPI_SHEET_ID).values);
+  const player = authenticate(harness);
+  let snapshot = player.snapshot;
+  let recordId;
+  const stages = [
+    { stage: "候補者面談", column: 1, date: "2026-10-01" },
+    { stage: "提案", column: 8, date: "2026-10-02" },
+    { stage: "C面談予約", column: 9, date: "2026-10-03" },
+    { stage: "クライアント面談", column: 17, date: "2026-10-04" },
+    { stage: "内定承諾", column: 22, date: "2026-10-05" },
+    { stage: "稼働開始", column: 24, date: "2026-10-06" },
+  ];
+  harness.writes.length = 0;
+  harness.apiCalls.length = 0;
+  for (const [index, step] of stages.entries()) {
+    const current = snapshot.activities.find(item => item.recordId === recordId);
+    const activity = newCandidate({
+      candidateName: "六工程候補者", company: index === 0 ? "" : "六工程クライアント",
+      stage: step.stage, date: step.date,
+      ...(current ? { recordId: current.recordId, rowVersion: current.rowVersion } : {}),
+    });
+    snapshot = assertSuccess(mutate(harness, player.token, "saveActivity", { activity })).snapshot;
+    const recorded = snapshot.activities.find(item => item.candidateName === activity.candidateName && item.stage === step.stage);
+    assert.ok(recorded, `Saved ${step.stage} must return as an activity`);
+    recordId ??= recorded.recordId;
+    assert.equal(recorded.recordId, recordId, "Later stages must update the original proposal rather than create another row");
+    assert.equal(recorded.date, step.date);
+    const row = rowWithCandidate(harness, activity.candidateName);
+    assert.equal(harness.context.NODE_TESTS.day(row[step.column - 1]), step.date, `${step.stage} must save its actual date to the agreed DB column`);
+    for (const [metricIndex, metric] of stages.entries()) {
+      const expected = metricIndex <= index ? 1 : 0;
+      assert.equal(snapshot.counts.all["ND-001"][metric.stage], expected);
+      assert.equal(snapshot.counts["2026-10"]["ND-001"][metric.stage], expected);
+      assert.equal(snapshot.counts[metric.date]?.["ND-001"]?.[metric.stage] ?? 0, expected);
+      if (metricIndex > index) assert.equal(row[metric.column - 1], "", "Unrecorded stages must leave their date cells empty");
+    }
+    assert.equal(snapshot.counts.all["ND-001"]["内定"], 0, "An acceptance date must not invent a client-offer date");
+    assert.equal(snapshot.counts.all["ND-001"]["稼働開始予定"], 0, "An actual start must not invent a planned start date");
+    assert.equal(snapshot.counts.all["ND-001"]["紹介人数"], index > 0 ? 1 : 0);
+    assert.equal(matching.values.filter(item => item[2] === activity.candidateName).length, 1);
+    assert.deepEqual(matching.formulas[1], protectedFormulas, "Business formulas outside input cells must survive all six saves");
+    assert.deepEqual(harness.spreadsheet.getSheetById(KPI_SHEET_ID).values, kpiBefore, "The API must write DB dates and leave KPI formulas to recalculate");
+
+    const callsBeforeDuplicate = harness.apiCalls.length;
+    const currentVersion = snapshot.activities.find(item => item.recordId === recordId).rowVersion;
+    assert.equal(assertFailure(mutate(harness, player.token, "saveActivity", { activity: { ...activity, recordId, rowVersion: currentVersion } })).code, "ALREADY_RECORDED");
+    assert.equal(harness.apiCalls.length, callsBeforeDuplicate, "Repeated stage entry must not write another date or operation");
+
+    if (index === 0) {
+      const beforeStatus = clone(snapshot.counts);
+      snapshot = assertSuccess(mutate(harness, player.token, "updateStatus", { recordId, rowVersion: currentVersion, status: "稼働開始" })).snapshot;
+      assert.equal(rowWithCandidate(harness, activity.candidateName)[6], "稼働開始");
+      assert.deepEqual(snapshot.counts, beforeStatus, "A status label alone must not count the remaining five KPI stages");
+    }
+  }
+  const finalCounts = clone(snapshot.counts);
+  const finalVersion = snapshot.activities.find(item => item.recordId === recordId).rowVersion;
+  snapshot = assertSuccess(mutate(harness, player.token, "updateStatus", { recordId, rowVersion: finalVersion, status: "辞退（本人希望）" })).snapshot;
+  assert.deepEqual(snapshot.counts, finalCounts, "A later status change must preserve already-recorded historical outcomes");
+  assert.equal(harness.spreadsheet.getSheetByName("_NODE_operations").values.filter(row => row[2] === "saveActivity").length, 6);
+});
+
 test("another actor cannot retrieve a saved operation's private response by reusing its ID", () => {
   const { harness, player } = signedInFixture();
   const otherPlayer = authenticate(harness, "ND-002");
