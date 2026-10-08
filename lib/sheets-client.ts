@@ -45,6 +45,27 @@ export function validateEndpoint(value: string): string {
   return url.href;
 }
 
+function recoverableContentUrl(response: Response): string | null {
+  if (response.status !== 404 || !response.redirected) return null;
+  let url: URL;
+  try { url = new URL(response.url); } catch { return null; }
+  if (url.protocol !== "https:" || url.hostname !== "script.googleusercontent.com" ||
+      url.pathname !== "/macros/echo" || url.port || url.username || url.password || url.hash ||
+      url.searchParams.getAll("user_content_key").length !== 1 || !url.searchParams.get("user_content_key")?.trim() ||
+      url.searchParams.getAll("lib").length > 1 ||
+      [...url.searchParams.keys()].some(key => key !== "user_content_key" && key !== "lib")) return null;
+  return response.url;
+}
+
+function waitForContent(signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) { reject(signal.reason); return; }
+    const abort = () => { clearTimeout(timer); reject(signal.reason); };
+    const timer = setTimeout(() => { signal.removeEventListener("abort", abort); resolve(); }, 3_000);
+    signal.addEventListener("abort", abort, { once: true });
+  });
+}
+
 export async function sheetRequest<T>(
   endpoint: string,
   action: string,
@@ -53,16 +74,26 @@ export async function sheetRequest<T>(
 ): Promise<T> {
   const target = validateEndpoint(endpoint);
   const timeout = AbortSignal.timeout(45_000);
+  const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
   let response: Response;
   try {
     response = await fetch(target, {
       method: "POST",
       headers: { "Content-Type": "text/plain;charset=utf-8" },
       credentials: "omit",
+      cache: "no-store",
       redirect: "follow",
-      signal: options.signal ? AbortSignal.any([options.signal, timeout]) : timeout,
+      signal,
       body: JSON.stringify({ version: 1, action, payload, token: options.token, operationId: options.operationId }),
     });
+    const contentUrl = recoverableContentUrl(response);
+    if (contentUrl) {
+      // Retry only Google's already-generated result, never the operation POST.
+      // Keep this temporary URL in memory only; it must not be logged or persisted.
+      await waitForContent(signal);
+      signal.throwIfAborted();
+      response = await fetch(contentUrl, { method: "GET", credentials: "omit", cache: "no-store", redirect: "error", signal });
+    }
   } catch (error) {
     if (options.signal?.aborted) throw error;
     throw new SheetApiError("NETWORK", "Googleとの応答を確認できませんでした。入力は残っています。接続を確認し、同じ内容で再試行してください。");
