@@ -117,3 +117,7 @@ APIを編集した際は、新しいバージョンでWebアプリの既存デ�
 `node --test tests/apps-script*.test.mjs` はVM上のApps Script／Sheetsモックで確認します。実GoogleのOAuth、匿名Webアプリからのブラウザアクセス、シートの保護と数式の具体的な動作は別途複製ファイルで確認する必要があります。このローカル実装だけでは接続済み・本番稼働済みにはなりません。
 
 Google公式：[Webアプリ](https://developers.google.com/apps-script/guides/web)、[Sheets batchUpdate](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets/batchUpdate)、[Developer Metadata](https://developers.google.com/workspace/sheets/api/guides/metadata)、[ScriptLock](https://developers.google.com/apps-script/reference/lock/lock-service)。
+
+## 候補者・業務管理表の編集
+
+[MANAGEMENT.md](MANAGEMENT.md) に取消・復元、26項目編集、管理表の閲覧・入力と検証手順を記載しています。通常の成果追加は従来の19列だけを入力します。新しい候補者編集は26列のうち数式以外の入力セルを変更できます。既存の数式・自動表示・リンク付きセルは保護します。

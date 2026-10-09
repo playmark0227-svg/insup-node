@@ -116,7 +116,7 @@ class MockRange {
 
 class MockSheet {
   constructor(spreadsheet, { id, name, values = [], formulas = [] }) {
-    Object.assign(this, { spreadsheet, id, name, values: clone(values), formulas: clone(formulas), validations: {}, maxRows: Math.max(1000, values.length), protections: [], hidden: false });
+    Object.assign(this, { spreadsheet, id, name, values: clone(values), formulas: clone(formulas), validations: {}, formats: {}, maxRows: Math.max(1000, values.length), protections: [], hidden: false });
     formulas.forEach((row, r) => row.forEach((formula, c) => {
       if (formula) { this.values[r] ??= []; this.values[r][c] ??= formula; }
     }));
@@ -131,7 +131,7 @@ class MockSheet {
     const rows = Array.from(this.values, (row, index) => row?.some(present) || this.formulas[index]?.some(present) ? index + 1 : 0);
     return Math.max(0, ...rows);
   }
-  getLastColumn() { return Math.max(0, ...this.values.map(row => row.reduce((last, value, index) => present(value) ? index + 1 : last, 0)), ...this.formulas.map(row => row.length)); }
+  getLastColumn() { return Math.max(0, ...this.values.filter(Boolean).map(row => row.reduce((last, value, index) => present(value) ? index + 1 : last, 0)), ...this.formulas.filter(Boolean).map(row => row.length)); }
   getMaxRows() { return Math.max(this.maxRows, this.values.length); }
   getMaxColumns() { return Math.max(26, this.getLastColumn()); }
   getDataRange() { return this.getRange(1, 1, Math.max(1, this.getLastRow()), Math.max(1, this.getLastColumn())); }
@@ -208,7 +208,7 @@ class MockSpreadsheet {
             const values = cells.map(entry => Array.from({ length: maxColumns }, (_, i) => {
               const cell = entry.values?.[i] ?? {};
               const value = cell.userEnteredValue ?? {};
-              const format = cell.userEnteredFormat?.numberFormat?.type;
+              const format = cell.userEnteredFormat?.numberFormat?.type ?? sheet.formats[`${row+cells.indexOf(entry)},${column+i}`]?.numberFormat?.type;
               if (typeof value.numberValue === "number" && ["DATE", "DATE_TIME", "TIME"].includes(format)) {
                 return new Date((value.numberValue - 25569) * 86400000 - 9 * 3600 * 1000);
               }
@@ -217,6 +217,7 @@ class MockSpreadsheet {
             sheet.getRange(row, column, values.length, maxColumns).setValues(values);
             cells.forEach((entry, r) => (entry.values ?? []).forEach((cell, c) => {
               sheet.formulas[row + r - 1][column + c - 1] = cell.userEnteredValue?.formulaValue ?? "";
+              if(cell.userEnteredFormat)sheet.formats[`${row+r},${column+c}`]=clone(cell.userEnteredFormat);
             }));
           }
           replies.push({});
@@ -304,6 +305,14 @@ export function createHarness({ spreadsheetId = "test-spreadsheet", sheets = [],
     Sheets: { Spreadsheets: { get: (id, options) => {
       sheetReads.push({ spreadsheetId: id, options: clone(options) });
       const book = context.SpreadsheetApp.openById(id);
+      if(options.ranges){return {sheets:options.ranges.map(range=>{
+        const match=range.match(/^'(.+)'!([A-Z]+)(\d+):([A-Z]+)(\d+)$/);assert.ok(match,range);const sheet=book.getSheetByName(match[1].replace(/''/g,"'")),start=Number(match[3]),end=Number(match[5]),width=columnNumber(match[4]);
+        return {properties:{sheetId:sheet.id},data:[{startRow:start-1,startColumn:0,rowData:Array.from({length:end-start+1},(_,i)=>({values:Array.from({length:width},(_,j)=>{
+          const v=sheet.values[start+i-1]?.[j]??"",f=sheet.formulas[start+i-1]?.[j],key=`${start+i},${j+1}`,fmt=sheet.formats[key];
+          const raw=f?{formulaValue:f}:v instanceof Date?{numberValue:(v.getTime()+9*3600*1000)/86400000+25569}:typeof v==="number"?{numberValue:v}:typeof v==="boolean"?{boolValue:v}:v!==""?{stringValue:v}:{};
+          return {userEnteredValue:raw,formattedValue:String(v),...(sheet.validations[key]?{dataValidation:clone(sheet.validations[key])}:{}),...(fmt?{userEnteredFormat:clone(fmt)}:{})};
+        })}))}]};
+      })};}
       return { sheets: book.getSheets().map(sheet => ({ properties: { sheetId: sheet.id, gridProperties: { rowCount: Math.max(sheet.maxRows, sheet.values.length) } } })) };
     }, DeveloperMetadata: { search: (body, id) => {
       metadataReads.push({ spreadsheetId: id, body: clone(body) });
@@ -1977,4 +1986,87 @@ test("an unexpired probe actor still cannot update an existing record outside it
   assert.equal(assertFailure(mutate(harness, probePlayer.token, "updateStatus", { recordId: existing.recordId, rowVersion: existing.rowVersion, status: "辞退（本人希望）" })).code, "CONFLICT");
   assert.equal(assertFailure(mutate(harness, probePlayer.token, "saveActivity", { activity: { ...existing, stage: "クライアント面談", date: "2026-10-07" } })).code, "CONFLICT");
   assert.deepEqual(harness.apiCalls, []); assert.deepEqual(harness.writes, []);
+});
+
+test("candidate records include undated and unmapped rows for admin and retain player privacy",()=>{
+ const f=signedInFixture(),sheet=f.harness.spreadsheet.getSheetById(MATCHING_SHEET_ID);
+ sheet.getRange(2,1).clearContent();sheet.getRange(2,8).clearContent();sheet.getRange(3,4).setValue("旧担当");
+ const admin=assertSuccess(request(f.harness,"snapshot",{}, {token:f.admin.token}));
+ assert.equal(admin.records.length,4);assert.equal(admin.records.find(r=>r.row===2).candidateName,"本人候補");assert.equal(admin.records.find(r=>r.row===3).playerId,"");
+ const player=assertSuccess(request(f.harness,"snapshot",{}, {token:f.player.token}));
+ assert.equal(player.records.length,3);assert.ok(player.records.every(r=>r.playerId==="ND-001"));assert.ok(!JSON.stringify(player).includes("他者秘密候補"));
+});
+test("canceling a deduplicated interview clears all matching proposal dates once, supports replay and restore",()=>{
+ const f=signedInFixture();const before=assertSuccess(request(f.harness,"snapshot",{}, {token:f.player.token}));
+ assert.equal(before.counts["2026-10"]["ND-001"]["候補者面談"],2);
+ const r=before.records.find(r=>r.row===2),id=randomUUID(),payload={recordId:r.recordId,rowVersion:r.rowVersion,stage:"候補者面談"};
+ const result=assertSuccess(request(f.harness,"cancelAchievement",payload,{token:f.player.token,operationId:id}));
+ assert.equal(result.snapshot.counts["2026-10"]["ND-001"]["候補者面談"],1);
+ assert.equal(result.snapshot.records.find(r=>r.row===2).values[0],"");assert.equal(result.snapshot.records.find(r=>r.row===4).values[0],"");
+ assert.equal(result.snapshot.records.find(r=>r.row===2).values[7],"2026-10-05");assert.equal(result.changeId,id);
+ const calls=f.harness.apiCalls.length;assertSuccess(request(f.harness,"cancelAchievement",payload,{token:f.player.token,operationId:id}));assert.equal(f.harness.apiCalls.length,calls);
+ const restored=assertSuccess(request(f.harness,"restoreChange",{changeId:id},{token:f.player.token,operationId:randomUUID()}));
+ assert.equal(restored.snapshot.counts["2026-10"]["ND-001"]["候補者面談"],2);
+});
+test("proposal cancellation touches only its row and other owners, formulas and KPI remain intact",()=>{
+ const f=signedInFixture(),before=assertSuccess(request(f.harness,"snapshot",{}, {token:f.player.token})),r=before.records.find(r=>r.row===2);
+ const sheet=f.harness.spreadsheet.getSheetById(MATCHING_SHEET_ID),formulas=clone(sheet.formulas),kpi=clone(f.harness.spreadsheet.getSheetById(KPI_SHEET_ID).values);
+ const result=assertSuccess(request(f.harness,"cancelAchievement",{recordId:r.recordId,rowVersion:r.rowVersion,stage:"提案"},{token:f.player.token,operationId:randomUUID()}));
+ assert.equal(result.snapshot.counts["2026-10"]["ND-001"]["提案"],1);assert.equal(sheet.getRange(4,8).getValue(),"2026-10-05");assert.equal(sheet.getRange(3,8).getValue(),"2026-10-05");
+ assert.deepEqual(sheet.formulas,formulas);assert.deepEqual(f.harness.spreadsheet.getSheetById(KPI_SHEET_ID).values,kpi);
+});
+test("candidate edit validates ownership, stale versions, formulas, stage dates, renames and restores",()=>{
+ const f=signedInFixture(),snapshot=assertSuccess(request(f.harness,"snapshot",{}, {token:f.player.token})),r=snapshot.records.find(r=>r.row===2),foreign=f.admin.snapshot.records.find(r=>r.row===3);
+ const update=(record,changes)=>request(f.harness,"updateRecord",{recordId:record.recordId,rowVersion:record.rowVersion,changes},{token:f.player.token,operationId:randomUUID()});
+ assert.equal(assertFailure(update(foreign,{13:"侵入"})).code,"FORBIDDEN");assert.equal(assertFailure(update(r,{5:"数式を破壊"})).code,"FORMULA_PROTECTED");
+ assert.equal(assertFailure(update({...r,rowVersion:"old"},{13:"メモ"})).code,"CONFLICT");assert.equal(assertFailure(update(r,{17:"2026-11-01"})).code,"INVALID_DATE");
+ const edited=assertSuccess(update(r,{3:"修正候補",13:"進捗メモ",17:"2026-10-06"}));
+ const fresh=edited.snapshot.records.find(a=>a.recordId===r.recordId);assert.equal(fresh.candidateName,"修正候補");assert.equal(fresh.values[16],"2026-10-06");assert.equal(edited.snapshot.counts["2026-10"]["ND-001"]["クライアント面談"],1);
+ const restored=assertSuccess(request(f.harness,"restoreChange",{changeId:edited.changeId},{token:f.player.token,operationId:randomUUID()}));assert.equal(restored.snapshot.records.find(a=>a.recordId===r.recordId).candidateName,"本人候補");
+});
+test("restore rejects another actor and refuses to overwrite a later direct spreadsheet edit",()=>{
+ const f=signedInFixture(),r=f.player.snapshot.records.find(r=>r.row===2),changed=assertSuccess(request(f.harness,"cancelAchievement",{recordId:r.recordId,rowVersion:r.rowVersion,stage:"提案"},{token:f.player.token,operationId:randomUUID()}));
+ const other=authenticate(f.harness,"ND-002");assert.equal(assertFailure(request(f.harness,"restoreChange",{changeId:changed.changeId},{token:other.token,operationId:randomUUID()})).code,"FORBIDDEN");
+ f.harness.spreadsheet.getSheetById(MATCHING_SHEET_ID).getRange(2,13).setValue("後からの変更");
+ assert.equal(assertFailure(request(f.harness,"restoreChange",{changeId:changed.changeId},{token:f.player.token,operationId:randomUUID()})).code,"CONFLICT");
+});
+test("candidates may be created without achievements and cannot be assigned to another player",()=>{
+ const f=signedInFixture(),data={candidateName:"未面談の人",playerId:"ND-001",company:"",position:"FS"};
+ assert.equal(assertFailure(request(f.harness,"createCandidate",{...data,playerId:"ND-002"},{token:f.player.token,operationId:randomUUID()})).code,"FORBIDDEN");
+ const result=assertSuccess(request(f.harness,"createCandidate",data,{token:f.player.token,operationId:randomUUID()}));assert.ok(result.snapshot.records.some(r=>r.candidateName===data.candidateName&&r.values[0]===""));assert.equal(result.snapshot.counts["2026-10"]["ND-001"]["候補者面談"],2);
+});
+test("administrative table reads are bounded, exclude app secrets and recheck access",()=>{
+ const f=signedInFixture();
+ assert.equal(assertFailure(request(f.harness,"managementTables",{}, {token:f.player.token})).code,"FORBIDDEN");
+ const list=assertSuccess(request(f.harness,"managementTables",{}, {token:f.admin.token}));assert.ok(list.tables.every(t=>!t.title.startsWith("_NODE_")));
+ assert.equal(assertFailure(request(f.harness,"managementTable",{sheetId:8001},{token:f.admin.token})).code,"PROTECTED_SHEET");
+ assert.equal(assertFailure(request(f.harness,"managementTable",{sheetId:KPI_SHEET_ID,startRow:0},{token:f.admin.token})).code,"VALIDATION");
+ const read=assertSuccess(request(f.harness,"managementTable",{sheetId:KPI_SHEET_ID,startRow:1},{token:f.admin.token}));assert.equal(read.rows.length,50);assert.equal(read.rows[1].cells[1].readonly,true);assert.ok(f.harness.sheetReads.at(-1).options.ranges[0].endsWith("A1:Z50"));
+});
+test("administrative input changes preserve formulas, validation and literal formula-looking text",()=>{
+ const f=signedInFixture(),sheet=f.harness.spreadsheet.insertSheet("案件管理表");sheet.getRange(2,1,1,3).setValues([["案件","ステータス","原価"]]);sheet.getRange(3,1,1,3).setValues([["案件A","募集中","=1+2"]]);sheet.validations["3,2"]={strict:true,condition:{type:"ONE_OF_LIST",values:[{userEnteredValue:"募集中"},{userEnteredValue:"停止"}]}};
+ const read=()=>assertSuccess(request(f.harness,"managementTable",{sheetId:sheet.id,startRow:1},{token:f.admin.token})).rows.find(r=>r.row===3);
+ const initial=read(),id=randomUUID();const save=changes=>request(f.harness,"saveManagementRow",{sheetId:sheet.id,row:3,rowVersion:initial.version,changes},{token:f.admin.token,operationId:randomUUID()});
+ assert.equal(assertFailure(save({2:"不正選択"})).code,"VALIDATION");assert.equal(assertFailure(save({3:1})).code,"FORMULA_PROTECTED");
+ const result=assertSuccess(request(f.harness,"saveManagementRow",{sheetId:sheet.id,row:3,rowVersion:initial.version,changes:{1:"=literal",2:"停止"}},{token:f.admin.token,operationId:id}));
+ // The mock's setValues parses formulas; inspect the actual request instead.
+ const literal=f.harness.apiCalls.at(-1).body.requests[0].updateCells.rows[0].values[0];assert.deepEqual(literal.userEnteredValue,{stringValue:"=literal"});assert.equal(sheet.formulas[2][0],"");assert.equal(sheet.formulas[2][2],"=1+2");assert.equal(result.changeId,id);
+ assert.equal(assertFailure(save({2:"募集中"})).code,"CONFLICT");
+ assertSuccess(request(f.harness,"restoreChange",{changeId:id},{token:f.admin.token,operationId:randomUUID()}));assert.equal(sheet.values[2][0],"案件A");
+});
+
+test("a waiting candidate records its first interview on the existing row",()=>{
+ const f=signedInFixture();
+ const created=assertSuccess(request(f.harness,"createCandidate",{candidateName:"面談予定候補",playerId:"ND-001",company:"予定企業",position:"FS"},{token:f.player.token,operationId:randomUUID()}));
+ const r=created.snapshot.records.find(r=>r.candidateName==="面談予定候補");assert.ok(r.candidateId);
+ const saved=assertSuccess(request(f.harness,"saveActivity",{activity:{playerId:"ND-001",recordId:r.recordId,rowVersion:r.rowVersion,candidateId:r.candidateId,candidateName:r.candidateName,source:r.source,company:"",position:"FS",stage:"候補者面談",date:"2026-10-06"}},{token:f.player.token,operationId:randomUUID()}));
+ assert.equal(saved.snapshot.records.length,created.snapshot.records.length);
+ const after=saved.snapshot.records.find(x=>x.recordId===r.recordId);assert.equal(after.values[0],"2026-10-06");assert.equal(after.values[1],"予定企業");
+ assert.equal(saved.snapshot.counts["2026-10"]["ND-001"]["候補者面談"],3);
+});
+test("later management pages retain the original field headings",()=>{
+ const f=signedInFixture(),sheet=f.harness.spreadsheet.insertSheet("案件管理表");sheet.getRange(2,1,1,3).setValues([["案件名","ステータス","原価"]]);
+ const page=assertSuccess(request(f.harness,"managementTable",{sheetId:sheet.id,startRow:51},{token:f.admin.token}));
+ assert.equal(page.rows[0].row,51);assert.equal(page.headers[0],"案件名");assert.equal(page.headers[2],"原価");
+ assert.ok(f.harness.sheetReads.some(read=>read.options.ranges?.[0]?.endsWith("A2:Z2")));
 });

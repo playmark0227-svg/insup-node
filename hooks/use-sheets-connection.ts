@@ -187,6 +187,14 @@ export function useSheetsConnection() {
     finally { mutationRunning.current = false; if (isCurrent(g)) setBusy(false); }
   };
 
+  const readManagement = async <T,>(action: "managementTables" | "managementTable", payload: unknown = {}): Promise<T> => {
+    if (!token.current || snapshot?.self.role!=="admin") throw new Error("管理者でログインしてください。");
+    const g=generation.current;
+    const data=await sheetRequest<T>(endpoint,action,payload,{token:token.current});
+    if (!isCurrent(g)) throw new Error("ログイン状態が変更されました。");
+    return data;
+  };
+
   const logout = async () => {
     const oldToken = token.current; clearSession(); setBusy(false); setCredentials(null);
     if (oldToken) { try { await sheetRequest(endpoint, "logout", {}, {token:oldToken}); } catch { /* Local session already removed; server session has an expiry. */ } }
@@ -198,5 +206,5 @@ export function useSheetsConnection() {
   };
 
   return { ready, endpoint, mode, players, setPlayers, activities, setActivities, snapshot, authenticated, loadPhase, busy, error,
-    credentials, dismissCredentials:() => setCredentials(null), connect, login, logout, refresh, mutate, showDemo };
+    credentials, dismissCredentials:() => setCredentials(null), connect, login, logout, refresh, mutate, readManagement, showDemo };
 }

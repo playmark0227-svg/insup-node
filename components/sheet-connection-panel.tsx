@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { FileSpreadsheet, RefreshCw, CheckCircle2, Clock3 } from "lucide-react";
 import { Input } from "./ui/input";
-import { inputColumns } from "../lib/sheets-schema";
+import { matchingFields } from "../lib/management-data";
 import type { SheetDestination } from "../lib/sheets-client";
 
 type Props = {
@@ -45,7 +45,7 @@ export function SheetConnectionPanel(props: Props) {
         </ol>
         <div className="sheet-links"><a href={`${import.meta.env.BASE_URL}apps-script/SETUP.md`} target="_blank" rel="noreferrer">設定手順</a><a href={`${import.meta.env.BASE_URL}apps-script/Code.gs`} download>Google側の連携コード</a></div>
       </details>
-      <details className="schema-details"><summary>対応する入力項目（19項目）</summary><div>{inputColumns.map(c=><span key={c.column}><code>{c.column}</code>{c.label}</span>)}</div></details>
+      <details className="schema-details"><summary>候補者の管理項目（26項目）</summary><div>{matchingFields.map((label,i)=><span key={label}><code>{String.fromCharCode(65+i)}</code>{label}</span>)}</div></details>
       {props.destination && <div className="sheet-links"><p className="panel-note">保存先：{props.destination.title}</p><a href={props.destination.matchingUrl} target="_blank" rel="noreferrer">保存先のマッチングDBを開く</a><a href={props.destination.kpiUrl} target="_blank" rel="noreferrer">保存先のKPI・KGIを開く</a></div>}
       {props.onDemo && <button className="text-button" disabled={props.busy} onClick={props.onDemo}>サンプル画面を確認</button>}
     </section>

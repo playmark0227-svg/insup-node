@@ -3,7 +3,13 @@ import type { Activity, Metric, Player } from "./node-data";
 export type SheetPlayer = Player & { sheetNames?: string[] };
 export type Counts = Record<string, Record<string, Partial<Record<Metric, number>>>>;
 export type SheetDestination = { title: string; matchingUrl: string; kpiUrl: string };
+export type CandidateRecord = { recordId: string; rowVersion: string; row: number; playerId: string; candidateId?: string; candidateName: string; source: string; values: (string | number | boolean)[]; formulaColumns: number[] };
+export type ManagementCell = {column:number;value:string|number|boolean;display:string;kind:"text"|"date"|"time"|"number"|"percent"|"boolean";options:string[];readonly:boolean;note:string};
+export type ManagementRow = {row:number;version:string;cells:ManagementCell[]};
+export type ManagementTable = {sheetId:number;title:string;startRow:number;rowCount:number;columnCount:number;readonly:boolean;headers?:string[];rows:ManagementRow[]};
+export type ManagementTableInfo = {sheetId:number;title:string;rowCount:number;columnCount:number};
 export type SheetSnapshot = {
+  records?: CandidateRecord[];
   self: { playerId: string; role: "admin" | "player" };
   players: SheetPlayer[];
   activities: Activity[];
@@ -16,6 +22,7 @@ export type SheetSnapshot = {
 export type MutationResult = {
   snapshot: SheetSnapshot;
   credentials?: { id: string; password: string };
+  changeId?: string;
 };
 
 export class SheetApiError extends Error {
@@ -120,7 +127,7 @@ export async function sheetRequest<T>(
   const target = validateEndpoint(endpoint);
   const timeout = AbortSignal.timeout(45_000);
   const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
-  const readOnly = action === "snapshot" || action === "health";
+  const readOnly = ["snapshot","health","managementTables","managementTable"].includes(action);
   const body = JSON.stringify({ version: 1, action, payload, token: options.token, operationId: options.operationId });
   for (let attempt = 0; attempt < (readOnly ? 2 : 1); attempt++) {
     let recoveringResult = false;
@@ -202,6 +209,9 @@ export function assertSnapshot(value: unknown): asserts value is SheetSnapshot {
   }
   if (s.self.role === "player" && (!s.players.some(p => p.id === s.self.playerId) || s.activities.some(a => a.playerId !== s.self.playerId))) {
     throw new SheetApiError("INVALID_RESPONSE", "本人のデータを確認できませんでした。再ログインしてください。");
+  }
+  if (s.records && (!Array.isArray(s.records) || s.records.some(r => typeof r.recordId!=="string" || typeof r.rowVersion!=="string" || typeof r.playerId!=="string" || typeof r.candidateName!=="string" || !Array.isArray(r.values) || r.values.length!==26 || !Array.isArray(r.formulaColumns) || r.values.some(v=>!["string","number","boolean"].includes(typeof v)) || (s.self.role==="player" && r.playerId!==s.self.playerId)))) {
+    throw new SheetApiError("INVALID_RESPONSE","候補者情報の形式または閲覧権限を確認できませんでした。");
   }
   if (s.destination && (s.self.role !== "admin" || typeof s.destination.title !== "string" ||
       ![s.destination.matchingUrl, s.destination.kpiUrl].every(url => typeof url === "string" && /^https:\/\/docs\.google\.com\/spreadsheets\/d\/[A-Za-z0-9_-]+\/edit(?:\?gid=\d+(?:#gid=\d+)?|#gid=\d+)$/.test(url)))) {
