@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { initialPlayers, makeDemoActivities, type Activity } from "../lib/node-data";
-import { assertSnapshot, sheetRequest, validateEndpoint, SheetApiError, type MutationResult, type SheetSnapshot, type SheetPlayer } from "../lib/sheets-client";
+import { assertSnapshot, sheetRequest, validateEndpoint, SheetApiError, type MutationResult, type SheetSnapshot, type SheetPlayer, type InterviewAdvice, type InterviewAdviceState } from "../lib/sheets-client";
 
 const ENDPOINT_KEY = "insup.node.endpoint.v1";
 const SESSION_KEY = "insup.node.session.v1";
@@ -187,13 +187,17 @@ export function useSheetsConnection() {
     finally { mutationRunning.current = false; if (isCurrent(g)) setBusy(false); }
   };
 
-  const analyzeReviews = async (period:string) => {
+  const requestAdvice = async <T,>(action:string,period:string):Promise<T> => {
     if (!token.current) throw new Error("ログインしてください。");
     const g=generation.current;
-    const data=await sheetRequest<{summary:string;actions:string[];count:number;generatedAt:string}>(endpoint,"analyzeInterviewReviews",{period},{token:token.current});
-    if(!isCurrent(g))throw new Error("ログイン状態が変更されました。");
-    return data;
+    try {
+      const data=await sheetRequest<T>(endpoint,action,{period},{token:token.current});
+      if(!isCurrent(g))throw new Error("ログイン状態が変更されました。");
+      return data;
+    }catch(e){if(isCurrent(g)&&isExpired(e))clearSession();throw e;}
   };
+  const analyzeReviews = (period:string) => requestAdvice<InterviewAdvice>("analyzeInterviewReviews",period);
+  const readAdvice = (period:string) => requestAdvice<InterviewAdviceState>("readInterviewAdvice",period);
 
   const readManagement = async <T,>(action: "managementTables" | "managementTable", payload: unknown = {}): Promise<T> => {
     if (!token.current || snapshot?.self.role!=="admin") throw new Error("管理者でログインしてください。");
@@ -214,5 +218,5 @@ export function useSheetsConnection() {
   };
 
   return { ready, endpoint, mode, players, setPlayers, activities, setActivities, snapshot, authenticated, loadPhase, busy, error,
-    credentials, dismissCredentials:() => setCredentials(null), connect, login, logout, refresh, mutate, readManagement, analyzeReviews, showDemo };
+    credentials, dismissCredentials:() => setCredentials(null), connect, login, logout, refresh, mutate, readManagement, analyzeReviews, readAdvice, showDemo };
 }

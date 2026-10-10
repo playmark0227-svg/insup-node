@@ -200,3 +200,47 @@ test("a save supersedes a pending refresh and its confirmed result remains autho
   assert.equal(h.calls[2].options.operationId,"same-test-operation");
   h.unmount();
 });
+
+for (const method of ["analyzeReviews","readAdvice"]) test(`${method} clears a confirmed expired session instead of retaining private candidate data`,async()=>{
+  const action = method === "analyzeReviews" ? "analyzeInterviewReviews" : "readInterviewAdvice";
+  const h = harness(call => {
+    if (call.action === "snapshot") return snapshot;
+    if (call.action === action) throw new SheetApiError("SESSION_EXPIRED","再ログインしてください。");
+    throw new Error(`unexpected request: ${call.action}`);
+  },{storedToken:token});
+  await flush(); assert.equal(h.render().authenticated,true); assert.equal(h.render().snapshot,snapshot);
+  await assert.rejects(() => h.render()[method]("2026-10"),{code:"SESSION_EXPIRED"});
+  assert.equal(h.render().authenticated,false); assert.equal(h.render().snapshot,null);
+  assert.equal(h.render().players.length,0); assert.equal(h.render().activities.length,0);
+  assert.equal(h.sessionStorage.getItem(SESSION_KEY),null);
+  assert.equal(h.calls[1].action,action); assert.equal(h.calls[1].payload.period,"2026-10"); assert.equal(h.calls[1].options.token,token);
+  await assert.rejects(() => h.render()[method]("2026-10"),/ログインしてください/);
+  assert.equal(h.calls.length,2);
+  h.unmount();
+});
+
+for (const method of ["analyzeReviews","readAdvice"]) test(`${method} rejects a late successful response after logout`,async()=>{
+  const response = deferred();
+  const h = harness(call => call.action === "snapshot" ? snapshot : call.action === "logout" ? {} : response.promise,{storedToken:token});
+  await flush(); const pending = h.render()[method]("2026-10");
+  await h.render().logout(); const updates = h.updates();
+  assert.equal(h.render().authenticated,false); assert.equal(h.render().snapshot,null);
+  response.resolve({summary:"以前のセッションの改善案",actions:["確認する"],count:1,generatedAt:"2026-10-10T05:00:00Z"});
+  await assert.rejects(pending,/ログイン状態が変更されました/);
+  assert.equal(h.updates(),updates); assert.equal(h.sessionStorage.getItem(SESSION_KEY),null);
+  assert.equal(h.render().authenticated,false); assert.equal(h.render().snapshot,null);
+  h.unmount();
+});
+
+for (const method of ["analyzeReviews","readAdvice"]) test(`${method} transient AI failure keeps the existing session and recorded reasons available`,async()=>{
+  const h = harness(call => {
+    if (call.action === "snapshot") return snapshot;
+    throw new SheetApiError("NETWORK","改善案を再取得してください。");
+  },{storedToken:token});
+  await flush();
+  await assert.rejects(() => h.render()[method]("2026-10"),{code:"NETWORK"});
+  assert.equal(h.render().authenticated,true); assert.equal(h.render().snapshot,snapshot);
+  assert.equal(JSON.parse(h.sessionStorage.getItem(SESSION_KEY)).token,token);
+  assert.equal(h.calls.length,2); assert.equal(h.render().busy,false);
+  h.unmount();
+});

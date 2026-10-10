@@ -119,8 +119,9 @@ function nodeHandle_(request) {
   var action = request.action;
   if (action === 'health') return health_();
   if (action === 'login') return login_(request.payload || {});
-  if (['snapshot','logout','saveActivity','updateStatus','updateProfile','createPlayer','updateRecord','cancelAchievement','restoreChange','managementTables','managementTable','saveManagementRow','createCandidate','saveInterviewReview','analyzeInterviewReviews'].indexOf(action) < 0) fail_('BAD_REQUEST', '対応していない操作です。');
+  if (['snapshot','logout','saveActivity','updateStatus','updateProfile','createPlayer','updateRecord','cancelAchievement','restoreChange','managementTables','managementTable','saveManagementRow','createCandidate','saveInterviewReview','analyzeInterviewReviews','readInterviewAdvice'].indexOf(action) < 0) fail_('BAD_REQUEST', '対応していない操作です。');
   if (action === 'analyzeInterviewReviews') return analyzeInterviewReviews_(request);
+  if (action === 'readInterviewAdvice') return readInterviewAdvice_(request);
   if (action === 'managementTables' || action === 'managementTable') {
     var session = authenticate_(request.token), accounts = readAccountStore_(), actor = activeActor_(accounts,session);
     requireAdmin_(actor);
@@ -1146,26 +1147,122 @@ function reviewAggregate_(store,user,period) {
   var rows=readInterviewReviews_(store,user).filter(function(r){var record=findRecord_(store,r.recordId);return day_(record.values[16])&&!day_(record.values[21])&&!day_(record.values[23])&&(period==='all'||r.interviewDate.indexOf(period)===0);});
   return REVIEW_CATEGORIES.map(function(category){return {category:category,count:rows.filter(function(r){return r.category===category;}).length};}).filter(function(r){return r.count>0;});
 }
+var REVIEW_AI_INDEX='NODE_AI_ADVICE_INDEX';
+var REVIEW_AI_PENDING='NODE_AI_PENDING';
+var REVIEW_AI_LIMIT=24;
+function aiJsonProperty_(key,fallback) {
+  try{return JSON.parse(props_().getProperty(key)||JSON.stringify(fallback));}catch(e){return fallback;}
+}
+function aiQuota_() {
+  var q=aiJsonProperty_('NODE_AI_QUOTA',{});
+  if(q.day!==today_()||!q.users||typeof q.users!=='object')return {day:today_(),total:0,users:{}};
+  return q;
+}
+function aiUsage_(id) {
+  var q=aiQuota_();
+  return {userRemaining:Math.max(0,3-(Number(q.users[id])||0)),teamRemaining:Math.max(0,10-(Number(q.total)||0)),resetAt:new Date(new Date(q.day+'T00:00:00+09:00').getTime()+86400000).toISOString()};
+}
+function aiScope_(store,user,period) {
+  return hash_(store.config.spreadsheetId+'|'+user.id+'|'+user.role+'|'+period);
+}
+function aiAdvice_(scope) {
+  var value=props_().getProperty('NODE_AI_ADVICE_'+scope);
+  if(!value)return null;
+  try{
+    var result=JSON.parse(Utilities.ungzip(Utilities.newBlob(Utilities.base64Decode(value),'application/gzip')).getDataAsString('UTF-8'));
+    if(!result||typeof result.summary!=='string'||!Array.isArray(result.actions)||!Array.isArray(result.aggregate)||typeof result.inputSignature!=='string')return null;
+    return result;
+  }catch(e){return null;}
+}
+// Each report is compressed below the per-property quota. Only 24 scopes are retained.
+// Reports contain fixed category counts and generated prose, never candidate notes or names.
+function saveAiAdvice_(scope,result) {
+  var value=Utilities.base64Encode(Utilities.gzip(Utilities.newBlob(JSON.stringify(result),'application/json')).getBytes());
+  if(value.length>8000)fail_('AI_UNAVAILABLE','AIの結果が長すぎました。理由の記録は保存されています。');
+  var properties=props_(),index=aiJsonProperty_(REVIEW_AI_INDEX,[]);
+  if(!Array.isArray(index))index=[];
+  index=index.filter(function(row){return row&&row.scope!==scope&&typeof row.scope==='string';});
+  index.push({scope:scope,generatedAt:result.generatedAt});
+  while(index.length>REVIEW_AI_LIMIT){var removed=index.shift();properties.deleteProperty('NODE_AI_ADVICE_'+removed.scope);}
+  properties.setProperty('NODE_AI_ADVICE_'+scope,value);
+  properties.setProperty(REVIEW_AI_INDEX,JSON.stringify(index));
+}
+function aiPending_() {
+  var pending=aiJsonProperty_(REVIEW_AI_PENDING,{}),now=Date.now();
+  Object.keys(pending).forEach(function(scope){if(!pending[scope]||pending[scope].expiresAt<=now)delete pending[scope];});
+  return pending;
+}
+function aiResult_(result,user,source) {
+  return Object.assign({},result,{source:source,usage:aiUsage_(user.id)});
+}
+function readInterviewAdvice_(request) {
+  var session=authenticate_(request.token),store=readStore_({readOnly:true}),user=activeActor_(store,session),period=String((request.payload||{}).period||'');
+  var aggregate=reviewAggregate_(store,user,period),scope=aiScope_(store,user,period),advice=aiAdvice_(scope),pending=aiPending_()[scope],properties=props_();
+  snapshotActor_(store,request.token);
+  return {advice:advice?aiResult_(advice,user,'saved'):null,stale:!!advice&&advice.inputSignature!==hash_(stableJson_(aggregate)),aggregate:aggregate,count:aggregate.reduce(function(n,r){return n+r.count;},0),usage:aiUsage_(user.id),configured:!!properties.getProperty('NODE_GEMINI_API_KEY')&&properties.getProperty('NODE_GEMINI_FREE_TIER_CONFIRMED')==='true',pending:!!pending,pendingUntil:pending?new Date(pending.expiresAt).toISOString():null};
+}
 function analyzeInterviewReviews_(request) {
   var session=authenticate_(request.token),store=readStore_({readOnly:true}),user=activeActor_(store,session),period=String((request.payload||{}).period||'');
-  var aggregate=reviewAggregate_(store,user,period),count=aggregate.reduce(function(n,r){return n+r.count;},0);
+  var aggregate=reviewAggregate_(store,user,period),count=aggregate.reduce(function(n,r){return n+r.count;},0),signature=hash_(stableJson_(aggregate)),scope=aiScope_(store,user,period);
   if(!count)fail_('VALIDATION','この期間の未マッチ理由を先に登録してください。');
-  var properties=props_(),key=properties.getProperty('NODE_GEMINI_API_KEY');
-  if(!key||properties.getProperty('NODE_GEMINI_FREE_TIER_CONFIRMED')!=='true')fail_('AI_NOT_CONFIGURED','管理者が課金未設定の専用Geminiプロジェクトを接続してください。');
-  var cacheKey='review-ai-'+hash_(user.id+'|'+user.role+'|'+period+'|'+stableJson_(aggregate)),cache=CacheService.getScriptCache(),cached=cache.get(cacheKey);
-  if(cached)return JSON.parse(cached);
-  withLock_(function(){
-    var quotaKey='NODE_AI_QUOTA',now=today_(),q=JSON.parse(properties.getProperty(quotaKey)||'{}');
-    if(q.day!==now)q={day:now,total:0,users:{}};
-    if(q.total>=10||(q.users[user.id]||0)>=3)fail_('AI_LIMIT','本日のAI利用上限です。理由の記録・集計は引き続き使えます。');
-    q.total++;q.users[user.id]=(q.users[user.id]||0)+1;properties.setProperty(quotaKey,JSON.stringify(q));
+  var properties=props_(),reservationId=Utilities.getUuid();
+  var previous=withLock_(function(){
+    var saved=aiAdvice_(scope);
+    if(saved&&saved.inputSignature===signature)return saved;
+    var key=properties.getProperty('NODE_GEMINI_API_KEY');
+    if(!key||properties.getProperty('NODE_GEMINI_FREE_TIER_CONFIRMED')!=='true')fail_('AI_NOT_CONFIGURED','管理者が課金未設定の専用Geminiプロジェクトを接続してください。');
+    var pending=aiPending_();
+    if(pending[scope])fail_('AI_IN_PROGRESS','この期間の改善案を作成中です。結果を確認してお待ちください。利用回数は追加していません。');
+    if(Object.keys(pending).length>=REVIEW_AI_LIMIT)fail_('BUSY','AIが混み合っています。少し待ってから結果を確認してください。');
+    var q=aiQuota_();
+    if(q.total>=10||(q.users[user.id]||0)>=3)fail_('AI_LIMIT','本日のAI利用上限です。保存済みの改善案と理由の記録は引き続き使えます。翌日0時に回数が戻ります。');
+    q.total++;q.users[user.id]=(q.users[user.id]||0)+1;
+    // One lock reserves quota and the in-flight scope together, then releases before fetching.
+    var updates={};updates.NODE_AI_QUOTA=JSON.stringify(q);pending[scope]={id:reservationId,signature:signature,expiresAt:Date.now()+360000};updates[REVIEW_AI_PENDING]=JSON.stringify(pending);properties.setProperties(updates,false);
+    return null;
   });
+  if(previous){snapshotActor_(store,request.token);return aiResult_(previous,user,'saved');}
+  try{
+    var body=generateAiAdvice_(aggregate,properties.getProperty('NODE_GEMINI_API_KEY'));
+    snapshotActor_(store,request.token);
+    var result={summary:body.summary.trim(),actions:body.actions.map(function(a){return a.trim();}),count:count,period:period,aggregate:aggregate,inputSignature:signature,generatedAt:new Date().toISOString()};
+    withLock_(function(){saveAiAdvice_(scope,result);});
+    snapshotActor_(store,request.token);
+    return aiResult_(result,user,'generated');
+  }finally{
+    withLock_(function(){var pending=aiPending_();if(pending[scope]&&pending[scope].id===reservationId){delete pending[scope];properties.setProperty(REVIEW_AI_PENDING,JSON.stringify(pending));}});
+  }
+}
+
+function generateAiAdvice_(aggregate,key) {
   // Only fixed categories and counts are sent. No user text, names, IDs or dates.
-  var response=UrlFetchApp.fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent',{method:'post',contentType:'application/json',headers:{'x-goog-api-key':key},muteHttpExceptions:true,payload:JSON.stringify({systemInstruction:{parts:[{text:'人材紹介業務の改善支援。未マッチ理由の集計から日本語で傾向の要約と次回面談前にできる具体的な確認・準備を3つ提案。件数だけでは原因を断定できないと明示。個人の採用適否や順位を判断しない。理由未確認はクライアントへの確認を提案。JSONのみ: summary(文字列), actions(文字列の配列)。'}]},contents:[{role:'user',parts:[{text:JSON.stringify(aggregate)}]}],generationConfig:{temperature:0.2,maxOutputTokens:1800,responseMimeType:'application/json',responseSchema:{type:'OBJECT',properties:{summary:{type:'STRING'},actions:{type:'ARRAY',items:{type:'STRING'}}},required:['summary','actions']}}})});
-  if(response.getResponseCode()===429)fail_('AI_LIMIT','Googleの無料枠の上限です。時間をおいて再試行してください。有料処理への切り替えは行いません。');
+  var response;
+  try{response=UrlFetchApp.fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent',{method:'post',contentType:'application/json',headers:{'x-goog-api-key':key},muteHttpExceptions:true,payload:JSON.stringify({systemInstruction:{parts:[{text:'人材紹介業務の改善支援。未マッチ理由の分類と件数だけを材料に、日本語で短い傾向の要約と、次回のC面談前に実行する具体的な確認・準備を3つ提案。要約は1800文字以内、各改善案は600文字以内。一般論だけにせず、担当者が誰に何を確認し何を記録すればよいかを示す。件数の少ない分類や理由未確認から原因を断定しない。条件・募集枠など担当者の努力だけで変えられない事情も区別。個人の採用適否や順位を判断しない。理由未確認はクライアントへの事実確認を提案。要約に件数だけでは原因を断定できないと明示。JSONのみ: summary(文字列), actions(文字列の配列)。'}]},contents:[{role:'user',parts:[{text:JSON.stringify(aggregate)}]}],generationConfig:{temperature:0.2,maxOutputTokens:1800,responseMimeType:'application/json',responseSchema:{type:'OBJECT',properties:{summary:{type:'STRING'},actions:{type:'ARRAY',items:{type:'STRING'}}},required:['summary','actions']}}})});}catch(e){fail_('AI_UNAVAILABLE','AIとの通信を確認できませんでした。理由の記録は保存されています。結果を確認してから再試行してください。');}
+  if(response.getResponseCode()===429)fail_('AI_LIMIT','Googleの無料枠の上限です。時間をおいて再試行してください。保存済みの改善案と理由の記録は引き続き使えます。');
   if(response.getResponseCode()!==200)fail_('AI_UNAVAILABLE','AIから結果を取得できませんでした。理由の記録は保存されています。');
   var body;try{var json=JSON.parse(response.getContentText());body=JSON.parse(json.candidates[0].content.parts.map(function(p){return p.text||'';}).join(''));}catch(e){fail_('AI_UNAVAILABLE','AIの応答形式を確認できませんでした。');}
-  if(typeof body.summary!=='string'||body.summary.length>4000||!Array.isArray(body.actions)||!body.actions.length||body.actions.length>5||body.actions.some(function(a){return typeof a!=='string'||a.length>1500;}))fail_('AI_UNAVAILABLE','AIの応答形式を確認できませんでした。');
-  snapshotActor_(store,request.token);
-  var result={summary:body.summary,actions:body.actions,count:count,generatedAt:new Date().toISOString()};cache.put(cacheKey,JSON.stringify(result),21600);return result;
+  if(typeof body.summary!=='string'||!body.summary.trim()||body.summary.length>4000||!Array.isArray(body.actions)||!body.actions.length||body.actions.length>5||body.actions.some(function(a){return typeof a!=='string'||!a.trim()||a.length>1500;}))fail_('AI_UNAVAILABLE','AIの応答形式を確認できませんでした。');
+  return {summary:body.summary.trim(),actions:body.actions.map(function(a){return a.trim();})};
+}
+
+// Owner-run smoke test: one synthetic free-tier request; no business-sheet access,
+// quota mutation or report-index eviction. Its temporary property is always restored.
+function verifyNodeAiUsability() {
+  requireOwner_();
+  var properties=props_(),key=properties.getProperty('NODE_GEMINI_API_KEY');
+  if(!key||properties.getProperty('NODE_GEMINI_FREE_TIER_CONFIRMED')!=='true')fail_('AI_NOT_CONFIGURED','Geminiの無料枠設定を確認してください。');
+  var aggregate=[{category:'事前確認不足',count:2},{category:'理由未確認',count:1}],body=generateAiAdvice_(aggregate,key);
+  var result={summary:body.summary,actions:body.actions,count:3,period:'all',aggregate:aggregate,inputSignature:hash_(stableJson_(aggregate)),generatedAt:new Date().toISOString()};
+  var value=Utilities.base64Encode(Utilities.gzip(Utilities.newBlob(JSON.stringify(result),'application/json')).getBytes());
+  if(value.length>8000)fail_('AI_VERIFICATION_FAILED','AIの保存サイズを確認できませんでした。');
+  withLock_(function(){
+    var probeKey='NODE_AI_UX_PROBE',previous=properties.getProperty(probeKey);
+    try{
+      properties.setProperty(probeKey,value);
+      var restored=JSON.parse(Utilities.ungzip(Utilities.newBlob(Utilities.base64Decode(properties.getProperty(probeKey)),'application/gzip')).getDataAsString('UTF-8'));
+      if(stableJson_(restored)!==stableJson_(result))fail_('AI_VERIFICATION_FAILED','AIの保存・復元を確認できませんでした。');
+    }finally{if(previous===null)properties.deleteProperty(probeKey);else properties.setProperty(probeKey,previous);}
+  });
+  var proof={success:true,model:'gemini-3.5-flash-lite',actions:body.actions.length,storageBytes:value.length,checked:['synthetic structured response','compressed property round trip','temporary property restored','no business sheet access','no app quota or advice index changes']};
+  Logger.log(JSON.stringify(proof));return proof;
 }

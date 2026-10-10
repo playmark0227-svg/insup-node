@@ -31,7 +31,7 @@ test("POST carries the token and operation id only in the body, never a query or
   assert.deepEqual(await sheetRequest(endpoint,"updateStatus",{status:"稼働開始"},{token:"test-token",operationId:"same-operation"}),{saved:true});
 });
 
-for (const action of ["snapshot", "login", "saveActivity"]) test(`${action} recovers a redirected result 404 after 700ms with no repeated POST`, async t => {
+for (const action of ["snapshot", "login", "saveActivity", "analyzeInterviewReviews"]) test(`${action} recovers a redirected result 404 after 700ms with no repeated POST`, async t => {
   t.mock.timers.enable({apis:["setTimeout"]});
   const calls: {url:string;init?:RequestInit}[] = [];
   t.mock.method(globalThis,"fetch",async (url:string|URL|Request, init?:RequestInit) => {
@@ -138,7 +138,7 @@ test("cancellation and the original 45-second deadline stop delayed recovery bef
 test("an initial login or write network failure never retries its POST", async t => {
   let calls = 0;
   t.mock.method(globalThis,"fetch",async () => { calls++; throw new TypeError("offline"); });
-  for (const action of ["login","saveActivity","updateStatus","resetPassword","logout","unknown-action"]) {
+  for (const action of ["login","saveActivity","updateStatus","resetPassword","logout","analyzeInterviewReviews","unknown-action"]) {
     const before = calls;
     await assert.rejects(() => sheetRequest(endpoint,action,{},{token:"test-token",operationId:"same-operation"}),{code:"NETWORK"});
     assert.equal(calls,before + 1);
@@ -148,7 +148,7 @@ test("an initial login or write network failure never retries its POST", async t
 test("temporary HTTP failures cannot replay a login or write", async t => {
   let calls = 0;
   t.mock.method(globalThis,"fetch",async () => { calls++; return new Response("temporarily unavailable",{status:503}); });
-  for (const action of ["login","saveActivity","updateStatus","resetPassword","logout"]) {
+  for (const action of ["login","saveActivity","updateStatus","resetPassword","logout","analyzeInterviewReviews"]) {
     const before = calls;
     await assert.rejects(() => sheetRequest(endpoint,action),{code:"HTTP"});
     assert.equal(calls,before + 1);
@@ -375,4 +375,59 @@ test("lost or invalid write responses keep the operation payload while definitiv
   for(const code of ["CONFLICT","SCHEMA_MISMATCH","UNAUTHENTICATED","VALIDATION","READ_ONLY"])
     assert.equal(isUncertainWrite(new SheetApiError(code,"rejected")),false);
   assert.equal(isUncertainWrite(new Error("body interrupted")),true);
+});
+
+test("retrieving saved advice may retry one interrupted read without generating or consuming another AI request", async t => {
+  t.mock.timers.enable({apis:["setTimeout"]});
+  const deadline = new AbortController();
+  const advice = {summary:"条件の確認を優先します。",actions:["提案前に勤務条件を照合する"],count:2,generatedAt:"2026-10-10T05:00:00Z"};
+  const result = {advice,stale:false,count:2,configured:true,pending:false,usage:{userRemaining:2,teamRemaining:9,resetAt:"2026-10-10T15:00:00Z"}};
+  const calls: {url:string;init?:RequestInit}[] = [];
+  let deadlines = 0;
+  t.mock.method(AbortSignal,"timeout",(milliseconds:number) => { deadlines++; assert.equal(milliseconds,45_000); return deadline.signal; });
+  t.mock.method(globalThis,"fetch",async (url:string|URL|Request,init?:RequestInit) => {
+    calls.push({url:String(url),init});
+    if (calls.length === 1) throw new TypeError("temporary read interruption");
+    return new Response(JSON.stringify({ok:true,data:result}));
+  });
+  const pending = sheetRequest(endpoint,"readInterviewAdvice",{period:"2026-10"},{token:"test-token"});
+  await flushMicrotasks(); t.mock.timers.tick(749); await flushMicrotasks(); assert.equal(calls.length,1);
+  t.mock.timers.tick(1); assert.deepEqual(await pending,result);
+  assert.equal(calls.length,2); assert.equal(deadlines,1);
+  assert.ok(calls.every(call => call.url === endpoint && call.init?.method === "POST" && JSON.parse(String(call.init?.body)).action === "readInterviewAdvice"));
+  assert.equal(calls[0].init?.body,calls[1].init?.body); assert.equal(calls[0].init?.signal,calls[1].init?.signal);
+});
+
+for (const action of ["analyzeInterviewReviews","readInterviewAdvice"]) test(`${action} network failure directs users to saved advice without suggesting a business-save replay`, async t => {
+  t.mock.timers.enable({apis:["setTimeout"]});
+  let calls = 0;
+  t.mock.method(globalThis,"fetch",async () => { calls++; throw new TypeError("offline"); });
+  const pending = sheetRequest(endpoint,action,{period:"2026-10"},{token:"test-token"});
+  const checked = assert.rejects(pending,(error:unknown) => {
+    assert.ok(error instanceof SheetApiError); assert.equal(error.code,"NETWORK");
+    assert.match(error.message,/改善案/); assert.match(error.message,/理由の記録は保存済み/); assert.match(error.message,/再取得/);
+    assert.doesNotMatch(error.message,/保存結果を確認できない|同じ内容で再試行|入力は残っています/);
+    return true;
+  });
+  await flushMicrotasks(); if (action === "readInterviewAdvice") t.mock.timers.tick(750);
+  await checked; assert.equal(calls,action === "readInterviewAdvice" ? 2 : 1);
+});
+
+for (const action of ["analyzeInterviewReviews","readInterviewAdvice"]) test(`${action} timeout preserves recorded reasons and offers saved-result recovery`, async t => {
+  const deadline = new AbortController();
+  let calls = 0;
+  t.mock.method(AbortSignal,"timeout",(milliseconds:number) => { assert.equal(milliseconds,45_000); return deadline.signal; });
+  t.mock.method(globalThis,"fetch",async (_url:string|URL|Request,init?:RequestInit) => {
+    calls++;
+    return new Promise<Response>((_resolve,reject) => init?.signal?.addEventListener("abort",() => reject(init.signal?.reason),{once:true}));
+  });
+  const pending = sheetRequest(endpoint,action,{period:"2026-10"});
+  const checked = assert.rejects(pending,(error:unknown) => {
+    assert.ok(error instanceof SheetApiError); assert.equal(error.code,"TIMEOUT");
+    assert.match(error.message,/改善案.*45秒/); assert.match(error.message,/理由の記録は保存済み/); assert.match(error.message,/保存済みの改善案を再取得/);
+    assert.doesNotMatch(error.message,/保存結果を確認できない|同じ内容で再試行/);
+    return true;
+  });
+  await flushMicrotasks(); deadline.abort(new DOMException("advice deadline expired","TimeoutError"));
+  await checked; assert.equal(calls,1);
 });

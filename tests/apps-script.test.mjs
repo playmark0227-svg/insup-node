@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { gzipSync, gunzipSync } from "node:zlib";
 import vm from "node:vm";
 import test from "node:test";
 
 const CODE_PATH = fileURLToPath(new URL("../google-apps-script/Code.gs", import.meta.url));
 const clone = value => structuredClone(value);
 const bytes = value => typeof value === "string" ? Buffer.from(value) : Buffer.from(value.map(n => n & 255));
+const mockBlob = (value,contentType=null) => ({ getBytes: () => signedBytes(bytes(value)), getDataAsString: () => bytes(value).toString("utf8"), getContentType: () => contentType });
 const signedBytes = buffer => [...buffer].map(n => n > 127 ? n - 256 : n);
 const columnNumber = name => [...name.toUpperCase()].reduce((sum, letter) => sum * 26 + letter.charCodeAt(0) - 64, 0);
 const present = value => value !== undefined && value !== null && value !== "";
@@ -373,7 +375,9 @@ export function createHarness({ spreadsheetId = "test-spreadsheet", sheets = [],
       base64EncodeWebSafe: value => bytes(value).toString("base64url"),
       base64Decode: value => signedBytes(Buffer.from(value, "base64")),
       base64DecodeWebSafe: value => signedBytes(Buffer.from(value, "base64url")),
-      newBlob: value => ({ getBytes: () => signedBytes(bytes(value)), getDataAsString: () => bytes(value).toString() }),
+      newBlob: (value,contentType=null) => mockBlob(value,contentType),
+      gzip: blob => mockBlob(signedBytes(gzipSync(bytes(blob.getBytes()))),"application/gzip"),
+      ungzip: blob => { if(!blob.getContentType())throw new Error("Blob object must have non-null content type for this operation");return mockBlob(signedBytes(gunzipSync(bytes(blob.getBytes()))),"application/octet-stream"); },
       formatDate: (value, timezone, pattern) => {
         const date = new RealDate(value.getTime());
         const offset = timezone === "Asia/Tokyo" ? 9 * 3600 * 1000 : 0;
@@ -2108,4 +2112,102 @@ test("AI refuses unconfirmed free tier and handles free quota exhaustion without
  assert.equal(assertFailure(request(harness,"analyzeInterviewReviews",{period:"all"},{token:player.token})).code,"AI_NOT_CONFIGURED");
  harness.properties.NODE_GEMINI_API_KEY="fixture-key";harness.properties.NODE_GEMINI_FREE_TIER_CONFIRMED="true";harness.context.CacheService={getScriptCache:()=>({get:()=>null})};let calls=0;harness.context.UrlFetchApp.fetch=()=>{calls++;return {getResponseCode:()=>429};};
  for(let i=0;i<4;i++)assert.equal(assertFailure(request(harness,"analyzeInterviewReviews",{period:"all"},{token:player.token})).code,"AI_LIMIT");assert.equal(calls,3);
+});
+
+function readyAiFixture() {
+ const f=reviewFixture();assertSuccess(request(f.harness,"saveInterviewReview",f.payload,{token:f.player.token,operationId:randomUUID()}));
+ f.harness.properties.NODE_GEMINI_API_KEY="fixture-key";f.harness.properties.NODE_GEMINI_FREE_TIER_CONFIRMED="true";
+ f.answer={summary:"条件確認から始めます。件数だけでは原因を断定できません。",actions:["提案前に希望条件を本人に確認し、クライアントと照合する"]};
+ f.response=()=>({getResponseCode:()=>200,getContentText:()=>JSON.stringify({candidates:[{content:{parts:[{text:JSON.stringify(f.answer)}]}}]})});
+ return f;
+}
+test("advice survives cache eviction, has current allowance, and is isolated by actor and period",()=>{
+ const f=readyAiFixture();let calls=0;f.harness.context.UrlFetchApp.fetch=()=>{calls++;return f.response();};
+ const generate=()=>assertSuccess(request(f.harness,"analyzeInterviewReviews",{period:"2026-10"},{token:f.player.token}));
+ const generated=generate();assert.equal(generated.source,"generated");assert.deepEqual(generated.aggregate,[{category:"条件のずれ",count:1}]);assert.equal(generated.usage.userRemaining,2);assert.equal(generated.usage.teamRemaining,9);assert.equal(generated.usage.resetAt,"2026-10-07T15:00:00.000Z");
+ f.harness.context.CacheService={getScriptCache:()=>({get:()=>null,put:()=>{}})};
+ const restored=assertSuccess(request(f.harness,"readInterviewAdvice",{period:"2026-10"},{token:f.player.token}));assert.equal(restored.advice.summary,generated.summary);assert.equal(restored.advice.source,"saved");assert.equal(restored.stale,false);assert.equal(restored.pending,false);assert.equal(restored.configured,true);
+ f.harness.properties.NODE_AI_QUOTA=JSON.stringify({day:"2026-10-07",total:10,users:{"ND-001":3}});
+ assert.equal(generate().usage.userRemaining,0);assert.equal(calls,1,"saved identical input does not spend another request even at the daily limit");
+ const other=authenticate(f.harness,"ND-002");assert.equal(assertSuccess(request(f.harness,"readInterviewAdvice",{period:"2026-10"},{token:other.token})).advice,null);
+ assert.equal(assertSuccess(request(f.harness,"readInterviewAdvice",{period:"all"},{token:f.player.token})).advice,null);
+ assert.equal(assertSuccess(request(f.harness,"readInterviewAdvice",{period:"2026-10"},{token:f.admin.token})).advice,null);
+ delete f.harness.properties.NODE_GEMINI_API_KEY;const disconnected=assertSuccess(request(f.harness,"readInterviewAdvice",{period:"2026-10"},{token:f.player.token}));assert.equal(disconnected.configured,false);assert.equal(disconnected.advice.summary,generated.summary);
+ assert.equal(assertFailure(request(f.harness,"readInterviewAdvice",{period:"2026-10"},{token:"invalid"})).code,"UNAUTHENTICATED");
+});
+test("changed categories or matched outcomes mark the previous advice stale without discarding it",()=>{
+ const f=readyAiFixture();f.harness.context.UrlFetchApp.fetch=f.response;
+ const report=assertSuccess(request(f.harness,"analyzeInterviewReviews",{period:"all"},{token:f.player.token}));
+ const reviews=f.harness.spreadsheet.getSheetByName("_NODE_interview_reviews");reviews.getRange(2,4).setValue("事前確認不足");
+ const changed=assertSuccess(request(f.harness,"readInterviewAdvice",{period:"all"},{token:f.player.token}));assert.equal(changed.stale,true);assert.equal(changed.count,1);assert.deepEqual(changed.aggregate,[{category:"事前確認不足",count:1}]);assert.equal(changed.advice.summary,report.summary);
+ f.harness.spreadsheet.getSheetById(MATCHING_SHEET_ID).getRange(2,22).setValue("2026-10-07");
+ const matched=assertSuccess(request(f.harness,"readInterviewAdvice",{period:"all"},{token:f.player.token}));assert.equal(matched.stale,true);assert.equal(matched.count,0);assert.equal(matched.advice.count,1);assert.equal(matched.advice.summary,report.summary);
+});
+test("a simultaneous retry exposes pending status and does not reserve quota or call Gemini twice",()=>{
+ const f=readyAiFixture();let calls=0;f.harness.context.UrlFetchApp.fetch=()=>{
+   calls++;assert.equal(f.harness.locks.held,false,"external AI request must not hold the business-write lock");
+   const reading=assertSuccess(request(f.harness,"readInterviewAdvice",{period:"all"},{token:f.player.token}));assert.equal(reading.pending,true);assert.ok(reading.pendingUntil);
+   assert.equal(assertFailure(request(f.harness,"analyzeInterviewReviews",{period:"all"},{token:f.player.token})).code,"AI_IN_PROGRESS");
+   assert.equal(JSON.parse(f.harness.properties.NODE_AI_QUOTA).total,1);return f.response();
+ };
+ assertSuccess(request(f.harness,"analyzeInterviewReviews",{period:"all"},{token:f.player.token}));assert.equal(calls,1);
+ const reading=assertSuccess(request(f.harness,"readInterviewAdvice",{period:"all"},{token:f.player.token}));assert.equal(reading.pending,false);assert.equal(reading.advice.source,"saved");assert.equal(reading.usage.userRemaining,2);
+});
+test("failed new generation releases its reservation and preserves an earlier usable report",()=>{
+ const f=readyAiFixture();f.harness.context.UrlFetchApp.fetch=f.response;const old=assertSuccess(request(f.harness,"analyzeInterviewReviews",{period:"all"},{token:f.player.token}));
+ f.harness.spreadsheet.getSheetByName("_NODE_interview_reviews").getRange(2,4).setValue("理由未確認");
+ f.harness.context.UrlFetchApp.fetch=()=>{throw new Error("private provider diagnostic fixture-key");};
+ const error=assertFailure(request(f.harness,"analyzeInterviewReviews",{period:"all"},{token:f.player.token}));assert.equal(error.code,"AI_UNAVAILABLE");assert.ok(!error.message.includes("fixture-key"));
+ const reading=assertSuccess(request(f.harness,"readInterviewAdvice",{period:"all"},{token:f.player.token}));assert.equal(reading.pending,false);assert.equal(reading.stale,true);assert.equal(reading.advice.summary,old.summary);assert.equal(reading.usage.userRemaining,1);
+ f.harness.context.UrlFetchApp.fetch=f.response;const retry=assertSuccess(request(f.harness,"analyzeInterviewReviews",{period:"all"},{token:f.player.token}));assert.equal(retry.source,"generated");assert.deepEqual(retry.aggregate,[{category:"理由未確認",count:1}]);assert.equal(retry.usage.userRemaining,0);
+});
+test("expired pending reservations recover after six minutes and daily quota resets in JST",()=>{
+ const f=readyAiFixture();let calls=0;f.harness.context.UrlFetchApp.fetch=()=>{calls++;return f.response();};
+ const store=f.harness.context.readStore_({readOnly:true}),scope=f.harness.context.aiScope_(store,{id:"ND-001",role:"player"},"all");
+ f.harness.properties.NODE_AI_PENDING=JSON.stringify({[scope]:{id:"expired-worker",signature:"previous",expiresAt:f.harness.clock.milliseconds-1}});
+ f.harness.properties.NODE_AI_QUOTA=JSON.stringify({day:"2026-10-06",total:10,users:{"ND-001":3}});
+ const report=assertSuccess(request(f.harness,"analyzeInterviewReviews",{period:"all"},{token:f.player.token}));assert.equal(report.usage.userRemaining,2);assert.equal(report.usage.teamRemaining,9);assert.equal(calls,1);assert.deepEqual(JSON.parse(f.harness.properties.NODE_AI_PENDING),{});
+});
+test("saved report storage is bounded and rejects overlarge content without truncating it",()=>{
+ const f=readyAiFixture(),result={summary:"集計の要約",actions:["面談前の条件確認"],count:1,period:"all",aggregate:[{category:"条件のずれ",count:1}],inputSignature:"signature",generatedAt:"2026-10-07T06:00:00.000Z"};
+ for(let i=0;i<27;i++)f.harness.context.saveAiAdvice_(String(i),result);
+ const index=JSON.parse(f.harness.properties.NODE_AI_ADVICE_INDEX);assert.equal(index.length,24);assert.equal(f.harness.context.aiAdvice_("0"),null);assert.equal(f.harness.context.aiAdvice_("26").summary,result.summary);
+ const keys=Object.keys(f.harness.properties).filter(k=>k.startsWith("NODE_AI_ADVICE_")&&k!=="NODE_AI_ADVICE_INDEX");assert.equal(keys.length,24);assert.ok(keys.every(k=>f.harness.properties[k].length<=8000));
+ const oversized={...result,summary:Array.from({length:1000},()=>randomUUID()).join("")};assert.throws(()=>f.harness.context.saveAiAdvice_("oversized",oversized),error=>error.nodeCode==="AI_UNAVAILABLE");assert.equal(f.harness.context.aiAdvice_("oversized"),null);assert.equal(JSON.parse(f.harness.properties.NODE_AI_ADVICE_INDEX).length,24);
+});
+test("read advice rechecks access after aggregation and refuses a revoked session",()=>{
+ const f=readyAiFixture();let revoked=false;f.harness.spreadsheet.readObserver=read=>{
+  if(!revoked&&read.sheetId===f.harness.spreadsheet.getSheetByName("_NODE_interview_reviews").id){revoked=true;f.harness.context.props_().deleteProperty(f.harness.context.sessionKey_(f.player.token));}
+ };
+ assert.equal(assertFailure(request(f.harness,"readInterviewAdvice",{period:"all"},{token:f.player.token})).code,"UNAUTHENTICATED");assert.equal(revoked,true);
+});
+test("AI advice and live usability probe pass an explicit gzip MIME type when restoring saved blobs",()=>{
+ const f=readyAiFixture(),utilities=f.harness.context.Utilities,ungzip=utilities.ungzip;
+ const compressed=utilities.gzip(utilities.newBlob("{}","application/json")).getBytes();assert.throws(()=>ungzip(utilities.newBlob(compressed)),/non-null content type/);
+ const contentTypes=[];utilities.ungzip=blob=>{contentTypes.push(blob.getContentType());return ungzip(blob);};f.harness.context.UrlFetchApp.fetch=f.response;
+ const generated=assertSuccess(request(f.harness,"analyzeInterviewReviews",{period:"all"},{token:f.player.token}));
+ const restored=assertSuccess(request(f.harness,"readInterviewAdvice",{period:"all"},{token:f.player.token}));assert.equal(restored.advice.summary,generated.summary);
+ assert.equal(f.harness.context.verifyNodeAiUsability().success,true);assert.deepEqual(contentTypes,["application/gzip","application/gzip"]);
+});
+test("owner AI usability probe exercises the production schema and restores only its temporary property",()=>{
+ for(const prior of [null,"pre-existing probe value"]){
+  const harness=createHarness({properties:{NODE_CONFIG:JSON.stringify({ownerEmail:"owner@example.test"}),NODE_GEMINI_API_KEY:"fixture-key",NODE_GEMINI_FREE_TIER_CONFIRMED:"true",NODE_AI_QUOTA:JSON.stringify({day:"2026-10-07",total:9,users:{"ND-001":2}}),NODE_AI_ADVICE_INDEX:JSON.stringify([{scope:"previous-scope",generatedAt:"previous-time"}]),NODE_AI_ADVICE_previous:"preserved-report",...(prior===null?{}:{NODE_AI_UX_PROBE:prior})}});
+  const before=clone(harness.properties);harness.spreadsheet.beforeRead=()=>{throw new Error("The usability probe must not read business sheets");};let calls=0;
+  harness.context.UrlFetchApp.fetch=(url,options)=>{
+   calls++;assert.equal(harness.locks.held,false);assert.equal(url,"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent");assert.equal(options.headers["x-goog-api-key"],"fixture-key");
+   const payload=JSON.parse(options.payload);assert.deepEqual(JSON.parse(payload.contents[0].parts[0].text),[{category:"事前確認不足",count:2},{category:"理由未確認",count:1}]);assert.equal(payload.generationConfig.responseMimeType,"application/json");assert.deepEqual(payload.generationConfig.responseSchema.required,["summary","actions"]);
+   return {getResponseCode:()=>200,getContentText:()=>JSON.stringify({candidates:[{content:{parts:[{text:JSON.stringify({summary:"Private response: 原因の断定はできません。",actions:["面談前に本人と条件を確認","クライアントから未マッチ理由を確認"]})}]}}]})};
+  };
+  const proof=harness.context.verifyNodeAiUsability();assert.equal(proof.success,true);assert.equal(proof.model,"gemini-3.5-flash-lite");assert.equal(proof.actions,2);assert.ok(proof.storageBytes<8000);assert.equal(calls,1);assert.deepEqual(harness.properties,before);assert.equal(harness.writes.length,0);assert.equal(harness.spreadsheet.reads.length,0);
+  const logs=JSON.stringify(harness.logs);assert.ok(!logs.includes("fixture-key"));assert.ok(!logs.includes("Private response"));
+ }
+});
+test("owner AI probe refuses unauthorized or unconfirmed use before fetching and restores on persistence failure",()=>{
+ const harness=createHarness({properties:{NODE_CONFIG:JSON.stringify({ownerEmail:"owner@example.test"}),NODE_GEMINI_API_KEY:"fixture-key",NODE_GEMINI_FREE_TIER_CONFIRMED:"true",NODE_AI_UX_PROBE:"previous"}}),before=clone(harness.properties);
+ let calls=0;harness.context.UrlFetchApp.fetch=()=>{calls++;return {getResponseCode:()=>200,getContentText:()=>JSON.stringify({candidates:[{content:{parts:[{text:JSON.stringify({summary:"検証用要約",actions:["検証用確認"]})}]}}]})};};
+ harness.context.Session.getActiveUser=()=>({getEmail:()=>"other@example.test"});assert.throws(()=>harness.context.verifyNodeAiUsability(),error=>error.nodeCode==="FORBIDDEN");assert.equal(calls,0);
+ harness.context.Session.getActiveUser=()=>({getEmail:()=>"owner@example.test"});harness.properties.NODE_GEMINI_FREE_TIER_CONFIRMED="false";assert.throws(()=>harness.context.verifyNodeAiUsability(),error=>error.nodeCode==="AI_NOT_CONFIGURED");assert.equal(calls,0);harness.properties.NODE_GEMINI_FREE_TIER_CONFIRMED="true";
+ const api=harness.context.PropertiesService.getScriptProperties(),setProperty=api.setProperty;
+ api.setProperty=function(key,value){if(key==="NODE_AI_UX_PROBE"&&value!=="previous")throw new Error("Injected property storage failure");return setProperty.call(this,key,value);};
+ assert.throws(()=>harness.context.verifyNodeAiUsability(),/Injected property storage failure/);assert.equal(calls,1);assert.deepEqual(harness.properties,before);assert.equal(harness.logs.length,0);assert.equal(harness.writes.length,0);assert.equal(harness.spreadsheet.reads.length,0);
 });

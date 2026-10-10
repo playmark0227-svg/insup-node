@@ -9,6 +9,9 @@ export type ManagementRow = {row:number;version:string;cells:ManagementCell[]};
 export type ManagementTable = {sheetId:number;title:string;startRow:number;rowCount:number;columnCount:number;readonly:boolean;headers?:string[];rows:ManagementRow[]};
 export type ManagementTableInfo = {sheetId:number;title:string;rowCount:number;columnCount:number};
 export type InterviewReview = {recordId:string;playerId:string;interviewDate:string;category:string;memo:string;nextAction:string;version:string;updatedAt:string};
+export type InterviewAdviceUsage = {userRemaining:number;teamRemaining:number;resetAt:string};
+export type InterviewAdvice = {summary:string;actions:string[];count:number;generatedAt:string;period?:string;source?:"generated"|"saved";aggregate?:{category:string;count:number}[];usage?:InterviewAdviceUsage};
+export type InterviewAdviceState = {advice:InterviewAdvice|null;stale:boolean;count:number;usage:InterviewAdviceUsage;configured:boolean;pending:boolean};
 export type SheetSnapshot = {
   reviewFeature?: boolean;
   interviewReviews?: InterviewReview[];
@@ -101,6 +104,9 @@ async function recoverContent(url: string, signal: AbortSignal): Promise<{ respo
 }
 
 function connectionError(action: string, timedOut: boolean): SheetApiError {
+  if (["analyzeInterviewReviews","readInterviewAdvice"].includes(action)) return new SheetApiError(timedOut?"TIMEOUT":"NETWORK",timedOut
+    ? "改善案の応答が45秒以内に届きませんでした。理由の記録は保存済みです。「保存済みの改善案を再取得」で結果を確認できます。"
+    : "改善案の通信が途中で切れました。理由の記録は保存済みです。接続を確認して改善案を再取得してください。");
   if (timedOut) {
     const message = action === "login"
       ? "ログインの応答が45秒以内に届きませんでした。IDとパスワードはそのままで、もう一度ログインしてください。"
@@ -130,7 +136,7 @@ export async function sheetRequest<T>(
   const target = validateEndpoint(endpoint);
   const timeout = AbortSignal.timeout(45_000);
   const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
-  const readOnly = ["snapshot","health","managementTables","managementTable"].includes(action);
+  const readOnly = ["snapshot","health","managementTables","managementTable","readInterviewAdvice"].includes(action);
   const body = JSON.stringify({ version: 1, action, payload, token: options.token, operationId: options.operationId });
   for (let attempt = 0; attempt < (readOnly ? 2 : 1); attempt++) {
     let recoveringResult = false;
