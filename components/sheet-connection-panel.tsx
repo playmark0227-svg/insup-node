@@ -3,6 +3,7 @@ import { FileSpreadsheet, RefreshCw, CheckCircle2, Clock3 } from "lucide-react";
 import { Input } from "./ui/input";
 import { matchingFields } from "../lib/management-data";
 import type { SheetDestination } from "../lib/sheets-client";
+import { sheetNotices } from "../lib/sheet-notices";
 
 type Props = {
   endpoint: string; mode: "live" | "demo"; busy: boolean; error: string;
@@ -10,11 +11,13 @@ type Props = {
   destination?: SheetDestination;
   onConnect: (value: string) => Promise<void>; onRefresh: () => Promise<void>;
   onDemo?: () => void;
+  onReviewPlayers?: () => void;
 };
 
 export function SheetConnectionPanel(props: Props) {
   const [url, setUrl] = useState(props.endpoint);
   const [message, setMessage] = useState("");
+  const notices = sheetNotices(props.warnings);
   return <div className="connection-layout">
     <section className="card connection-main">
       <span className="connection-symbol"><FileSpreadsheet size={30}/></span>
@@ -35,7 +38,12 @@ export function SheetConnectionPanel(props: Props) {
         <button className="primary-button" disabled={props.busy}>{props.busy ? "確認中…" : "接続先を確認して設定"}</button>
         {(message || props.error) && <p className="connection-message" role="status">{message || props.error}</p>}
       </form>
-      {props.warnings.length > 0 && <div className="info-box" role="status">{props.warnings.map((warning,i)=><p key={i}>{warning}</p>)}</div>}
+      {notices.alerts.length > 0 && <div className="info-box" role="status">{notices.alerts.map((warning,i)=><p key={i}>{warning}</p>)}</div>}
+      {notices.unassignedRows > 0 && props.onReviewPlayers && <details className="connection-help">
+        <summary>担当者の確認（{notices.unassignedRows}件）</summary>
+        <p className="panel-note">担当者を確認する必要がある記録があります。プレイヤー管理で、シートに記載された担当名を登録すると本人の成果に反映されます。</p>
+        <button className="text-button" onClick={props.onReviewPlayers}>プレイヤー管理で確認する</button>
+      </details>}
       <details className="connection-help">
         <summary>管理者向けの初期設定</summary>
         <ol>
