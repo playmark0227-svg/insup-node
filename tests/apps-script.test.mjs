@@ -196,7 +196,10 @@ class MockSpreadsheet {
     const replies = [];
     try {
       for (const request of body.requests ?? []) {
-        if (request.updateCells || request.appendCells) {
+        if(request.addSheet){
+          const p=request.addSheet.properties;if(this.getSheetByName(p.title)||this.getSheetById(p.sheetId))throw new Error("Duplicate sheet");
+          const sheet=new MockSheet(this,{id:p.sheetId,name:p.title});sheet.maxRows=p.gridProperties.rowCount;this.sheets.push(sheet);replies.push({addSheet:{properties:p}});
+        } else if (request.updateCells || request.appendCells) {
           const input = request.updateCells ?? request.appendCells;
           const sheet = this.getSheetById(input.sheetId ?? input.range?.sheetId ?? input.start?.sheetId);
           if (!sheet) throw new Error("Unknown destination sheet");
@@ -262,6 +265,7 @@ class MockSpreadsheet {
       }
       return { status: 200, body: JSON.stringify({ spreadsheetId: this.id, replies }) };
     } catch (error) {
+      this.sheets=saved.map(x=>x.sheet);
       saved.forEach(({ sheet, values, formulas, validations, maxRows }) => Object.assign(sheet, { values, formulas, validations, maxRows }));
       this.metadata = oldMetadata.map(({ item, value, row }) => Object.assign(item, { value, row }));
       this.nextMetadataId = initialMetadataId;
@@ -2069,4 +2073,39 @@ test("later management pages retain the original field headings",()=>{
  const page=assertSuccess(request(f.harness,"managementTable",{sheetId:sheet.id,startRow:51},{token:f.admin.token}));
  assert.equal(page.rows[0].row,51);assert.equal(page.headers[0],"案件名");assert.equal(page.headers[2],"原価");
  assert.ok(f.harness.sheetReads.some(read=>read.options.ranges?.[0]?.endsWith("A2:Z2")));
+});
+
+function reviewFixture() {
+ const f=signedInFixture();f.harness.spreadsheet.getSheetById(MATCHING_SHEET_ID).getRange(2,17).setValues([["2026-10-07"]]);
+ const snapshot=assertSuccess(request(f.harness,"snapshot",{}, {token:f.player.token}));
+ f.payload={recordId:f.records[0].id,rowVersion:snapshot.records[0].rowVersion,reviewVersion:"",category:"条件のずれ",memo:"本人候補の詳しい秘密",nextAction:"次回の確認"};return f;
+}
+test("interview review saves only in the sidecar, preserves KPI/business cells, and retries once",()=>{
+ const {harness,player,payload}=reviewFixture();const before=clone(harness.spreadsheet.getSheetById(MATCHING_SHEET_ID).values);const id=randomUUID();
+ const saved=assertSuccess(request(harness,"saveInterviewReview",payload,{token:player.token,operationId:id}));
+ assert.equal(saved.snapshot.interviewReviews.length,1);assert.equal(saved.snapshot.interviewReviews[0].memo,payload.memo);
+ assert.deepEqual(harness.spreadsheet.getSheetById(MATCHING_SHEET_ID).values,before);
+ assertSuccess(request(harness,"saveInterviewReview",payload,{token:player.token,operationId:id}));assert.equal(harness.spreadsheet.getSheetByName("_NODE_interview_reviews").getLastRow(),2);
+});
+test("review requires actual C interview and denies another player's row and stale version",()=>{
+ const {harness,player,payload}=reviewFixture();
+ assert.equal(assertFailure(request(harness,"saveInterviewReview",{...payload,recordId:"ROW-22222222-2222-4222-8222-222222222222"},{token:player.token,operationId:randomUUID()})).code,"FORBIDDEN");
+ assert.equal(assertFailure(request(harness,"saveInterviewReview",{...payload,rowVersion:"stale"},{token:player.token,operationId:randomUUID()})).code,"CONFLICT");
+ const sheet=harness.spreadsheet.getSheetById(MATCHING_SHEET_ID);sheet.getRange(2,17).setValues([[""]]);const s=assertSuccess(request(harness,"snapshot",{}, {token:player.token}));
+ assert.equal(assertFailure(request(harness,"saveInterviewReview",{...payload,rowVersion:s.records[0].rowVersion},{token:player.token,operationId:randomUUID()})).code,"VALIDATION");
+});
+test("AI payload contains categories/counts only and caches without another paid-capable call",()=>{
+ const {harness,player,payload}=reviewFixture();assertSuccess(request(harness,"saveInterviewReview",payload,{token:player.token,operationId:randomUUID()}));
+ harness.properties.NODE_GEMINI_API_KEY="fixture-key";harness.properties.NODE_GEMINI_FREE_TIER_CONFIRMED="true";
+ const cached=new Map();harness.context.CacheService={getScriptCache:()=>({get:k=>cached.get(k),put:(k,v)=>cached.set(k,v)})};let calls=0;
+ harness.context.UrlFetchApp.fetch=(url,options)=>{calls++;assert.equal(url,"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent");assert.equal(options.headers["x-goog-api-key"],"fixture-key");const data=JSON.parse(options.payload);assert.deepEqual(JSON.parse(data.contents[0].parts[0].text),[{category:"条件のずれ",count:1}]);assert.ok(!options.payload.includes("秘密"));return {getResponseCode:()=>200,getContentText:()=>JSON.stringify({candidates:[{content:{parts:[{text:JSON.stringify({summary:"条件確認を検討。原因の断定はできません。",actions:["条件を面談前に確認"]})}]}}]})};};
+ assert.equal(assertSuccess(request(harness,"analyzeInterviewReviews",{period:"2026-10"},{token:player.token})).count,1);
+ assertSuccess(request(harness,"analyzeInterviewReviews",{period:"2026-10"},{token:player.token}));assert.equal(calls,1);
+ harness.spreadsheet.getSheetById(MATCHING_SHEET_ID).getRange(2,22).setValues([["2026-10-08"]]);assert.equal(assertFailure(request(harness,"analyzeInterviewReviews",{period:"2026-10"},{token:player.token})).code,"VALIDATION");
+});
+test("AI refuses unconfirmed free tier and handles free quota exhaustion without fallback",()=>{
+ const {harness,player,payload}=reviewFixture();assertSuccess(request(harness,"saveInterviewReview",payload,{token:player.token,operationId:randomUUID()}));
+ assert.equal(assertFailure(request(harness,"analyzeInterviewReviews",{period:"all"},{token:player.token})).code,"AI_NOT_CONFIGURED");
+ harness.properties.NODE_GEMINI_API_KEY="fixture-key";harness.properties.NODE_GEMINI_FREE_TIER_CONFIRMED="true";harness.context.CacheService={getScriptCache:()=>({get:()=>null})};let calls=0;harness.context.UrlFetchApp.fetch=()=>{calls++;return {getResponseCode:()=>429};};
+ for(let i=0;i<4;i++)assert.equal(assertFailure(request(harness,"analyzeInterviewReviews",{period:"all"},{token:player.token})).code,"AI_LIMIT");assert.equal(calls,3);
 });

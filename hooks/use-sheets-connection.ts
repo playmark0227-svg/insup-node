@@ -187,6 +187,14 @@ export function useSheetsConnection() {
     finally { mutationRunning.current = false; if (isCurrent(g)) setBusy(false); }
   };
 
+  const analyzeReviews = async (period:string) => {
+    if (!token.current) throw new Error("ログインしてください。");
+    const g=generation.current;
+    const data=await sheetRequest<{summary:string;actions:string[];count:number;generatedAt:string}>(endpoint,"analyzeInterviewReviews",{period},{token:token.current});
+    if(!isCurrent(g))throw new Error("ログイン状態が変更されました。");
+    return data;
+  };
+
   const readManagement = async <T,>(action: "managementTables" | "managementTable", payload: unknown = {}): Promise<T> => {
     if (!token.current || snapshot?.self.role!=="admin") throw new Error("管理者でログインしてください。");
     const g=generation.current;
@@ -206,5 +214,5 @@ export function useSheetsConnection() {
   };
 
   return { ready, endpoint, mode, players, setPlayers, activities, setActivities, snapshot, authenticated, loadPhase, busy, error,
-    credentials, dismissCredentials:() => setCredentials(null), connect, login, logout, refresh, mutate, readManagement, showDemo };
+    credentials, dismissCredentials:() => setCredentials(null), connect, login, logout, refresh, mutate, readManagement, analyzeReviews, showDemo };
 }

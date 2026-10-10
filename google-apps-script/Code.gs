@@ -119,7 +119,8 @@ function nodeHandle_(request) {
   var action = request.action;
   if (action === 'health') return health_();
   if (action === 'login') return login_(request.payload || {});
-  if (['snapshot','logout','saveActivity','updateStatus','updateProfile','createPlayer','updateRecord','cancelAchievement','restoreChange','managementTables','managementTable','saveManagementRow','createCandidate'].indexOf(action) < 0) fail_('BAD_REQUEST', '対応していない操作です。');
+  if (['snapshot','logout','saveActivity','updateStatus','updateProfile','createPlayer','updateRecord','cancelAchievement','restoreChange','managementTables','managementTable','saveManagementRow','createCandidate','saveInterviewReview','analyzeInterviewReviews'].indexOf(action) < 0) fail_('BAD_REQUEST', '対応していない操作です。');
+  if (action === 'analyzeInterviewReviews') return analyzeInterviewReviews_(request);
   if (action === 'managementTables' || action === 'managementTable') {
     var session = authenticate_(request.token), accounts = readAccountStore_(), actor = activeActor_(accounts,session);
     requireAdmin_(actor);
@@ -149,6 +150,7 @@ function nodeHandle_(request) {
       return mutationResponse_(readStore_(), user, action, previous.result, operationId, request.token);
     }
     var plan;
+    if (action === 'saveInterviewReview') plan = planInterviewReview_(store,user,payload);
     if (action === 'saveActivity') plan = planActivity_(store, user, payload.activity);
     if (action === 'updateStatus') plan = planStatus_(store, user, payload);
     if (action === 'updateProfile') plan = planProfile_(store, user, payload.player);
@@ -423,6 +425,8 @@ function publicPlayer_(player) { return { id: player.id, name: player.name, team
 function buildSnapshot_(store, user) {
   var all = activities_(store);
   var snapshot={ self: { playerId: user.id, role: user.role }, players: store.players.filter(function (p) { return p.active && p.role === 'player'; }).map(publicPlayer_), activities: all.filter(function (a) { return user.role === 'admin' || a.playerId === user.id; }), counts: countActivities_(all, store.players), syncedAt: new Date().toISOString(), warnings: store.warnings.slice(), writesEnabled: store.schemaCompatible&&writesEnabled_(store.config) && store.book.getSpreadsheetTimeZone() === 'Asia/Tokyo' };
+  snapshot.interviewReviews=readInterviewReviews_(store,user);
+  snapshot.reviewFeature=true;
   snapshot.records=store.schemaCompatible ? store.records.filter(function(r){return user.role==='admin'||r.playerId===user.id;}).map(publicRecord_) : [];
   if(user.role==='admin'){
     var prefix='https://docs.google.com/spreadsheets/d/'+encodeURIComponent(store.config.spreadsheetId)+'/edit#gid=';
@@ -1097,4 +1101,61 @@ function verifyNodeManagementCopy_(metrics,checkRecords) {
     if(hash_(stableJson_([finalValues.map(function(r){return r.map(valueKey_);}),finalFormulas]))!==fingerprint||sheetRowCount_(matching)!==beforeRows||stableJson_(config_())!==stableJson_(production))fail_('COPY_VERIFICATION_FAILED','後始末または接続設定の照合に失敗しました。');
     result.checked.push('既存値・数式・行数・本番接続設定の保持');Logger.log(JSON.stringify(result));return result;
   });
+}
+
+/* C-interview learning: detailed notes stay in the managed workbook. */
+var REVIEW_TAB='_NODE_interview_reviews';
+var REVIEW_HEADERS=['record_id','player_id','interview_date','category','memo','next_action','version','updated_at'];
+var REVIEW_CATEGORIES=['条件のずれ','事前確認不足','面談準備不足','仕事内容の認識違い','連絡・日程調整','募集枠・タイミング','他案件との比較','理由未確認','その他'];
+function reviewRows_(book) {
+  var sheet=book.getSheetByName(REVIEW_TAB);if(!sheet)return [];
+  if(sheet.getLastRow()>5001)fail_('REVIEW_LIMIT','振り返りが5000件を超えています。管理者に確認してください。');
+  return table_(sheet,REVIEW_HEADERS).slice(1);
+}
+function readInterviewReviews_(store,user) {
+  return reviewRows_(store.book).filter(function(r){var record=findRecord_(store,String(r[0]));return record&&(user.role==='admin'||record.playerId===user.id)&&record.playerId===String(r[1]);}).map(function(r){return {recordId:String(r[0]),playerId:String(r[1]),interviewDate:day_(findRecord_(store,String(r[0])).values[16])||String(r[2]),category:String(r[3]),memo:String(r[4]),nextAction:String(r[5]),version:String(r[6]),updatedAt:String(r[7])};});
+}
+function planInterviewReview_(store,user,payload) {
+  var record=findRecord_(store,payload.recordId);actorOwns_(user,record);checkVersion_(record,payload.rowVersion);
+  var interview=day_(record.values[16]);if(!interview)fail_('VALIDATION','C面談実施を先に登録してください。');
+  if(day_(record.values[21])||day_(record.values[23]))fail_('VALIDATION','マッチ済みの提案には未マッチ理由を登録できません。');
+  var rows=reviewRows_(store.book),index=rows.findIndex(function(r){return r[0]===record.recordId;});
+  if(index>=0&&rows[index][6]!==payload.reviewVersion||index<0&&payload.reviewVersion)fail_('CONFLICT','振り返りが更新されています。再取得してください。');
+  var values=[record.recordId,record.playerId,interview,choice_(payload.category,REVIEW_CATEGORIES),shortText_(payload.memo,2000,false),shortText_(payload.nextAction,1000,false),Utilities.getUuid(),new Date().toISOString()];
+  if(rows.filter(function(r){return r[0]===record.recordId;}).length>1)fail_('CONFLICT','振り返りが重複しています。管理者に確認してください。');
+  var sheet=store.book.getSheetByName(REVIEW_TAB),requests=[],id;
+  if(!sheet){id=Math.floor(Math.random()*1000000000);requests.push({addSheet:{properties:{sheetId:id,title:REVIEW_TAB,gridProperties:{rowCount:5001,columnCount:8}}}});requests.push(rowUpdateRequest_(id,1,REVIEW_HEADERS));}
+  else {id=sheet.getSheetId();if(sheet.getLastRow()>=5001&&index<0)fail_('REVIEW_LIMIT','振り返りの保存上限に達しました。');}
+  var row=index<0?rows.length+2:index+2;
+  if(sheet&&row>sheet.getMaxRows())requests.push({appendDimension:{sheetId:id,dimension:'ROWS',length:row-sheet.getMaxRows()}});
+  if(sheet&&row<=sheet.getMaxRows()&&sheet.getRange(row,1,1,8).getFormulas()[0].some(Boolean))fail_('FORMULA_PROTECTED','振り返りの保存先に数式があります。');
+  requests.push(rowUpdateRequest_(id,row,values));return {requests:requests,result:{recordId:record.recordId}};
+}
+function reviewAggregate_(store,user,period) {
+  if(period!=='all'&&!/^\d{4}-\d{2}(?:-\d{2})?$/.test(period))fail_('VALIDATION','集計期間を確認してください。');
+  var rows=readInterviewReviews_(store,user).filter(function(r){var record=findRecord_(store,r.recordId);return day_(record.values[16])&&!day_(record.values[21])&&!day_(record.values[23])&&(period==='all'||r.interviewDate.indexOf(period)===0);});
+  return REVIEW_CATEGORIES.map(function(category){return {category:category,count:rows.filter(function(r){return r.category===category;}).length};}).filter(function(r){return r.count>0;});
+}
+function analyzeInterviewReviews_(request) {
+  var session=authenticate_(request.token),store=readStore_({readOnly:true}),user=activeActor_(store,session),period=String((request.payload||{}).period||'');
+  var aggregate=reviewAggregate_(store,user,period),count=aggregate.reduce(function(n,r){return n+r.count;},0);
+  if(!count)fail_('VALIDATION','この期間の未マッチ理由を先に登録してください。');
+  var properties=props_(),key=properties.getProperty('NODE_GEMINI_API_KEY');
+  if(!key||properties.getProperty('NODE_GEMINI_FREE_TIER_CONFIRMED')!=='true')fail_('AI_NOT_CONFIGURED','管理者が課金未設定の専用Geminiプロジェクトを接続してください。');
+  var cacheKey='review-ai-'+hash_(user.id+'|'+user.role+'|'+period+'|'+stableJson_(aggregate)),cache=CacheService.getScriptCache(),cached=cache.get(cacheKey);
+  if(cached)return JSON.parse(cached);
+  withLock_(function(){
+    var quotaKey='NODE_AI_QUOTA',now=today_(),q=JSON.parse(properties.getProperty(quotaKey)||'{}');
+    if(q.day!==now)q={day:now,total:0,users:{}};
+    if(q.total>=10||(q.users[user.id]||0)>=3)fail_('AI_LIMIT','本日のAI利用上限です。理由の記録・集計は引き続き使えます。');
+    q.total++;q.users[user.id]=(q.users[user.id]||0)+1;properties.setProperty(quotaKey,JSON.stringify(q));
+  });
+  // Only fixed categories and counts are sent. No user text, names, IDs or dates.
+  var response=UrlFetchApp.fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent',{method:'post',contentType:'application/json',headers:{'x-goog-api-key':key},muteHttpExceptions:true,payload:JSON.stringify({systemInstruction:{parts:[{text:'人材紹介業務の改善支援。未マッチ理由の集計から日本語で傾向の要約と次回面談前にできる具体的な確認・準備を3つ提案。件数だけでは原因を断定できないと明示。個人の採用適否や順位を判断しない。理由未確認はクライアントへの確認を提案。JSONのみ: summary(文字列), actions(文字列の配列)。'}]},contents:[{role:'user',parts:[{text:JSON.stringify(aggregate)}]}],generationConfig:{temperature:0.2,maxOutputTokens:1800,responseMimeType:'application/json',responseSchema:{type:'OBJECT',properties:{summary:{type:'STRING'},actions:{type:'ARRAY',items:{type:'STRING'}}},required:['summary','actions']}}})});
+  if(response.getResponseCode()===429)fail_('AI_LIMIT','Googleの無料枠の上限です。時間をおいて再試行してください。有料処理への切り替えは行いません。');
+  if(response.getResponseCode()!==200)fail_('AI_UNAVAILABLE','AIから結果を取得できませんでした。理由の記録は保存されています。');
+  var body;try{var json=JSON.parse(response.getContentText());body=JSON.parse(json.candidates[0].content.parts.map(function(p){return p.text||'';}).join(''));}catch(e){fail_('AI_UNAVAILABLE','AIの応答形式を確認できませんでした。');}
+  if(typeof body.summary!=='string'||body.summary.length>4000||!Array.isArray(body.actions)||!body.actions.length||body.actions.length>5||body.actions.some(function(a){return typeof a!=='string'||a.length>1500;}))fail_('AI_UNAVAILABLE','AIの応答形式を確認できませんでした。');
+  snapshotActor_(store,request.token);
+  var result={summary:body.summary,actions:body.actions,count:count,generatedAt:new Date().toISOString()};cache.put(cacheKey,JSON.stringify(result),21600);return result;
 }

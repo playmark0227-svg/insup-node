@@ -8,7 +8,10 @@ export type ManagementCell = {column:number;value:string|number|boolean;display:
 export type ManagementRow = {row:number;version:string;cells:ManagementCell[]};
 export type ManagementTable = {sheetId:number;title:string;startRow:number;rowCount:number;columnCount:number;readonly:boolean;headers?:string[];rows:ManagementRow[]};
 export type ManagementTableInfo = {sheetId:number;title:string;rowCount:number;columnCount:number};
+export type InterviewReview = {recordId:string;playerId:string;interviewDate:string;category:string;memo:string;nextAction:string;version:string;updatedAt:string};
 export type SheetSnapshot = {
+  reviewFeature?: boolean;
+  interviewReviews?: InterviewReview[];
   records?: CandidateRecord[];
   self: { playerId: string; role: "admin" | "player" };
   players: SheetPlayer[];
@@ -213,6 +216,7 @@ export function assertSnapshot(value: unknown): asserts value is SheetSnapshot {
   if (s.records && (!Array.isArray(s.records) || s.records.some(r => typeof r.recordId!=="string" || typeof r.rowVersion!=="string" || typeof r.playerId!=="string" || typeof r.candidateName!=="string" || !Array.isArray(r.values) || r.values.length!==26 || !Array.isArray(r.formulaColumns) || r.values.some(v=>!["string","number","boolean"].includes(typeof v)) || (s.self.role==="player" && r.playerId!==s.self.playerId)))) {
     throw new SheetApiError("INVALID_RESPONSE","候補者情報の形式または閲覧権限を確認できませんでした。");
   }
+  if(s.interviewReviews && (!Array.isArray(s.interviewReviews)||s.interviewReviews.some(r=>[r.recordId,r.playerId,r.interviewDate,r.category,r.memo,r.nextAction,r.version,r.updatedAt].some(v=>typeof v!=="string")||(s.self.role==="player"&&r.playerId!==s.self.playerId))))throw new SheetApiError("INVALID_RESPONSE","振り返りの閲覧権限を確認できませんでした。");
   if (s.destination && (s.self.role !== "admin" || typeof s.destination.title !== "string" ||
       ![s.destination.matchingUrl, s.destination.kpiUrl].every(url => typeof url === "string" && /^https:\/\/docs\.google\.com\/spreadsheets\/d\/[A-Za-z0-9_-]+\/edit(?:\?gid=\d+(?:#gid=\d+)?|#gid=\d+)$/.test(url)))) {
     throw new SheetApiError("INVALID_RESPONSE", "保存先の情報を確認できませんでした。管理者で再ログインしてください。");
