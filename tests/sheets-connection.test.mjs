@@ -28,7 +28,7 @@ async function flush() { for (let i=0; i<12; i++) await Promise.resolve(); }
 
 // Execute the actual hook against a small deterministic hook runtime. This
 // exposes races and state restoration without adding a browser/test dependency.
-function harness(handle, {storedToken, malformedSession, deadlineController} = {}) {
+function harness(handle, {storedToken, malformedSession, deadlineController, browser} = {}) {
   const slots = [], effects = [], calls = [];
   let cursor = 0, stateUpdates = 0;
   const localStorage = storage({[ENDPOINT_KEY]:endpoint});
@@ -58,6 +58,7 @@ function harness(handle, {storedToken, malformedSession, deadlineController} = {
   const timeoutDurations=[];
   const deadlineSignals=deadlineController ? {any:signals=>AbortSignal.any(signals),timeout:ms=>{timeoutDurations.push(ms); return deadlineController.signal;}} : AbortSignal;
   const context=vm.createContext({exports,module:{exports},AbortController,AbortSignal:deadlineSignals,JSON,Error,localStorage,sessionStorage,
+    ...(browser || {}),
     fetch:async()=>({ok:true,json:async()=>({endpoint})}),
     require:name=>name==="react" ? react : name.includes("node-data") ? {initialPlayers:[player],makeDemoActivities:()=>[]} : {assertSnapshot,validateEndpoint,SheetApiError,sheetRequest}});
   vm.runInContext(source,context);
@@ -243,4 +244,58 @@ for (const method of ["analyzeReviews","readAdvice"]) test(`${method} transient 
   assert.equal(JSON.parse(h.sessionStorage.getItem(SESSION_KEY)).token,token);
   assert.equal(h.calls.length,2); assert.equal(h.render().busy,false);
   h.unmount();
+});
+
+function autoSyncBrowser() {
+  let now=0, serial=0;
+  const timers=new Map(), listeners=new Map();
+  const document={visibilityState:'visible',activeElement:null,editorOpen:false,querySelector(){return this.editorOpen?{}:null;},addEventListener:(n,f)=>listeners.set(n,f),removeEventListener:n=>listeners.delete(n)};
+  const navigator={onLine:true};
+  const window={addEventListener:(n,f)=>listeners.set(n,f),removeEventListener:n=>listeners.delete(n)};
+  return {document,navigator,window,Date:{now:()=>now},setTimeout:(fn,delay)=>{const id=++serial;timers.set(id,{fn,delay});return id;},clearTimeout:id=>timers.delete(id),timers,listeners,
+    advance:async()=>{const [id,timer]=[...timers][0];timers.delete(id);now+=timer.delay;await timer.fn();await flush();},
+  };
+}
+
+test('automatic snapshots are quiet, stop while hidden or editing, and resume without overlapping',async()=>{
+  const browser=autoSyncBrowser();
+  const pending=deferred(); let reads=0;
+  const h=harness(call=>{if(call.action==='snapshot')return ++reads===2?pending.promise:snapshot;return {};},{storedToken:token,browser});
+  await flush();h.render();
+  assert.equal(browser.timers.size,1);
+  assert.equal([...browser.timers.values()][0].delay,30_000);
+  browser.document.visibilityState='hidden';await browser.advance();assert.equal(reads,1);
+  browser.document.visibilityState='visible';browser.document.editorOpen=true;await browser.advance();assert.equal(reads,1);
+  browser.document.editorOpen=false;await browser.advance();
+  assert.equal(reads,2);assert.equal(h.render().busy,false);assert.equal(h.render().syncing,true);
+  await h.render().refresh(true);assert.equal(reads,2);
+  pending.resolve({...snapshot,syncedAt:'2026-10-10T00:00:00Z'});await flush();
+  assert.equal(h.render().syncing,false);assert.equal(h.render().snapshot.syncedAt,'2026-10-10T00:00:00Z');
+  h.unmount();assert.equal(browser.timers.size,0);assert.equal(browser.listeners.size,0);
+});
+
+test('automatic sync backs off after a temporary failure without losing data or blocking writes',async()=>{
+  const browser=autoSyncBrowser();let reads=0;
+  const h=harness(call=>{if(call.action==='snapshot'){if(++reads===2)throw new Error('temporary');return snapshot;}return {snapshot};},{storedToken:token,browser});
+  await flush();h.render();await browser.advance();await flush();
+  assert.equal(h.render().snapshot.syncedAt,snapshot.syncedAt);assert.equal(h.render().busy,false);assert.equal(h.render().error,'');assert.ok(h.render().syncError);
+  assert.equal([...browser.timers.values()][0].delay,60_000);
+  await browser.advance();assert.equal(h.render().syncError,'');assert.equal([...browser.timers.values()][0].delay,30_000);
+  h.unmount();
+});
+
+test('background refresh does not invalidate an in-flight AI result',async()=>{
+  const ai=deferred();const h=harness(call=>call.action==='analyzeInterviewReviews'?ai.promise:snapshot,{storedToken:token});
+  await flush();const running=h.render().analyzeReviews('2026-10');await h.render().refresh(true);
+  const advice={summary:'test',actions:['test'],count:1,generatedAt:'2026-10-10T00:00:00Z'};
+  ai.resolve(advice);assert.deepEqual(await running,advice);h.unmount();
+});
+
+test('a late automatic snapshot cannot update an editor opened during the request',async()=>{
+  const browser=autoSyncBrowser(),late=deferred();let reads=0;
+  const h=harness(call=>++reads===1?snapshot:late.promise,{storedToken:token,browser});
+  await flush();h.render();await browser.advance();
+  browser.document.editorOpen=true;
+  late.resolve({...snapshot,syncedAt:'2026-10-10T00:00:00Z'});await flush();
+  assert.equal(h.render().snapshot.syncedAt,snapshot.syncedAt);assert.equal(h.render().syncing,false);h.unmount();
 });

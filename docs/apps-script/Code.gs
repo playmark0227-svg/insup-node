@@ -133,10 +133,14 @@ function nodeHandle_(request) {
     var snapshotStore = readStore_({ readOnly: true });
     return authenticatedSnapshot_(snapshotStore, request.token);
   }
-  return withLock_(function () {
+  var committed = withLock_(function () {
     var user = authenticate_(request.token);
     if (action === 'logout') { props_().deleteProperty(sessionKey_(request.token)); return { loggedOut: true }; }
-    var store = readStore_();
+    var activity = request.payload && request.payload.activity;
+    var existingRow = ['saveInterviewReview','updateStatus','updateRecord','cancelAchievement'].indexOf(action) >= 0 || action === 'saveActivity' && activity && activity.recordId;
+    // Existing-row edits only need named candidate rows. New rows still inspect
+    // the entire template, preserving blank-row and formula protection.
+    var store = readStore_({ readOnly: !!existingRow });
     user = activeActor_(store, user);
     if (!store.schemaCompatible) fail_('SCHEMA_MISMATCH','入力対象19列の見出しまたは順序が一致しません。管理者が実際の列を確認してください。');
     if (!writesEnabled_(store.config)) fail_('WRITES_DISABLED', '現在は読み取り専用です。管理者による接続先の書き込み設定が必要です。');
@@ -148,7 +152,7 @@ function nodeHandle_(request) {
     var previous = operation_(store, operationId);
     if (previous) {
       if (previous.actorId !== user.id || previous.action !== action || previous.payloadHash !== payloadHash) fail_('OPERATION_CONFLICT', '同じ保存IDを別の内容に使うことはできません。');
-      return mutationResponse_(readStore_(), user, action, previous.result, operationId, request.token);
+      return { user:user, result:previous.result, operationId:operationId };
     }
     var plan;
     if (action === 'saveInterviewReview') plan = planInterviewReview_(store,user,payload);
@@ -162,8 +166,13 @@ function nodeHandle_(request) {
     if (action === 'restoreChange') plan = planRestoreChange_(store,user,payload);
     if (action === 'saveManagementRow') plan = planManagementRow_(store,user,payload);
     commit_(store, user, action, operationId, payloadHash, plan);
-    return mutationResponse_(readStore_(), user, action, plan.result || {}, operationId, request.token);
+    return { user:user, result:plan.result || {}, operationId:operationId };
   });
+  if (action === 'logout') return committed;
+  // The atomic write is complete. Do not make other writers wait for a fresh
+  // dashboard read, and do not fetch thousands of formula-only template rows.
+  var freshStore = readStore_({ readOnly:true });
+  return mutationResponse_(freshStore, committed.user, action, committed.result, committed.operationId, request.token);
 }
 
 /* Authentication is entirely server-side. Tokens and passwords are never stored in sheet cells. */
@@ -328,7 +337,11 @@ function readStore_(options, accountStore) {
   });
   var length = Math.max(1, matching.getLastRow());
   if (length > 50000) fail_('DATA_LIMIT', 'データ量の確認が必要です。管理者に連絡してください。');
-  if (options && options.readOnly) {
+  var fullGridKey = 'NODE_FULL_GRID_' + hash_(config.spreadsheetId + '|' + matching.getSheetId() + '|' + length), fullGridCache, useFullGrid = false;
+  try { fullGridCache = CacheService.getScriptCache(); useFullGrid = fullGridCache.get(fullGridKey) === '1'; } catch (_) { /* Cache is optional. */ }
+  // This caches only a choice to read the entire grid, never a data snapshot or
+  // a shortened boundary. Edits cannot be omitted by an outdated cache entry.
+  if (options && options.readOnly && !useFullGrid) {
     // Formula-filled template rows make getLastRow much larger than the actual
     // candidate table. A:D is enough to retain every named/unknown-owner row.
     // Mutations still load the full grid for blank-row and formula protection.
@@ -336,6 +349,7 @@ function readStore_(options, accountStore) {
     for (var i = identityRows.length - 1; i >= lastCandidate; i--) {
       if (normalizeName_(identityRows[i][2])) { lastCandidate = i + 1; break; }
     }
+    if (lastCandidate === length && fullGridCache) { try { fullGridCache.put(fullGridKey, '1', 1800); } catch (_) { /* Reading remains available without cache. */ } }
     length = lastCandidate;
   }
   var range = matching.getRange(1, 1, length, 26), values = range.getValues(), formulas = range.getFormulas();
@@ -561,6 +575,7 @@ function operation_(store, id) {
 function mutationResponse_(store, user, action, result, operationId, token) {
   var response = { snapshot: token ? authenticatedSnapshot_(store,token) : buildSnapshot_(store, user) };
   if (result.undo) response.changeId=operationId;
+  if (action === 'createPlayer' && token) requireAdmin_(snapshotActor_(store, token));
   if (action === 'createPlayer') response.credentials = { id: result.playerId, password: credentialPassword_(user.id, operationId) };
   return response;
 }
@@ -579,10 +594,10 @@ function commit_(store, user, action, operationId, payloadHash, plan) {
   if (plan.row) {
     if (businessSheet.getSheetId() !== Number(store.config.matchingSheetId) || businessSheet.getSheetId() === Number(store.config.kpiSheetId)) fail_('PROTECTED_SHEET', 'このタブは書き込めません。');
     if (plan.record) {
-      var ids = metadataMap_(businessSheet, NODE.recordKey), currentRow = Object.keys(ids).find(function (row) { return ids[row].value === plan.recordId; });
+      var currentMetadata = metadataMaps_(businessSheet, [NODE.recordKey, NODE.sourceKey]), ids = currentMetadata[NODE.recordKey], currentRow = Object.keys(ids).find(function (row) { return ids[row].value === plan.recordId; });
       if (!currentRow) fail_('CONFLICT', '対象の行が削除されています。同期してください。');
       currentRow = Number(currentRow);
-      var currentRange = businessSheet.getRange(currentRow, 1, 1, 26), currentValues = currentRange.getValues()[0], currentFormulas = currentRange.getFormulas()[0], currentSources = metadataMap_(businessSheet, NODE.sourceKey);
+      var currentRange = businessSheet.getRange(currentRow, 1, 1, 26), currentValues = currentRange.getValues()[0], currentFormulas = currentRange.getFormulas()[0], currentSources = currentMetadata[NODE.sourceKey];
       if (rowVersion_(plan.recordId, currentValues, currentFormulas, currentSources[currentRow] ? currentSources[currentRow].value : '') !== plan.record.version || currentRow !== plan.row) fail_('CONFLICT', '対象行が更新・並べ替えされています。同期してから再入力してください。');
     }
     var maxRows = sheetRowCount_(businessSheet);
@@ -1039,7 +1054,7 @@ function planRestoreChange_(store,user,payload) {
 function revalidateManagementPlan_(store,user,plan) {
   var accountStore={config:store.config,book:store.book,playerSheet:store.playerSheet,players:readPlayers_(store.playerSheet)};
   var freshActor=activeActor_(accountStore,user);if(freshActor.role!==user.role)fail_('CONFLICT','権限が更新されました。再ログインしてください。');
-  var latest=plan.recordChecks&&plan.recordChecks.length?readStore_(null,accountStore):null;
+  var latest=plan.recordChecks&&plan.recordChecks.length?readStore_({readOnly:true},accountStore):null;
   (plan.recordChecks||[]).forEach(function(c){var fresh=findRecord_(latest,c.recordId);actorOwns_(user,fresh);if(fresh.row!==c.row||fresh.version!==c.version)fail_('CONFLICT','対象行が更新されました。再取得してください。');});
   (plan.checks||[]).forEach(function(c){var sheet=c.recordId?store.matching:managementSheet_(store.book,c.sheetId);if(!c.recordId)requireAdmin_(user);
     if(gridFingerprint_(gridRead_(store.book,sheet,c.row,1)[0])!==c.before)fail_('CONFLICT','保存前に行が更新されました。再取得してください。');
@@ -1265,4 +1280,16 @@ function verifyNodeAiUsability() {
   });
   var proof={success:true,model:'gemini-3.5-flash-lite',actions:body.actions.length,storageBytes:value.length,checked:['synthetic structured response','compressed property round trip','temporary property restored','no business sheet access','no app quota or advice index changes']};
   Logger.log(JSON.stringify(proof));return proof;
+}
+
+/** Owner-run read-only comparison. No business writes or configuration changes. */
+function verifyNodeSyncPerformance() {
+  requireOwner_();
+  var started=Date.now(), full=readStore_(), fullSnapshot=buildSnapshot_(full,{id:'ADMIN',role:'admin'}), fullMs=Date.now()-started;
+  started=Date.now();
+  var trimmed=readStore_({readOnly:true}), trimmedSnapshot=buildSnapshot_(trimmed,{id:'ADMIN',role:'admin'}), trimmedMs=Date.now()-started;
+  delete fullSnapshot.syncedAt; delete trimmedSnapshot.syncedAt;
+  if(stableJson_(fullSnapshot)!==stableJson_(trimmedSnapshot))fail_('SYNC_VERIFICATION_FAILED','読み取り中にデータが変わったか、取得結果が一致しません。再確認してください。');
+  var result={success:true,fullRows:full.values.length,activeRows:trimmed.values.length,fullReadMs:fullMs,trimmedReadMs:trimmedMs,checked:['same records and KPI counts','same row versions and formulas','read only; no business writes']};
+  Logger.log(JSON.stringify(result)); return result;
 }

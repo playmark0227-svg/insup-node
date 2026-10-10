@@ -22,12 +22,16 @@ export function useSheetsConnection() {
   const [loadPhase, setLoadPhase] = useState<ConnectionLoadPhase>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [syncing, setSyncing] = useState(false);
+  const [syncError, setSyncError] = useState("");
   const [credentials, setCredentials] = useState<{id: string; password: string} | null>(null);
   const token = useRef("");
   const generation = useRef(0);
   const requestVersion = useRef(0);
   const mutationRunning = useRef(false);
   const loginRunning = useRef(false);
+  const refreshRunning = useRef(false);
+  const refreshLatest = useRef<(background?: boolean) => Promise<boolean | undefined>>(async () => undefined);
   const activeRequest = useRef<AbortController | null>(null);
   const mounted = useRef(true);
 
@@ -51,7 +55,7 @@ export function useSheetsConnection() {
 
   const applySnapshot = useCallback((data: unknown) => {
     assertSnapshot(data);
-    setSnapshot(data); setPlayers(data.players); setActivities(data.activities); setError("");
+    setSnapshot(data); setPlayers(data.players); setActivities(data.activities); setError(""); setSyncError("");
   }, []);
 
   const clearSession = useCallback(() => {
@@ -59,7 +63,7 @@ export function useSheetsConnection() {
     generation.current++; token.current = "";
     ++requestVersion.current;
     writeStorage(sessionStorage, SESSION_KEY, null);
-    setAuthenticated(false); setLoadPhase(null);
+    setAuthenticated(false); setLoadPhase(null); setSyncing(false); setSyncError("");
     setSnapshot(null); setPlayers([]); setActivities([]); setCredentials(null); setBusy(false);
   }, []);
 
@@ -157,19 +161,62 @@ export function useSheetsConnection() {
     }
   };
 
-  const refresh = async () => {
-    if (!token.current || mutationRunning.current || loginRunning.current) return;
-    const {controller, g} = beginLoad("loading"), version = requestVersion.current;
+  const refresh = async (background = false): Promise<boolean | undefined> => {
+    if (!token.current || mutationRunning.current || loginRunning.current || refreshRunning.current || activeRequest.current) return;
+    // Avoid changing an editor's baseline or row revision while someone types,
+    // including an editor opened while this request was already in flight.
+    const editing = () => typeof document !== "undefined" && !!(document.querySelector('[role="dialog"], [role="alertdialog"]') || document.activeElement?.matches('input, textarea, select, [contenteditable="true"]'));
+    if (background && editing()) return;
+    refreshRunning.current = true;
+    const controller = new AbortController(), g = generation.current, version = ++requestVersion.current;
+    activeRequest.current = controller;
+    setSyncing(true);
+    if (!background) { setBusy(true); setLoadPhase("loading"); setError(""); }
     try {
       const data = await sheetRequest<SheetSnapshot>(endpoint, "snapshot", {}, {token: token.current, signal: controller.signal});
-      if (isCurrent(g) && version === requestVersion.current) applySnapshot(data);
+      if (isCurrent(g) && version === requestVersion.current && (!background || !editing())) { applySnapshot(data); setSyncError(""); }
+      return true;
     } catch (e) {
       if (isCurrent(g) && version === requestVersion.current) {
-        if(isExpired(e)) clearSession();
-        setError(e instanceof Error ? e.message : "再取得できませんでした。"); throw e;
+        if (isExpired(e)) clearSession();
+        else if (background) setSyncError("自動同期を再試行しています。表示中のデータは前回取得した内容です。");
+        else { setError(e instanceof Error ? e.message : "再取得できませんでした。"); throw e; }
       }
-    } finally { if (version === requestVersion.current) finishLoad(g, controller); }
+      return isCurrent(g) && version === requestVersion.current ? false : undefined;
+    } finally {
+      refreshRunning.current = false;
+      if (activeRequest.current === controller) activeRequest.current = null;
+      if (isCurrent(g)) { setSyncing(false); if (version === requestVersion.current && !background) { setBusy(false); setLoadPhase(null); } }
+    }
   };
+  refreshLatest.current = refresh;
+
+  const hasSnapshot = !!snapshot;
+  useEffect(() => {
+    if (!authenticated || mode !== "live" || !hasSnapshot || typeof document === "undefined") return;
+    let stopped = false, failures = 0, lastAttempt = Date.now();
+    let timer: ReturnType<typeof setTimeout>;
+    const schedule = () => { clearTimeout(timer); timer = setTimeout(() => void tick(), Math.min(300_000, 30_000 * 2 ** failures)); };
+    const tick = async () => {
+      clearTimeout(timer);
+      if (stopped) return;
+      if (document.visibilityState === "visible" && navigator.onLine !== false) {
+        lastAttempt = Date.now();
+        const success = await refreshLatest.current(true);
+        if (success === true) failures = 0;
+        if (success === false) failures = Math.min(4, failures + 1);
+      }
+      if (!stopped) schedule();
+    };
+    const resume = () => {
+      if (!refreshRunning.current && !mutationRunning.current && document.visibilityState === "visible" && navigator.onLine !== false && Date.now() - lastAttempt >= 10_000) void tick();
+    };
+    schedule();
+    document.addEventListener("visibilitychange", resume);
+    window.addEventListener("focus", resume);
+    window.addEventListener("online", resume);
+    return () => { stopped = true; clearTimeout(timer); document.removeEventListener("visibilitychange", resume); window.removeEventListener("focus", resume); window.removeEventListener("online", resume); };
+  }, [authenticated, mode, endpoint, hasSnapshot]);
 
   const mutate = async (action: string, payload: unknown, operationId: string) => {
     if (!snapshot || !token.current) throw new Error("ログインしてください。");
@@ -218,5 +265,5 @@ export function useSheetsConnection() {
   };
 
   return { ready, endpoint, mode, players, setPlayers, activities, setActivities, snapshot, authenticated, loadPhase, busy, error,
-    credentials, dismissCredentials:() => setCredentials(null), connect, login, logout, refresh, mutate, readManagement, analyzeReviews, readAdvice, showDemo };
+    syncing, syncError, credentials, dismissCredentials:() => setCredentials(null), connect, login, logout, refresh, mutate, readManagement, analyzeReviews, readAdvice, showDemo };
 }

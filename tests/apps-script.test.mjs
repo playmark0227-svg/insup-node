@@ -2211,3 +2211,49 @@ test("owner AI probe refuses unauthorized or unconfirmed use before fetching and
  api.setProperty=function(key,value){if(key==="NODE_AI_UX_PROBE"&&value!=="previous")throw new Error("Injected property storage failure");return setProperty.call(this,key,value);};
  assert.throws(()=>harness.context.verifyNodeAiUsability(),/Injected property storage failure/);assert.equal(calls,1);assert.deepEqual(harness.properties,before);assert.equal(harness.logs.length,0);assert.equal(harness.writes.length,0);assert.equal(harness.spreadsheet.reads.length,0);
 });
+
+test('existing record saves trim formula-only rows and release the lock before response reads',()=>{
+  const {harness,player}=signedInFixture();
+  const sheet=harness.spreadsheet.getSheetById(MATCHING_SHEET_ID);
+  const row=activityFor(player.snapshot);
+  for(let i=sheet.values.length;i<3948;i++){sheet.values[i]=Array(26).fill('');sheet.formulas[i]=Array(26).fill('');sheet.formulas[i][13]='=IF(C'+(i+1)+'="","",1)';}
+  harness.spreadsheet.reads.length=0;
+  let committed=false,unlockedRead=false;
+  const previousBatch=harness.spreadsheet.batchUpdate.bind(harness.spreadsheet);
+  harness.spreadsheet.batchUpdate=body=>{assert.equal(harness.locks.held,true);const result=previousBatch(body);committed=true;return result;};
+  harness.spreadsheet.readObserver=read=>{if(committed&&read.sheetId===MATCHING_SHEET_ID){assert.equal(harness.locks.held,false);unlockedRead=true;}};
+  const result=assertSuccess(mutate(harness,player.token,'updateStatus',{recordId:row.recordId,rowVersion:row.rowVersion,status:'辞退（本人希望）'}));
+  assert.ok(unlockedRead);
+  const reads=harness.spreadsheet.reads.filter(r=>r.sheetId===MATCHING_SHEET_ID&&r.columns===26);
+  assert.ok(reads.every(r=>r.rows<3948),'No full 26-column template read for an existing record');
+  assert.equal(activityFor(result.snapshot).rowVersion!==row.rowVersion,true);
+  assert.equal(harness.apiCalls.length,1,'One atomic commit');
+});
+
+test('owner sync performance probe compares actual reads without changing sheets or settings',()=>{
+  const {harness}=signedInFixture();const before=JSON.stringify(harness.properties);
+  const result=harness.context.verifyNodeSyncPerformance();
+  assert.equal(result.success,true);assert.equal(harness.apiCalls.length,0);assert.equal(JSON.stringify(harness.properties),before);
+});
+
+test('full-grid hint skips extra identity reads but never caches data or masks external edits',()=>{
+  const {harness,player}=signedInFixture();
+  assertSuccess(request(harness,'snapshot',{}, {token:player.token}));
+  const sheet=harness.spreadsheet.getSheetById(MATCHING_SHEET_ID);
+  sheet.getRange(2,7).setValues([['辞退（本人希望）']]);
+  harness.spreadsheet.reads.length=0;
+  const result=assertSuccess(request(harness,'snapshot',{}, {token:player.token}));
+  assert.equal(activityFor(result).status,'辞退（本人希望）');
+  assert.ok(!harness.spreadsheet.reads.some(r=>r.sheetId===MATCHING_SHEET_ID&&r.columns===4));
+  harness.context.CacheService={getScriptCache(){throw new Error('unavailable');}};
+  assertSuccess(request(harness,'snapshot',{}, {token:player.token}));
+});
+
+test('revocation after a committed write blocks the unlocked response without replaying the write',()=>{
+  const {harness,player}=signedInFixture();const row=activityFor(player.snapshot);
+  const previousBatch=harness.spreadsheet.batchUpdate.bind(harness.spreadsheet);let committed=false;
+  harness.spreadsheet.batchUpdate=body=>{const result=previousBatch(body);committed=true;return result;};
+  harness.spreadsheet.readObserver=read=>{if(committed&&read.sheetId===MATCHING_SHEET_ID)delete harness.properties[harness.context.sessionKey_(player.token)];};
+  assert.equal(assertFailure(mutate(harness,player.token,'updateStatus',{recordId:row.recordId,rowVersion:row.rowVersion,status:'辞退（本人希望）'})).code,'UNAUTHENTICATED');
+  assert.equal(harness.apiCalls.length,1);
+});
