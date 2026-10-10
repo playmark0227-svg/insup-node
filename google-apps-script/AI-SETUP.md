@@ -12,7 +12,7 @@ APIキーは所有者が作成し、Apps Scriptの「プロジェクトの設定
 | NODE_GEMINI_API_KEY | 専用プロジェクトのAPIキー |
 | NODE_GEMINI_FREE_TIER_CONFIRMED | true（課金未設定・無料枠を確認後） |
 
-`gemini-2.5-flash-lite` の標準generateContentのみを利用。別モデルや有料処理への自動切り替えはない。
+`gemini-3.5-flash-lite` の標準generateContentのみを利用。別モデルや有料処理への自動切り替えはない。
 課金を後から有効化するとAPIの利用条件が変わる。アプリはGoogleの請求設定を検出する権限を持たないため、専用プロジェクトに請求アカウントを接続しない。
 1日全体10回・1アカウント3回のアプリ上限を設け、同じ期間・同じ集計結果は6時間再利用する。Google側の無料枠・レート制限が優先され、429時は停止する。
 API失敗も利用回数に数える。日本時間の日付が変わるとリセット。

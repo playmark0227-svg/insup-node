@@ -1105,6 +1105,16 @@ function verifyNodeManagementCopy_(metrics,checkRecords) {
 
 /* C-interview learning: detailed notes stay in the managed workbook. */
 var REVIEW_TAB='_NODE_interview_reviews';
+function verifyNodeGeminiConnection() {
+  requireOwner_();
+  var p=props_(),key=p.getProperty('NODE_GEMINI_API_KEY');
+  if(!key||p.getProperty('NODE_GEMINI_FREE_TIER_CONFIRMED')!=='true')fail_('AI_NOT_CONFIGURED','Geminiの設定を確認してください。');
+  var r=UrlFetchApp.fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent',{method:'post',contentType:'application/json',headers:{'x-goog-api-key':key},muteHttpExceptions:true,payload:JSON.stringify({contents:[{parts:[{text:'接続テストです。OKとだけ返してください。'}]}],generationConfig:{maxOutputTokens:16}})});
+  if(r.getResponseCode()!==200)fail_('AI_UNAVAILABLE','Gemini接続テスト HTTP '+r.getResponseCode());
+  var body=JSON.parse(r.getContentText());
+  if(!body.candidates||!body.candidates[0].content)fail_('AI_UNAVAILABLE','Geminiの応答を確認できません。');
+  Logger.log('Gemini接続確認成功：gemini-3.5-flash-lite（業務データ送信なし）');
+}
 var REVIEW_HEADERS=['record_id','player_id','interview_date','category','memo','next_action','version','updated_at'];
 var REVIEW_CATEGORIES=['条件のずれ','事前確認不足','面談準備不足','仕事内容の認識違い','連絡・日程調整','募集枠・タイミング','他案件との比較','理由未確認','その他'];
 function reviewRows_(book) {
@@ -1151,7 +1161,7 @@ function analyzeInterviewReviews_(request) {
     q.total++;q.users[user.id]=(q.users[user.id]||0)+1;properties.setProperty(quotaKey,JSON.stringify(q));
   });
   // Only fixed categories and counts are sent. No user text, names, IDs or dates.
-  var response=UrlFetchApp.fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent',{method:'post',contentType:'application/json',headers:{'x-goog-api-key':key},muteHttpExceptions:true,payload:JSON.stringify({systemInstruction:{parts:[{text:'人材紹介業務の改善支援。未マッチ理由の集計から日本語で傾向の要約と次回面談前にできる具体的な確認・準備を3つ提案。件数だけでは原因を断定できないと明示。個人の採用適否や順位を判断しない。理由未確認はクライアントへの確認を提案。JSONのみ: summary(文字列), actions(文字列の配列)。'}]},contents:[{role:'user',parts:[{text:JSON.stringify(aggregate)}]}],generationConfig:{temperature:0.2,maxOutputTokens:1800,responseMimeType:'application/json',responseSchema:{type:'OBJECT',properties:{summary:{type:'STRING'},actions:{type:'ARRAY',items:{type:'STRING'}}},required:['summary','actions']}}})});
+  var response=UrlFetchApp.fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent',{method:'post',contentType:'application/json',headers:{'x-goog-api-key':key},muteHttpExceptions:true,payload:JSON.stringify({systemInstruction:{parts:[{text:'人材紹介業務の改善支援。未マッチ理由の集計から日本語で傾向の要約と次回面談前にできる具体的な確認・準備を3つ提案。件数だけでは原因を断定できないと明示。個人の採用適否や順位を判断しない。理由未確認はクライアントへの確認を提案。JSONのみ: summary(文字列), actions(文字列の配列)。'}]},contents:[{role:'user',parts:[{text:JSON.stringify(aggregate)}]}],generationConfig:{temperature:0.2,maxOutputTokens:1800,responseMimeType:'application/json',responseSchema:{type:'OBJECT',properties:{summary:{type:'STRING'},actions:{type:'ARRAY',items:{type:'STRING'}}},required:['summary','actions']}}})});
   if(response.getResponseCode()===429)fail_('AI_LIMIT','Googleの無料枠の上限です。時間をおいて再試行してください。有料処理への切り替えは行いません。');
   if(response.getResponseCode()!==200)fail_('AI_UNAVAILABLE','AIから結果を取得できませんでした。理由の記録は保存されています。');
   var body;try{var json=JSON.parse(response.getContentText());body=JSON.parse(json.candidates[0].content.parts.map(function(p){return p.text||'';}).join(''));}catch(e){fail_('AI_UNAVAILABLE','AIの応答形式を確認できませんでした。');}
