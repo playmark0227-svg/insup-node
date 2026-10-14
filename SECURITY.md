@@ -43,3 +43,15 @@ Googleの請求設定をアプリが自動検知する権限はない。課金�
 `npm ci`、`npm test`、`npm run build`、`npm audit`。ビルドは共有するAI集計ルールをApps Scriptへ生成する。ブラウザとGoogle側で同じ計算ルールを使う。Google側の実テストと公開URLの確認はローカルテストとは分けて記録する。Google側のCode.gsを保存し既存デプロイを新バージョンへ更新してから、フロントを公開する。
 
 参照: [Gemini利用規約](https://ai.google.dev/gemini-api/terms)、[Apps Script Webアプリ](https://developers.google.com/apps-script/guides/web)、[CSP](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Security-Policy)。
+
+## 2026-10-14 Google側の公開反映
+
+既存のウェブアプリをバージョン7へ更新した。実行者・アクセス範囲・公開URLを変えていない。Googleで保存後に表示された関数一覧と、デプロイ完了画面で新しいバージョンを確認した。
+
+実際の管理用コピーの1763行で `verifyNodeSyncPerformance` が成功し、記録・KPI件数・行の更新版・数式の読み取り結果が一致した。業務セルへ書き込みは行っていない。
+
+`verifyNodeWorkspaceAi` が実Googleで成功。架空の匿名集計だけからGemini 3.5 Flash Liteの構造化応答（提案二件、質問二件）を取得した。業務シートを読み書きせず、アプリの生成回数や保存済み提案を変更していない。
+
+既存の公開エンドポイントのhealthはconfigured=true、writesEnabled=true、protocol=1。新しいreadWorkspaceInsights、auditSecurity、changePasswordを認証情報なしで呼び、すべてUNAUTHENTICATEDで拒否されることを確認した。架空のログインやパスワード入力は行っていない。
+
+ローカル259テストとGitHub上のApplication checksが成功。新バージョンで本番利用者のパスワードを実際に変更する操作、他の端末のログアウト、本番の業務セル保存は未実検証。これらは権限・競合・再送を含む回帰テストで確認し、本番利用者の認証情報や業務記録はテストで変更していない。
