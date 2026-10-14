@@ -8,9 +8,11 @@ type InsightTab = "tasks" | "coach" | "meeting";
 type WorkspaceInsightsProps = {
   snapshot: SheetSnapshot;
   period: string;
+  businessDay?: string;
   live: boolean;
   enabled?: boolean;
   active?: boolean;
+  busy?: boolean;
   onReadInsights: (period: string) => Promise<WorkspaceInsightState>;
   onAnalyzeInsights: (period: string) => Promise<WorkspaceInsightAdvice>;
   onOpenRecord?: (recordId: string, kind?: FollowUpTask["kind"]) => void;
@@ -19,7 +21,7 @@ const errorMessage = (error: unknown) => error instanceof Error ? error.message 
 const pendingError = (error: unknown) => !!error && typeof error === "object" && "code" in error && error.code === "AI_IN_PROGRESS";
 const jstDateTime = (value: string) => Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString("ja-JP", { timeZone: "Asia/Tokyo", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }) : "日時未確認";
 
-export function WorkspaceInsights({ snapshot, period, live, enabled = true, active = true, onReadInsights, onAnalyzeInsights, onOpenRecord }: WorkspaceInsightsProps) {
+export function WorkspaceInsights({ snapshot, period, businessDay, live, enabled = true, active = true, busy = false, onReadInsights, onAnalyzeInsights, onOpenRecord }: WorkspaceInsightsProps) {
   const id = useId();
   const admin = snapshot.self.role === "admin";
   const [tab, setTab] = useState<InsightTab>("tasks");
@@ -40,7 +42,8 @@ export function WorkspaceInsights({ snapshot, period, live, enabled = true, acti
   const periodRef = useRef(period); periodRef.current = period;
   const activeRef = useRef(active); activeRef.current = active;
   const readRef = useRef(onReadInsights); readRef.current = onReadInsights;
-  const today = insightToday();
+  const busyRef = useRef(busy); busyRef.current = busy;
+  const today = businessDay || insightToday();
   const tasks = useMemo(() => buildFollowUpTasks(snapshot, today), [snapshot, today]);
   const aggregate = useMemo(() => buildWorkspaceInsightAggregate(snapshot, period, today), [snapshot, period, today]);
   const state = states[period];
@@ -50,7 +53,7 @@ export function WorkspaceInsights({ snapshot, period, live, enabled = true, acti
   const members = snapshot.players.filter(player => player.id !== "ADMIN" && (admin || player.id === snapshot.self.playerId));
   const hasData = aggregate.metrics.some(metric => metric.count > 0) || tasks.length > 0 || aggregate.reviewReasons.length > 0;
   const exhausted = !!state && (state.usage.userRemaining <= 0 || state.usage.teamRemaining <= 0);
-  const disabled = !!running || reading || !live || !enabled || !hasData || state?.configured === false || state?.pending === true || ((!advice || stale) && exhausted);
+  const disabled = busy || !!running || reading || !live || !enabled || !hasData || state?.configured === false || state?.pending === true || ((!advice || stale) && exhausted);
 
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; ++readVersion.current; queuedRead.current = null; }; }, []);
   useEffect(() => { setLimit(20); }, [urgency, owner]);
@@ -62,7 +65,7 @@ export function WorkspaceInsights({ snapshot, period, live, enabled = true, acti
   }, [running]);
 
   async function readReport(target = period) {
-    if (!live || !enabled) return;
+    if (!live || !enabled || busyRef.current) return;
     if (readLock.current || generateLock.current) { queuedRead.current = target; return; }
     readLock.current = true;
     const version = ++readVersion.current;
@@ -81,7 +84,7 @@ export function WorkspaceInsights({ snapshot, period, live, enabled = true, acti
       if (mounted.current && activeRef.current && (queued || periodRef.current !== target)) void readReport(queued || periodRef.current);
     }
   }
-  useEffect(() => { if (active && live && enabled) void readReport(period); }, [active, live, enabled, period]);
+  useEffect(() => { if (active && live && enabled && !busy) void readReport(period); }, [active, live, enabled, period, today, busy]);
 
   async function generate() {
     if (generateLock.current || readLock.current || disabled) return;
@@ -158,7 +161,7 @@ export function WorkspaceInsights({ snapshot, period, live, enabled = true, acti
       {state?.pending && !running && <p className="insight-notice" role="status">この集計を別の画面で作成中です。少し待って「保存済みの整理を再取得」を押してください。</p>}
       {running && <div className="insight-progress" role="status"><LoaderCircle size={18} className="review-spinner" /><div><strong>{elapsed < 10 ? "記録済みの成果を確認しています" : elapsed < 25 ? "成果と進捗から、行動を整理しています" : "Googleからの応答を待っています"} · {elapsed}秒</strong><p>画面を切り替えても処理は続きます。応答が途切れた場合は、保存済みの整理を再取得できます。</p></div></div>}
       {errors[period] && <div className="form-error" role="alert">{errors[period]}</div>}
-      <div className="insight-ai-tools">{live && enabled && <button className="text-button" disabled={reading || !!running} onClick={() => void readReport()}><RefreshCw size={14} className={reading ? "review-spinner" : ""} />{reading ? "保存済みの整理を確認中…" : "保存済みの整理を再取得"}</button>}{state && <span>本日の新規生成：あなた あと{state.usage.userRemaining}回 / チーム あと{state.usage.teamRemaining}回</span>}</div>
+      <div className="insight-ai-tools">{live && enabled && <button className="text-button" disabled={busy || reading || !!running} onClick={() => void readReport()}><RefreshCw size={14} className={reading ? "review-spinner" : ""} />{reading ? "保存済みの整理を確認中…" : "保存済みの整理を再取得"}</button>}{state && <span>本日の新規生成：あなた あと{state.usage.userRemaining}回 / チーム あと{state.usage.teamRemaining}回</span>}</div>
       {exhausted && !running && <p className="insight-notice">本日の生成上限です。保存済みの整理は引き続き確認できます。</p>}
       {advice ? <div className="insight-advice"><div className="insight-report-heading"><span>AIによる行動の提案 · {jstDateTime(advice.generatedAt)} 作成</span><button className="secondary-button" onClick={() => void copyReport()}><Clipboard size={15} />{copied ? "コピーしました" : admin ? "会議用にコピー" : "準備用にコピー"}</button></div>{stale && <p className="insight-notice">記録や日付が変わったため、以前の集計による提案を表示しています。「最新の記録でAIの整理を更新」で作り直せます。</p>}<p className="insight-summary">{advice.summary}</p>
         {tab === "coach" ? <ol className="insight-priorities">{advice.priorities.map((priority, index) => <li key={index}><span>{index + 1}</span><div><h4>{priority.title}</h4><p>{priority.action}</p><small>根拠：{workspaceEvidenceLabel(priority.evidenceKey, advice.aggregate)}</small></div></li>)}</ol> : <><h4>{admin ? "会議で確認すること" : "面談前に確認すること"}</h4>{advice.meetingQuestions.length ? <ol className="insight-questions">{advice.meetingQuestions.map((question, index) => <li key={index}>{question}</li>)}</ol> : <p className="panel-note">この集計からの追加の確認事項はありません。個別の案件条件は進捗画面で確認してください。</p>}<p className="insight-notice">{admin ? "評価は数字だけで決めず、担当案件の条件と本人への確認を含めて判断してください。" : "この提案は成果の集計から作成しています。個別の候補者やクライアントの条件は、進捗画面の記録で確認してください。"}</p><button className="text-button" onClick={() => setTab("coach")}>優先する行動も確認する<ArrowUpRight size={15} /></button></>}
