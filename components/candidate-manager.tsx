@@ -25,8 +25,8 @@ export function useManagementSave(onSave:ManagementMutation,live=true) {
  return {save,busy,error,uncertain,undo,restore:async()=>{if(undo&&await save("restoreChange",{changeId:undo}))setUndo(null);}};
 }
 
-export function CandidateManager({records,players,admin,busy,canWrite,live,onSave}:{records:CandidateRecord[];players:SheetPlayer[];admin:boolean;busy:boolean;canWrite:boolean;live:boolean;onSave:ManagementMutation}) {
- const [search,setSearch]=useState(""),[owner,setOwner]=useState("all"),[status,setStatus]=useState("all"),[page,setPage]=useState(1),[selected,setSelected]=useState<string|null>(null),[create,setCreate]=useState(false);
+export function CandidateManager({records,players,admin,busy,canWrite,live,onSave,initialRecordId}:{records:CandidateRecord[];players:SheetPlayer[];admin:boolean;busy:boolean;canWrite:boolean;live:boolean;onSave:ManagementMutation;initialRecordId?:string|null}) {
+ const [search,setSearch]=useState(""),[owner,setOwner]=useState("all"),[status,setStatus]=useState("all"),[page,setPage]=useState(1),[selected,setSelected]=useState<string|null>(initialRecordId||null),[create,setCreate]=useState(false);
  const save=useManagementSave(onSave,live);
  const filtered=records.filter(r=>(owner==="all"||owner==="unassigned"&&!r.playerId||owner===r.playerId)&&(status==="all"||valueAt(r,7)===status)&&r.values.join(" ").toLowerCase().includes(search.toLowerCase()));
  const rows=filtered.slice((page-1)*15,page*15),record=records.find(r=>r.recordId===selected);

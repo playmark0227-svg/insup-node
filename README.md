@@ -2,7 +2,7 @@
 
 管理者（PC）とプレイヤー（PC・スマートフォン）の成果・ランキングアプリです。GitHub Pagesで画面を配信し、Google Apps Scriptが非公開スプレッドシートの読み書きと本人確認を行います。
 
-公開画面: https://playmark0227-svg.github.io/insup-node/
+公開画面: https://insupnode.vifight.com/
 
 ## 接続状態と設定
 
@@ -57,3 +57,7 @@ Node.js 22.13以上で `npm ci`、`npm run dev` を実行します。`npm test` 
 GitHub Pagesは `main` ブランチの `/docs` を公開元に設定します。ソース変更後はビルドした `docs/` とソースを一緒にコミット・pushします。Apps Scriptの更新はGoogle側のデプロイも更新してください。
 
 Viteのbaseは `/insup-node/` です。透過ロゴもこのサブパスから読み込みます。元のSites版は変更していません。
+
+## 2026-10-14 運用改善
+
+パスワードの本人変更と全端末ログアウト、保存直前の権限再確認、管理者のアクセス状態確認、公開接続先の固定、CSPと公開ファイル検査を追加。AIによる個人の改善支援と会議準備、実日付から抽出する次の対応一覧を追加。Geminiへ氏名・会社・自由記述を送らず、既存の無料枠と利用上限を維持する。詳しい実装範囲と未実装の運用機能は [SECURITY.md](SECURITY.md) を参照。

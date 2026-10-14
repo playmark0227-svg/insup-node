@@ -13,7 +13,7 @@ const ENDPOINT_KEY = "insup.node.endpoint.v1";
 const player = {id:"ND-001",name:"テスト担当",team:"NODE",target:20,bio:"",color:"blue"};
 const snapshot = {self:{playerId:player.id,role:"player"},players:[player],activities:[],counts:{},syncedAt:"2026-10-08T00:00:00Z",warnings:[],writesEnabled:true};
 const source = ts.transpileModule(fs.readFileSync(new URL("../hooks/use-sheets-connection.ts", import.meta.url), "utf8")
-  .replace("import.meta.env.BASE_URL", '"/insup-node/"'), {compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;
+  .replace("import.meta.env.BASE_URL", '"/insup-node/"').replace("import.meta.env.PROD", "TEST_PRODUCTION"), {compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;
 
 function storage(entries = {}) {
   const values = new Map(Object.entries(entries));
@@ -28,10 +28,10 @@ async function flush() { for (let i=0; i<12; i++) await Promise.resolve(); }
 
 // Execute the actual hook against a small deterministic hook runtime. This
 // exposes races and state restoration without adding a browser/test dependency.
-function harness(handle, {storedToken, malformedSession, deadlineController, browser} = {}) {
+function harness(handle, {storedToken, malformedSession, deadlineController, browser, manifestEndpoint=endpoint, storedEndpoint=endpoint, manifestFailure=false, production=false} = {}) {
   const slots = [], effects = [], calls = [];
   let cursor = 0, stateUpdates = 0;
-  const localStorage = storage({[ENDPOINT_KEY]:endpoint});
+  const localStorage = storage({[ENDPOINT_KEY]:storedEndpoint});
   const sessionStorage = storage(storedToken ? {[SESSION_KEY]:JSON.stringify({endpoint,token:storedToken})} : malformedSession ? {[SESSION_KEY]:"invalid-json"} : {});
   const depsEqual = (a,b) => a && b && a.length===b.length && a.every((x,i)=>Object.is(x,b[i]));
   const react = {
@@ -57,9 +57,9 @@ function harness(handle, {storedToken, malformedSession, deadlineController, bro
   const exports={};
   const timeoutDurations=[];
   const deadlineSignals=deadlineController ? {any:signals=>AbortSignal.any(signals),timeout:ms=>{timeoutDurations.push(ms); return deadlineController.signal;}} : AbortSignal;
-  const context=vm.createContext({exports,module:{exports},AbortController,AbortSignal:deadlineSignals,JSON,Error,localStorage,sessionStorage,
+  const context=vm.createContext({exports,module:{exports},AbortController,AbortSignal:deadlineSignals,JSON,Error,localStorage,sessionStorage,TEST_PRODUCTION:production,
     ...(browser || {}),
-    fetch:async()=>({ok:true,json:async()=>({endpoint})}),
+    fetch:async()=>{if(manifestFailure)throw new Error("設定取得失敗");return {ok:true,json:async()=>({endpoint:manifestEndpoint})};},
     require:name=>name==="react" ? react : name.includes("node-data") ? {initialPlayers:[player],makeDemoActivities:()=>[]} : {assertSnapshot,validateEndpoint,SheetApiError,sheetRequest}});
   vm.runInContext(source,context);
   const render = () => {cursor=0; const result=exports.useSheetsConnection(); while(effects.length) effects.shift()(); return result;};
@@ -132,6 +132,7 @@ test("an older login response remains compatible without a second snapshot reque
 test("restoration shows progress immediately and a transient failure does not log out",async()=>{
   const pending=deferred(); let reads=0;
   const h=harness(()=>++reads===1 ? pending.promise : snapshot,{storedToken:token});
+  await flush();
   assert.equal(h.render().ready,true); assert.equal(h.render().authenticated,true); assert.equal(h.render().loadPhase,"restoring");
   pending.reject(new SheetApiError("NETWORK","一時的な通信失敗")); await flush();
   assert.equal(h.render().authenticated,true); assert.equal(h.render().busy,false);
@@ -166,7 +167,7 @@ test("repeated submit sends one login and logout rejects a late response",async(
 
 test("changing the endpoint cancels pending authentication and cannot apply its response",async()=>{
   const response=deferred();
-  const h=harness(call=>call.action==="health" ? {configured:true} : response.promise);
+  const h=harness(call=>call.action==="health" ? {configured:true} : response.promise,{manifestEndpoint:""});
   await flush(); const pending=h.render().login("ND-001","only-a-test-password");
   await h.render().connect(otherEndpoint);
   assert.equal(h.calls[0].options.signal.aborted,true);
@@ -298,4 +299,59 @@ test('a late automatic snapshot cannot update an editor opened during the reques
   browser.document.editorOpen=true;
   late.resolve({...snapshot,syncedAt:'2026-10-10T00:00:00Z'});await flush();
   assert.equal(h.render().snapshot.syncedAt,snapshot.syncedAt);assert.equal(h.render().syncing,false);h.unmount();
+});
+
+test("published endpoint ignores a stale local override and rejects credential redirection",async()=>{
+  const h=harness(call=>call.action==="login"?{token,snapshot}:snapshot,{storedEndpoint:otherEndpoint});
+  await flush();
+  assert.equal(h.render().endpoint,endpoint);
+  await assert.rejects(()=>h.render().connect(otherEndpoint),/固定/);
+  assert.equal(h.calls.length,0);
+  await h.render().login("ND-001","private-password");
+  assert.ok(h.calls.every(call=>call.target===endpoint));
+  h.unmount();
+});
+
+test("manifest network failure does not send a stored session or use demo data",async()=>{
+  const h=harness(()=>snapshot,{storedToken:token,storedEndpoint:otherEndpoint,manifestFailure:true});
+  await flush();
+  assert.equal(h.calls.length,0);assert.equal(h.render().mode,"live");
+  assert.equal(h.render().authenticated,false);assert.equal(h.render().snapshot,null);
+  assert.equal(h.render().players.length,0);assert.match(h.render().error,/設定取得失敗/);
+  h.unmount();
+});
+
+test("password change clears private data and all local credentials without storing passwords",async()=>{
+  const h=harness(call=>call.action==="changePassword"?{changed:true}:snapshot,{storedToken:token});
+  await flush();
+  await h.render().changePassword("old-private-password","new-private-password");
+  assert.equal(h.render().authenticated,false);assert.equal(h.render().snapshot,null);
+  assert.equal(h.sessionStorage.getItem(SESSION_KEY),null);
+  assert.ok(!JSON.stringify([...h.sessionStorage.values,...h.localStorage.values]).includes("private-password"));
+  assert.equal(h.calls.filter(c=>c.action==="changePassword").length,1);
+  h.unmount();
+});
+
+test("uncertain password-change result signs out without automatic credential replay",async()=>{
+  const h=harness(call=>{if(call.action==="changePassword")throw new SheetApiError("NETWORK","通信失敗");return snapshot;},{storedToken:token});
+  await flush();
+  await assert.rejects(()=>h.render().changePassword("old-private-password","new-private-password"),/新しいパスワード/);
+  assert.equal(h.render().authenticated,false);assert.equal(h.render().snapshot,null);
+  assert.equal(h.calls.filter(c=>c.action==="changePassword").length,1);
+  h.unmount();
+});
+
+
+test("empty published configuration never falls back to a local endpoint or stored token",async()=>{
+  const h=harness(()=>snapshot,{production:true,manifestEndpoint:"",storedEndpoint:otherEndpoint,storedToken:token});
+  await flush();assert.equal(h.calls.length,0);assert.equal(h.render().mode,"live");
+  assert.equal(h.render().snapshot,null);assert.equal(h.render().authenticated,false);
+  assert.match(h.render().error,/未設定/);h.unmount();
+});
+
+test("generic API password ambiguity also signs out without replay",async()=>{
+  const h=harness(call=>{if(call.action==="changePassword")throw new SheetApiError("API","不明な結果");return snapshot;},{storedToken:token});
+  await flush();await assert.rejects(()=>h.render().changePassword("old-private-password","new-private-password"),/新しいパスワード/);
+  assert.equal(h.render().authenticated,false);assert.equal(h.sessionStorage.getItem(SESSION_KEY),null);
+  assert.equal(h.calls.filter(c=>c.action==="changePassword").length,1);h.unmount();
 });

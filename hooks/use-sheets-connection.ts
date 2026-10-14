@@ -26,6 +26,7 @@ export function useSheetsConnection() {
   const [syncError, setSyncError] = useState("");
   const [credentials, setCredentials] = useState<{id: string; password: string} | null>(null);
   const token = useRef("");
+  const pinnedEndpoint = useRef("");
   const generation = useRef(0);
   const requestVersion = useRef(0);
   const mutationRunning = useRef(false);
@@ -71,12 +72,22 @@ export function useSheetsConnection() {
     mounted.current = true;
     const {controller, g} = beginLoad(null);
     (async () => {
-      let target = readStorage(localStorage, ENDPOINT_KEY) || "";
-      if (!target) {
-        try {
-          const response = await fetch(`${import.meta.env.BASE_URL}connection.json`, { cache: "no-store", signal: controller.signal });
-          if (response.ok) target = (await response.json()).endpoint || "";
-        } catch { /* No live endpoint has been configured. */ }
+      let target = "";
+      try {
+        // The published manifest is authoritative. An obsolete or tampered
+        // localStorage endpoint must never receive credentials or sessions.
+        const response = await fetch(`${import.meta.env.BASE_URL}connection.json`, { cache: "no-store", signal: controller.signal });
+        if (!response.ok) throw new Error("接続設定を取得できませんでした。画面を再読み込みしてください。");
+        const manifest = await response.json();
+        if (manifest.endpoint) { target = validateEndpoint(manifest.endpoint); pinnedEndpoint.current = target; }
+        else if (import.meta.env.PROD) throw new Error("公開アプリの接続設定が未設定です。管理者に確認してください。");
+      } catch (e) {
+        if (isCurrent(g)) {
+          setMode("live"); setPlayers([]); setActivities([]);
+          setError(e instanceof Error ? e.message : "接続設定を確認できませんでした。");
+          setReady(true); finishLoad(g, controller);
+        }
+        return;
       }
       if (!isCurrent(g)) return;
       if (!target) { setReady(true); finishLoad(g, controller); return; }
@@ -95,7 +106,7 @@ export function useSheetsConnection() {
             setAuthenticated(true); setLoadPhase("restoring");
             const data = await sheetRequest<SheetSnapshot>(target, "snapshot", {}, {token: session.token, signal: controller.signal});
             if (isCurrent(g)) applySnapshot(data);
-          }
+          } else writeStorage(sessionStorage, SESSION_KEY, null);
         }
       } catch (e) {
         if (isCurrent(g)) {
@@ -116,6 +127,7 @@ export function useSheetsConnection() {
     let target: string;
     try { target = validateEndpoint(value); }
     catch (e) { setError(e instanceof Error ? e.message : "接続先を確認してください。"); throw e; }
+    if (pinnedEndpoint.current && target !== pinnedEndpoint.current) throw new Error("公開アプリの接続先は固定されています。変更は管理者が公開設定から行ってください。");
     loginRunning.current = false;
     const {controller, g} = beginLoad(null);
     try {
@@ -245,6 +257,36 @@ export function useSheetsConnection() {
   };
   const analyzeReviews = (period:string) => requestAdvice<InterviewAdvice>("analyzeInterviewReviews",period);
   const readAdvice = (period:string) => requestAdvice<InterviewAdviceState>("readInterviewAdvice",period);
+  const analyzeInsights = (period:string) => requestAdvice<import("../lib/workspace-insights").WorkspaceInsightAdvice>("analyzeWorkspaceInsights",period);
+  const readInsights = (period:string) => requestAdvice<import("../lib/workspace-insights").WorkspaceInsightState>("readWorkspaceInsights",period);
+
+  const readSecurity = async <T,>(): Promise<T> => {
+    if (!token.current || snapshot?.self.role !== "admin") throw new Error("管理者でログインしてください。");
+    const g = generation.current;
+    try {
+      const data = await sheetRequest<T>(endpoint, "auditSecurity", {}, {token:token.current});
+      if (!isCurrent(g)) throw new Error("ログイン状態が変更されました。");
+      return data;
+    } catch (e) { if (isCurrent(g) && isExpired(e)) clearSession(); throw e; }
+  };
+
+  const changePassword = async (currentPassword: string, newPassword: string) => {
+    if (!token.current || !snapshot) throw new Error("ログインしてください。");
+    if (mutationRunning.current || loginRunning.current) throw new Error("保存が完了してから変更してください。");
+    const g = generation.current;
+    mutationRunning.current = true; ++requestVersion.current;
+    activeRequest.current?.abort(); activeRequest.current = null;
+    setBusy(true); setError("");
+    try {
+      const data = await sheetRequest<{changed:boolean}>(endpoint, "changePassword", {currentPassword,newPassword}, {token:token.current});
+      if (!data || data.changed !== true) throw new Error("変更結果を確認できませんでした。");
+      if (isCurrent(g)) clearSession();
+    } catch (e) {
+      if (isCurrent(g) && (isExpired(e) || isUncertainPasswordChange(e))) clearSession();
+      if (isUncertainPasswordChange(e)) throw new Error("変更結果を確認できませんでした。新しいパスワードでログインし、入れなければ元のパスワードで確認してください。");
+      throw e;
+    } finally { mutationRunning.current = false; if (isCurrent(g)) setBusy(false); }
+  };
 
   const readManagement = async <T,>(action: "managementTables" | "managementTable", payload: unknown = {}): Promise<T> => {
     if (!token.current || snapshot?.self.role!=="admin") throw new Error("管理者でログインしてください。");
@@ -265,5 +307,9 @@ export function useSheetsConnection() {
   };
 
   return { ready, endpoint, mode, players, setPlayers, activities, setActivities, snapshot, authenticated, loadPhase, busy, error,
-    syncing, syncError, credentials, dismissCredentials:() => setCredentials(null), connect, login, logout, refresh, mutate, readManagement, analyzeReviews, readAdvice, showDemo };
+    syncing, syncError, credentials, dismissCredentials:() => setCredentials(null), connect, login, logout, refresh, mutate, readManagement, analyzeReviews, readAdvice, analyzeInsights, readInsights, readSecurity, changePassword, showDemo };
+}
+
+function isUncertainPasswordChange(e: unknown) {
+  return !(e instanceof SheetApiError) || ["NETWORK", "TIMEOUT", "HTTP", "NOT_JSON", "INTERNAL", "API", "SHEET_READ_FAILED", "SHEET_WRITE_FAILED", "INVALID_RESPONSE"].includes(e.code);
 }

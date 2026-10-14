@@ -12,7 +12,7 @@ function contentResponse(status = 404, url = contentUrl, redirected = true) {
 async function flushMicrotasks() { for (let i = 0; i < 6; i++) await Promise.resolve(); }
 
 test("credentials cannot be sent to a non-deployed, non-Google or query-bearing URL",()=>{
-  for(const value of ["http://script.google.com/macros/s/AKfycb_TEST_DEPLOYMENT_1234567890/exec", "https://evil.example/exec", endpoint+"?password=secret", endpoint.replace("/exec","/dev"), endpoint.replace("script.google.com","script.google.com.evil.example")]) {
+  for(const value of ["http://script.google.com/macros/s/AKfycb_TEST_DEPLOYMENT_1234567890/exec", "https://evil.example/exec", endpoint+"?password=secret", endpoint.replace("/exec","/dev"), endpoint.replace("script.google.com","script.google.com.evil.example"), endpoint.replace("script.google.com", "script.google.com:8443")]) {
     assert.throws(()=>validateEndpoint(value));
   }
   assert.equal(validateEndpoint(endpoint),endpoint);
@@ -22,6 +22,7 @@ test("POST carries the token and operation id only in the body, never a query or
   t.mock.method(globalThis,"fetch",async (url: string|URL|Request, init?:RequestInit)=>{
     assert.equal(String(url),endpoint);
     assert.equal(init?.credentials,"omit"); assert.equal(init?.method,"POST"); assert.equal(init?.cache,"no-store");
+    assert.equal(init?.referrerPolicy,"no-referrer");
     assert.match(String((init?.headers as Record<string,string>)["Content-Type"]),/^text\/plain/);
     const body=JSON.parse(String(init?.body));
     assert.equal(body.token,"test-token"); assert.equal(body.operationId,"same-operation");
@@ -323,6 +324,34 @@ test("a player snapshot rejects another player's private activity and missing se
   assert.throws(()=>assertSnapshot({...snapshot,players:[{...player,target:0}]}));
 });
 
+test("malformed and null snapshot substructures fail closed with a controlled error", () => {
+  const validRecord = {recordId:"r",rowVersion:"v",row:2,playerId:player.id,candidateName:"候補者",source:"自社",values:Array(26).fill(""),formulaColumns:[5]};
+  const validActivity = {id:"a",recordId:"r",rowVersion:"v",playerId:player.id,candidateId:"c",candidateName:"候補者",source:"自社",company:"会社",position:"FS",stage:"提案",date:"2026-10-07"};
+  assert.doesNotThrow(() => assertSnapshot({...snapshot,activities:[validActivity],records:[validRecord]}));
+  for (const malformed of [
+    null, [], {...snapshot,self:null}, {...snapshot,self:{playerId:player.id,role:{toString:null}}},
+    {...snapshot,players:[null]}, {...snapshot,players:[player,player]}, {...snapshot,activities:[null]},
+    {...snapshot,activities:[{...validActivity,stage:"unknown"}]}, {...snapshot,warnings:[{}]},
+    {...snapshot,counts:[]}, {...snapshot,counts:{all:null}}, {...snapshot,counts:{all:{[player.id]:null}}},
+    {...snapshot,counts:{all:{[player.id]:{"提案":-1}}}}, {...snapshot,counts:{all:{[player.id]:{"提案":"4"}}}},
+    {...snapshot,counts:{all:{[player.id]:{"提案":Infinity}}}}, {...snapshot,records:null},
+    {...snapshot,records:[null]}, {...snapshot,records:[{...validRecord,row:0}]},
+    {...snapshot,records:[{...validRecord,values:[Infinity,...Array(25).fill("")]}]},
+    {...snapshot,records:[{...validRecord,formulaColumns:[27]}]}, {...snapshot,records:[{...validRecord,formulaColumns:[5,5]}]},
+    {...snapshot,interviewReviews:[null]}, {...snapshot,destination:null},
+  ]) assert.throws(() => assertSnapshot(malformed), {name:"SheetApiError",code:"INVALID_RESPONSE"});
+  // All-team totals are intentionally shared for rankings, even for a player.
+  assert.doesNotThrow(() => assertSnapshot({...snapshot,counts:{all:{"ND-002":{"提案":4}}}}));
+});
+
+test("malformed API error fields are never exposed as non-string error messages", async t => {
+  t.mock.method(globalThis,"fetch",async () => new Response(JSON.stringify({ok:false,error:{code:{secret:"bad"},message:{token:"private"}}})));
+  await assert.rejects(() => sheetRequest(endpoint,"login"), (error:unknown) => {
+    assert.ok(error instanceof SheetApiError); assert.equal(error.code,"API");
+    assert.equal(error.message,"スプレッドシートへの操作に失敗しました。"); return true;
+  });
+});
+
 const destination = {
   title: "テスト管理シート",
   matchingUrl: "https://docs.google.com/spreadsheets/d/test-destination-id/edit#gid=34567",
@@ -430,4 +459,18 @@ for (const action of ["analyzeInterviewReviews","readInterviewAdvice"]) test(`${
   });
   await flushMicrotasks(); deadline.abort(new DOMException("advice deadline expired","TimeoutError"));
   await checked; assert.equal(calls,1);
+});
+
+test("workspace insight generation never replays while saved-insight recovery safely retries a read", async t => {
+  t.mock.timers.enable({apis:["setTimeout"]});
+  let calls = 0;
+  t.mock.method(globalThis,"fetch",async () => { calls++; throw new TypeError("offline"); });
+  const generated = assert.rejects(() => sheetRequest(endpoint,"analyzeWorkspaceInsights",{period:"2026-10"}), (error:unknown) => {
+    assert.ok(error instanceof SheetApiError); assert.equal(error.code,"NETWORK");
+    assert.match(error.message,/AI分析.*保存済み/); assert.doesNotMatch(error.message,/同じ内容で再試行|保存結果/); return true;
+  });
+  await generated; assert.equal(calls,1);
+  const recovered = sheetRequest(endpoint,"readWorkspaceInsights",{period:"2026-10"});
+  const checked = assert.rejects(recovered,{code:"NETWORK"});
+  await flushMicrotasks(); t.mock.timers.tick(750); await checked; assert.equal(calls,3);
 });

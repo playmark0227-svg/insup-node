@@ -16,6 +16,7 @@ var NODE = Object.freeze({
   configKey: 'NODE_CONFIG',
   pepperKey: 'NODE_PEPPER',
   sessionHours: 6,
+  sessionsPerAccount: 8,
   stages: ['候補者面談','提案','C面談予約','クライアント面談','内定','内定承諾','稼働開始予定','稼働開始'],
   stageColumns: [1,8,9,17,21,22,23,24],
   positions: ['アポインター','FS','ディレクション','コールシステム','コンサル','その他'],
@@ -119,7 +120,11 @@ function nodeHandle_(request) {
   var action = request.action;
   if (action === 'health') return health_();
   if (action === 'login') return login_(request.payload || {});
-  if (['snapshot','logout','saveActivity','updateStatus','updateProfile','createPlayer','updateRecord','cancelAchievement','restoreChange','managementTables','managementTable','saveManagementRow','createCandidate','saveInterviewReview','analyzeInterviewReviews','readInterviewAdvice'].indexOf(action) < 0) fail_('BAD_REQUEST', '対応していない操作です。');
+  if (action === 'changePassword') return changePassword_(request);
+  if (action === 'auditSecurity') return auditSecurity_(request);
+  if (['snapshot','logout','saveActivity','updateStatus','updateProfile','createPlayer','updateRecord','cancelAchievement','restoreChange','managementTables','managementTable','saveManagementRow','createCandidate','saveInterviewReview','analyzeInterviewReviews','readInterviewAdvice','readWorkspaceInsights','analyzeWorkspaceInsights'].indexOf(action) < 0) fail_('BAD_REQUEST', '対応していない操作です。');
+  if (action === 'readWorkspaceInsights') return readWorkspaceInsights_(request);
+  if (action === 'analyzeWorkspaceInsights') return analyzeWorkspaceInsights_(request);
   if (action === 'analyzeInterviewReviews') return analyzeInterviewReviews_(request);
   if (action === 'readInterviewAdvice') return readInterviewAdvice_(request);
   if (action === 'managementTables' || action === 'managementTable') {
@@ -165,7 +170,7 @@ function nodeHandle_(request) {
     if (action === 'cancelAchievement') plan = planCancelAchievement_(store,user,payload);
     if (action === 'restoreChange') plan = planRestoreChange_(store,user,payload);
     if (action === 'saveManagementRow') plan = planManagementRow_(store,user,payload);
-    commit_(store, user, action, operationId, payloadHash, plan);
+    commit_(store, user, action, operationId, payloadHash, plan, request.token);
     return { user:user, result:plan.result || {}, operationId:operationId };
   });
   if (action === 'logout') return committed;
@@ -187,11 +192,19 @@ function constantEqual_(a, b) {
   return diff === 0;
 }
 function sessionKey_(token) { return 'NODE_SESSION_' + hash_(token); }
+function authRecord_(id) {
+  var raw=props_().getProperty('NODE_AUTH_'+id),auth;
+  try{auth=raw?JSON.parse(raw):null;}catch(_){return null;}
+  if(!auth||typeof auth.salt!=='string'||typeof auth.hash!=='string'||auth.salt.length>200||auth.hash.length!==43||(auth.version!==undefined&&typeof auth.version!=='string'))return null;
+  return auth;
+}
 function authenticate_(token) {
   if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(token)) fail_('UNAUTHENTICATED', 'ログインしてください。');
-  var raw = props_().getProperty(sessionKey_(token));
-  var session = raw ? JSON.parse(raw) : null;
-  if (!session || !session.expiresAt || session.expiresAt <= Date.now()) { props_().deleteProperty(sessionKey_(token)); fail_('UNAUTHENTICATED', 'ログインの有効期限が切れました。'); }
+  var key=sessionKey_(token),raw=props_().getProperty(key),session;
+  try{session=raw?JSON.parse(raw):null;}catch(_){session=null;}
+  if (!session || typeof session.id!=='string' || typeof session.expiresAt!=='number' || !isFinite(session.expiresAt) || session.expiresAt <= Date.now()) { props_().deleteProperty(key); fail_('UNAUTHENTICATED', 'ログインの有効期限が切れました。'); }
+  var auth=authRecord_(session.id);
+  if(!auth||(session.authVersion||null)!==(auth.version||null)){props_().deleteProperty(key);fail_('UNAUTHENTICATED','パスワードが更新されました。もう一度ログインしてください。');}
   return { id: session.id };
 }
 function activeActor_(store, session) {
@@ -222,7 +235,7 @@ function issueSession_(payload) {
   if (now - globalRate.start >= 60 * 1000) globalRate = { start: now, attempts: 0 };
   if (rate.failures >= 5 || globalRate.attempts >= 60) fail_('RATE_LIMITED', 'ログイン試行が多すぎます。時間をおいて再試行してください。');
   globalRate.attempts++; props_().setProperty('NODE_LOGIN_RATE', JSON.stringify(globalRate));
-  var auth = raw ? JSON.parse(raw) : { salt: 'unavailable', hash: '' };
+  var auth = authRecord_(id) || { salt: 'unavailable', hash: '' };
   var valid = constantEqual_(passwordHash_(password, auth.salt), auth.hash);
   if (!valid) { rate.failures++; props_().setProperty(rateKey, JSON.stringify(rate)); fail_('INVALID_CREDENTIALS', 'IDまたはパスワードを確認してください。'); }
   var store = readAccountStore_(config), actor = store.players.find(function (p) { return p.id === id && p.active; });
@@ -230,17 +243,66 @@ function issueSession_(payload) {
   props_().deleteProperty(rateKey);
   cleanupSessions_();
   var token = random256_();
-  props_().setProperty(sessionKey_(token), JSON.stringify({ id: id, expiresAt: Date.now() + NODE.sessionHours * 60 * 60 * 1000 }));
+  registerSession_(id,token,auth.version||null);
   return { token: token, accountStore: store };
+}
+function sessionIndexKey_(id) {return 'NODE_SESSIONS_INDEX_'+hash_(id);}
+function parseSession_(raw) {try{var session=JSON.parse(raw);return session&&typeof session.id==='string'&&typeof session.expiresAt==='number'&&isFinite(session.expiresAt)&&session.expiresAt>Date.now()?session:null;}catch(_){return null;}}
+function registerSession_(id,token,authVersion) {
+  var properties=props_(),index=[];
+  try{index=JSON.parse(properties.getProperty(sessionIndexKey_(id))||'[]');}catch(_){}
+  if(!Array.isArray(index))index=[];
+  index=index.filter(function(key){if(typeof key!=='string'||!/^NODE_SESSION_[A-Za-z0-9_-]{43}$/.test(key))return false;var session=parseSession_(properties.getProperty(key));return session&&session.id===id;});
+  while(index.length>=NODE.sessionsPerAccount)properties.deleteProperty(index.shift());
+  var key=sessionKey_(token);
+  properties.setProperty(key,JSON.stringify({id:id,issuedAt:Date.now(),expiresAt:Date.now()+NODE.sessionHours*3600000,authVersion:authVersion}));
+  index.push(key);
+  try{properties.setProperty(sessionIndexKey_(id),JSON.stringify(index));}catch(error){properties.deleteProperty(key);throw error;}
 }
 function cleanupSessions_() {
   var now = Date.now(), last = Number(props_().getProperty('NODE_CLEANUP_AT'));
   if (isFinite(last) && last <= now && now - last < 60000) return;
-  var all = props_().getProperties();
+  var all = props_().getProperties(),groups=Object.create(null);
   Object.keys(all).forEach(function (key) {
-    if (key.indexOf('NODE_SESSION_') === 0) { try { if (JSON.parse(all[key]).expiresAt <= now) props_().deleteProperty(key); } catch (_) { props_().deleteProperty(key); } }
+    if (!/^NODE_SESSION_[A-Za-z0-9_-]{43}$/.test(key)) return;
+    var session=parseSession_(all[key]);
+    if(!session){props_().deleteProperty(key);return;}
+    if(!groups[session.id])groups[session.id]=[];
+    groups[session.id].push({key:key,time:session.issuedAt||session.expiresAt-NODE.sessionHours*3600000});
   });
+  Object.keys(groups).forEach(function(id){var sessions=groups[id].sort(function(a,b){return a.time-b.time;});while(sessions.length>NODE.sessionsPerAccount)props_().deleteProperty(sessions.shift().key);props_().setProperty(sessionIndexKey_(id),JSON.stringify(sessions.map(function(s){return s.key;})));});
   props_().setProperty('NODE_CLEANUP_AT', String(now));
+}
+function changePassword_(request) {
+  return withLock_(function(){
+    var session=authenticate_(request.token),accounts=readAccountStore_(),user=activeActor_(accounts,session),payload=request.payload||{};
+    var current=payload.currentPassword,next=payload.newPassword;
+    if(typeof current!=='string'||current.length>200||typeof next!=='string'||next.length<12||next.length>200||/[\u0000-\u001f\u007f]/.test(next)||next===current)fail_('VALIDATION','新しいパスワードは現在と異なる12〜200文字で入力してください。');
+    var properties=props_(),rateKey='NODE_RATE_'+hash_(user.id),rate;
+    try{rate=JSON.parse(properties.getProperty(rateKey)||'null');}catch(_){rate=null;}
+    if(!rate||typeof rate.start!=='number'||typeof rate.failures!=='number'||Date.now()-rate.start>=15*60000)rate={start:Date.now(),failures:0};
+    if(rate.failures>=5)fail_('RATE_LIMITED','パスワードの確認回数が多すぎます。時間をおいて再試行してください。');
+    var auth=authRecord_(user.id);
+    if(!auth||!constantEqual_(passwordHash_(current,auth.salt),auth.hash)){rate.failures++;properties.setProperty(rateKey,JSON.stringify(rate));fail_('INVALID_CREDENTIALS','現在のパスワードを確認してください。');}
+    snapshotActor_(accounts,request.token);
+    var all=properties.getProperties(),revoke={};
+    Object.keys(all).forEach(function(key){if(!/^NODE_SESSION_[A-Za-z0-9_-]{43}$/.test(key))return;var old=parseSession_(all[key]);if(old&&old.id===user.id)revoke[key]=JSON.stringify({id:user.id,expiresAt:0});});
+    if(Object.keys(revoke).length){properties.setProperties(revoke,false);if(Object.keys(revoke).some(function(key){return properties.getProperty(key)!==revoke[key];}))fail_('INTERNAL','ログイン状態を更新できませんでした。もう一度ログインしてからパスワードを変更してください。');}
+    var updated=makeAuth_(next);updated.version=random256_();var serialized=JSON.stringify(updated),authKey='NODE_AUTH_'+user.id;
+    // A credential version also revokes any legacy session missed by cleanup.
+    // Check the persisted value if Google reports an ambiguous property write.
+    try{properties.setProperty(authKey,serialized);}catch(error){if(properties.getProperty(authKey)!==serialized)throw error;}
+    if(properties.getProperty(authKey)!==serialized)fail_('INTERNAL','パスワードの保存を確認できませんでした。新旧どちらかのパスワードでログインを確認してください。');
+    properties.deleteProperty(rateKey);properties.deleteProperty(sessionIndexKey_(user.id));
+    return {changed:true};
+  });
+}
+function auditSecurity_(request) {
+  var session=authenticate_(request.token),accounts=readAccountStore_(),user=activeActor_(accounts,session);requireAdmin_(user);
+  var store=readStore_({readOnly:true},accounts),properties=props_(),all=properties.getProperties(),sessions=0;
+  Object.keys(all).forEach(function(key){if(!/^NODE_SESSION_[A-Za-z0-9_-]{43}$/.test(key))return;var s=parseSession_(all[key]),account=s&&store.players.find(function(p){return p.id===s.id&&p.active;});if(account){var auth=authRecord_(s.id);if(auth&&(s.authVersion||null)===(auth.version||null))sessions++;}});
+  var result={checkedAt:new Date().toISOString(),activePlayers:store.players.filter(function(p){return p.active&&p.role==='player';}).length,activeAdmins:store.players.filter(function(p){return p.active&&p.role==='admin';}).length,disabledAccounts:store.players.filter(function(p){return !p.active;}).length,activeSessions:sessions,sessionsPerAccountLimit:NODE.sessionsPerAccount,sessionHours:NODE.sessionHours,missingCredentials:store.players.filter(function(p){return p.active&&!authRecord_(p.id);}).length,unmappedRecords:store.records.filter(function(r){return !r.playerId;}).length,writesEnabled:store.schemaCompatible&&writesEnabled_(store.config)&&store.book.getSpreadsheetTimeZone()==='Asia/Tokyo',originalProtected:true,aiConfigured:!!properties.getProperty('NODE_GEMINI_API_KEY'),aiFreeTierConfirmed:properties.getProperty('NODE_GEMINI_FREE_TIER_CONFIRMED')==='true'};
+  requireAdmin_(snapshotActor_(store,request.token));return result;
 }
 function snapshotActor_(store, token) {
   var players = readPlayers_(store.playerSheet), actor = activeActor_({ players: players }, authenticate_(token));
@@ -436,12 +498,13 @@ function countActivities_(activities, players) {
   });
   return counts;
 }
-function publicPlayer_(player) { return { id: player.id, name: player.name, team: player.team, color: player.color, target: player.target, bio: player.bio, sheetNames: player.sheetNames.slice() }; }
+function publicPlayer_(player,user) { var own=user.role==='admin'||user.id===player.id;return { id: player.id, name: player.name, team: player.team, color: player.color, target: player.target, bio: own?player.bio:'', sheetNames: own?player.sheetNames.slice():[] }; }
 function buildSnapshot_(store, user) {
   var all = activities_(store);
-  var snapshot={ self: { playerId: user.id, role: user.role }, players: store.players.filter(function (p) { return p.active && p.role === 'player'; }).map(publicPlayer_), activities: all.filter(function (a) { return user.role === 'admin' || a.playerId === user.id; }), counts: countActivities_(all, store.players), syncedAt: new Date().toISOString(), warnings: store.warnings.slice(), writesEnabled: store.schemaCompatible&&writesEnabled_(store.config) && store.book.getSpreadsheetTimeZone() === 'Asia/Tokyo' };
+  var snapshot={ self: { playerId: user.id, role: user.role }, players: store.players.filter(function (p) { return p.active && p.role === 'player'; }).map(function(player){return publicPlayer_(player,user);}), activities: all.filter(function (a) { return user.role === 'admin' || a.playerId === user.id; }), counts: countActivities_(all, store.players), syncedAt: new Date().toISOString(), warnings: store.warnings.slice(), writesEnabled: store.schemaCompatible&&writesEnabled_(store.config) && store.book.getSpreadsheetTimeZone() === 'Asia/Tokyo' };
   snapshot.interviewReviews=readInterviewReviews_(store,user);
   snapshot.reviewFeature=true;
+  snapshot.securityFeature=true; snapshot.workspaceFeature=true;
   snapshot.records=store.schemaCompatible ? store.records.filter(function(r){return user.role==='admin'||r.playerId===user.id;}).map(publicRecord_) : [];
   if(user.role==='admin'){
     var prefix='https://docs.google.com/spreadsheets/d/'+encodeURIComponent(store.config.spreadsheetId)+'/edit#gid=';
@@ -587,7 +650,7 @@ function cell_(value) {
   return { userEnteredValue: typeof value === 'number' ? { numberValue: value } : typeof value === 'boolean' ? { boolValue: value } : { stringValue: String(value == null ? '' : value) } };
 }
 function rowUpdateRequest_(sheetId, row, cells) { return { updateCells: { range: { sheetId: sheetId, startRowIndex: row - 1, endRowIndex: row, startColumnIndex: 0, endColumnIndex: cells.length }, rows: [{ values: cells.map(cell_) }], fields: 'userEnteredValue' } }; }
-function commit_(store, user, action, operationId, payloadHash, plan) {
+function commit_(store, user, action, operationId, payloadHash, plan, token) {
   if(!store.schemaCompatible)fail_('SCHEMA_MISMATCH','入力対象19列の見出しが一致しません。');
   if (store.book.getSpreadsheetTimeZone() !== 'Asia/Tokyo') fail_('TIMEZONE', '接続先スプレッドシートのタイムゾーンがAsia/Tokyoであることを確認してください。');
   var requests = [], businessSheet = store.matching;
@@ -613,6 +676,7 @@ function commit_(store, user, action, operationId, payloadHash, plan) {
   }
   if (plan.profileRow && store.playerSheet.getRange(plan.profileRow,1,1,NODE.playerHeaders.length).getFormulas()[0].some(Boolean)) fail_('FORMULA_PROTECTED', 'プロフィールの入力先に数式があります。');
   revalidateManagementPlan_(store,user,plan);
+  if(token)snapshotActor_(store,token);
   Array.prototype.push.apply(requests, plan.requests || []);
   if(JSON.stringify(plan.result||{}).length>48000)fail_('VALIDATION','変更履歴が大きすぎます。長いメモは項目を分けて保存してください。');
   requests.push({ appendCells: { sheetId: store.operationSheet.getSheetId(), rows: [{ values: [operationId,user.id,action,payloadHash,JSON.stringify(plan.result || {}),new Date().toISOString()].map(cell_) }], fields: 'userEnteredValue' } });
@@ -1222,6 +1286,7 @@ function analyzeInterviewReviews_(request) {
   if(!count)fail_('VALIDATION','この期間の未マッチ理由を先に登録してください。');
   var properties=props_(),reservationId=Utilities.getUuid();
   var previous=withLock_(function(){
+    snapshotActor_(store,request.token);
     var saved=aiAdvice_(scope);
     if(saved&&saved.inputSignature===signature)return saved;
     var key=properties.getProperty('NODE_GEMINI_API_KEY');
@@ -1241,7 +1306,7 @@ function analyzeInterviewReviews_(request) {
     var body=generateAiAdvice_(aggregate,properties.getProperty('NODE_GEMINI_API_KEY'));
     snapshotActor_(store,request.token);
     var result={summary:body.summary.trim(),actions:body.actions.map(function(a){return a.trim();}),count:count,period:period,aggregate:aggregate,inputSignature:signature,generatedAt:new Date().toISOString()};
-    withLock_(function(){saveAiAdvice_(scope,result);});
+    withLock_(function(){snapshotActor_(store,request.token);saveAiAdvice_(scope,result);});
     snapshotActor_(store,request.token);
     return aiResult_(result,user,'generated');
   }finally{
@@ -1292,4 +1357,254 @@ function verifyNodeSyncPerformance() {
   if(stableJson_(fullSnapshot)!==stableJson_(trimmedSnapshot))fail_('SYNC_VERIFICATION_FAILED','読み取り中にデータが変わったか、取得結果が一致しません。再確認してください。');
   var result={success:true,fullRows:full.values.length,activeRows:trimmed.values.length,fullReadMs:fullMs,trimmedReadMs:trimmedMs,checked:['same records and KPI counts','same row versions and formulas','read only; no business writes']};
   Logger.log(JSON.stringify(result)); return result;
+}
+
+/* BEGIN GENERATED WORKSPACE RULES */
+// Generated from lib/workspace-insights.ts; browser and server use identical rules.
+var NODE_INSIGHT_RULES = (function () { var exports = {};
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.workspaceEvidenceKeys = exports.insightReviewCategories = exports.insightMetrics = void 0;
+exports.validInsightDate = validInsightDate;
+exports.validInsightPeriod = validInsightPeriod;
+exports.insightToday = insightToday;
+exports.previousInsightPeriod = previousInsightPeriod;
+exports.scopedInsightRecords = scopedInsightRecords;
+exports.buildFollowUpTasks = buildFollowUpTasks;
+exports.buildWorkspaceInsightAggregate = buildWorkspaceInsightAggregate;
+exports.workspaceInsightFingerprint = workspaceInsightFingerprint;
+exports.insightPeriodLabel = insightPeriodLabel;
+exports.workspaceEvidenceLabel = workspaceEvidenceLabel;
+exports.workspaceInsightCopyText = workspaceInsightCopyText;
+exports.insightMetrics = [
+    { key: "interviews", stage: "候補者面談", label: "面談実施" },
+    { key: "proposals", stage: "提案", label: "提案数" },
+    { key: "booked", stage: "C面談予約", label: "C面談予約" },
+    { key: "clientInterviews", stage: "クライアント面談", label: "C面談実施" },
+    { key: "matches", stage: "内定承諾", label: "マッチ数" },
+    { key: "starts", stage: "稼働開始", label: "稼働開始" },
+];
+exports.insightReviewCategories = ["条件のずれ", "事前確認不足", "面談準備不足", "仕事内容の認識違い", "連絡・日程調整", "募集枠・タイミング", "他案件との比較", "理由未確認", "その他"];
+exports.workspaceEvidenceKeys = [...exports.insightMetrics.map(metric => metric.key), "interviewsToday", "interviewsOverdue", "resultsWaiting", "startsOverdue", "missingReviews", "proposalTarget", "reviewReasons"];
+const valueAt = (record, column) => String(record.values[column - 1] ?? "").trim();
+function validInsightDate(value) {
+    if (!/^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/.test(value))
+        return false;
+    const year = Number(value.slice(0, 4));
+    if (year < 1900 || year > 2100)
+        return false;
+    const date = new Date(`${value}T00:00:00.000Z`);
+    return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}
+function validInsightPeriod(period) {
+    return period === "all" || /^\d{4}-(0[1-9]|1[0-2])$/.test(period) && Number(period.slice(0, 4)) >= 1900 && Number(period.slice(0, 4)) <= 2100 || validInsightDate(period);
+}
+function insightToday(now = new Date()) {
+    return new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Tokyo", year: "numeric", month: "2-digit", day: "2-digit" }).format(now);
+}
+function previousInsightPeriod(period) {
+    if (period === "all")
+        return null;
+    if (!validInsightPeriod(period))
+        throw new Error("集計期間を確認してください。");
+    const date = new Date(`${period.length === 7 ? `${period}-01` : period}T00:00:00.000Z`);
+    if (period.length === 7)
+        date.setUTCMonth(date.getUTCMonth() - 1);
+    else
+        date.setUTCDate(date.getUTCDate() - 1);
+    return date.toISOString().slice(0, period.length);
+}
+const daysBetween = (earlier, later) => Math.floor((Date.parse(`${later}T00:00:00Z`) - Date.parse(`${earlier}T00:00:00Z`)) / 86400000);
+const endedStatus = (record) => /^(落選|辞退|案件枠埋まり|合格後離脱|稼働後離脱|C面談ブッチ)/.test(valueAt(record, 7)) || validInsightDate(valueAt(record, 26));
+const finishedRecord = (record) => endedStatus(record) || validInsightDate(valueAt(record, 24)) || valueAt(record, 7) === "稼働開始";
+/** Restrict records again even when a malformed client snapshot contains other owners. */
+function scopedInsightRecords(snapshot) {
+    const owners = new Set(snapshot.players.filter(player => player.id !== "ADMIN" && (snapshot.self.role === "admin" || player.id === snapshot.self.playerId)).map(player => player.id));
+    return (snapshot.records || []).filter(record => owners.has(record.playerId));
+}
+/** Dates indicate missing recorded milestones, not an inferred failure or a contact history. */
+function buildFollowUpTasks(snapshot, today = insightToday()) {
+    if (!validInsightDate(today))
+        throw new Error("本日の日付を確認してください。");
+    const reviewed = new Set((snapshot.interviewReviews || []).filter(review => snapshot.self.role === "admin" || review.playerId === snapshot.self.playerId).map(review => review.recordId));
+    const tasks = [];
+    const seen = new Set();
+    for (const record of scopedInsightRecords(snapshot)) {
+        if (seen.has(record.recordId))
+            continue;
+        seen.add(record.recordId);
+        const interviewed = valueAt(record, 17), scheduled = valueAt(record, 10), plannedStart = valueAt(record, 23), offered = valueAt(record, 21), matched = valueAt(record, 22);
+        const base = { recordId: record.recordId, candidateName: record.candidateName, companyName: valueAt(record, 2), playerId: record.playerId };
+        const add = (task) => tasks.push({ ...base, ...task, id: `${record.recordId}:${task.kind}` });
+        if (!finishedRecord(record)) {
+            if (validInsightDate(plannedStart) && plannedStart < today) {
+                add({ kind: "start_overdue", urgency: "overdue", title: "稼働開始の状況を確認", evidence: `稼働予定 ${plannedStart} · 開始日は未記録`, suggestedAction: "実際の開始日、または予定の変更を確認して記録する。", date: plannedStart });
+            }
+            else if (validInsightDate(scheduled) && !validInsightDate(interviewed) && scheduled <= today) {
+                add({ kind: scheduled === today ? "interview_today" : "interview_overdue", urgency: scheduled === today ? "today" : "overdue", title: scheduled === today ? "今日のC面談を確認" : "C面談の実施状況を確認", evidence: `C面談予定 ${scheduled}${valueAt(record, 11) ? ` ${valueAt(record, 11)}` : ""} · 実施日は未記録`, suggestedAction: scheduled === today ? "参加意思と日時を確認し、面談後に実施日を記録する。" : "実施、延期、辞退のいずれかを確認し、日付と進捗を更新する。", date: scheduled });
+            }
+            else if (validInsightDate(interviewed) && interviewed <= today && !validInsightDate(offered) && !validInsightDate(matched)) {
+                const deadline = valueAt(record, 18);
+                const deadlineDue = validInsightDate(deadline) && deadline <= today;
+                if (deadlineDue || daysBetween(interviewed, today) >= 3)
+                    add({ kind: "result_waiting", urgency: deadlineDue ? deadline < today ? "overdue" : "today" : "followup", title: "面談結果の状況を確認", evidence: `C面談実施 ${interviewed}${validInsightDate(deadline) ? ` · 回答期日 ${deadline}` : ""} · 合格・承諾日は未記録`, suggestedAction: "結果と回答予定をクライアントに確認する。合否待ちは不成立と判断しない。", date: deadlineDue ? deadline : interviewed });
+            }
+        }
+        if (endedStatus(record) && validInsightDate(interviewed) && interviewed <= today && !validInsightDate(matched) && !validInsightDate(valueAt(record, 24)) && !reviewed.has(record.recordId)) {
+            add({ kind: "missing_review", urgency: "followup", title: "確認できた理由を振り返りに残す", evidence: `C面談実施 ${interviewed} · ${valueAt(record, 7) || "離脱日を記録済み"} · 振り返り未記録`, suggestedAction: "不成立の理由を事実と推測に分け、次回の対応を記録する。", date: interviewed });
+        }
+    }
+    const order = { overdue: 0, today: 1, followup: 2 };
+    return tasks.sort((left, right) => order[left.urgency] - order[right.urgency] || left.date.localeCompare(right.date) || left.recordId.localeCompare(right.recordId));
+}
+const nonnegativeCount = (value) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+/** Safe preview of the server aggregate; raw records never become an AI request body. */
+function buildWorkspaceInsightAggregate(snapshot, period, today = insightToday()) {
+    if (!validInsightPeriod(period) || !validInsightDate(today))
+        throw new Error("集計期間と本日の日付を確認してください。");
+    const members = snapshot.players.filter(player => player.id !== "ADMIN" && (snapshot.self.role === "admin" || player.id === snapshot.self.playerId));
+    const owners = new Set(members.map(player => player.id));
+    const previous = previousInsightPeriod(period);
+    const count = (target, stage) => [...owners].reduce((total, owner) => total + nonnegativeCount(snapshot.counts[target]?.[owner]?.[stage]), 0);
+    const records = scopedInsightRecords(snapshot);
+    const tasks = buildFollowUpTasks(snapshot, today);
+    const eligibleIds = new Set(records.filter(record => {
+        const date = valueAt(record, 17);
+        return validInsightDate(date) && !validInsightDate(valueAt(record, 22)) && !validInsightDate(valueAt(record, 24)) && (period === "all" || date.startsWith(period));
+    }).map(record => record.recordId));
+    const reasonCounts = new Map();
+    const reviewedIds = new Set();
+    for (const review of snapshot.interviewReviews || []) {
+        if (!owners.has(review.playerId) || !eligibleIds.has(review.recordId) || reviewedIds.has(review.recordId) || !exports.insightReviewCategories.includes(review.category))
+            continue;
+        reviewedIds.add(review.recordId);
+        reasonCounts.set(review.category, (reasonCounts.get(review.category) || 0) + 1);
+    }
+    return {
+        role: snapshot.self.role,
+        period,
+        asOf: today,
+        metrics: exports.insightMetrics.map(metric => ({ key: metric.key, count: count(period, metric.stage), previousCount: previous ? count(previous, metric.stage) : null })),
+        proposalTarget: period.length === 7 ? members.reduce((total, member) => total + (Number.isSafeInteger(member.target) && member.target > 0 && member.target <= 9999 ? member.target : 0), 0) : null,
+        memberCount: members.length,
+        pipeline: {
+            interviewsToday: tasks.filter(task => task.kind === "interview_today").length,
+            interviewsOverdue: tasks.filter(task => task.kind === "interview_overdue").length,
+            resultsWaiting: tasks.filter(task => task.kind === "result_waiting").length,
+            startsOverdue: tasks.filter(task => task.kind === "start_overdue").length,
+            missingReviews: tasks.filter(task => task.kind === "missing_review").length,
+        },
+        reviewReasons: exports.insightReviewCategories.filter(category => reasonCounts.has(category)).map(category => ({ category, count: reasonCounts.get(category) })),
+    };
+}
+function workspaceInsightFingerprint(aggregate) {
+    return JSON.stringify({
+        role: aggregate.role, period: aggregate.period, asOf: aggregate.asOf,
+        metrics: exports.insightMetrics.map(metric => {
+            const found = aggregate.metrics.find(item => item.key === metric.key);
+            return { key: metric.key, count: found?.count ?? 0, previousCount: found?.previousCount ?? null };
+        }),
+        proposalTarget: aggregate.proposalTarget, memberCount: aggregate.memberCount,
+        pipeline: { interviewsToday: aggregate.pipeline.interviewsToday, interviewsOverdue: aggregate.pipeline.interviewsOverdue, resultsWaiting: aggregate.pipeline.resultsWaiting, startsOverdue: aggregate.pipeline.startsOverdue, missingReviews: aggregate.pipeline.missingReviews },
+        reviewReasons: exports.insightReviewCategories.map(category => ({ category, count: aggregate.reviewReasons.filter(reason => reason.category === category).reduce((sum, reason) => sum + reason.count, 0) })).filter(reason => reason.count > 0),
+    });
+}
+function insightPeriodLabel(period) {
+    if (period === "all")
+        return "累計";
+    if (!validInsightPeriod(period))
+        return "期間未確認";
+    return period.length === 7 ? `${period.slice(0, 4)}年${Number(period.slice(5))}月` : period.replaceAll("-", "/");
+}
+function workspaceEvidenceLabel(key, aggregate) {
+    const metric = exports.insightMetrics.find(item => item.key === key);
+    if (metric)
+        return `${metric.label} ${aggregate.metrics.find(item => item.key === key)?.count ?? 0}件`;
+    const labels = { interviewsToday: "今日のC面談", interviewsOverdue: "予定日を過ぎたC面談・実施日未記録", resultsWaiting: "結果の確認対象", startsOverdue: "稼働予定日を過ぎた・開始日未記録", missingReviews: "不成立の振り返り未記録" };
+    if (key === "proposalTarget")
+        return aggregate.proposalTarget === null ? "月間目標の対象外" : `月間提案目標 ${aggregate.proposalTarget}件`;
+    if (key === "reviewReasons")
+        return aggregate.reviewReasons.length ? aggregate.reviewReasons.map(reason => `${reason.category} ${reason.count}件`).join(" / ") : "理由の記録なし";
+    return `${labels[key]} ${aggregate.pipeline[key]}件`;
+}
+function workspaceInsightCopyText(advice) {
+    const date = new Date(advice.generatedAt);
+    const generated = Number.isFinite(date.getTime()) ? date.toLocaleString("ja-JP", { timeZone: "Asia/Tokyo", year: "numeric", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }) : "日時未確認";
+    return [
+        `INSUP NODE ${advice.aggregate.role === "admin" ? "成果ミーティングの準備" : "活動と面談の準備"}`,
+        `対象期間：${insightPeriodLabel(advice.period)}`, `生成日時：${generated}（日本時間）`,
+        "", "記録済みの成果", ...advice.aggregate.metrics.map(metric => workspaceEvidenceLabel(metric.key, advice.aggregate)),
+        "", "AIによる整理", advice.summary,
+        "", "次の行動の提案", ...advice.priorities.flatMap((priority, index) => [`${index + 1}. ${priority.title}`, priority.action, `根拠：${workspaceEvidenceLabel(priority.evidenceKey, advice.aggregate)}`]),
+        "", advice.aggregate.role === "admin" ? "会議で確認すること" : "面談前に確認すること", ...advice.meetingQuestions.map((question, index) => `${index + 1}. ${question}`),
+        "", "成果は各工程の日付による件数です。同じ候補者が同じ月に工程を進んだ割合ではありません。AIの提案は記録を確認して判断してください。",
+    ].join("\n");
+}
+
+return exports; })();
+/* END GENERATED WORKSPACE RULES */
+
+/* Privacy-safe workspace coaching. Client sends a period, never business notes. */
+function workspaceScope_(store,user,period) { return hash_(store.config.spreadsheetId+'|'+user.id+'|'+user.role+'|workspace-v1|'+period); }
+function workspaceAggregate_(store,user,period) {
+  if(!NODE_INSIGHT_RULES.validInsightPeriod(period))fail_('VALIDATION','集計期間を確認してください。');
+  return NODE_INSIGHT_RULES.buildWorkspaceInsightAggregate(buildSnapshot_(store,user),period,today_());
+}
+function workspaceBody_(body) {
+  function text(value,max){return typeof value==='string'&&value.trim()&&value.length<=max&&!/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(value);}
+  if(!body||!text(body.summary,600)||!Array.isArray(body.priorities)||!body.priorities.length||body.priorities.length>3||body.priorities.some(function(p){return !p||!text(p.title,80)||!text(p.action,400)||NODE_INSIGHT_RULES.workspaceEvidenceKeys.indexOf(p.evidenceKey)<0;})||!Array.isArray(body.meetingQuestions)||body.meetingQuestions.length>3||body.meetingQuestions.some(function(q){return !text(q,200);}))fail_('AI_UNAVAILABLE','AIの応答形式を確認できませんでした。保存された実績はそのままです。');
+  return {summary:body.summary.trim(),priorities:body.priorities.map(function(p){return {title:p.title.trim(),action:p.action.trim(),evidenceKey:p.evidenceKey};}),meetingQuestions:body.meetingQuestions.map(function(q){return q.trim();})};
+}
+function workspaceAdvice_(scope) {
+  var value=props_().getProperty('NODE_AI_ADVICE_'+scope);if(!value)return null;
+  try{var result=JSON.parse(Utilities.ungzip(Utilities.newBlob(Utilities.base64Decode(value),'application/gzip')).getDataAsString('UTF-8'));workspaceBody_(result);if(!result.aggregate||typeof result.inputSignature!=='string'||result.kind!=='workspace-v1')return null;return result;}catch(e){return null;}
+}
+function readWorkspaceInsights_(request) {
+  var session=authenticate_(request.token),store=readStore_({readOnly:true}),user=activeActor_(store,session),period=String((request.payload||{}).period||'');
+  var aggregate=workspaceAggregate_(store,user,period),scope=workspaceScope_(store,user,period),advice=workspaceAdvice_(scope),pending=aiPending_()[scope],properties=props_();
+  snapshotActor_(store,request.token);
+  return {advice:advice?aiResult_(advice,user,'saved'):null,stale:!!advice&&advice.inputSignature!==hash_(stableJson_(aggregate)),configured:!!properties.getProperty('NODE_GEMINI_API_KEY')&&properties.getProperty('NODE_GEMINI_FREE_TIER_CONFIRMED')==='true',pending:!!pending,usage:aiUsage_(user.id)};
+}
+function analyzeWorkspaceInsights_(request) {
+  var session=authenticate_(request.token),store=readStore_({readOnly:true}),user=activeActor_(store,session),period=String((request.payload||{}).period||'');
+  var aggregate=workspaceAggregate_(store,user,period),signature=hash_(stableJson_(aggregate)),scope=workspaceScope_(store,user,period),properties=props_(),reservationId=Utilities.getUuid();
+  var previous=withLock_(function(){
+    snapshotActor_(store,request.token);
+    var saved=workspaceAdvice_(scope);if(saved&&saved.inputSignature===signature)return saved;
+    if(!properties.getProperty('NODE_GEMINI_API_KEY')||properties.getProperty('NODE_GEMINI_FREE_TIER_CONFIRMED')!=='true')fail_('AI_NOT_CONFIGURED','管理者が無料枠の専用Geminiプロジェクトを接続してください。');
+    var pending=aiPending_();if(pending[scope])fail_('AI_IN_PROGRESS','この集計のAI提案を作成中です。保存済みの結果を確認してください。利用回数は追加していません。');
+    if(Object.keys(pending).length>=REVIEW_AI_LIMIT)fail_('BUSY','AIが混み合っています。少し待ってから再確認してください。');
+    var q=aiQuota_();if(q.total>=10||(q.users[user.id]||0)>=3)fail_('AI_LIMIT','本日のAI利用上限です。保存済みの提案と案件の確認は引き続き使えます。翌日0時に回数が戻ります。');
+    q.total++;q.users[user.id]=(q.users[user.id]||0)+1;pending[scope]={id:reservationId,signature:signature,expiresAt:Date.now()+360000};
+    var updates={};updates.NODE_AI_QUOTA=JSON.stringify(q);updates[REVIEW_AI_PENDING]=JSON.stringify(pending);properties.setProperties(updates,false);return null;
+  });
+  if(previous){snapshotActor_(store,request.token);return aiResult_(previous,user,'saved');}
+  try{
+    var body=generateWorkspaceInsights_(aggregate,properties.getProperty('NODE_GEMINI_API_KEY'));
+    snapshotActor_(store,request.token);
+    var result=Object.assign({},body,{kind:'workspace-v1',aggregate:aggregate,period:period,inputSignature:signature,generatedAt:new Date().toISOString()});
+    withLock_(function(){snapshotActor_(store,request.token);saveAiAdvice_(scope,result);});
+    snapshotActor_(store,request.token);return aiResult_(result,user,'generated');
+  }finally{withLock_(function(){var pending=aiPending_();if(pending[scope]&&pending[scope].id===reservationId){delete pending[scope];properties.setProperty(REVIEW_AI_PENDING,JSON.stringify(pending));}});}
+}
+function generateWorkspaceInsights_(aggregate,key) {
+  var response;
+  var instruction='人材紹介の業務改善を支援。渡すのは匿名の工程件数、前期間件数、提案目標、未記録の予定、理由分類だけ。氏名、会社、メモは渡していない。日本語で短い要約、具体的な次の行動を最大三つ、確認したい質問を最大三つ作る。adminなら成果ミーティングの確認点、playerなら本人の面談準備・次の行動。期間別工程件数は別の候補者集団であり、転換率や原因を断定しない。予定超過は実施未記録の確認であり、未実施・怠慢と決めつけない。結果待ちは不成立とみなさない。データが少ない時はその限界を説明。採用適否、個人の優劣、機微属性や能力を評価しない。名付けた人物、会社、具体的な実績の捏造をしない。数字や達成率は画面が実データから表示するので、文章に集計値を転記しない。各提案のevidenceKeyは固定キーから選び、対象の集計が無いときは提案しない。操作、保存、連絡は利用者が内容を確認して実施する。JSONだけ: summary、priorities（title/action/evidenceKey）、meetingQuestions。';
+  try{response=UrlFetchApp.fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent',{method:'post',contentType:'application/json',headers:{'x-goog-api-key':key},muteHttpExceptions:true,payload:JSON.stringify({systemInstruction:{parts:[{text:instruction}]},contents:[{role:'user',parts:[{text:JSON.stringify(aggregate)}]}],generationConfig:{temperature:0.2,maxOutputTokens:1600,responseMimeType:'application/json',responseSchema:{type:'OBJECT',properties:{summary:{type:'STRING'},priorities:{type:'ARRAY',items:{type:'OBJECT',properties:{title:{type:'STRING'},action:{type:'STRING'},evidenceKey:{type:'STRING',enum:NODE_INSIGHT_RULES.workspaceEvidenceKeys}},required:['title','action','evidenceKey']}},meetingQuestions:{type:'ARRAY',items:{type:'STRING'}}},required:['summary','priorities','meetingQuestions']}}})});}catch(e){fail_('AI_UNAVAILABLE','AIとの通信を確認できませんでした。保存済みの結果を確認してから再試行してください。');}
+  if(response.getResponseCode()===429)fail_('AI_LIMIT','Googleの無料枠の上限です。保存済みの提案や案件の確認は引き続き使えます。');
+  if(response.getResponseCode()!==200)fail_('AI_UNAVAILABLE','AIから結果を取得できませんでした。保存された実績はそのままです。');
+  var body;try{var json=JSON.parse(response.getContentText());body=JSON.parse(json.candidates[0].content.parts.map(function(p){return p.text||'';}).join(''));}catch(e){fail_('AI_UNAVAILABLE','AIの応答形式を確認できませんでした。');}
+  var result=workspaceBody_(body);
+  result.priorities.forEach(function(priority){
+    var evidence=priority.evidenceKey;
+    if(Object.prototype.hasOwnProperty.call(aggregate.pipeline,evidence)&&aggregate.pipeline[evidence]<=0||evidence==='proposalTarget'&&!(aggregate.proposalTarget>0)||evidence==='reviewReasons'&&!aggregate.reviewReasons.length)fail_('AI_UNAVAILABLE','AIの提案と元の集計が一致しませんでした。実績を確認してから再試行してください。');
+  });
+  return result;
+}
+/** Synthetic AI smoke test: no business reads, no quota or saved-report writes. */
+function verifyNodeWorkspaceAi() {
+  requireOwner_();var properties=props_(),key=properties.getProperty('NODE_GEMINI_API_KEY');
+  if(!key||properties.getProperty('NODE_GEMINI_FREE_TIER_CONFIRMED')!=='true')fail_('AI_NOT_CONFIGURED','Geminiの無料枠設定を確認してください。');
+  var aggregate={role:'admin',period:'2026-10',asOf:'2026-10-14',metrics:NODE_INSIGHT_RULES.insightMetrics.map(function(m){return {key:m.key,count:2,previousCount:1};}),proposalTarget:20,memberCount:1,pipeline:{interviewsToday:1,interviewsOverdue:1,resultsWaiting:1,startsOverdue:0,missingReviews:0},reviewReasons:[]};
+  var result=generateWorkspaceInsights_(aggregate,key);var proof={success:true,model:'gemini-3.5-flash-lite',priorities:result.priorities.length,questions:result.meetingQuestions.length,checked:['synthetic aggregate only','validated structured output','no business reads','no app quota or reports changed']};Logger.log(JSON.stringify(proof));return proof;
 }

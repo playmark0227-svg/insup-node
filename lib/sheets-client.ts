@@ -1,4 +1,4 @@
-import type { Activity, Metric, Player } from "./node-data";
+import { stages, type Activity, type Metric, type Player } from "./node-data.ts";
 
 export type SheetPlayer = Player & { sheetNames?: string[] };
 export type Counts = Record<string, Record<string, Partial<Record<Metric, number>>>>;
@@ -13,6 +13,8 @@ export type InterviewAdviceUsage = {userRemaining:number;teamRemaining:number;re
 export type InterviewAdvice = {summary:string;actions:string[];count:number;generatedAt:string;period?:string;source?:"generated"|"saved";aggregate?:{category:string;count:number}[];usage?:InterviewAdviceUsage};
 export type InterviewAdviceState = {advice:InterviewAdvice|null;stale:boolean;count:number;usage:InterviewAdviceUsage;configured:boolean;pending:boolean};
 export type SheetSnapshot = {
+  securityFeature?: boolean;
+  workspaceFeature?: boolean;
   reviewFeature?: boolean;
   interviewReviews?: InterviewReview[];
   records?: CandidateRecord[];
@@ -52,7 +54,7 @@ export function validateEndpoint(value: string): string {
   catch { throw new SheetApiError("INVALID_ENDPOINT", "Apps ScriptのウェブアプリURL（/exec）を入力してください。"); }
   if (url.protocol !== "https:" || url.hostname !== "script.google.com" ||
       !/^\/macros\/s\/[A-Za-z0-9_-]{20,}\/exec$/.test(url.pathname) ||
-      url.username || url.password || url.search || url.hash) {
+      url.port || url.username || url.password || url.search || url.hash) {
     throw new SheetApiError("INVALID_ENDPOINT", "Apps ScriptのウェブアプリURL（/exec）を入力してください。");
   }
   return url.href;
@@ -89,7 +91,7 @@ async function recoverContent(url: string, signal: AbortSignal): Promise<{ respo
     await waitForRetry(signal, delays[attempt]);
     signal.throwIfAborted();
     try {
-      const response = await fetch(url, { method: "GET", credentials: "omit", cache: "no-store", redirect: "error", signal });
+      const response = await fetch(url, { method: "GET", credentials: "omit", cache: "no-store", referrerPolicy: "no-referrer", redirect: "error", signal });
       if (attempt === 0 && (response.status === 404 || temporaryHttpStatuses.has(response.status))) continue;
       // A stream interruption may occur after successful response headers.
       // It is still safe to recover this generated result with the final GET.
@@ -104,6 +106,9 @@ async function recoverContent(url: string, signal: AbortSignal): Promise<{ respo
 }
 
 function connectionError(action: string, timedOut: boolean): SheetApiError {
+  if (["analyzeWorkspaceInsights", "readWorkspaceInsights"].includes(action)) return new SheetApiError(timedOut ? "TIMEOUT" : "NETWORK", timedOut
+    ? "AI分析の応答が45秒以内に届きませんでした。成果データはそのままです。保存済みの分析を再取得してください。"
+    : "AI分析の通信が途中で切れました。成果データはそのままです。接続を確認して保存済みの分析を再取得してください。");
   if (["analyzeInterviewReviews","readInterviewAdvice"].includes(action)) return new SheetApiError(timedOut?"TIMEOUT":"NETWORK",timedOut
     ? "改善案の応答が45秒以内に届きませんでした。理由の記録は保存済みです。「保存済みの改善案を再取得」で結果を確認できます。"
     : "改善案の通信が途中で切れました。理由の記録は保存済みです。接続を確認して改善案を再取得してください。");
@@ -136,7 +141,7 @@ export async function sheetRequest<T>(
   const target = validateEndpoint(endpoint);
   const timeout = AbortSignal.timeout(45_000);
   const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
-  const readOnly = ["snapshot","health","managementTables","managementTable","readInterviewAdvice"].includes(action);
+  const readOnly = ["snapshot","health","managementTables","managementTable","readInterviewAdvice","readWorkspaceInsights"].includes(action);
   const body = JSON.stringify({ version: 1, action, payload, token: options.token, operationId: options.operationId });
   for (let attempt = 0; attempt < (readOnly ? 2 : 1); attempt++) {
     let recoveringResult = false;
@@ -148,6 +153,7 @@ export async function sheetRequest<T>(
         headers: { "Content-Type": "text/plain;charset=utf-8" },
         credentials: "omit",
         cache: "no-store",
+        referrerPolicy: "no-referrer",
         redirect: "follow",
         signal,
         body,
@@ -176,7 +182,8 @@ export async function sheetRequest<T>(
         throw new SheetApiError("NOT_JSON", "連携用の応答が返りませんでした。Google側のウェブアプリ公開設定とURLを確認してください。");
       }
       if (envelope?.ok !== true) {
-        throw new SheetApiError(envelope?.error?.code || "API", envelope?.error?.message || "スプレッドシートへの操作に失敗しました。");
+        throw new SheetApiError(typeof envelope?.error?.code === "string" && envelope.error.code ? envelope.error.code : "API",
+          typeof envelope?.error?.message === "string" && envelope.error.message ? envelope.error.message : "スプレッドシートへの操作に失敗しました。");
       }
       if (!Object.hasOwn(envelope, "data")) throw new SheetApiError("INVALID_RESPONSE", "連携先から正しいデータを取得できませんでした。");
       return envelope.data as T;
@@ -207,23 +214,39 @@ export async function sheetRequest<T>(
 }
 
 export function assertSnapshot(value: unknown): asserts value is SheetSnapshot {
-  const s = value as SheetSnapshot;
-  if (!s || !s.self || !["admin", "player"].includes(s.self.role) ||
-      typeof s.self.playerId !== "string" || !Array.isArray(s.players) || !Array.isArray(s.activities) ||
-      !s.counts || typeof s.counts !== "object" || typeof s.writesEnabled !== "boolean" ||
-      !Array.isArray(s.warnings) || typeof s.syncedAt !== "string" ||
-      s.players.some(p => typeof p.id !== "string" || typeof p.name !== "string" || !Number.isSafeInteger(p.target) || p.target < 1) ||
-      s.activities.some(a => typeof a.id !== "string" || typeof a.playerId !== "string" || typeof a.date !== "string")) {
-    throw new SheetApiError("INVALID_RESPONSE", "連携データの形式が正しくありません。Google側の連携コードを更新してください。");
-  }
+  const object = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
+  const strings = (v: Record<string, unknown>, names: string[]) => names.every(name => typeof v[name] === "string");
+  const optionalStrings = (v: Record<string, unknown>, names: string[]) => names.every(name => v[name] === undefined || typeof v[name] === "string");
+  const invalid = (message = "連携データの形式が正しくありません。Google側の連携コードを更新してください。") => {
+    throw new SheetApiError("INVALID_RESPONSE", message);
+  };
+  if (!object(value) || !object(value.self) || typeof value.self.role !== "string" || !["admin", "player"].includes(value.self.role) ||
+      typeof value.self.playerId !== "string" || !value.self.playerId || !Array.isArray(value.players) || !Array.isArray(value.activities) ||
+      !object(value.counts) || typeof value.writesEnabled !== "boolean" ||
+      (value.securityFeature !== undefined && typeof value.securityFeature !== "boolean") || (value.workspaceFeature !== undefined && typeof value.workspaceFeature !== "boolean") ||
+      !Array.isArray(value.warnings) || value.warnings.some(w => typeof w !== "string") || typeof value.syncedAt !== "string" ||
+      value.players.some(p => !object(p) || !strings(p, ["id", "name"]) || !p.id || !Number.isSafeInteger(p.target) || Number(p.target) < 1 ||
+        !optionalStrings(p, ["team", "bio", "color"]) || (p.sheetNames !== undefined && (!Array.isArray(p.sheetNames) || p.sheetNames.some(n => typeof n !== "string")))) ||
+      value.activities.some(a => !object(a) || !strings(a, ["id", "playerId", "date", "candidateId", "candidateName", "source", "company", "position", "stage"]) ||
+        !a.id || !a.playerId || !stages.includes(a.stage as Activity["stage"]) || !/^\d{4}-\d{2}-\d{2}$/.test(String(a.date)) ||
+        !optionalStrings(a, ["recordId", "rowVersion", "status", "probability", "interviewScheduledDate", "clientInterviewScheduledTime", "offerScheduledDate", "memo"]))) invalid();
+  const s = value as unknown as SheetSnapshot;
+  if (new Set(s.players.map(p => p.id)).size !== s.players.length ||
+      Object.values(s.counts).some(people => !object(people) || Object.values(people).some(metrics => !object(metrics) ||
+        Object.values(metrics).some(count => !Number.isSafeInteger(count) || Number(count) < 0)))) invalid();
   if (s.self.role === "player" && (!s.players.some(p => p.id === s.self.playerId) || s.activities.some(a => a.playerId !== s.self.playerId))) {
     throw new SheetApiError("INVALID_RESPONSE", "本人のデータを確認できませんでした。再ログインしてください。");
   }
-  if (s.records && (!Array.isArray(s.records) || s.records.some(r => typeof r.recordId!=="string" || typeof r.rowVersion!=="string" || typeof r.playerId!=="string" || typeof r.candidateName!=="string" || !Array.isArray(r.values) || r.values.length!==26 || !Array.isArray(r.formulaColumns) || r.values.some(v=>!["string","number","boolean"].includes(typeof v)) || (s.self.role==="player" && r.playerId!==s.self.playerId)))) {
+  if (s.records !== undefined && (!Array.isArray(s.records) || s.records.some(r => !object(r) ||
+      !strings(r, ["recordId", "rowVersion", "playerId", "candidateName", "source"]) || !r.recordId || !r.rowVersion ||
+      !Number.isSafeInteger(r.row) || Number(r.row) < 1 || !optionalStrings(r, ["candidateId"]) ||
+      !Array.isArray(r.values) || r.values.length !== 26 || r.values.some(v => !["string", "number", "boolean"].includes(typeof v) || typeof v === "number" && !Number.isFinite(v)) ||
+      !Array.isArray(r.formulaColumns) || r.formulaColumns.some(c => !Number.isSafeInteger(c) || c < 1 || c > 26) ||
+      new Set(r.formulaColumns).size !== r.formulaColumns.length || (s.self.role === "player" && r.playerId !== s.self.playerId)))) {
     throw new SheetApiError("INVALID_RESPONSE","候補者情報の形式または閲覧権限を確認できませんでした。");
   }
-  if(s.interviewReviews && (!Array.isArray(s.interviewReviews)||s.interviewReviews.some(r=>[r.recordId,r.playerId,r.interviewDate,r.category,r.memo,r.nextAction,r.version,r.updatedAt].some(v=>typeof v!=="string")||(s.self.role==="player"&&r.playerId!==s.self.playerId))))throw new SheetApiError("INVALID_RESPONSE","振り返りの閲覧権限を確認できませんでした。");
-  if (s.destination && (s.self.role !== "admin" || typeof s.destination.title !== "string" ||
+  if(s.interviewReviews !== undefined && (!Array.isArray(s.interviewReviews)||s.interviewReviews.some(r=>!object(r) || !strings(r,["recordId","playerId","interviewDate","category","memo","nextAction","version","updatedAt"]) ||(s.self.role==="player"&&r.playerId!==s.self.playerId))))throw new SheetApiError("INVALID_RESPONSE","振り返りの閲覧権限を確認できませんでした。");
+  if (s.destination !== undefined && (!object(s.destination) || s.self.role !== "admin" || typeof s.destination.title !== "string" ||
       ![s.destination.matchingUrl, s.destination.kpiUrl].every(url => typeof url === "string" && /^https:\/\/docs\.google\.com\/spreadsheets\/d\/[A-Za-z0-9_-]+\/edit(?:\?gid=\d+(?:#gid=\d+)?|#gid=\d+)$/.test(url)))) {
     throw new SheetApiError("INVALID_RESPONSE", "保存先の情報を確認できませんでした。管理者で再ログインしてください。");
   }

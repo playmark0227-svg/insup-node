@@ -1,0 +1,11 @@
+import {readFileSync,writeFileSync} from "node:fs";
+import ts from "typescript";
+const start="/* BEGIN GENERATED WORKSPACE RULES */",end="/* END GENERATED WORKSPACE RULES */";
+const source=readFileSync("lib/workspace-insights.ts","utf8");
+const code=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020}}).outputText;
+if (/\brequire\(/.test(code)) throw new Error("Workspace rules must not import a runtime dependency.");
+const generated=`${start}\n// Generated from lib/workspace-insights.ts; browser and server use identical rules.\nvar NODE_INSIGHT_RULES = (function () { var exports = {};\n${code}\nreturn exports; })();\n${end}`;
+const path="google-apps-script/Code.gs";
+const previous=readFileSync(path,"utf8"),from=previous.indexOf(start),to=previous.indexOf(end);
+if ((from<0)!==(to<0)) throw new Error("Generated rules markers are inconsistent.");
+writeFileSync(path,from<0?`${previous}\n${generated}\n`:`${previous.slice(0,from)}${generated}${previous.slice(to+end.length)}`);
