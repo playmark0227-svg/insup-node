@@ -1,0 +1,31 @@
+.background-save{position:relative;flex-shrink:0}
+.topbar:has(.background-save){position:sticky;top:0;z-index:45;gap:12px}
+.background-save-trigger{display:flex;align-items:center;gap:7px;min-height:36px;padding:0 10px;border:1px solid #c7e4fb;border-radius:7px;background:#edf8ff;color:#0870c6;font-size:12px;font-weight:600;white-space:nowrap}
+.background-save-saved .background-save-trigger{background:#f0faf6;border-color:#cbe9dc;color:#277457}
+.background-save-failed .background-save-trigger{background:#fff5ed;border-color:#efd3bc;color:#9b501d}
+.background-save-announcement{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.background-save-panel{position:absolute;z-index:60;right:0;top:calc(100% + 12px);width:370px;max-width:calc(100vw - 32px);max-height:calc(100dvh - 112px);overflow:auto;padding:18px;background:#fff;border:1px solid #cfe0ef;border-radius:11px;box-shadow:0 10px 30px #16456c20;color:#24486d;text-align:left}
+.background-save-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.background-save-heading>div{display:flex;align-items:center;gap:8px;color:#0870c6;font-size:14px}
+.background-save-saved .background-save-heading>div{color:#277457}
+.background-save-failed .background-save-heading>div{color:#9b501d}
+.background-save-heading>button{display:flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:5px;color:#688299}
+.background-save-heading>button:hover{background:#edf5fb}
+.background-save-label{font-size:13px;font-weight:600;margin-top:10px!important;overflow-wrap:anywhere}
+.background-save-help{font-size:12px;line-height:1.8;margin-top:10px!important;color:#536f8b}
+.background-save-error{background:#fff5ed;border:1px solid #f1dece;border-radius:6px;padding:10px;font-size:12px;line-height:1.7;margin-top:12px!important;overflow-wrap:anywhere;color:#8b4d24}
+.background-save-details{margin-top:13px;padding-top:12px;border-top:1px solid #e0eaf3;font-size:12px;line-height:1.8}
+.background-save-details summary{cursor:pointer;font-weight:600;color:#426889}
+.background-save-details ul{padding-left:18px;margin:10px 0;list-style:disc;max-height:210px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}
+.background-save-details li{margin-bottom:6px}
+.background-save-details .text-button{min-height:32px;font-size:12px}
+.background-save-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:16px}
+.background-save-actions .primary-button,.background-save-actions .secondary-button,.background-save-discard .secondary-button{min-height:36px;padding:0 12px;font-size:12px}
+.background-save-actions .text-button{font-size:12px;white-space:normal}
+.background-save-discard{margin-top:13px;border-top:1px solid #e4ecf4;padding-top:12px;color:#825631;font-size:12px;line-height:1.8}
+.background-save-discard>div{display:flex;gap:8px;margin-top:10px}
+.background-save-spinner{animation:background-save-spin 1.1s linear infinite}
+@keyframes background-save-spin{to{transform:rotate(360deg)}}
+@media(max-width:767px){.topbar-right.has-background-save{gap:8px}.topbar-right.has-background-save .preview-chip{display:none}.topbar:has(.background-save) .breadcrumbs{min-width:0}.topbar:has(.background-save) .breadcrumbs strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.background-save-trigger{gap:5px;padding:0 7px;font-size:11px}.background-save-trigger>svg:last-child{display:none}.background-save-panel{position:fixed;top:69px;right:12px;width:370px;max-width:calc(100vw - 24px);max-height:calc(100dvh - 160px)}.background-save-actions .primary-button{width:100%;min-height:42px}}
+@media(max-width:380px){.topbar-right.has-background-save>button{display:none}.background-save-trigger{padding:0 6px}}
+@media(prefers-reduced-motion:reduce){.background-save-spinner{animation:none}}

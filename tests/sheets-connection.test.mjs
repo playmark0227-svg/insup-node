@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import vm from "node:vm";
 import ts from "typescript";
-import {assertSnapshot, validateEndpoint, SheetApiError} from "../lib/sheets-client.ts";
+import {assertSnapshot, isUncertainWrite, validateEndpoint, SheetApiError} from "../lib/sheets-client.ts";
+import {matchingFields} from "../lib/management-data.ts";
 
 const endpoint = "https://script.google.com/macros/s/AKfycb_TEST_DEPLOYMENT_1234567890/exec";
 const otherEndpoint = endpoint.replace("TEST_DEPLOYMENT", "OTHER_DEPLOYMENT");
@@ -60,7 +61,7 @@ function harness(handle, {storedToken, malformedSession, deadlineController, bro
   const context=vm.createContext({exports,module:{exports},AbortController,AbortSignal:deadlineSignals,JSON,Error,localStorage,sessionStorage,TEST_PRODUCTION:production,
     ...(browser || {}),
     fetch:async()=>{if(manifestFailure)throw new Error("設定取得失敗");return {ok:true,json:async()=>({endpoint:manifestEndpoint})};},
-    require:name=>name==="react" ? react : name.includes("node-data") ? {initialPlayers:[player],makeDemoActivities:()=>[]} : {assertSnapshot,validateEndpoint,SheetApiError,sheetRequest}});
+    require:name=>name==="react" ? react : name.includes("node-data") ? {initialPlayers:[player],makeDemoActivities:()=>[]} : name.includes("management-data") ? {matchingFields} : {assertSnapshot,isUncertainWrite,validateEndpoint,SheetApiError,sheetRequest}});
   vm.runInContext(source,context);
   const render = () => {cursor=0; const result=exports.useSheetsConnection(); while(effects.length) effects.shift()(); return result;};
   render();
@@ -354,4 +355,97 @@ test("generic API password ambiguity also signs out without replay",async()=>{
   await flush();await assert.rejects(()=>h.render().changePassword("old-private-password","new-private-password"),/新しいパスワード/);
   assert.equal(h.render().authenticated,false);assert.equal(h.sessionStorage.getItem(SESSION_KEY),null);
   assert.equal(h.calls.filter(c=>c.action==="changePassword").length,1);h.unmount();
+});
+
+test('background save accepts immutable input immediately, without a foreground busy state or premature counts',async()=>{
+  const response=deferred(),browser=autoSyncBrowser();
+  const h=harness(call=>call.action==='snapshot'?snapshot:response.promise,{storedToken:token,browser});
+  await flush();
+  const input={activity:{candidateName:'保存テスト候補者',stage:'提案',date:'2026-10-14',interviewScheduledDate:'2026-10-20',clientInterviewScheduledTime:'18:35',offerScheduledDate:'2026-10-21',memo:'元の入力'}};
+  assert.equal(h.render().submitMutation('saveActivity',input,'background-original-id'),undefined);
+  input.activity.memo='送信後に書き換えた入力';
+  const active=h.render();
+  assert.equal(active.busy,false);assert.equal(active.hasPendingSave,true);assert.equal(active.backgroundSave.status,'saving');
+  assert.equal(active.snapshot,snapshot);assert.equal(h.calls[1].payload.activity.memo,'元の入力');
+  assert.ok(active.backgroundSave.details.includes('メモ：元の入力'));
+  assert.ok(active.backgroundSave.details.includes('C面談予定日：2026-10-20'));
+  assert.ok(active.backgroundSave.details.includes('C面談予定開始時刻：18:35'));
+  assert.ok(active.backgroundSave.details.includes('オファー予定日：2026-10-21'));
+  assert.equal(browser.listeners.has('beforeunload'),true);
+  let prevented=false;const event={preventDefault(){prevented=true;},returnValue:null};
+  browser.listeners.get('beforeunload')(event);assert.equal(prevented,true);assert.equal(event.returnValue,'');
+  assert.throws(()=>active.submitMutation('saveActivity',input,'duplicate-new-id'),{code:'MUTATION_PENDING'});
+  await active.refresh(true);assert.equal(h.calls.length,2);
+  await assert.rejects(()=>active.logout(),{code:'MUTATION_PENDING'});
+  await assert.rejects(()=>active.changePassword('old','new'),/保存が完了/);
+  const committed={...snapshot,syncedAt:'2026-10-14T14:00:00Z'};
+  response.resolve({snapshot:committed,changeId:'undo-this-change'});await flush();
+  const done=h.render();assert.equal(done.snapshot,committed);assert.equal(done.backgroundSave.status,'saved');
+  assert.equal(done.backgroundSave.changeId,'undo-this-change');assert.equal(done.hasPendingSave,false);
+  assert.equal(browser.listeners.has('beforeunload'),false);assert.equal(done.busy,false);
+  assert.ok(!JSON.stringify([...h.sessionStorage.values,...h.localStorage.values]).includes('元の入力'));
+  done.dismissBackgroundSave();assert.equal(h.render().backgroundSave,null);h.unmount();
+});
+
+test('unknown background outcome survives view rerenders and retries exact input and operation ID once',async()=>{
+  let attempts=0;const response=deferred();
+  const h=harness(call=>{
+    if(call.action==='snapshot')return snapshot;
+    if(++attempts===1)throw new SheetApiError('TIMEOUT','結果が未確認です');
+    return response.promise;
+  },{storedToken:token});
+  await flush();h.render().submitMutation('updateStatus',{recordId:'retained-record',status:'提案'},'retained-operation');await flush();
+  const failed=h.render();assert.equal(failed.backgroundSave.status,'failed');assert.equal(failed.backgroundSave.uncertain,true);
+  assert.equal(failed.hasPendingSave,true);assert.equal(failed.busy,false);
+  for(let i=0;i<3;i++)assert.equal(h.render().backgroundSave.operationId,'retained-operation');
+  assert.throws(()=>failed.dismissBackgroundSave(),{code:'MUTATION_PENDING'});
+  await assert.rejects(()=>failed.mutate('createPlayer',{},'other-operation'),{code:'MUTATION_PENDING'});
+  failed.retryBackgroundSave();h.render().retryBackgroundSave();await flush();
+  assert.equal(attempts,2);assert.equal(h.calls[1].options.operationId,h.calls[2].options.operationId);
+  assert.deepEqual(h.calls[1].payload,h.calls[2].payload);
+  response.resolve({snapshot});await flush();assert.equal(h.render().backgroundSave.status,'saved');h.unmount();
+});
+
+test('definite background failure retains the draft for inspection until explicit dismissal',async()=>{
+  const h=harness(call=>{if(call.action==='snapshot')return snapshot;throw new SheetApiError('ROW_CONFLICT','別の画面で変更されています');},{storedToken:token});
+  await flush();h.render().submitMutation('updateRecord',{recordId:'a',changes:{2:'保持する会社名',13:'保持する詳細メモ'}},'conflict-id');await flush();
+  const failed=h.render();assert.equal(failed.backgroundSave.status,'failed');assert.equal(failed.backgroundSave.uncertain,false);
+  assert.ok(failed.backgroundSave.details.includes('会社名：保持する会社名'));
+  assert.ok(failed.backgroundSave.details.includes('メモ：保持する詳細メモ'));
+  failed.dismissBackgroundSave();assert.equal(h.render().hasPendingSave,false);assert.equal(h.render().backgroundSave,null);h.unmount();
+});
+
+test('background session expiry removes private drafts and no late previous-account result is applied',async()=>{
+  const write=deferred(),ai=deferred();
+  const h=harness(call=>call.action==='snapshot'?snapshot:call.action==='readInterviewAdvice'?ai.promise:write.promise,{storedToken:token});
+  await flush();const reading=h.render().readAdvice('2026-10');
+  h.render().submitMutation('saveActivity',{activity:{candidateName:'private candidate',memo:'private memo'}},'private-operation');
+  ai.reject(new SheetApiError('SESSION_EXPIRED','expired'));await assert.rejects(reading);await flush();
+  assert.equal(h.render().backgroundSave,null);assert.equal(h.render().snapshot,null);
+  const updates=h.updates();write.resolve({snapshot});await flush();assert.equal(h.updates(),updates);
+  assert.equal(h.render().backgroundSave,null);assert.equal(h.render().authenticated,false);h.unmount();
+});
+
+test('unmount discards pending private jobs and never updates detached state',async()=>{
+  const response=deferred();const h=harness(call=>call.action==='snapshot'?snapshot:response.promise,{storedToken:token});
+  await flush();h.render().submitMutation('updateProfile',{player:{id:'ND-001',bio:'private draft'}},'unmount-op');
+  h.unmount();const updates=h.updates();response.resolve({snapshot});await flush();assert.equal(h.updates(),updates);
+});
+
+test('background save invalidates earlier reads and never applies an old snapshot after confirming its write',async()=>{
+  let reads=0;const read=deferred(),write=deferred();
+  const h=harness(call=>call.action==='snapshot'?(++reads===1?snapshot:read.promise):write.promise,{storedToken:token});
+  await flush();const refreshing=h.render().refresh(true);
+  h.render().submitMutation('updateStatus',{recordId:'a',status:'提案'},'newer-operation');
+  assert.equal(h.calls[1].options.signal.aborted,true);
+  const committed={...snapshot,syncedAt:'2026-10-14T14:00:00Z'};write.resolve({snapshot:committed});await flush();
+  read.resolve(snapshot);await refreshing;assert.equal(h.render().snapshot,committed);h.unmount();
+});
+
+test('credential operations and malformed input cannot be accepted as background jobs',async()=>{
+  const h=harness(()=>snapshot,{storedToken:token});await flush();
+  assert.throws(()=>h.render().submitMutation('resetPassword',{password:'private'},'x'),{code:'INVALID_ACTION'});
+  const cyclic={};cyclic.self=cyclic;
+  assert.throws(()=>h.render().submitMutation('updateRecord',cyclic,'x'),{code:'INVALID_PAYLOAD'});
+  assert.equal(h.render().backgroundSave,null);assert.equal(h.calls.length,1);h.unmount();
 });
