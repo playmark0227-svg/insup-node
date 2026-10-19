@@ -13,6 +13,8 @@ var NODE = Object.freeze({
   operationsTab: '_NODE_operations',
   recordKey: 'NODE_RECORD_ID',
   sourceKey: 'NODE_SOURCE',
+  deletedKey: 'NODE_DELETED_CANDIDATE',
+  candidateProfileKey: 'NODE_CANDIDATE_PROFILE_ID',
   configKey: 'NODE_CONFIG',
   pepperKey: 'NODE_PEPPER',
   sessionHours: 6,
@@ -122,7 +124,7 @@ function nodeHandle_(request) {
   if (action === 'login') return login_(request.payload || {});
   if (action === 'changePassword') return changePassword_(request);
   if (action === 'auditSecurity') return auditSecurity_(request);
-  if (['snapshot','logout','saveActivity','updateStatus','updateProfile','createPlayer','updateRecord','cancelAchievement','restoreChange','managementTables','managementTable','saveManagementRow','createCandidate','saveInterviewReview','analyzeInterviewReviews','readInterviewAdvice','readWorkspaceInsights','analyzeWorkspaceInsights'].indexOf(action) < 0) fail_('BAD_REQUEST', '対応していない操作です。');
+  if (['snapshot','logout','saveActivity','updateStatus','updateProfile','createPlayer','updateRecord','deleteCandidate','cancelAchievement','restoreChange','managementTables','managementTable','saveManagementRow','createCandidate','saveInterviewReview','saveCandidateProfile','saveClient','analyzeInterviewReviews','readInterviewAdvice','readWorkspaceInsights','analyzeWorkspaceInsights'].indexOf(action) < 0) fail_('BAD_REQUEST', '対応していない操作です。');
   if (action === 'readWorkspaceInsights') return readWorkspaceInsights_(request);
   if (action === 'analyzeWorkspaceInsights') return analyzeWorkspaceInsights_(request);
   if (action === 'analyzeInterviewReviews') return analyzeInterviewReviews_(request);
@@ -142,7 +144,7 @@ function nodeHandle_(request) {
     var user = authenticate_(request.token);
     if (action === 'logout') { props_().deleteProperty(sessionKey_(request.token)); return { loggedOut: true }; }
     var activity = request.payload && request.payload.activity;
-    var existingRow = ['saveInterviewReview','updateStatus','updateRecord','cancelAchievement'].indexOf(action) >= 0 || action === 'saveActivity' && activity && activity.recordId;
+    var existingRow = ['saveInterviewReview','saveCandidateProfile','saveClient','updateStatus','updateRecord','deleteCandidate','cancelAchievement'].indexOf(action) >= 0 || action === 'saveActivity' && activity && activity.recordId;
     // Existing-row edits only need named candidate rows. New rows still inspect
     // the entire template, preserving blank-row and formula protection.
     var store = readStore_({ readOnly: !!existingRow });
@@ -166,7 +168,10 @@ function nodeHandle_(request) {
     if (action === 'updateProfile') plan = planProfile_(store, user, payload.player);
     if (action === 'createPlayer') plan = planPlayer_(store, user, payload, operationId);
     if (action === 'createCandidate') plan = planCandidate_(store,user,payload);
+    if (action === 'saveCandidateProfile') plan = planCandidateProfile_(store,user,payload);
+    if (action === 'saveClient') plan = planClient_(store,user,payload);
     if (action === 'updateRecord') plan = planRecord_(store,user,payload);
+    if (action === 'deleteCandidate') plan = planDeleteCandidate_(store,user,payload,operationId);
     if (action === 'cancelAchievement') plan = planCancelAchievement_(store,user,payload);
     if (action === 'restoreChange') plan = planRestoreChange_(store,user,payload);
     if (action === 'saveManagementRow') plan = planManagementRow_(store,user,payload);
@@ -416,7 +421,8 @@ function readStore_(options, accountStore) {
   }
   var range = matching.getRange(1, 1, length, 26), values = range.getValues(), formulas = range.getFormulas();
   var headerRow = detectHeader_(values),schemaCompatible=mappedHeadersMatch_(values[headerRow-1]);
-  var metadata = metadataMaps_(matching, [NODE.recordKey, NODE.sourceKey]), ids = metadata[NODE.recordKey], sources = metadata[NODE.sourceKey], records = [], warnings = [];
+  var metadata = metadataMaps_(matching, [NODE.recordKey, NODE.sourceKey, NODE.deletedKey, NODE.candidateProfileKey]), ids = metadata[NODE.recordKey], sources = metadata[NODE.sourceKey], records = [], warnings = [];
+  Object.keys(metadata[NODE.candidateProfileKey]).forEach(function(row){if(!intakeId_(metadata[NODE.candidateProfileKey][row].value))fail_('METADATA_CONFLICT','面談情報の管理IDを確認してください。');});
   var unknown = 0, missingIds = 0, invalidDates = 0, seenIds = {};
   for (var n = headerRow; n < values.length; n++) {
     var row = values[n], name = normalizeName_(row[2]);
@@ -429,7 +435,7 @@ function readStore_(options, accountStore) {
     seenIds[recordId] = true;
     var dates = NODE.stageColumns.map(function (column) { var result = day_(row[column - 1]); if (!result && row[column - 1] !== '' && row[column - 1] != null) invalidDates++; return result; });
     var source = sources[n + 1] ? sources[n + 1].value : '';
-    records.push({ row: n + 1, recordId: recordId, playerId: owner || '', candidateId: candidateId_(owner, name), name: name, values: row, formulas: formulas[n], dates: dates, source: source, sourceMetadataId: sources[n + 1] && sources[n + 1].metadataId, version: rowVersion_(recordId, row, formulas[n], source) });
+    records.push({ row: n + 1, recordId: recordId, playerId: owner || '', candidateId: candidateId_(owner, name), name: name, values: row, formulas: formulas[n], dates: dates, source: source, sourceMetadataId: sources[n + 1] && sources[n + 1].metadataId, profileId: metadata[NODE.candidateProfileKey][n + 1] && metadata[NODE.candidateProfileKey][n + 1].value || '', version: rowVersion_(recordId, row, formulas[n], source) });
   }
   if (unknown) warnings.push('担当者IDに対応しない行が' + unknown + '行あります。管理者が別名の対応表を確認してください。');
   if(!schemaCompatible)warnings.push('入力対象19列の見出しまたは順序が未確認です。実績は表示せず、書き込みを停止しています。管理者が接続先の列を確認してください。');
@@ -441,7 +447,7 @@ function readStore_(options, accountStore) {
   else if(config.purpose==='production'&&config.spreadsheetId===props_().getProperty(NODE.destinationKey))warnings.push('現在の接続先は登録済みの新しい管理シートです。');
   else if(config.purpose==='verification'&&config.spreadsheetId===props_().getProperty(NODE.verificationKey))warnings.push('現在の接続先は独立した検証用コピーです。');
   else warnings.push('接続先の用途を確認できません。管理者が設定を確認してください。');
-  return { config: config, book: book, matching: matching, playerSheet: playerSheet, operationSheet: operationSheet, players: players, values: values, formulas: formulas, headerRow: headerRow, schemaCompatible:schemaCompatible,records: records, warnings: warnings };
+  return { config: config, book: book, matching: matching, playerSheet: playerSheet, operationSheet: operationSheet, players: players, values: values, formulas: formulas, headerRow: headerRow, schemaCompatible:schemaCompatible,recordMetadata:ids,archivedMetadata:metadata[NODE.deletedKey],profileMetadata:metadata[NODE.candidateProfileKey],records: records, warnings: warnings };
 }
 function day_(value) {
   if (value instanceof Date) return isFinite(value.getTime()) ? Utilities.formatDate(value, 'Asia/Tokyo', 'yyyy-MM-dd') : '';
@@ -503,6 +509,8 @@ function buildSnapshot_(store, user) {
   var all = activities_(store);
   var snapshot={ self: { playerId: user.id, role: user.role }, players: store.players.filter(function (p) { return p.active && p.role === 'player'; }).map(function(player){return publicPlayer_(player,user);}), activities: all.filter(function (a) { return user.role === 'admin' || a.playerId === user.id; }), counts: countActivities_(all, store.players), syncedAt: new Date().toISOString(), warnings: store.warnings.slice(), writesEnabled: store.schemaCompatible&&writesEnabled_(store.config) && store.book.getSpreadsheetTimeZone() === 'Asia/Tokyo' };
   snapshot.interviewReviews=readInterviewReviews_(store,user);
+  snapshot.intakeFeature=true; snapshot.candidateProfiles=readCandidateProfiles_(store,user); snapshot.clients=clientEntries_(store.book);
+  snapshot.deletionFeature=true; snapshot.deletedCandidates=deletedCandidates_(store,user);
   snapshot.reviewFeature=true;
   snapshot.securityFeature=true; snapshot.workspaceFeature=true;
   snapshot.records=store.schemaCompatible ? store.records.filter(function(r){return user.role==='admin'||r.playerId===user.id;}).map(publicRecord_) : [];
@@ -535,6 +543,7 @@ function findRecord_(store, id) { return store.records.find(function (record) { 
 function checkVersion_(record, expected) { if (typeof expected !== 'string' || expected !== record.version) fail_('CONFLICT', 'データが更新されています。同期してから再入力してください。'); }
 function blankBusinessRow_(store) {
   for (var i = store.headerRow; i < store.values.length; i++) {
+    if (store.archivedMetadata && store.archivedMetadata[i+1] || store.profileMetadata && store.profileMetadata[i+1]) continue;
     if (NODE.inputColumns.every(function (column) { return (store.values[i][column - 1] === '' || store.values[i][column - 1] == null) && !store.formulas[i][column - 1]; })) return i + 1;
   }
   return Math.max(store.headerRow + 1, store.values.length + 1);
@@ -583,13 +592,22 @@ function planActivity_(store, user, activity) {
   } else if (si === 1 && !existing.values[1]) setPatch_(plan, 2, company);
   setPatch_(plan, NODE.stageColumns[si], dayDate_(date));
   setPatch_(plan, 7, NODE.stageStatuses[si]); if(memo!==undefined)setPatch_(plan, 13, memo);
-  if (si > 0 && activity.probability !== undefined && activity.probability !== '') setPatch_(plan, 12, choice_(activity.probability, ['Aヨミ','Bヨミ','Cヨミ','Dヨミ']));
+  // Omitted means preserve; an explicit empty choice clears a previously recorded probability.
+  if (si > 0 && activity.probability !== undefined) setPatch_(plan, 12, activity.probability === '' ? '' : choice_(activity.probability, ['Aヨミ','Bヨミ','Cヨミ','Dヨミ']));
   if (activity.interviewScheduledDate) { var scheduled = day_(activity.interviewScheduledDate); if (!scheduled) fail_('INVALID_DATE', 'C面談予定日を確認してください。'); setPatch_(plan, 10, dayDate_(scheduled)); }
   if (activity.clientInterviewScheduledTime) setPatch_(plan, 11, time_(activity.clientInterviewScheduledTime, true));
   if (source && source !== (existing && existing.source || '')) {
     plan.requests.push(existing && existing.sourceMetadataId ? { updateDeveloperMetadata: { dataFilters: [{ developerMetadataLookup: { metadataId: existing.sourceMetadataId } }], developerMetadata: { metadataValue: source }, fields: 'metadataValue' } } : metadataCreate_(store.matching.getSheetId(), plan.row, NODE.sourceKey, source));
   }
   plan.result = { recordId: plan.recordId };
+  if (activity.interviewProfile !== undefined) {
+    if (si !== 0) fail_('VALIDATION','面談プロフィールは候補者面談の登録時に保存してください。');
+    addCandidateProfileToPlan_(store,user,plan,existing,ownerId,activity.interviewProfile);
+  }
+  if (activity.profileSourceRecordId !== undefined) {
+    if (si !== 1 || existing || typeof activity.profileSourceRecordId !== 'string') fail_('VALIDATION','プロフィールの引継ぎ元は新しい提案に指定してください。');
+    linkCandidateProfileToPlan_(store,user,plan,ownerId,candidateId,activity.profileSourceRecordId);
+  }
   return plan;
 }
 function planStatus_(store, user, payload) {
@@ -676,6 +694,7 @@ function commit_(store, user, action, operationId, payloadHash, plan, token) {
   }
   if (plan.profileRow && store.playerSheet.getRange(plan.profileRow,1,1,NODE.playerHeaders.length).getFormulas()[0].some(Boolean)) fail_('FORMULA_PROTECTED', 'プロフィールの入力先に数式があります。');
   revalidateManagementPlan_(store,user,plan);
+  revalidateIntakePlan_(store,user,plan);
   if(token)snapshotActor_(store,token);
   Array.prototype.push.apply(requests, plan.requests || []);
   if(JSON.stringify(plan.result||{}).length>48000)fail_('VALIDATION','変更履歴が大きすぎます。長いメモは項目を分けて保存してください。');
@@ -784,8 +803,8 @@ function probeReservation_(store,actorId,allowExpired) {
   return probe;
 }
 function guardProbeBusinessMutation_(store,user,action,payload) {
-  if(['saveActivity','updateStatus','updateRecord','cancelAchievement','restoreChange','saveManagementRow','createCandidate'].indexOf(action)<0)return;
-  if((action==='restoreChange'||action==='saveManagementRow'||action==='createCandidate')&&probeReservation_(store,user.id,false))fail_('FORBIDDEN','検証専用アカウントにはこの操作は許可されていません。');
+  if(['saveActivity','updateStatus','updateRecord','deleteCandidate','cancelAchievement','restoreChange','saveManagementRow','createCandidate','saveCandidateProfile','saveClient'].indexOf(action)<0)return;
+  if((action==='restoreChange'||action==='saveManagementRow'||action==='createCandidate'||action==='saveCandidateProfile'||action==='saveClient')&&probeReservation_(store,user.id,false))fail_('FORBIDDEN','検証専用アカウントにはこの操作は許可されていません。');
   var activity=payload.activity||{},recordId=action==='saveActivity'?activity.recordId:payload.recordId,record=recordId?findRecord_(store,recordId):null;
   var targetId=record?record.playerId:action==='saveActivity'?activity.playerId:null;
   var probe=probeReservation_(store,user.id,false),targetProbe=targetId&&targetId!==user.id?probeReservation_(store,targetId,false):null;
@@ -985,7 +1004,7 @@ if (typeof NODE_TESTS !== 'undefined') Object.assign(NODE_TESTS,{constants:NODE,
 /* Candidate records and bounded administration tables. */
 function requireAdmin_(user) { if(user.role!=='admin')fail_('FORBIDDEN','管理者だけがこの管理表を利用できます。'); }
 function publicRecord_(r) {
-  return {recordId:r.recordId,rowVersion:r.version,row:r.row,playerId:r.playerId,candidateId:r.candidateId,candidateName:r.name,source:r.source,
+  return {recordId:r.recordId,rowVersion:r.version,row:r.row,playerId:r.playerId,candidateId:r.candidateId,candidateName:r.name,source:r.source,profileId:r.profileId||undefined,
     values:r.values.map(function(v,i){return v instanceof Date ? ([11,20].indexOf(i+1)>=0?time_(v,false):day_(v)) : v==null?'':v;}),formulaColumns:r.formulas.map(function(f,i){return f?i+1:0;}).filter(Boolean)};
 }
 function managementTabAllowed_(title) { return ['目標','案件管理表','ｴｰｼﾞｪﾝﾄ管理表','稼働者管理表',NODE.kpiTab,'1期目マッチングDB'].indexOf(title)>=0 || /^マッチ計上(?:[1-9]|1[0-2])月\s*$/.test(title) || title==='マッチ計上(8月)'; }
@@ -1084,6 +1103,34 @@ function planRecord_(store,user,payload) {
   var groups=[rowChange].concat(related.map(function(r){actorOwns_(user,r);var c=makeRowChange_(store.book,store.matching,r.row,null,{1:changes[1]},r.recordId,r.playerId,r.name);if(changes[1]){c.requests[0].updateCells.rows[0].values[0]=cell_(dayDate_(changes[1]));c.requests[0].updateCells.fields='userEnteredValue,userEnteredFormat.numberFormat';c.undo.entries[0].after=cell_(dayDate_(changes[1])).userEnteredValue;var raw=gridRead_(store.book,store.matching,r.row,1)[0];raw[0].userEnteredValue=c.undo.entries[0].after;raw[0].userEnteredFormat={numberFormat:cell_(dayDate_(changes[1])).userEnteredFormat.numberFormat};c.undo.after=gridFingerprint_(raw);}return c;}));
   var plan=combinedChangePlan_(groups,record.name+'の情報修正');plan.recordChecks=[record].concat(related).map(function(r){return {recordId:r.recordId,row:r.row,version:r.version};});return plan;
 }
+function deletedMarker_(entry) {try {return JSON.parse(entry.value);}catch(_){return null;}}
+function deletedCandidates_(store,user) {
+  var groups={};Object.keys(store.archivedMetadata||{}).forEach(function(row){var marker=deletedMarker_(store.archivedMetadata[row]);
+    if(!marker||!marker.changeId||!marker.recordId||!store.recordMetadata[row]||store.recordMetadata[row].value!==marker.recordId||user.role!=='admin'&&marker.playerId!==user.id)return;
+    var group=groups[marker.changeId];if(!group)group=groups[marker.changeId]={changeId:marker.changeId,playerId:marker.playerId,candidateName:marker.candidateName,deletedAt:marker.deletedAt,companies:[],recordCount:0};
+    group.recordCount++;if(marker.company&&group.companies.indexOf(marker.company)<0)group.companies.push(marker.company);
+  });return Object.keys(groups).map(function(id){return groups[id];}).sort(function(a,b){return b.deletedAt.localeCompare(a.deletedAt);});
+}
+function planDeleteCandidate_(store,user,payload,operationId) {
+  var record=findRecord_(store,payload.recordId);actorOwns_(user,record);checkVersion_(record,payload.rowVersion);
+  if(['record','candidate'].indexOf(payload.scope)<0)fail_('VALIDATION','削除する範囲を選択してください。');
+  var targets=payload.scope==='candidate'?store.records.filter(function(r){return r.playerId===record.playerId&&r.candidateId===record.candidateId;}):[record];
+  if(targets.length>50)fail_('DATA_LIMIT','一度に削除できる提案は50件までです。提案ごとに削除してください。');
+  if(!Array.isArray(payload.targets)||payload.targets.length!==targets.length||new Set(payload.targets.map(function(t){return t.recordId;})).size!==targets.length)fail_('CONFLICT','対象の提案が変わっています。再取得して削除範囲を確認してください。');
+  var probe=probeReservation_(store,user.id,false);if(probe&&targets.some(function(r){return probe.rows.indexOf(r.row)<0;}))fail_('FORBIDDEN','割り当てられた検証行だけ削除できます。');
+  var stamp=new Date().toISOString(),groups=targets.map(function(r){actorOwns_(user,r);if(store.archivedMetadata[r.row])fail_('CONFLICT','この候補者は削除済みです。再取得してください。');var expected=payload.targets.find(function(t){return t.recordId===r.recordId;});if(!expected)fail_('CONFLICT','対象の提案が変わっています。');checkVersion_(r,expected.rowVersion);
+    var cells=gridRead_(store.book,store.matching,r.row,1)[0],changes={};
+    [3,4].concat(NODE.stageColumns).forEach(function(col){if(publicCell_(cells[col-1],col).readonly)fail_('FORMULA_PROTECTED','氏名・担当・成果の日付に数式があるため削除できません。管理者に確認してください。');});
+    cells.forEach(function(c,i){if(!publicCell_(c,i+1).readonly&&Object.keys(c.userEnteredValue||{}).length)changes[i+1]='';});
+    var change=makeRowChange_(store.book,store.matching,r.row,null,changes,r.recordId,r.playerId,r.name);
+    change.requests.push(metadataCreate_(store.matching.getSheetId(),r.row,NODE.deletedKey,JSON.stringify({changeId:operationId,recordId:r.recordId,playerId:r.playerId,candidateName:r.name,company:String(r.values[1]||''),deletedAt:stamp})));
+    return change;
+  });
+  var plan=combinedChangePlan_(groups,record.name+'の'+(payload.scope==='candidate'?'候補者を削除':'提案を削除'));plan.recordChecks=targets.map(function(r){return {recordId:r.recordId,row:r.row,version:r.version};});
+  if(payload.scope==='candidate')plan.candidateDeleteCheck={playerId:record.playerId,candidateId:record.candidateId,ids:targets.map(function(r){return r.recordId;}).sort()};
+  plan.result.deletedCount=targets.length;return plan;
+}
+
 function planCancelAchievement_(store,user,payload) {
   var record=findRecord_(store,payload.recordId);actorOwns_(user,record);checkVersion_(record,payload.rowVersion);
   var si=NODE.stages.indexOf(payload.stage);if(si<0||!record.dates[si])fail_('CONFLICT','取り消す成果が見つかりません。再取得してください。');
@@ -1106,22 +1153,30 @@ function planManagementRow_(store,user,payload) {
 function planRestoreChange_(store,user,payload) {
   var original=operation_(store,payload.changeId);if(!original||!original.result.undo||original.action==='restoreChange')fail_('VALIDATION','元に戻せる変更ではありません。');
   if(probeReservation_(store,original.actorId,false))fail_('FORBIDDEN','検証用の変更はこの操作で復元できません。');
-  if(original.actorId!==user.id&&user.role!=='admin')fail_('FORBIDDEN','他の人の変更は元に戻せません。');
+  if(original.actorId!==user.id&&user.role!=='admin'&&!(original.action==='deleteCandidate'&&original.result.undo.every(function(item){return item.ownerId===user.id;})))fail_('FORBIDDEN','他の人の変更は元に戻せません。');
   var changes=original.result.undo.map(function(item){
     var sheet=item.recordId?store.matching:managementSheet_(store.book,item.sheetId);if(!item.recordId)requireAdmin_(user);
-    var record=item.recordId?findRecord_(store,item.recordId):null;if(item.recordId){actorOwns_(user,record);if(record.row!==item.row)fail_('CONFLICT','対象の行は並べ替えられています。現在の情報を確認してください。');}
+    var record=item.recordId?findRecord_(store,item.recordId):null,archived=null;
+    if(item.recordId&&original.action==='deleteCandidate'){
+      var ids=metadataMap_(sheet,NODE.recordKey),markers=metadataMap_(sheet,NODE.deletedKey);archived=markers[item.row];var marker=archived&&deletedMarker_(archived);
+      if(record||!ids[item.row]||ids[item.row].value!==item.recordId||!marker||marker.changeId!==payload.changeId||marker.recordId!==item.recordId||marker.playerId!==item.ownerId)fail_('CONFLICT','削除した行が変更・移動されています。管理者に確認してください。');
+      if(user.role!=='admin'&&marker.playerId!==user.id)fail_('FORBIDDEN','本人の候補者だけ復元できます。');
+    }else if(item.recordId){actorOwns_(user,record);if(record.row!==item.row)fail_('CONFLICT','対象の行は並べ替えられています。現在の情報を確認してください。');}
     var cells=gridRead_(store.book,sheet,item.row,1)[0];if(gridFingerprint_(cells)!==item.after)fail_('CONFLICT','その後の編集があるため元に戻せません。現在の情報を確認してください。');
     var requests=item.entries.map(function(e){if(publicCell_(cells[e.column-1],e.column).readonly)fail_('FORMULA_PROTECTED','元に戻すセルが数式になっています。');return rawCellRequest_(sheet.getSheetId(),item.row,e.column,e.before);});
-    return {requests:requests,check:{sheetId:sheet.getSheetId(),row:item.row,before:item.after,recordId:item.recordId},undo:{}};
+    if(archived)requests.push({deleteDeveloperMetadata:{dataFilter:{developerMetadataLookup:{metadataId:archived.metadataId}}}});
+    return {requests:requests,check:{sheetId:sheet.getSheetId(),row:item.row,before:item.after,recordId:item.recordId,archiveChangeId:archived?payload.changeId:null,archiveOwnerId:archived?item.ownerId:null},undo:{}};
   });var plan=combinedChangePlan_(changes,original.result.label+'を復元');delete plan.result.undo;return plan;
 }
 function revalidateManagementPlan_(store,user,plan) {
   var accountStore={config:store.config,book:store.book,playerSheet:store.playerSheet,players:readPlayers_(store.playerSheet)};
   var freshActor=activeActor_(accountStore,user);if(freshActor.role!==user.role)fail_('CONFLICT','権限が更新されました。再ログインしてください。');
-  var latest=plan.recordChecks&&plan.recordChecks.length?readStore_({readOnly:true},accountStore):null;
-  (plan.recordChecks||[]).forEach(function(c){var fresh=findRecord_(latest,c.recordId);actorOwns_(user,fresh);if(fresh.row!==c.row||fresh.version!==c.version)fail_('CONFLICT','対象行が更新されました。再取得してください。');});
+  var latest=plan.candidateDeleteCheck||plan.recordChecks&&plan.recordChecks.length?readStore_({readOnly:true},accountStore):null;
+  if(plan.candidateDeleteCheck){var group=plan.candidateDeleteCheck,ids=latest.records.filter(function(r){return r.playerId===group.playerId&&r.candidateId===group.candidateId;}).map(function(r){return r.recordId;}).sort();if(stableJson_(ids)!==stableJson_(group.ids))fail_('CONFLICT','削除対象の提案が増減しています。範囲を確認してください。');}
+  (plan.recordChecks||[]).forEach(function(c){var fresh=findRecord_(latest,c.recordId);actorOwns_(user,fresh);if(fresh.row!==c.row||fresh.version!==c.version||c.profileId!==undefined&&(fresh.profileId||'')!==c.profileId||c.playerId!==undefined&&fresh.playerId!==c.playerId)fail_('CONFLICT','対象行が更新されました。再取得してください。');});
   (plan.checks||[]).forEach(function(c){var sheet=c.recordId?store.matching:managementSheet_(store.book,c.sheetId);if(!c.recordId)requireAdmin_(user);
     if(gridFingerprint_(gridRead_(store.book,sheet,c.row,1)[0])!==c.before)fail_('CONFLICT','保存前に行が更新されました。再取得してください。');
+    if(c.archiveChangeId){var archived=metadataMap_(sheet,NODE.deletedKey)[c.row],marker=archived&&deletedMarker_(archived);if(!marker||marker.changeId!==c.archiveChangeId||marker.playerId!==c.archiveOwnerId||marker.recordId!==c.recordId)fail_('CONFLICT','削除済みの情報が変更されています。');if(user.role!=='admin'&&marker.playerId!==user.id)fail_('FORBIDDEN','本人の候補者だけ復元できます。');}
     if(c.recordId){var ids=metadataMap_(sheet,NODE.recordKey);if(!ids[c.row]||ids[c.row].value!==c.recordId)fail_('CONFLICT','対象の行が移動しました。再取得してください。');}
   });
 }
@@ -1607,4 +1662,137 @@ function verifyNodeWorkspaceAi() {
   if(!key||properties.getProperty('NODE_GEMINI_FREE_TIER_CONFIRMED')!=='true')fail_('AI_NOT_CONFIGURED','Geminiの無料枠設定を確認してください。');
   var aggregate={role:'admin',period:'2026-10',asOf:'2026-10-14',metrics:NODE_INSIGHT_RULES.insightMetrics.map(function(m){return {key:m.key,count:2,previousCount:1};}),proposalTarget:20,memberCount:1,pipeline:{interviewsToday:1,interviewsOverdue:1,resultsWaiting:1,startsOverdue:0,missingReviews:0},reviewReasons:[]};
   var result=generateWorkspaceInsights_(aggregate,key);var proof={success:true,model:'gemini-3.5-flash-lite',priorities:result.priorities.length,questions:result.meetingQuestions.length,checked:['synthetic aggregate only','validated structured output','no business reads','no app quota or reports changed']};Logger.log(JSON.stringify(proof));return proof;
+}
+
+/** Read-only owner probe. Plans deletion against the registered verification copy and never commits it. */
+function verifyNodeDeletionReadOnly() {
+  requireOwner_();var production=config_(),copyId=props_().getProperty(NODE.verificationKey);
+  if(!copyId||copyId===NODE.originalId||copyId===production.spreadsheetId||copyId===props_().getProperty(NODE.destinationKey))fail_('COPY_VERIFICATION_REQUIRED','独立した検証コピーを確認してください。');
+  var book=SpreadsheetApp.openById(copyId),tabs=resolveBusinessTabs_(book),config=JSON.parse(JSON.stringify(production));
+  config.spreadsheetId=copyId;config.purpose='verification';config.matchingSheetId=tabs.matching.getSheetId();config.kpiSheetId=tabs.kpi.getSheetId();
+  var playerSheet=book.getSheetByName(NODE.playersTab),store=readStore_({readOnly:true},{config:config,book:book,playerSheet:playerSheet,players:readPlayers_(playerSheet)});
+  if(!store.schemaCompatible)fail_('SCHEMA_MISMATCH','検証コピーの列を確認してください。');
+  var record=store.records.find(function(r){return r.playerId&&[3,4].concat(NODE.stageColumns).every(function(c){return !r.formulas[c-1];});});if(!record)fail_('COPY_VERIFICATION_REQUIRED','検証コピーに読み取り対象の候補者がありません。');
+  var user={id:record.playerId,role:'player'},payload={recordId:record.recordId,rowVersion:record.version,scope:'record',targets:[{recordId:record.recordId,rowVersion:record.version}]},plan=planDeleteCandidate_(store,user,payload,Utilities.getUuid());
+  revalidateManagementPlan_(store,user,plan);
+  if(!plan.result.undo||plan.result.undo.length!==1||plan.requests.some(function(r){return !r.updateCells&&!r.createDeveloperMetadata;}))fail_('COPY_VERIFICATION_FAILED','削除計画の形式を確認してください。');
+  var result={verified:true,readOnly:true,plannedRows:plan.result.deletedCount,requestCount:plan.requests.length,checked:['本人権限','行バージョン','数式保護','復元用の保存計画'],productionUnchanged:stableJson_(config_())===stableJson_(production)};Logger.log(JSON.stringify(result));return result;
+}
+
+/* Private interview intake and shared client choices. Details never enter AI input. */
+var CANDIDATE_PROFILE_TAB='_NODE_candidate_profiles';
+var CANDIDATE_PROFILE_HEADERS=['profileId','playerId','fields','introduction','version','updatedAt'];
+var CLIENT_TAB='_NODE_clients';
+var CLIENT_HEADERS=['id','name','active','version','updatedAt'];
+var INTERVIEW_FIELD_LIMITS={age:20,gender:20,residence:120,availableFrom:120,timeWindow:200,daysPerWeek:80,monthlyHours:80,sideJob:160,desiredHourlyRate:100,pcEnvironment:30,networkEnvironment:200,attendanceConcerns:600,workHistory:6000,achievements:1500,strengths:1500,crmOther:120,chatOther:120,interviewAvailability:300,workStyle:200,pcSkills:800};
+var INTERVIEW_CRM_TOOLS=['Salesforce','kintone','HubSpot','その他'];
+var INTERVIEW_CHAT_TOOLS=['Slack','Chatwork','その他'];
+function intakeText_(value,max) {
+  if(typeof value!=='string'||Array.from(value).length>max||/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value))fail_('VALIDATION','面談情報の文字数または入力形式を確認してください。');
+  return value.trim();
+}
+function interviewFields_(value) {
+  if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(function(k){return !Object.prototype.hasOwnProperty.call(INTERVIEW_FIELD_LIMITS,k)&&k!=='crmTools'&&k!=='chatTools';}))fail_('VALIDATION','面談情報の項目を確認してください。');
+  var result={};Object.keys(INTERVIEW_FIELD_LIMITS).forEach(function(k){result[k]=intakeText_(value[k]===undefined?'':value[k],INTERVIEW_FIELD_LIMITS[k]);});
+  if(['','Windows','MacBook','PCなし','購入予定','その他'].indexOf(result.pcEnvironment)<0||['','男性','女性','その他','回答しない'].indexOf(result.gender)<0)fail_('VALIDATION','面談情報の選択肢を確認してください。');
+  [['crmTools',INTERVIEW_CRM_TOOLS],['chatTools',INTERVIEW_CHAT_TOOLS]].forEach(function(pair){var values=value[pair[0]]===undefined?[]:value[pair[0]];if(!Array.isArray(values)||values.length>pair[1].length||values.some(function(v){return typeof v!=='string'||pair[1].indexOf(v)<0;})||new Set(values).size!==values.length)fail_('VALIDATION','面談情報の複数選択を確認してください。');result[pair[0]]=pair[1].filter(function(v){return values.indexOf(v)>=0;});});
+  return result;
+}
+function interviewBody_(payload) {
+  if(!payload||typeof payload!=='object'||Array.isArray(payload)||Object.keys(payload).some(function(k){return ['fields','introduction','profileVersion'].indexOf(k)<0;}))fail_('VALIDATION','保存する面談情報を確認してください。');
+  if(payload.profileVersion!==undefined&&typeof payload.profileVersion!=='string')fail_('VALIDATION','面談情報のバージョンを確認してください。');
+  return {fields:interviewFields_(payload.fields),introduction:intakeText_(payload.introduction===undefined?'':payload.introduction,1000),profileVersion:payload.profileVersion||''};
+}
+function intakeId_(value) {return typeof value==='string'&&/^[A-Za-z0-9_-]{16,128}$/.test(value);}
+function intakeTable_(book,title,headers) {
+  var sheet=book.getSheetByName(title);if(!sheet)return {sheet:null,rows:[],fingerprint:'missing'};
+  if(sheet.getLastRow()>5001)fail_('INTAKE_LIMIT','面談情報またはクライアントの保存上限に達しました。管理者に確認してください。');
+  var values=table_(sheet,headers),formulas=sheet.getRange(1,1,values.length,headers.length).getFormulas();
+  if(formulas.some(function(r){return r.some(Boolean);}))fail_('FORMULA_PROTECTED','面談情報・クライアントの管理タブに数式があります。保存を停止しました。');
+  return {sheet:sheet,rows:values.slice(1),fingerprint:hash_(stableJson_(values))};
+}
+function candidateProfileTable_(book) {
+  var state=intakeTable_(book,CANDIDATE_PROFILE_TAB,CANDIDATE_PROFILE_HEADERS),seen={};
+  state.entries=state.rows.map(function(row,i){
+    var fields;try{fields=interviewFields_(JSON.parse(row[2]));}catch(_){fail_('SCHEMA_MISMATCH','保存済みの面談情報の項目を確認してください。');}
+    if(!intakeId_(row[0])||typeof row[1]!=='string'||!row[1]||seen[row[0]]||!intakeId_(row[4])||typeof row[5]!=='string'||!/^\d{4}-\d{2}-\d{2}T/.test(row[5])||!isFinite(Date.parse(row[5])))fail_('SCHEMA_MISMATCH','保存済みの面談情報のID・担当・バージョンを確認してください。');
+    var introduction;try{introduction=intakeText_(row[3],1000);}catch(_){fail_('SCHEMA_MISMATCH','保存済みの紹介文を確認してください。');}seen[row[0]]=true;
+    return {profileId:row[0],playerId:row[1],fields:fields,introduction:introduction,version:row[4],updatedAt:row[5],row:i+2};
+  });return state;
+}
+function profileRecords_(store,profile) {return store.records.filter(function(r){return r.profileId===profile.profileId;});}
+function readCandidateProfiles_(store,user) {
+  return candidateProfileTable_(store.book).entries.filter(function(profile){var records=profileRecords_(store,profile);return records.length&&records.every(function(r){return r.playerId===profile.playerId;})&&(user.role==='admin'||profile.playerId===user.id);}).map(function(profile){return {profileId:profile.profileId,playerId:profile.playerId,recordIds:profileRecords_(store,profile).map(function(r){return r.recordId;}),fields:profile.fields,introduction:profile.introduction,version:profile.version,updatedAt:profile.updatedAt};});
+}
+function clientTable_(book) {
+  var state=intakeTable_(book,CLIENT_TAB,CLIENT_HEADERS),seen={},names={};
+  state.entries=state.rows.map(function(row,i){var name;try{name=shortText_(row[1],100,true);}catch(_){fail_('SCHEMA_MISMATCH','クライアント名を確認してください。');}var key=clientNameKey_(name);
+    if(!intakeId_(row[0])||seen[row[0]]||typeof row[2]!=='boolean'||!intakeId_(row[3])||typeof row[4]!=='string'||!isFinite(Date.parse(row[4]))||row[2]&&names[key])fail_('SCHEMA_MISMATCH','クライアントのID・状態・重複を確認してください。');seen[row[0]]=true;if(row[2])names[key]=true;
+    return {id:row[0],name:name,active:row[2],version:row[3],updatedAt:row[4],row:i+2};
+  });return state;
+}
+function clientNameKey_(name) {return name.normalize('NFKC').replace(/\s/g,'').toLowerCase();}
+function clientEntries_(book) {return clientTable_(book).entries.map(function(entry){return {id:entry.id,name:entry.name,active:entry.active,version:entry.version};});}
+function intakeWritePlan_(store,plan,title,headers,state,row,values) {
+  if(row>5001)fail_('INTAKE_LIMIT','保存上限に達しました。管理者に確認してください。');
+  plan.requests=plan.requests||[];plan.intakeTableChecks=plan.intakeTableChecks||[];plan.intakeTableChecks.push({title:title,headers:headers,fingerprint:state.fingerprint,sheetId:state.sheet?state.sheet.getSheetId():null});
+  var id;if(!state.sheet){do{id=Math.floor(Math.random()*1000000000)+1;}while(store.book.getSheets().some(function(sheet){return sheet.getSheetId()===id;}));plan.requests.push({addSheet:{properties:{sheetId:id,title:title,gridProperties:{rowCount:5001,columnCount:headers.length}}}});plan.requests.push(rowUpdateRequest_(id,1,headers));}
+  else{id=state.sheet.getSheetId();if(row>state.sheet.getMaxRows())plan.requests.push({appendDimension:{sheetId:id,dimension:'ROWS',length:row-state.sheet.getMaxRows()}});}
+  plan.requests.push(rowUpdateRequest_(id,row,values));
+}
+function addProfileRecordChecks_(plan,records) {
+  plan.recordChecks=plan.recordChecks||[];records.forEach(function(record){if(!plan.recordChecks.some(function(c){return c.recordId===record.recordId;}))plan.recordChecks.push({recordId:record.recordId,row:record.row,version:record.version,profileId:record.profileId||'',playerId:record.playerId});});
+}
+function matchingProfile_(store,state,record,ownerId) {
+  if(!record||!record.profileId)return null;
+  var profile=state.entries.find(function(p){return p.profileId===record.profileId;});
+  if(!profile||profile.playerId!==ownerId||!profileRecords_(store,profile).every(function(r){return r.playerId===ownerId;}))fail_('CONFLICT','面談情報の担当・関連する提案が変わっています。管理者に確認してください。');
+  return profile;
+}
+function addCandidateProfileToPlan_(store,user,plan,record,ownerId,payload) {
+  var body=interviewBody_(payload),state=candidateProfileTable_(store.book),previous=matchingProfile_(store,state,record,ownerId);
+  if(previous?body.profileVersion!==previous.version:!!body.profileVersion)fail_('CONFLICT','面談情報が更新されています。再取得してから編集してください。');
+  var profileId=previous?previous.profileId:Utilities.getUuid();
+  if(!previous){if(store.profileMetadata&&store.profileMetadata[plan.row||record.row])fail_('CONFLICT','この行には別の面談情報が関連付けられています。');plan.requests.push(metadataCreate_(store.matching.getSheetId(),plan.row||record.row,NODE.candidateProfileKey,profileId));}
+  var values=[profileId,ownerId,JSON.stringify(body.fields),body.introduction,Utilities.getUuid(),new Date().toISOString()];
+  intakeWritePlan_(store,plan,CANDIDATE_PROFILE_TAB,CANDIDATE_PROFILE_HEADERS,state,previous?previous.row:state.rows.length+2,values);
+  addProfileRecordChecks_(plan,record?[record].concat(previous?profileRecords_(store,previous):[]):[]);
+  if(previous)addProfileGroupCheck_(store,plan,previous.profileId);
+  else {plan.profileVacancyChecks=plan.profileVacancyChecks||[];plan.profileVacancyChecks.push(plan.row||record.row);}
+  plan.result=Object.assign({},plan.result||{},{recordId:record?record.recordId:plan.recordId,profileId:profileId});
+}
+function planCandidateProfile_(store,user,payload) {
+  var record=findRecord_(store,payload.recordId);actorOwns_(user,record);checkVersion_(record,payload.rowVersion);
+  if(typeof payload.profileVersion!=='string')fail_('CONFLICT','面談情報の最新バージョンを指定してください。');
+  var plan={requests:[],result:{}};addCandidateProfileToPlan_(store,user,plan,record,record.playerId,{fields:payload.fields,introduction:payload.introduction,profileVersion:payload.profileVersion});return plan;
+}
+function linkCandidateProfileToPlan_(store,user,plan,ownerId,candidateId,sourceId) {
+  var source=findRecord_(store,sourceId);actorOwns_(user,source);
+  if(source.playerId!==ownerId||source.candidateId!==candidateId)fail_('CONFLICT','同じ担当者・候補者の面談情報を選択してください。');
+  var state=candidateProfileTable_(store.book),profile=matchingProfile_(store,state,source,ownerId);if(!profile)fail_('VALIDATION','引継ぎ元の面談情報を先に保存してください。');
+  if(store.profileMetadata&&store.profileMetadata[plan.row])fail_('CONFLICT','保存先には別の面談情報が関連付けられています。');
+  plan.requests.push(metadataCreate_(store.matching.getSheetId(),plan.row,NODE.candidateProfileKey,profile.profileId));
+  plan.intakeTableChecks=[{title:CANDIDATE_PROFILE_TAB,headers:CANDIDATE_PROFILE_HEADERS,fingerprint:state.fingerprint,sheetId:state.sheet.getSheetId()}];
+  addProfileRecordChecks_(plan,profileRecords_(store,profile));addProfileGroupCheck_(store,plan,profile.profileId);
+  plan.profileVacancyChecks=[plan.row];plan.result.profileId=profile.profileId;
+}
+function planClient_(store,user,payload) {
+  var state=clientTable_(store.book),name=shortText_(payload.name,100,true),previous=null;
+  if(payload.id!==undefined){if(!intakeId_(payload.id)||typeof payload.version!=='string')fail_('VALIDATION','クライアントのIDとバージョンを確認してください。');previous=state.entries.find(function(c){return c.id===payload.id;});if(!previous||previous.version!==payload.version)fail_('CONFLICT','クライアントが更新されています。再取得してください。');}
+  else if(payload.version!==undefined&&payload.version!=='')fail_('CONFLICT','新しいクライアントには過去のバージョンを指定できません。');
+  if(payload.active!==undefined&&typeof payload.active!=='boolean')fail_('VALIDATION','クライアントの利用状態を確認してください。');
+  var active=payload.active===undefined?(previous?previous.active:true):payload.active,id=previous?previous.id:Utilities.getUuid();
+  if(active&&state.entries.some(function(c){return c.active&&c.id!==id&&clientNameKey_(c.name)===clientNameKey_(name);}))fail_('VALIDATION','同じクライアントが登録されています。既存のクライアントを選択してください。');
+  var plan={requests:[],result:{clientId:id}};intakeWritePlan_(store,plan,CLIENT_TAB,CLIENT_HEADERS,state,previous?previous.row:state.rows.length+2,[id,name,active,Utilities.getUuid(),new Date().toISOString()]);return plan;
+}
+function profileBindingSignature_(maps,profileId) {return stableJson_(Object.keys(maps[NODE.candidateProfileKey]||{}).filter(function(row){return maps[NODE.candidateProfileKey][row].value===profileId;}).map(function(row){return [Number(row),maps[NODE.recordKey][row]?maps[NODE.recordKey][row].value:''];}).sort(function(a,b){return a[0]-b[0];}));}
+function addProfileGroupCheck_(store,plan,profileId) {
+  var maps={};maps[NODE.candidateProfileKey]=store.profileMetadata;maps[NODE.recordKey]=store.recordMetadata;plan.profileGroupChecks=plan.profileGroupChecks||[];plan.profileGroupChecks.push({profileId:profileId,bindingSignature:profileBindingSignature_(maps,profileId)});
+}
+function revalidateIntakePlan_(store,user,plan) {
+  if(plan.profileGroupChecks||plan.profileVacancyChecks){var maps=metadataMaps_(store.matching,[NODE.candidateProfileKey,NODE.recordKey]);
+    (plan.profileGroupChecks||[]).forEach(function(check){if(profileBindingSignature_(maps,check.profileId)!==check.bindingSignature)fail_('CONFLICT','面談情報に関連する提案が保存前に変わっています。再取得してください。');});
+    (plan.profileVacancyChecks||[]).forEach(function(row){if(maps[NODE.candidateProfileKey][row])fail_('CONFLICT','保存先には別の面談情報が関連付けられています。');});
+  }
+  (plan.intakeTableChecks||[]).forEach(function(check){var current=intakeTable_(store.book,check.title,check.headers);if(current.fingerprint!==check.fingerprint||(current.sheet?current.sheet.getSheetId():null)!==check.sheetId)fail_('CONFLICT','面談情報またはクライアントが保存前に更新されました。再取得してください。');});
 }

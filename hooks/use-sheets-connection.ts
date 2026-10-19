@@ -12,7 +12,7 @@ export type BackgroundSaveState = {
   details: string[]; error: string; uncertain: boolean; changeId?: string;
 };
 type BackgroundJob = { state: BackgroundSaveState; payload: unknown; endpoint: string; token: string; generation: number };
-const backgroundActions = new Set(["updateRecord", "createCandidate", "cancelAchievement", "restoreChange", "saveActivity", "updateProfile", "updateStatus", "saveManagementRow", "saveInterviewReview"]);
+const backgroundActions = new Set(["saveCandidateProfile", "saveClient", "deleteCandidate", "updateRecord", "createCandidate", "cancelAchievement", "restoreChange", "saveActivity", "updateProfile", "updateStatus", "saveManagementRow", "saveInterviewReview"]);
 const readStorage = (storage: Storage, key: string) => { try { return storage.getItem(key); } catch { return null; } };
 const writeStorage = (storage: Storage, key: string, value: string | null) => {
   try { if (value === null) storage.removeItem(key); else storage.setItem(key, value); } catch { /* A memory-only session remains usable. */ }
@@ -384,17 +384,20 @@ export function useSheetsConnection() {
 }
 
 function saveLabel(action: string) {
-  return ({updateRecord:"候補者の変更",createCandidate:"候補者の登録",cancelAchievement:"成果の取り消し",restoreChange:"変更の復元",saveActivity:"成果の登録",updateProfile:"プロフィール",updateStatus:"進捗の変更",saveManagementRow:"業務管理表",saveInterviewReview:"面談の振り返り"} as Record<string,string>)[action] || "変更";
+  return ({saveCandidateProfile:"候補者の基本情報",saveClient:"取引先の登録・編集",deleteCandidate:"候補者・提案の削除",updateRecord:"候補者の変更",createCandidate:"候補者の登録",cancelAchievement:"成果の取り消し",restoreChange:"変更の復元",saveActivity:"成果の登録",updateProfile:"プロフィール",updateStatus:"進捗の変更",saveManagementRow:"業務管理表",saveInterviewReview:"面談の振り返り"} as Record<string,string>)[action] || "変更";
 }
 function saveDetails(action: string, owned: unknown, snapshot: SheetSnapshot): string[] {
   const data = owned as Record<string, unknown>, detail: string[] = [];
   const record = snapshot.records?.find(r => r.recordId === data.recordId);
   if (record) detail.push(`候補者：${record.candidateName}`);
-  const names: Record<string,string> = {candidateName:"候補者",company:"会社名",position:"ポジション",playerId:"担当ID",stage:"成果の工程",date:"実績日",source:"紹介元",status:"ステータス",probability:"ヨミ確度",interviewScheduledDate:"C面談予定日",clientInterviewScheduledTime:"C面談予定開始時刻",offerScheduledDate:"オファー予定日",memo:"メモ",category:"理由の分類",nextAction:"次回の対応",name:"氏名",team:"チーム",target:"目標",bio:"プロフィール",sheetNames:"担当者の別名",sheetId:"管理表ID",row:"行"};
+  if(action==="saveCandidateProfile")return [...detail,"面談の基本情報・紹介文を保存します。"];
+  if(action==="saveClient")return ["取引先マスターを保存します。登録済みの提案は変更しません。"];
+  const names: Record<string,string> = {candidateName:"候補者",company:"会社名",position:"ポジション",playerId:"担当ID",stage:"成果の工程",date:"実績日",source:"紹介元",status:"ステータス",probability:"ヨミ確度",interviewScheduledDate:"C面談予定日",clientInterviewScheduledTime:"C面談予定開始時刻",offerScheduledDate:"オファー予定日",memo:"メモ",category:"理由の分類",nextAction:"次回の対応",name:"氏名",team:"チーム",target:"目標",bio:"プロフィール",sheetNames:"担当者の別名",sheetId:"管理表ID",row:"行",scope:"削除範囲"};
   const source = (action === "saveActivity" ? data.activity : action === "updateProfile" ? data.player : data) as Record<string, unknown>;
   for (const [key,value] of Object.entries(source || {})) {
     if (names[key]) detail.push(`${names[key]}：${Array.isArray(value)?value.join("、"):String(value ?? "") || "（空欄）"}`);
   }
+  if (action==="deleteCandidate" && Array.isArray(data.targets)) detail.push(`削除対象：${data.targets.length}件 · 削除済み一覧から復元できます。`);
   if (data.changes && typeof data.changes === "object") for (const [column,value] of Object.entries(data.changes)) {
     detail.push(`${action === "updateRecord" ? matchingFields[Number(column)-1] || `${column}列` : `${column}列`}：${String(value ?? "") || "（空欄に変更）"}`);
   }

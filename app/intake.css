@@ -1,0 +1,35 @@
+.interview-intake{font-size:15px;line-height:1.65;min-width:0;color:#244c72}
+.interview-intake .intake-context{margin:0 0 20px;color:#587798}
+.interview-intake .intake-section{min-width:0;margin:0 0 24px;padding:0;border:0}
+.interview-intake .intake-section>legend{width:100%;margin:0 0 14px;padding:0 0 9px;border-bottom:1px solid #dbe8f6;color:#234e77;font-size:16px;font-weight:700}
+.interview-intake .intake-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+.interview-intake .intake-wide{grid-column:1/-1}
+.interview-intake .intake-field{display:flex;flex-direction:column;gap:6px;min-width:0;margin:0;font-size:15px;color:#345b81;font-weight:600}
+.interview-intake .intake-field>span{display:block}
+.interview-intake .intake-field>span>small,.interview-intake .intake-tool-group>span>small{margin-left:5px;font-size:12px;font-weight:400;color:#738aa4}
+.interview-intake .intake-field>input,.interview-intake .intake-field>select,.interview-intake .intake-field>textarea{box-sizing:border-box;width:100%;min-width:0;border:1px solid #cbdff3;border-radius:7px;padding:10px 12px;background:#fff;color:#244c72;font:inherit;font-size:15px;font-weight:400;line-height:1.6}
+.interview-intake .intake-field>textarea{resize:vertical;min-height:90px}
+.interview-intake .intake-field input::placeholder,.interview-intake .intake-field textarea::placeholder{color:#8a9fb5;opacity:1}
+.interview-intake .intake-field input:focus-visible,.interview-intake .intake-field select:focus-visible,.interview-intake .intake-field textarea:focus-visible,.interview-intake button:focus-visible,.interview-intake .intake-checks input:focus-visible{outline:2px solid #087fea;outline-offset:3px}
+.interview-intake .intake-hint{font-size:13px;font-weight:400;color:#637e9c}
+.interview-intake .intake-tool-group{min-width:0}
+.interview-intake .intake-tool-group>span{font-weight:600}
+.interview-intake .intake-checks{display:flex;flex-wrap:wrap;gap:8px;margin:9px 0}
+.interview-intake .intake-checks>label{display:inline-flex;align-items:center;gap:7px;min-height:40px;margin:0;padding:6px 12px;border:1px solid #cbdff3;border-radius:7px;background:#fff;font-size:15px;font-weight:400;cursor:pointer}
+.interview-intake .intake-checks input{width:17px;height:17px;margin:0;accent-color:#087fea}
+.interview-intake .intake-checks label:has(input:checked){border-color:#248be5;background:#eaf6ff;color:#075da9}
+.interview-intake fieldset:disabled{opacity:.65}
+.interview-intake .intake-introduction{margin-top:8px;padding:20px;border:1px solid #cee3f7;border-radius:10px;background:#f4faff;min-width:0}
+.interview-intake .intake-introduction-heading{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:8px}
+.interview-intake .intake-introduction-heading>div{min-width:0}
+.interview-intake .intake-introduction-heading h3{margin:0;color:#234e77;font-size:17px;font-weight:700}
+.interview-intake .intake-introduction-heading p{margin:5px 0 0;color:#627e9c;font-size:14px}
+.interview-intake .intake-introduction-heading>button{flex-shrink:0}
+.interview-intake .intake-privacy{margin:0 0 14px;color:#637e9c;font-size:13px}
+.interview-intake .intake-notice,.interview-intake .intake-replace{margin:12px 0;padding:11px 13px;border:1px solid #b9d8ef;border-radius:7px;background:#eaf5fd;font-size:14px;color:#305a7b;overflow-wrap:anywhere}
+.interview-intake .intake-replace p{margin:0 0 10px}
+.interview-intake .intake-replace>div{display:flex;gap:10px;flex-wrap:wrap}
+.interview-intake .intake-copy-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:10px;color:#637e9c;font-size:13px}
+.interview-intake .intake-error{font-size:14px;color:#b13b45}
+.interview-intake .intake-sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+@media(max-width:640px){.interview-intake .intake-grid{grid-template-columns:minmax(0,1fr);gap:14px}.interview-intake .intake-introduction{padding:15px}.interview-intake .intake-introduction-heading{align-items:stretch;flex-direction:column;gap:12px}.interview-intake .intake-introduction-heading>button{align-self:flex-start}.interview-intake .intake-field>input,.interview-intake .intake-field>select,.interview-intake .intake-field>textarea{font-size:16px}.interview-intake .intake-copy-row{flex-wrap:wrap}}

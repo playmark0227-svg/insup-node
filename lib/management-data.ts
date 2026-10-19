@@ -6,6 +6,30 @@ export const milestoneColumns: Record<Stage, number> = {"候補者面談":1,"提
 export const recordDateColumns = [1,8,9,10,17,18,21,22,23,24,25,26];
 export const recordTimeColumns = [11,20];
 export const valueAt = (r: CandidateRecord, col: number) => String(r.values[col-1] ?? "");
+export type CandidateSort = "interview-desc" | "interview-asc" | "registration-desc";
+export function statusTone(status:string):string {
+ const s=status.replace(/[\s（）()]/g,"");
+ if(s==="提案候補")return "proposal-candidate";
+ if(s==="提案なし")return "closed";
+ if(s.startsWith("提案完了"))return "proposed";
+ if(s.startsWith("面談確定"))return "scheduled";
+ if(s.startsWith("面談実施"))return "interviewed";
+ if(s.startsWith("合格シフト"))return "accepted";
+ if(s.startsWith("稼働予定日確定"))return "start-scheduled";
+ if(s==="稼働開始")return "started";
+ if(s.startsWith("案件枠"))return "filled";
+ if(/落選|辞退|離脱|ブッチ/.test(s))return "closed";
+ if(s.includes("リスケ"))return "scheduled";
+ return "neutral";
+}
+export function sortCandidateRecords(records:CandidateRecord[],sort:CandidateSort):CandidateRecord[] {
+ return [...records].sort((a,b)=>{
+  if(sort==="registration-desc")return b.row-a.row||a.recordId.localeCompare(b.recordId);
+  const ad=/^\d{4}-\d{2}-\d{2}$/.test(valueAt(a,1))?valueAt(a,1):"",bd=/^\d{4}-\d{2}-\d{2}$/.test(valueAt(b,1))?valueAt(b,1):"";
+  if(!ad||!bd)return ad?-1:bd?1:b.row-a.row;
+  return (sort==="interview-desc"?bd.localeCompare(ad):ad.localeCompare(bd))||b.row-a.row||a.recordId.localeCompare(b.recordId);
+ });
+}
 export function correctionRecords(records:CandidateRecord[],owner:string,stage:Stage,period:string):CandidateRecord[] {
  const col=milestoneColumns[stage];
  const found=records.filter(r=>r.playerId===owner&&/^\d{4}-\d{2}-\d{2}$/.test(valueAt(r,col))&&(period==="all"||valueAt(r,col).startsWith(period)));

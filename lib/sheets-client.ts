@@ -1,9 +1,11 @@
 import { stages, type Activity, type Metric, type Player } from "./node-data.ts";
+import { interviewStringFields, crmOptions, chatOptions, pcOptions, genderOptions, type CandidateProfile } from "./candidate-intake.ts";
 
 export type SheetPlayer = Player & { sheetNames?: string[] };
 export type Counts = Record<string, Record<string, Partial<Record<Metric, number>>>>;
 export type SheetDestination = { title: string; matchingUrl: string; kpiUrl: string };
-export type CandidateRecord = { recordId: string; rowVersion: string; row: number; playerId: string; candidateId?: string; candidateName: string; source: string; values: (string | number | boolean)[]; formulaColumns: number[] };
+export type CandidateRecord = { recordId: string; rowVersion: string; row: number; playerId: string; candidateId?: string; profileId?:string; candidateName: string; source: string; values: (string | number | boolean)[]; formulaColumns: number[] };
+export type ClientEntry = {id:string;name:string;active:boolean;version:string};
 export type ManagementCell = {column:number;value:string|number|boolean;display:string;kind:"text"|"date"|"time"|"number"|"percent"|"boolean";options:string[];readonly:boolean;note:string};
 export type ManagementRow = {row:number;version:string;cells:ManagementCell[]};
 export type ManagementTable = {sheetId:number;title:string;startRow:number;rowCount:number;columnCount:number;readonly:boolean;headers?:string[];rows:ManagementRow[]};
@@ -12,7 +14,13 @@ export type InterviewReview = {recordId:string;playerId:string;interviewDate:str
 export type InterviewAdviceUsage = {userRemaining:number;teamRemaining:number;resetAt:string};
 export type InterviewAdvice = {summary:string;actions:string[];count:number;generatedAt:string;period?:string;source?:"generated"|"saved";aggregate?:{category:string;count:number}[];usage?:InterviewAdviceUsage};
 export type InterviewAdviceState = {advice:InterviewAdvice|null;stale:boolean;count:number;usage:InterviewAdviceUsage;configured:boolean;pending:boolean};
+export type DeletedCandidate = {changeId:string;playerId:string;candidateName:string;deletedAt:string;companies:string[];recordCount:number};
 export type SheetSnapshot = {
+  intakeFeature?: boolean;
+  candidateProfiles?: CandidateProfile[];
+  clients?: ClientEntry[];
+  deletionFeature?: boolean;
+  deletedCandidates?: DeletedCandidate[];
   securityFeature?: boolean;
   workspaceFeature?: boolean;
   reviewFeature?: boolean;
@@ -239,13 +247,24 @@ export function assertSnapshot(value: unknown): asserts value is SheetSnapshot {
   }
   if (s.records !== undefined && (!Array.isArray(s.records) || s.records.some(r => !object(r) ||
       !strings(r, ["recordId", "rowVersion", "playerId", "candidateName", "source"]) || !r.recordId || !r.rowVersion ||
-      !Number.isSafeInteger(r.row) || Number(r.row) < 1 || !optionalStrings(r, ["candidateId"]) ||
+      !Number.isSafeInteger(r.row) || Number(r.row) < 1 || !optionalStrings(r, ["candidateId", "profileId"]) ||
       !Array.isArray(r.values) || r.values.length !== 26 || r.values.some(v => !["string", "number", "boolean"].includes(typeof v) || typeof v === "number" && !Number.isFinite(v)) ||
       !Array.isArray(r.formulaColumns) || r.formulaColumns.some(c => !Number.isSafeInteger(c) || c < 1 || c > 26) ||
       new Set(r.formulaColumns).size !== r.formulaColumns.length || (s.self.role === "player" && r.playerId !== s.self.playerId)))) {
     throw new SheetApiError("INVALID_RESPONSE","候補者情報の形式または閲覧権限を確認できませんでした。");
   }
   if(s.interviewReviews !== undefined && (!Array.isArray(s.interviewReviews)||s.interviewReviews.some(r=>!object(r) || !strings(r,["recordId","playerId","interviewDate","category","memo","nextAction","version","updatedAt"]) ||(s.self.role==="player"&&r.playerId!==s.self.playerId))))throw new SheetApiError("INVALID_RESPONSE","振り返りの閲覧権限を確認できませんでした。");
+  if (s.deletionFeature !== undefined && typeof s.deletionFeature !== "boolean") invalid();
+  if(s.intakeFeature!==undefined&&typeof s.intakeFeature!=="boolean")invalid();
+  if(s.clients!==undefined&&(!Array.isArray(s.clients)||s.clients.some(c=>!object(c)||!strings(c,["id","name","version"])||!c.id||!c.name||c.name.length>100||!c.version||typeof c.active!=="boolean")||new Set(s.clients.map(c=>c.id)).size!==s.clients.length))invalid("取引先情報の形式を確認できませんでした。");
+  if(s.candidateProfiles!==undefined&&(!Array.isArray(s.candidateProfiles)||s.candidateProfiles.some(p=>{
+    if(!object(p)||!strings(p,["profileId","playerId","version","updatedAt","introduction"])||!p.profileId||!p.version||[...p.introduction].length>1000||!Array.isArray(p.recordIds)||!p.recordIds.length||new Set(p.recordIds).size!==p.recordIds.length||!object(p.fields))return true;
+    if(s.self.role==="player"&&p.playerId!==s.self.playerId)return true;
+    if(p.recordIds.some(id=>typeof id!=="string"||!s.records?.some(r=>r.recordId===id&&r.playerId===p.playerId&&r.profileId===p.profileId)))return true;
+    const fields=p.fields;
+    return interviewStringFields.some(k=>typeof fields[k]!=="string")||!Array.isArray(fields.crmTools)||fields.crmTools.some(v=>!crmOptions.some(o=>o===v))||!Array.isArray(fields.chatTools)||fields.chatTools.some(v=>!chatOptions.some(o=>o===v))||(fields.pcEnvironment!==""&&!pcOptions.some(o=>o===fields.pcEnvironment))||!genderOptions.some(o=>o===fields.gender);
+  })||new Set(s.candidateProfiles.map(p=>p.profileId)).size!==s.candidateProfiles.length))invalid("候補者の基本情報の形式または閲覧権限を確認できませんでした。");
+  if (s.deletedCandidates !== undefined && (!Array.isArray(s.deletedCandidates) || s.deletedCandidates.some(r => !object(r) || !strings(r,["changeId","playerId","candidateName","deletedAt"]) || !r.changeId || !r.candidateName || !Array.isArray(r.companies) || r.companies.some(v => typeof v !== "string") || !Number.isSafeInteger(r.recordCount) || Number(r.recordCount)<1 || (s.self.role==="player"&&r.playerId!==s.self.playerId)))) invalid("削除済み候補者の形式または閲覧権限を確認できませんでした。");
   if (s.destination !== undefined && (!object(s.destination) || s.self.role !== "admin" || typeof s.destination.title !== "string" ||
       ![s.destination.matchingUrl, s.destination.kpiUrl].every(url => typeof url === "string" && /^https:\/\/docs\.google\.com\/spreadsheets\/d\/[A-Za-z0-9_-]+\/edit(?:\?gid=\d+(?:#gid=\d+)?|#gid=\d+)$/.test(url)))) {
     throw new SheetApiError("INVALID_RESPONSE", "保存先の情報を確認できませんでした。管理者で再ログインしてください。");

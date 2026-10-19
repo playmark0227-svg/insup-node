@@ -1,11 +1,89 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { validateEndpoint, sheetRequest, assertSnapshot, liveCount, businessToday, isUncertainWrite, SheetApiError } from "../lib/sheets-client.ts";
+import type { SheetSnapshot } from "../lib/sheets-client.ts";
+import { blankInterviewFields } from "../lib/candidate-intake.ts";
 
 const endpoint = "https://script.google.com/macros/s/AKfycb_TEST_DEPLOYMENT_1234567890/exec";
 const player = {id:"ND-001",name:"テスト担当",team:"NODE",target:20,bio:"",color:"blue"};
 const snapshot = {self:{playerId:player.id,role:"player"},players:[player],activities:[],counts:{},syncedAt:"2026-10-07T00:00:00Z",warnings:[],writesEnabled:true};
 const contentUrl = "https://script.googleusercontent.com/macros/echo?user_content_key=test-result-key&lib=test-lib";
+
+function intakeSnapshot():SheetSnapshot {
+ const recordId="fictional-record-id",profileId="fictional-profile-id";
+ return {...structuredClone(snapshot),self:{playerId:player.id,role:"player"},intakeFeature:true,
+  records:[{recordId,rowVersion:"row-version",row:2,playerId:player.id,profileId,candidateName:"架空の候補者",source:"",values:Array(26).fill(""),formulaColumns:[]}],
+  candidateProfiles:[{profileId,playerId:player.id,recordIds:[recordId],version:"profile-version",updatedAt:"2026-10-20T01:00:00Z",fields:blankInterviewFields(),introduction:"本人が確認した入力のみ。"}],
+  clients:[{id:"fictional-client-id",name:"架空の提案先",version:"client-version",active:true}]};
+}
+
+test("intake snapshots accept linked profiles, Unicode introductions, inactive clients and old backends",()=>{
+ assert.doesNotThrow(()=>assertSnapshot(snapshot));
+ const own=intakeSnapshot();own.candidateProfiles![0].introduction="😀".repeat(1000);
+ own.clients!.push({id:"inactive-client",name:"過去の架空提案先",version:"past-version",active:false});
+ assert.doesNotThrow(()=>assertSnapshot(own));
+ const another={...own.records![0],recordId:"second-linked-record",row:3};own.records!.push(another);
+ own.candidateProfiles![0].recordIds.push(another.recordId);assert.doesNotThrow(()=>assertSnapshot(own));
+ const empty={...structuredClone(snapshot),intakeFeature:true,candidateProfiles:[],clients:[]};
+ assert.doesNotThrow(()=>assertSnapshot(empty));
+ const admin=intakeSnapshot();admin.self={playerId:"ADMIN",role:"admin"};
+ assert.doesNotThrow(()=>assertSnapshot(admin));
+});
+
+test("private profiles cannot cross owners or exist without matching record and profile metadata",()=>{
+ const cases:Record<string,(value:SheetSnapshot)=>void>={
+  foreignProfile:value=>{value.candidateProfiles![0].playerId="ND-002";},
+  absentRecords:value=>{delete value.records;},
+  missingRecord:value=>{value.candidateProfiles![0].recordIds=["record-not-in-snapshot"];},
+  missingBinding:value=>{delete value.records![0].profileId;},
+  changedBinding:value=>{value.records![0].profileId="another-profile";},
+  duplicateRecord:value=>{value.candidateProfiles![0].recordIds.push(value.records![0].recordId);},
+  noLinkedRecord:value=>{value.candidateProfiles![0].recordIds=[];},
+  missingVersion:value=>{value.candidateProfiles![0].version="";},
+  missingProfileId:value=>{value.candidateProfiles![0].profileId="";},
+  duplicateProfile:value=>{value.candidateProfiles!.push(structuredClone(value.candidateProfiles![0]));},
+ };
+ for(const [description,change] of Object.entries(cases)){
+  const value=intakeSnapshot();change(value);
+  assert.throws(()=>assertSnapshot(value),{code:"INVALID_RESPONSE"},description);
+ }
+ const admin=intakeSnapshot();admin.self={playerId:"ADMIN",role:"admin"};admin.records![0].playerId="ND-002";
+ assert.throws(()=>assertSnapshot(admin),{code:"INVALID_RESPONSE"},"administrators also require the profile owner to match the linked record");
+});
+
+test("profile snapshot fields reject malformed text, tools, enum choices and oversized introductions",()=>{
+ const cases:Record<string,(value:SheetSnapshot)=>void>={
+  nonString:value=>{(value.candidateProfiles![0].fields as unknown as Record<string,unknown>).age=30;},
+  missingField:value=>{delete (value.candidateProfiles![0].fields as unknown as Record<string,unknown>).workHistory;},
+  badCrm:value=>{value.candidateProfiles![0].fields.crmTools=["unknown-crm"];},
+  badChat:value=>{value.candidateProfiles![0].fields.chatTools=["unknown-chat"];},
+  missingCrm:value=>{delete (value.candidateProfiles![0].fields as unknown as Record<string,unknown>).crmTools;},
+  malformedChat:value=>{(value.candidateProfiles![0].fields as unknown as Record<string,unknown>).chatTools="Slack";},
+  badPc:value=>{value.candidateProfiles![0].fields.pcEnvironment="unsupported-option";},
+  badGender:value=>{value.candidateProfiles![0].fields.gender="unsupported-option";},
+  longIntroduction:value=>{value.candidateProfiles![0].introduction="😀".repeat(1001);},
+  malformedFeature:value=>{(value as unknown as Record<string,unknown>).intakeFeature="true";},
+ };
+ for(const [description,change] of Object.entries(cases)){
+  const value=intakeSnapshot();change(value);
+  assert.throws(()=>assertSnapshot(value),{code:"INVALID_RESPONSE"},description);
+ }
+});
+
+test("shared client snapshots require a stable id, revision, name and boolean active flag",()=>{
+ const cases:Record<string,(value:SheetSnapshot)=>void>={
+  noId:value=>{value.clients![0].id="";},
+  noName:value=>{value.clients![0].name="";},
+  longName:value=>{value.clients![0].name="社".repeat(101);},
+  noVersion:value=>{value.clients![0].version="";},
+  badActive:value=>{(value.clients![0] as unknown as Record<string,unknown>).active="false";},
+  duplicateId:value=>{value.clients!.push({...value.clients![0],name:"別の架空提案先"});},
+ };
+ for(const [description,change] of Object.entries(cases)){
+  const value=intakeSnapshot();change(value);
+  assert.throws(()=>assertSnapshot(value),{code:"INVALID_RESPONSE"},description);
+ }
+});
 function contentResponse(status = 404, url = contentUrl, redirected = true) {
   return Object.defineProperties(new Response("<html>Not found</html>", {status}), {url:{value:url},redirected:{value:redirected}});
 }

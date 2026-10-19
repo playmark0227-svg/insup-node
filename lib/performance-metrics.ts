@@ -11,5 +11,5 @@ export const performanceMetrics = [
 ] as const satisfies ReadonlyArray<{ stage: Stage; label: string; dateLabel: string; description: string }>;
 
 export function stageLabel(stage: Stage): string {
-  return performanceMetrics.find(metric => metric.stage === stage)?.label || stage;
+  return stage === "内定" ? "合格（クライアント）" : performanceMetrics.find(metric => metric.stage === stage)?.label || stage;
 }
