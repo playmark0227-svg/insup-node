@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { validateEndpoint, sheetRequest, assertSnapshot, liveCount, businessToday, isUncertainWrite, SheetApiError } from "../lib/sheets-client.ts";
 import type { SheetSnapshot } from "../lib/sheets-client.ts";
+import { defaultWritingPreferences } from "../lib/on-device-ai.ts";
 import { blankInterviewFields } from "../lib/candidate-intake.ts";
 
 const endpoint = "https://script.google.com/macros/s/AKfycb_TEST_DEPLOYMENT_1234567890/exec";
@@ -217,7 +218,7 @@ test("cancellation and the original 45-second deadline stop delayed recovery bef
 test("an initial login or write network failure never retries its POST", async t => {
   let calls = 0;
   t.mock.method(globalThis,"fetch",async () => { calls++; throw new TypeError("offline"); });
-  for (const action of ["login","saveActivity","updateStatus","resetPassword","logout","analyzeInterviewReviews","unknown-action"]) {
+  for (const action of ["login","saveActivity","updateStatus","resetPassword","logout","analyzeInterviewReviews","generateWritingKit","saveWritingPreferences","unknown-action"]) {
     const before = calls;
     await assert.rejects(() => sheetRequest(endpoint,action,{},{token:"test-token",operationId:"same-operation"}),{code:"NETWORK"});
     assert.equal(calls,before + 1);
@@ -234,7 +235,7 @@ test("temporary HTTP failures cannot replay a login or write", async t => {
   }
 });
 
-for (const action of ["snapshot","health"]) test(`${action} retries an interrupted read once with the same total deadline`, async t => {
+for (const action of ["snapshot","health","readWritingKit","readWritingPreferences"]) test(`${action} retries an interrupted read once with the same total deadline`, async t => {
   t.mock.timers.enable({apis:["setTimeout"]});
   const deadline = new AbortController();
   let timeoutCalls = 0;
@@ -551,4 +552,19 @@ test("workspace insight generation never replays while saved-insight recovery sa
   const recovered = sheetRequest(endpoint,"readWorkspaceInsights",{period:"2026-10"});
   const checked = assert.rejects(recovered,{code:"NETWORK"});
   await flushMicrotasks(); t.mock.timers.tick(750); await checked; assert.equal(calls,3);
+});
+
+
+test("writing feature snapshots contain only validated fixed shared preferences",()=>{
+ const enabled={...snapshot,writingFeature:true,writingPreferences:defaultWritingPreferences()};
+ assert.doesNotThrow(()=>assertSnapshot(enabled));
+ assert.throws(()=>assertSnapshot({...enabled,writingFeature:"yes"}),{code:"INVALID_RESPONSE"});
+ assert.throws(()=>assertSnapshot({...enabled,writingPreferences:{...enabled.writingPreferences,referenceText:"private source"}}),{code:"INVALID_RESPONSE"});
+ assert.throws(()=>assertSnapshot({...enabled,writingPreferences:{...enabled.writingPreferences,tone:"invented"}}),{code:"INVALID_RESPONSE"});
+});
+
+test("writing AI connection failures explain saved-result recovery without replaying generation",async t=>{
+ let calls=0;t.mock.method(globalThis,"fetch",async()=>{calls++;throw new TypeError("offline");});
+ await assert.rejects(()=>sheetRequest(endpoint,"generateWritingKit",{style:"standard"},{token:"test-token"}),error=>error instanceof SheetApiError&&error.code==="NETWORK"&&/保存済みの構成を再取得/.test(error.message));
+ assert.equal(calls,1);
 });

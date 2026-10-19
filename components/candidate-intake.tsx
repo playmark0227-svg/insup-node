@@ -1,6 +1,6 @@
 "use client";
 
-import { useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { Check, Copy, FileText } from "lucide-react";
 import {
   chatOptions, composeCandidateIntroduction, crmOptions, genderOptions, introductionLimit,
@@ -8,6 +8,8 @@ import {
   type InterviewFields, type InterviewStringField, type IntroductionComposition,
 } from "@/lib/candidate-intake";
 import "@/app/intake.css";
+import { CandidateAiAssistant } from "@/components/candidate-ai-assistant";
+import type { CandidateAiConnection } from "@/lib/writing-ai";
 
 export type InterviewIntakeEditorProps = {
   candidateName: string;
@@ -16,11 +18,13 @@ export type InterviewIntakeEditorProps = {
   introduction: string;
   onIntroductionChange: (introduction: string) => void;
   disabled?: boolean;
+  ai?: CandidateAiConnection;
+  memo?: string;
 };
 
 /** Inline content: the parent supplies the dialog and save operation. */
 export function InterviewIntakeEditor({ candidateName, fields, onFieldsChange, introduction,
-  onIntroductionChange, disabled = false }: InterviewIntakeEditorProps) {
+  onIntroductionChange, disabled = false, ai, memo }: InterviewIntakeEditorProps) {
   const id = useId();
   const [formatResult, setFormatResult] = useState<IntroductionComposition | null>(null);
   const [formatSource, setFormatSource] = useState("");
@@ -28,7 +32,18 @@ export function InterviewIntakeEditor({ candidateName, fields, onFieldsChange, i
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState("");
   const [inputError, setInputError] = useState("");
+  const autoManaged = useRef(!introduction.trim());
   const currentSource = JSON.stringify([candidateName, fields]);
+  // Only the untouched immediate template follows input. User/AI drafts are explicit.
+  useEffect(() => {
+    if (!autoManaged.current || disabled) return;
+    const timer = setTimeout(() => {
+      const result = composeCandidateIntroduction(candidateName, fields);
+      if (result.text !== introduction) onIntroductionChange(result.text);
+      setFormatResult(result); setFormatSource(currentSource);
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [currentSource, introduction, disabled, onIntroductionChange]);
   const changedAfterFormat = !!formatResult && formatSource !== currentSource;
   const set = (key: InterviewStringField, value: string) => onFieldsChange({ ...fields, [key]: value });
   const field = (key: InterviewStringField, options?: { placeholder?: string; multiline?: boolean; maxLength?: number; hint?: string; inputMode?: "numeric" }) => {
@@ -48,6 +63,7 @@ export function InterviewIntakeEditor({ candidateName, fields, onFieldsChange, i
     onFieldsChange({ ...fields, [key]: fields[key].includes(value) ? fields[key].filter(item => item !== value) : [...fields[key], value] });
   }
   function format() {
+    autoManaged.current = false;
     const result = composeCandidateIntroduction(candidateName, fields);
     onIntroductionChange(result.text); setFormatResult(result); setFormatSource(currentSource);
     setReplaceDraft(false); setInputError(""); setCopied(false); setCopyError("");
@@ -77,7 +93,7 @@ export function InterviewIntakeEditor({ candidateName, fields, onFieldsChange, i
       {field("workStyle", { placeholder: "業務委託／在宅 など" })}
       {field("sideJob", { placeholder: "副業なし／本業と兼業 など" })}
       {field("desiredHourlyRate", { placeholder: "2,000円/時 など", hint: "円/時・円/月など、単位も入力してください。" })}
-      {field("attendanceConcerns", { multiline: true, maxLength: 400, placeholder: "稼働上の配慮・事前に確認したいことなど" })}
+      {field("attendanceConcerns", { multiline: true, maxLength: 400, placeholder: "稼働上の配慮・事前に確認したいことなど", hint: "社内確認用として保存し、共有文に自動挿入しません。" })}
     </div></fieldset>
 
     <fieldset disabled={disabled} className="intake-section"><legend>営業経験・実績</legend><div className="intake-grid">
@@ -96,9 +112,15 @@ export function InterviewIntakeEditor({ candidateName, fields, onFieldsChange, i
 
     <fieldset disabled={disabled} className="intake-section"><legend>面談可能日</legend><div className="intake-grid">{field("interviewAvailability", { multiline: true, maxLength: 400, placeholder: "候補日・時間帯・調整が必要な条件など" })}</div></fieldset>
 
-    <fieldset disabled={disabled} className="intake-section"><legend>その他・補足</legend><div className="intake-grid">{field("additionalNotes", { multiline: true, maxLength: 2000, placeholder: "他の項目に当てはまらない情報、元シートの補足など。出所の行番号もそのまま残せます。", hint: "元の記載を保存できます。内容や評価を推測して追加しません。" })}</div></fieldset>
+    <fieldset disabled={disabled} className="intake-section"><legend>その他・補足</legend><div className="intake-grid">{field("additionalNotes", { multiline: true, maxLength: 2000, placeholder: "他の項目に当てはまらない情報、元シートの補足など。出所の行番号もそのまま残せます。", hint: "元の記載を社内確認用として保存し、共有文に自動挿入しません。内容や評価を推測して追加しません。" })}</div></fieldset>
 
-    <section className="intake-introduction" aria-labelledby={`${id}-intro-heading`}><div className="intake-introduction-heading"><div><h3 id={`${id}-intro-heading`}>クライアント共有用の基本情報</h3><p>入力から整形します。文章は送る前に確認・修正できます。</p></div><button type="button" className="secondary-button" disabled={disabled} onClick={requestFormat}><FileText size={16}/>入力から整形</button></div>
+    {ai?.enabled && <CandidateAiAssistant candidateName={candidateName} fields={fields} memo={memo}
+      introduction={introduction} disabled={disabled} identityKey={ai.identityKey}
+      preferences={ai.preferences} onReadKit={ai.onReadKit} onGenerateKit={ai.onGenerateKit}
+      onNotesChange={({memo: note,reflection})=>onFieldsChange({...fields,interviewMemo:note,selfReflection:reflection})}
+      onSaveAdvice={text=>onFieldsChange({...fields,interviewAdvice:text})}
+      onApplyIntroduction={text=>{autoManaged.current=false;setFormatResult(null);setCopied(false);onIntroductionChange(text);}}/>}
+    <section className="intake-introduction" aria-labelledby={`${id}-intro-heading`}><div className="intake-introduction-heading"><div><h3 id={`${id}-intro-heading`}>クライアント共有用の基本情報</h3><p>入力中は基本情報の下書きを自動作成します。直接編集・AI案の採用後は上書きしません。</p></div><button type="button" className="secondary-button" disabled={disabled} onClick={requestFormat}><FileText size={16}/>入力から整形</button></div>
       <p className="intake-privacy">この整形は端末内で行います。外部AIには送信しません。</p>
       {replaceDraft && <div className="intake-replace" role="alert"><p>現在の編集文を、入力情報から整形し直します。</p><div><button type="button" className="secondary-button" disabled={disabled} onClick={() => setReplaceDraft(false)}>編集文を残す</button><button type="button" className="primary-button" disabled={disabled} onClick={format}>整形し直す</button></div></div>}
       {formatResult?.truncated && <p className="intake-notice" role="status">1000文字以内に収めるため、一部を省略しました。{formatResult.omittedFields.map(key => interviewFieldLabels[key]).join("・")}の入力原文は残っています。内容を確認して調整してください。</p>}
@@ -108,7 +130,7 @@ export function InterviewIntakeEditor({ candidateName, fields, onFieldsChange, i
         aria-describedby={`${id}-counter${inputError ? ` ${id}-input-error` : ""}`} onChange={event => {
           const value = event.target.value;
           if (unicodeLength(value) > introductionLimit) { setInputError("1000文字を超えるため、変更を反映していません。現在の文章を残しました。短くして入力してください。"); return; }
-          setInputError(""); setCopied(false); onIntroductionChange(value);
+          autoManaged.current = false; setInputError(""); setCopied(false); onIntroductionChange(value);
         }}/></label>
       <div className="intake-copy-row"><span id={`${id}-counter`} className={unicodeLength(introduction) > introductionLimit ? "intake-error" : ""}>{unicodeLength(introduction).toLocaleString()} / {introductionLimit.toLocaleString()}文字</span><button type="button" className="secondary-button" disabled={!introduction.trim() || unicodeLength(introduction) > introductionLimit} onClick={() => void copy()}>{copied ? <Check size={16}/> : <Copy size={16}/>}{copied ? "コピー済み" : "文章をコピー"}</button></div>
       {inputError && <p className="intake-error" id={`${id}-input-error`} role="alert">{inputError}</p>}{copyError && <p className="intake-error" role="alert">{copyError}</p>}<span className="intake-sr-only" role="status">{copied ? "基本情報の文章をコピーしました" : ""}</span>

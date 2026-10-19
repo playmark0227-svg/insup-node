@@ -1,5 +1,6 @@
 import { stages, type Activity, type Metric, type Player } from "./node-data.ts";
 import { interviewStringFields, crmOptions, chatOptions, pcOptions, genderOptions, type CandidateProfile } from "./candidate-intake.ts";
+import { validateWritingPreferences, type WritingPreferences } from './on-device-ai.ts';
 
 export type SheetPlayer = Player & { sheetNames?: string[] };
 export type Counts = Record<string, Record<string, Partial<Record<Metric, number>>>>;
@@ -16,6 +17,8 @@ export type InterviewAdvice = {summary:string;actions:string[];count:number;gene
 export type InterviewAdviceState = {advice:InterviewAdvice|null;stale:boolean;count:number;usage:InterviewAdviceUsage;configured:boolean;pending:boolean};
 export type DeletedCandidate = {changeId:string;playerId:string;candidateName:string;deletedAt:string;companies:string[];recordCount:number};
 export type SheetSnapshot = {
+  writingFeature?: boolean;
+  writingPreferences?: WritingPreferences;
   intakeFeature?: boolean;
   candidateProfiles?: CandidateProfile[];
   clients?: ClientEntry[];
@@ -114,6 +117,9 @@ async function recoverContent(url: string, signal: AbortSignal): Promise<{ respo
 }
 
 function connectionError(action: string, timedOut: boolean): SheetApiError {
+  if (["generateWritingKit", "readWritingKit"].includes(action)) return new SheetApiError(timedOut ? "TIMEOUT" : "NETWORK", timedOut
+    ? "AI文章構成の応答が45秒以内に届きませんでした。入力内容は残っています。保存済みの構成を再取得して確認してください。"
+    : "AI文章構成の通信が途中で切れました。入力内容は残っています。接続を確認し、保存済みの構成を再取得してください。");
   if (["analyzeWorkspaceInsights", "readWorkspaceInsights"].includes(action)) return new SheetApiError(timedOut ? "TIMEOUT" : "NETWORK", timedOut
     ? "AI分析の応答が45秒以内に届きませんでした。成果データはそのままです。保存済みの分析を再取得してください。"
     : "AI分析の通信が途中で切れました。成果データはそのままです。接続を確認して保存済みの分析を再取得してください。");
@@ -149,7 +155,7 @@ export async function sheetRequest<T>(
   const target = validateEndpoint(endpoint);
   const timeout = AbortSignal.timeout(45_000);
   const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
-  const readOnly = ["snapshot","health","managementTables","managementTable","readInterviewAdvice","readWorkspaceInsights"].includes(action);
+  const readOnly = ["snapshot","health","managementTables","managementTable","readInterviewAdvice","readWorkspaceInsights","readWritingKit","readWritingPreferences"].includes(action);
   const body = JSON.stringify({ version: 1, action, payload, token: options.token, operationId: options.operationId });
   for (let attempt = 0; attempt < (readOnly ? 2 : 1); attempt++) {
     let recoveringResult = false;
@@ -256,6 +262,8 @@ export function assertSnapshot(value: unknown): asserts value is SheetSnapshot {
   if(s.interviewReviews !== undefined && (!Array.isArray(s.interviewReviews)||s.interviewReviews.some(r=>!object(r) || !strings(r,["recordId","playerId","interviewDate","category","memo","nextAction","version","updatedAt"]) ||(s.self.role==="player"&&r.playerId!==s.self.playerId))))throw new SheetApiError("INVALID_RESPONSE","振り返りの閲覧権限を確認できませんでした。");
   if (s.deletionFeature !== undefined && typeof s.deletionFeature !== "boolean") invalid();
   if(s.intakeFeature!==undefined&&typeof s.intakeFeature!=="boolean")invalid();
+  if(s.writingFeature!==undefined&&typeof s.writingFeature!=="boolean")invalid();
+  if(s.writingPreferences!==undefined){try{validateWritingPreferences(s.writingPreferences);}catch{invalid('紹介文の共有設定を確認できませんでした。');}}
   if(s.clients!==undefined&&(!Array.isArray(s.clients)||s.clients.some(c=>!object(c)||!strings(c,["id","name","version"])||!c.id||!c.name||c.name.length>100||!c.version||typeof c.active!=="boolean")||new Set(s.clients.map(c=>c.id)).size!==s.clients.length))invalid("取引先情報の形式を確認できませんでした。");
   if(s.candidateProfiles!==undefined&&(!Array.isArray(s.candidateProfiles)||s.candidateProfiles.some(p=>{
     if(!object(p)||!strings(p,["profileId","playerId","version","updatedAt","introduction"])||!p.profileId||!p.version||[...p.introduction].length>1000||!Array.isArray(p.recordIds)||!p.recordIds.length||new Set(p.recordIds).size!==p.recordIds.length||!object(p.fields))return true;

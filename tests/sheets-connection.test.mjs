@@ -6,6 +6,7 @@ import ts from "typescript";
 import {assertSnapshot, isUncertainWrite, validateEndpoint, SheetApiError} from "../lib/sheets-client.ts";
 import {matchingFields} from "../lib/management-data.ts";
 import {interviewFieldLabels,interviewStringFields,blankInterviewFields} from "../lib/candidate-intake.ts";
+import {assertWritingKitState,validateWritingPreferences,defaultWritingPreferences,writingSectionIds,writingTopicCodes} from "../lib/writing-ai.ts";
 
 const endpoint = "https://script.google.com/macros/s/AKfycb_TEST_DEPLOYMENT_1234567890/exec";
 const otherEndpoint = endpoint.replace("TEST_DEPLOYMENT", "OTHER_DEPLOYMENT");
@@ -62,7 +63,7 @@ function harness(handle, {storedToken, malformedSession, deadlineController, bro
   const context=vm.createContext({exports,module:{exports},AbortController,AbortSignal:deadlineSignals,JSON,Error,localStorage,sessionStorage,TEST_PRODUCTION:production,
     ...(browser || {}),
     fetch:async()=>{if(manifestFailure)throw new Error("設定取得失敗");return {ok:true,json:async()=>({endpoint:manifestEndpoint})};},
-    require:name=>name==="react" ? react : name.includes("node-data") ? {initialPlayers:[player],makeDemoActivities:()=>[]} : name.includes("management-data") ? {matchingFields} : name.includes("candidate-intake") ? {interviewFieldLabels,interviewStringFields} : {assertSnapshot,isUncertainWrite,validateEndpoint,SheetApiError,sheetRequest}});
+    require:name=>name==="react" ? react : name.includes("node-data") ? {initialPlayers:[player],makeDemoActivities:()=>[]} : name.includes("management-data") ? {matchingFields} : name.includes("candidate-intake") ? {interviewFieldLabels,interviewStringFields} : name.includes("writing-ai") ? {assertWritingKitState,validateWritingPreferences} : {assertSnapshot,isUncertainWrite,validateEndpoint,SheetApiError,sheetRequest}});
   vm.runInContext(source,context);
   const render = () => {cursor=0; const result=exports.useSheetsConnection(); while(effects.length) effects.shift()(); return result;};
   render();
@@ -484,4 +485,129 @@ test('dismissal logout new login and unmount never let an old recovery callback 
  const h=harness(call=>{if(call.action==='snapshot')return snapshot;if(call.action==='login')return {token:`${token}-new-login`};if(call.action==='logout')return {loggedOut:true};throw new SheetApiError('VALIDATION','確認してください');},{storedToken:token});await flush();
  const input={recordId:'private-record',rowVersion:'private-version',profileVersion:'',fields:{...blankInterviewFields(),workHistory:'以前の職歴'},introduction:'以前の紹介文'};h.render().submitMutation('saveCandidateProfile',input,'old-private-operation');await flush();const oldCopy=h.render().copyBackgroundIntakeInput;assert.ok(oldCopy().includes('以前の職歴'));h.render().dismissBackgroundSave();assert.throws(oldCopy,{code:'INTAKE_INPUT_UNAVAILABLE'});await h.render().logout();assert.throws(oldCopy,{code:'INTAKE_INPUT_UNAVAILABLE'});
  await h.render().login('ND-001','new-login-password');h.render().submitMutation('saveCandidateProfile',{...input,fields:{...blankInterviewFields(),workHistory:'新しいログイン後の職歴'}},'new-private-operation');await flush();assert.throws(oldCopy,{code:'STALE_SESSION'});const newCopy=h.render().copyBackgroundIntakeInput;assert.ok(newCopy().includes('新しいログイン後の職歴'));h.unmount();assert.throws(newCopy,{code:'INTAKE_INPUT_UNAVAILABLE'});
+});
+
+const writingAdminSnapshot={...snapshot,self:{playerId:'ADMIN',role:'admin'},writingFeature:true,writingPreferences:defaultWritingPreferences()};
+function writingState(overrides={}) {
+ return {kit:{generatedAt:'2026-10-20T00:00:00.000Z',source:'generated',style:'standard',preferenceVersion:'initial',
+  sections:writingSectionIds.map(id=>({id,heading:`見出し ${id}`,lead:'以下の事実を確認してください。'})),
+  coaching:writingTopicCodes.map(code=>({code,questions:['具体的な事実を確認できますか？'],actions:['確認内容を記録する。']}))},
+  pending:false,configured:true,preferences:defaultWritingPreferences(),usage:{userRemaining:2,teamRemaining:9,resetAt:'2026-10-20T15:00:00.000Z'},...overrides};
+}
+const writingMethods=['readWritingKit','generateWritingKit','readWritingPreferences','saveWritingPreferences'];
+const writingArgument=method=>method==='saveWritingPreferences'?defaultWritingPreferences():method.endsWith('Kit')?'standard':undefined;
+const writingReply=method=>method.endsWith('Kit')?writingState():{preferences:{...defaultWritingPreferences(),version:'server-updated-version'}};
+
+for(const method of ['readWritingKit','generateWritingKit']) test(`${method} sends only normalized style and never caller candidate text or reference material`,async()=>{
+ const h=harness(call=>call.action==='snapshot'?snapshot:writingState(),{storedToken:token});await flush();
+ for(const style of ['standard','concise',{style:'concise',candidateName:'非公開の候補者',memo:'内部面談メモ',referenceText:'固有名を含む参考文章',profile:{workHistory:'非公開経歴'},apiKey:'not-a-key'}]) {
+  const result=await h.render()[method](style),call=h.calls.at(-1);
+  assert.equal(result.kit.sections.length,6);assert.equal(call.action,method);assert.equal(call.target,endpoint);assert.equal(call.options.token,token);
+  assert.deepEqual(Object.keys(call.payload),['style']);assert.equal(call.payload.style,style==='concise'?'concise':'standard');
+  assert.doesNotMatch(JSON.stringify(call.payload),/非公開|内部面談|固有名|reference|candidate|profile|apiKey/);
+ }
+ assert.equal(h.render().snapshot,snapshot);assert.equal(h.render().authenticated,true);assert.equal(h.render().busy,false);
+ assert.doesNotMatch(JSON.stringify([...h.sessionStorage.values,...h.localStorage.values]),/非公開|内部面談|固有名/);h.unmount();
+});
+
+test('all writing methods reject an unauthenticated call before making a request',async()=>{
+ const h=harness(()=>{throw new Error('No network call is expected');});await flush();
+ for(const method of writingMethods)await assert.rejects(()=>h.render()[method](writingArgument(method)),/ログインしてください/);
+ assert.equal(h.calls.length,0);assert.equal(h.render().snapshot,null);h.unmount();
+});
+
+test('readWritingPreferences validates the actual fixed schema and has an empty outbound payload',async()=>{
+ const expected={...defaultWritingPreferences(),version:'shared-preference-version',targetLength:600,tone:'plain'};
+ const h=harness(call=>call.action==='snapshot'?snapshot:{preferences:expected},{storedToken:token});await flush();
+ const result=await h.render().readWritingPreferences();assert.deepEqual(result,expected);
+ assert.equal(h.calls.at(-1).action,'readWritingPreferences');assert.equal(Object.keys(h.calls.at(-1).payload).length,0);
+ result.sectionOrder.reverse();assert.deepEqual(expected.sectionOrder,defaultWritingPreferences().sectionOrder);
+ assert.equal(h.render().snapshot,snapshot);h.unmount();
+});
+
+test('saveWritingPreferences requires admin and blocks extra keys or source documents before sending',async()=>{
+ const user=harness(()=>snapshot,{storedToken:token});await flush();
+ await assert.rejects(()=>user.render().saveWritingPreferences(defaultWritingPreferences()),/管理者/);assert.equal(user.calls.length,1);user.unmount();
+ const h=harness(call=>call.action==='snapshot'?writingAdminSnapshot:{preferences:defaultWritingPreferences()},{storedToken:token});await flush();
+ for(const invalid of [{...defaultWritingPreferences(),referenceText:'非公開の参考文'},
+  {...defaultWritingPreferences(),candidateName:'非公開候補者'}, {...defaultWritingPreferences(),targetLength:200},
+  {...defaultWritingPreferences(),sectionOrder:['basic','basic','results','tools','availability','summary']}]) {
+  await assert.rejects(()=>h.render().saveWritingPreferences(invalid));
+ }
+ assert.equal(h.calls.length,1);assert.equal(h.render().snapshot,writingAdminSnapshot);
+ assert.doesNotMatch(JSON.stringify([...h.sessionStorage.values,...h.localStorage.values]),/非公開/);h.unmount();
+});
+
+test('confirmed preference save updates only snapshot preferences using the validated server version',async()=>{
+ const pending=deferred(),h=harness(call=>call.action==='snapshot'?writingAdminSnapshot:pending.promise,{storedToken:token});await flush();
+ const source={...defaultWritingPreferences(),tone:'plain',targetLength:600},original=structuredClone(source);
+ const save=h.render().saveWritingPreferences(source),call=h.calls.at(-1);
+ source.sectionOrder.reverse();assert.deepEqual(call.payload.preferences,original,'In-flight settings own their section order');
+ assert.deepEqual(Object.keys(call.payload),['preferences']);assert.equal(call.options.token,token);
+ assert.equal(h.render().snapshot,writingAdminSnapshot);assert.equal(h.render().busy,false);
+ const saved={...original,version:'confirmed-server-version'};pending.resolve({preferences:saved});
+ assert.deepEqual(await save,saved);
+ const updated=h.render().snapshot;assert.deepEqual(updated.writingPreferences,saved);
+ assert.equal(updated.players,writingAdminSnapshot.players);assert.equal(updated.activities,writingAdminSnapshot.activities);
+ assert.equal(updated.counts,writingAdminSnapshot.counts);assert.equal(updated.syncedAt,writingAdminSnapshot.syncedAt);
+ assert.equal(writingAdminSnapshot.writingPreferences.version,'initial');
+ assert.doesNotMatch(JSON.stringify([...h.sessionStorage.values,...h.localStorage.values]),/confirmed-server-version/);h.unmount();
+});
+
+for(const method of writingMethods)test(`${method} rejects a late response after logout and a different login without updating the new account`,async()=>{
+ const pending=deferred(),newToken=`${token}-new-account`,newSnapshot={...snapshot,writingPreferences:{...defaultWritingPreferences(),version:'new-account-settings'}};
+ const h=harness(call=>call.action==='snapshot'?writingAdminSnapshot:call.action==='logout'?{}:call.action==='login'?{token:newToken,snapshot:newSnapshot}:pending.promise,{storedToken:token});await flush();
+ const request=h.render()[method](writingArgument(method));assert.equal(h.calls.at(-1).options.token,token);
+ await h.render().logout();await h.render().login('ND-001','not-stored-password');const updates=h.updates();
+ pending.resolve(writingReply(method));await assert.rejects(request,/ログイン状態が変更されました/);
+ assert.equal(h.updates(),updates);assert.equal(h.render().snapshot,newSnapshot);assert.equal(h.render().authenticated,true);
+ assert.equal(JSON.parse(h.sessionStorage.getItem(SESSION_KEY)).token,newToken);h.unmount();
+});
+
+for(const method of writingMethods)test(`${method} retained from a previous login cannot send using a new account token`,async()=>{
+ const newToken=`${token}-different-login`,newSnapshot={...snapshot,writingPreferences:{...defaultWritingPreferences(),version:'new-account-settings'}};
+ const h=harness(call=>call.action==='snapshot'?writingAdminSnapshot:call.action==='logout'?{}:call.action==='login'?{token:newToken,snapshot:newSnapshot}:writingReply(method),{storedToken:token});await flush();
+ const retained=h.render()[method];
+ await h.render().logout();await h.render().login('ND-001','not-stored-password');
+ const count=h.calls.length,updates=h.updates();
+ await assert.rejects(()=>retained(writingArgument(method)),/ログイン状態が変更されました/);
+ assert.equal(h.calls.length,count,'An old callback cannot make an authenticated request with the new token');
+ assert.equal(h.updates(),updates);assert.equal(h.render().snapshot,newSnapshot);assert.equal(h.render().authenticated,true);
+ assert.equal(JSON.parse(h.sessionStorage.getItem(SESSION_KEY)).token,newToken);h.unmount();
+});
+
+for(const method of writingMethods)test(`${method} clears an expired session but preserves data after a transient failure`,async()=>{
+ for(const failure of ['SESSION_EXPIRED','NETWORK']) {
+  const h=harness(call=>{if(call.action==='snapshot')return writingAdminSnapshot;throw new SheetApiError(failure,'再確認してください。');},{storedToken:token});await flush();
+  await assert.rejects(()=>h.render()[method](writingArgument(method)),{code:failure});
+  assert.equal(h.calls.length,2);assert.equal(h.render().authenticated,failure==='NETWORK');
+  assert.equal(h.render().snapshot,failure==='NETWORK'?writingAdminSnapshot:null);
+  assert.equal(h.render().busy,false);assert.equal(h.sessionStorage.getItem(SESSION_KEY)!==null,failure==='NETWORK');h.unmount();
+ }
+});
+
+for(const method of writingMethods)test(`${method} ignores a response after unmount`,async()=>{
+ const pending=deferred(),h=harness(call=>call.action==='snapshot'?writingAdminSnapshot:pending.promise,{storedToken:token});await flush();
+ const running=h.render()[method](writingArgument(method));h.unmount();const updates=h.updates();
+ pending.resolve(writingReply(method));await assert.rejects(running,/ログイン状態が変更されました/);assert.equal(h.updates(),updates);
+});
+
+test('malformed writing kit or preference responses keep the original snapshot and session',async()=>{
+ const invalidState=writingState();invalidState.kit.sections[0].id=invalidState.kit.sections[1].id;
+ for(const [method,response] of [['readWritingKit',invalidState],['generateWritingKit',writingState({usage:{userRemaining:-1,teamRemaining:9,resetAt:'invalid'}})],
+  ['readWritingPreferences',{preferences:{...defaultWritingPreferences(),sourceText:'non-shareable reference'}}],
+  ['saveWritingPreferences',{preferences:{...defaultWritingPreferences(),sectionOrder:[]}}]]) {
+  const h=harness(call=>call.action==='snapshot'?writingAdminSnapshot:response,{storedToken:token});await flush();
+  await assert.rejects(()=>h.render()[method](writingArgument(method)));assert.equal(h.render().snapshot,writingAdminSnapshot);
+  assert.equal(h.render().authenticated,true);assert.equal(h.render().busy,false);assert.ok(h.sessionStorage.getItem(SESSION_KEY));h.unmount();
+ }
+});
+
+test('background snapshot refresh keeps a pending writing result valid and preference saves preserve refreshed data',async()=>{
+ const pending=deferred(),refreshed={...writingAdminSnapshot,syncedAt:'2026-10-20T02:00:00Z'};let reads=0;
+ const h=harness(call=>call.action==='snapshot'?(++reads===1?writingAdminSnapshot:refreshed):pending.promise,{storedToken:token});await flush();
+ const save=h.render().saveWritingPreferences(defaultWritingPreferences());await h.render().refresh(true);
+ const saved={...defaultWritingPreferences(),version:'confirmed-after-refresh'};pending.resolve({preferences:saved});await save;
+ assert.equal(h.render().snapshot.syncedAt,refreshed.syncedAt);assert.deepEqual(h.render().snapshot.writingPreferences,saved);
+ assert.equal(h.render().snapshot.players,refreshed.players);h.unmount();
 });

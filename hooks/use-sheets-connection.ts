@@ -3,6 +3,7 @@ import { initialPlayers, makeDemoActivities, type Activity } from "../lib/node-d
 import { assertSnapshot, isUncertainWrite, sheetRequest, validateEndpoint, SheetApiError, type MutationResult, type SheetSnapshot, type SheetPlayer, type InterviewAdvice, type InterviewAdviceState } from "../lib/sheets-client";
 import { matchingFields } from "../lib/management-data";
 import { interviewFieldLabels, interviewStringFields } from "../lib/candidate-intake";
+import { assertWritingKitState, validateWritingPreferences, type WritingKitState, type WritingPreferences, type WritingStyle } from "../lib/writing-ai";
 
 const ENDPOINT_KEY = "insup.node.endpoint.v1";
 const SESSION_KEY = "insup.node.session.v1";
@@ -349,6 +350,37 @@ export function useSheetsConnection() {
   const analyzeInsights = (period:string) => requestAdvice<import("../lib/workspace-insights").WorkspaceInsightAdvice>("analyzeWorkspaceInsights",period);
   const readInsights = (period:string) => requestAdvice<import("../lib/workspace-insights").WorkspaceInsightState>("readWorkspaceInsights",period);
 
+  const writingGeneration=generation.current, writingToken=token.current;
+  const requestWriting = async <T,>(action:string,payload:unknown):Promise<T> => {
+    if(!isCurrent(writingGeneration)||token.current!==writingToken)throw new Error("ログイン状態が変更されました。");
+    if(!writingToken||!snapshot)throw new Error("ログインしてください。");
+    const g=writingGeneration;
+    try{
+      const data=await sheetRequest<T>(endpoint,action,payload,{token:token.current});
+      if(!isCurrent(g))throw new Error("ログイン状態が変更されました。");
+      return data;
+    }catch(e){if(isCurrent(g)&&isExpired(e))clearSession();throw e;}
+  };
+  // This request deliberately has no parameter for a candidate or private text.
+  const writingKit = async(action:'readWritingKit'|'generateWritingKit',style:WritingStyle):Promise<WritingKitState>=>{
+    const data=await requestWriting<WritingKitState>(action,{style:style==='concise'?'concise':'standard'});
+    assertWritingKitState(data);return data;
+  };
+  const readWritingKit=(style:WritingStyle)=>writingKit('readWritingKit',style);
+  const generateWritingKit=(style:WritingStyle)=>writingKit('generateWritingKit',style);
+  const readWritingPreferences=async()=>{
+    const data=await requestWriting<{preferences:WritingPreferences}>('readWritingPreferences',{});
+    return validateWritingPreferences(data.preferences);
+  };
+  const saveWritingPreferences=async(value:WritingPreferences)=>{
+    if(snapshot?.self.role!=='admin')throw new Error('管理者でログインしてください。');
+    const preferences=validateWritingPreferences(value);
+    const data=await requestWriting<{preferences:WritingPreferences}>('saveWritingPreferences',{preferences});
+    const saved=validateWritingPreferences(data.preferences);
+    setSnapshot(previous=>previous?{...previous,writingPreferences:saved}:previous);
+    return saved;
+  };
+
   const readSecurity = async <T,>(): Promise<T> => {
     if (!token.current || snapshot?.self.role !== "admin") throw new Error("管理者でログインしてください。");
     const g = generation.current;
@@ -397,7 +429,7 @@ export function useSheetsConnection() {
   };
 
   return { ready, endpoint, mode, players, setPlayers, activities, setActivities, snapshot, authenticated, loadPhase, busy, error,
-    syncing, syncError, backgroundSave, hasPendingSave, submitMutation, retryBackgroundSave, dismissBackgroundSave, copyBackgroundIntakeInput, credentials, dismissCredentials:() => setCredentials(null), connect, login, logout, refresh, mutate, readManagement, analyzeReviews, readAdvice, analyzeInsights, readInsights, readSecurity, changePassword, showDemo };
+    syncing, syncError, backgroundSave, hasPendingSave, submitMutation, retryBackgroundSave, dismissBackgroundSave, copyBackgroundIntakeInput, credentials, dismissCredentials:() => setCredentials(null), connect, login, logout, refresh, mutate, readManagement, analyzeReviews, readAdvice, analyzeInsights, readInsights, readWritingKit, generateWritingKit, readWritingPreferences, saveWritingPreferences, readSecurity, changePassword, showDemo };
 }
 
 function saveLabel(action: string) {

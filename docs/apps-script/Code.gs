@@ -124,7 +124,11 @@ function nodeHandle_(request) {
   if (action === 'login') return login_(request.payload || {});
   if (action === 'changePassword') return changePassword_(request);
   if (action === 'auditSecurity') return auditSecurity_(request);
-  if (['snapshot','logout','saveActivity','updateStatus','updateProfile','createPlayer','updateRecord','deleteCandidate','cancelAchievement','restoreChange','managementTables','managementTable','saveManagementRow','createCandidate','saveInterviewReview','saveCandidateProfile','saveClient','analyzeInterviewReviews','readInterviewAdvice','readWorkspaceInsights','analyzeWorkspaceInsights'].indexOf(action) < 0) fail_('BAD_REQUEST', '対応していない操作です。');
+  if (['snapshot','logout','saveActivity','updateStatus','updateProfile','createPlayer','updateRecord','deleteCandidate','cancelAchievement','restoreChange','managementTables','managementTable','saveManagementRow','createCandidate','saveInterviewReview','saveCandidateProfile','saveClient','analyzeInterviewReviews','readInterviewAdvice','readWorkspaceInsights','analyzeWorkspaceInsights','readWritingKit','generateWritingKit','readWritingPreferences','saveWritingPreferences'].indexOf(action) < 0) fail_('BAD_REQUEST', '対応していない操作です。');
+  if (action === 'readWritingKit') return readWritingKit_(request);
+  if (action === 'generateWritingKit') return generateWritingKit_(request);
+  if (action === 'readWritingPreferences') return readWritingPreferences_(request);
+  if (action === 'saveWritingPreferences') return saveWritingPreferences_(request);
   if (action === 'readWorkspaceInsights') return readWorkspaceInsights_(request);
   if (action === 'analyzeWorkspaceInsights') return analyzeWorkspaceInsights_(request);
   if (action === 'analyzeInterviewReviews') return analyzeInterviewReviews_(request);
@@ -511,6 +515,7 @@ function buildSnapshot_(store, user) {
   snapshot.interviewReviews=readInterviewReviews_(store,user);
   snapshot.intakeFeature=true; snapshot.candidateProfiles=readCandidateProfiles_(store,user); snapshot.clients=clientEntries_(store.book);
   snapshot.deletionFeature=true; snapshot.deletedCandidates=deletedCandidates_(store,user);
+  snapshot.writingFeature=true; snapshot.writingPreferences=writingPreferences_();
   snapshot.reviewFeature=true;
   snapshot.securityFeature=true; snapshot.workspaceFeature=true;
   snapshot.records=store.schemaCompatible ? store.records.filter(function(r){return user.role==='admin'||r.playerId===user.id;}).map(publicRecord_) : [];
@@ -1684,7 +1689,7 @@ var CANDIDATE_PROFILE_TAB='_NODE_candidate_profiles';
 var CANDIDATE_PROFILE_HEADERS=['profileId','playerId','fields','introduction','version','updatedAt'];
 var CLIENT_TAB='_NODE_clients';
 var CLIENT_HEADERS=['id','name','active','version','updatedAt'];
-var INTERVIEW_FIELD_LIMITS={age:20,gender:20,residence:120,availableFrom:120,timeWindow:200,daysPerWeek:80,monthlyHours:80,sideJob:160,desiredHourlyRate:100,pcEnvironment:30,networkEnvironment:200,attendanceConcerns:600,workHistory:6000,achievements:1500,strengths:1500,crmOther:120,chatOther:120,interviewAvailability:300,workStyle:200,pcSkills:800,additionalNotes:2000};
+var INTERVIEW_FIELD_LIMITS={age:20,gender:20,residence:120,availableFrom:120,timeWindow:200,daysPerWeek:80,monthlyHours:80,sideJob:160,desiredHourlyRate:100,pcEnvironment:30,networkEnvironment:200,attendanceConcerns:600,workHistory:6000,achievements:1500,strengths:1500,crmOther:120,chatOther:120,interviewAvailability:300,workStyle:200,pcSkills:800,additionalNotes:2000,interviewMemo:2000,selfReflection:2000,interviewAdvice:5000};
 var INTERVIEW_CRM_TOOLS=['Salesforce','kintone','HubSpot','その他'];
 var INTERVIEW_CHAT_TOOLS=['Slack','Chatwork','その他'];
 function intakeText_(value,max) {
@@ -1795,4 +1800,147 @@ function revalidateIntakePlan_(store,user,plan) {
     (plan.profileVacancyChecks||[]).forEach(function(row){if(maps[NODE.candidateProfileKey][row])fail_('CONFLICT','保存先には別の面談情報が関連付けられています。');});
   }
   (plan.intakeTableChecks||[]).forEach(function(check){var current=intakeTable_(store.book,check.title,check.headers);if(current.fingerprint!==check.fingerprint||(current.sheet?current.sheet.getSheetId():null)!==check.sheetId)fail_('CONFLICT','面談情報またはクライアントが保存前に更新されました。再取得してください。');});
+}
+
+/* Shared AI writing forms. No candidate fields, record identifiers, free text or
+ * categories derived from a person can reach this provider. Personal drafts are
+ * assembled in the browser from these generic forms and remain owner scoped. */
+var WRITING_PREFERENCES_KEY='NODE_WRITING_PREFERENCES';
+var WRITING_SECTION_IDS=['basic','experience','results','tools','availability','summary'];
+var WRITING_COACHING_CODES=['requirements','experience','communication','schedule','proposal','reflection'];
+var WRITING_STYLES=['standard','concise'];
+function writingObject_(value,keys,code) {
+  if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(function(key){return keys.indexOf(key)<0;}))fail_(code||'VALIDATION','AI書式の入力項目を確認してください。');
+  return value;
+}
+function writingPreferencesBody_(value) {
+  writingObject_(value,['version','tone','targetLength','includeSummary','sectionOrder']);
+  if(typeof value.version!=='string'||!(/^(?:initial|[A-Za-z0-9_-]{16,80})$/).test(value.version)||['formal','plain'].indexOf(value.tone)<0||[600,1000].indexOf(value.targetLength)<0||typeof value.includeSummary!=='boolean'||!Array.isArray(value.sectionOrder)||value.sectionOrder.length!==6||value.sectionOrder.some(function(id,index){return WRITING_SECTION_IDS.indexOf(id)<0||value.sectionOrder.indexOf(id)!==index;}))fail_('VALIDATION','AI書式の設定を確認してください。');
+  return {version:value.version,tone:value.tone,targetLength:value.targetLength,includeSummary:value.includeSummary,sectionOrder:value.sectionOrder.slice()};
+}
+function writingPreferences_() {
+  var raw=props_().getProperty(WRITING_PREFERENCES_KEY);
+  if(raw){try{return writingPreferencesBody_(JSON.parse(raw));}catch(e){fail_('AI_UNAVAILABLE','AI書式の共有設定を確認してください。');}}
+  return {version:'initial',tone:'formal',targetLength:1000,includeSummary:true,sectionOrder:WRITING_SECTION_IDS.slice()};
+}
+function writingStyle_(payload) {
+  writingObject_(payload,['style']);var style=payload.style===undefined?'standard':payload.style;
+  if(WRITING_STYLES.indexOf(style)<0)fail_('VALIDATION','AI書式の種類を確認してください。');return style;
+}
+function writingWritable_(store,token) {
+  var actor=snapshotActor_(store,token);
+  assertManagedBook_(store.book);
+  if(!writesEnabled_(store.config)||store.book.getSpreadsheetTimeZone()!=='Asia/Tokyo')fail_('WRITES_DISABLED','現在は読み取り専用です。AI書式の更新は管理者に確認してください。');
+  return actor;
+}
+function readWritingPreferences_(request) {
+  var session=authenticate_(request.token),accounts=readAccountStore_();activeActor_(accounts,session);
+  writingObject_(request.payload===undefined?{}:request.payload,[]);var preferences=writingPreferences_();snapshotActor_(accounts,request.token);
+  return {preferences:preferences};
+}
+function saveWritingPreferences_(request) {
+  var session=authenticate_(request.token),accounts=readAccountStore_();requireAdmin_(activeActor_(accounts,session));
+  var payload=writingObject_(request.payload===undefined?{}:request.payload,['preferences']),next=writingPreferencesBody_(payload.preferences);
+  return withLock_(function(){
+    requireAdmin_(writingWritable_(accounts,request.token));var current=writingPreferences_();
+    if(current.version!==next.version)fail_('VERSION_CONFLICT','ほかの管理者が書式設定を変更しました。最新の設定を確認してから保存してください。');
+    var comparable=Object.assign({},next,{version:current.version});
+    if(stableJson_(current)===stableJson_(comparable))return {preferences:current};
+    next.version=Utilities.getUuid();
+    // Only finite enum/boolean settings are stored. Never retain reference prose.
+    props_().setProperty(WRITING_PREFERENCES_KEY,JSON.stringify(next));
+    return {preferences:next};
+  });
+}
+function writingScope_(style) {return 'writing-kit-v1-'+style;}
+function writingKitKey_(style) {return 'NODE_AI_WRITING_KIT_'+style;}
+function writingKitBody_(body,preferences) {
+  writingObject_(body,['sections','coaching'],'AI_UNAVAILABLE');
+  function text(value,max){return typeof value==='string'&&value.trim()&&value.length<=max&&!/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(value);}
+  if(!Array.isArray(body.sections)||body.sections.length!==6||!Array.isArray(body.coaching)||body.coaching.length!==6)fail_('AI_UNAVAILABLE','AI書式の応答形式を確認できませんでした。');
+  var sections=body.sections.map(function(section,index){
+    writingObject_(section,['id','heading','lead'],'AI_UNAVAILABLE');
+    if(section.id!==preferences.sectionOrder[index]||!text(section.heading,32)||!text(section.lead,120))fail_('AI_UNAVAILABLE','AI書式の応答形式を確認できませんでした。');
+    return {id:section.id,heading:section.heading.trim(),lead:section.lead.trim()};
+  });
+  var coaching=body.coaching.map(function(item,index){
+    writingObject_(item,['code','questions','actions'],'AI_UNAVAILABLE');
+    if(item.code!==WRITING_COACHING_CODES[index]||!Array.isArray(item.questions)||item.questions.length<1||item.questions.length>3||item.questions.some(function(q){return !text(q,140);})||!Array.isArray(item.actions)||item.actions.length<1||item.actions.length>3||item.actions.some(function(a){return !text(a,180);}))fail_('AI_UNAVAILABLE','AI書式の応答形式を確認できませんでした。');
+    return {code:item.code,questions:item.questions.map(function(q){return q.trim();}),actions:item.actions.map(function(a){return a.trim();})};
+  });
+  // Forms may ask for facts, but must not assert an invented biography or score.
+  var prose=sections.map(function(s){return s.heading+' '+s.lead;}).concat(coaching.map(function(c){return c.questions.concat(c.actions).join(' ');})).join(' ');
+  if(/[0-9０-９]+\s*(?:歳|年の経験|件の実績|万円|円|位|点|％|%)/.test(prose)||/(?:採用すべき|不採用にすべき|採用適性|この候補者は|同氏は|当該候補者は)/.test(prose))fail_('AI_UNAVAILABLE','AIが入力のない人物の評価を含めたため、書式を保存しませんでした。');
+  return {sections:sections,coaching:coaching};
+}
+function writingKit_(style,preferences) {
+  var raw=props_().getProperty(writingKitKey_(style));if(!raw)return null;
+  try{
+    var saved=JSON.parse(Utilities.ungzip(Utilities.newBlob(Utilities.base64Decode(raw),'application/gzip')).getDataAsString('UTF-8'));
+    if(saved.kind!=='writing-kit-v1'||saved.style!==style||saved.preferenceVersion!==preferences.version||typeof saved.generatedAt!=='string'||!isFinite(Date.parse(saved.generatedAt)))return null;
+    var body=writingKitBody_({sections:saved.sections,coaching:saved.coaching},preferences);
+    return Object.assign({},body,{generatedAt:saved.generatedAt,style:style,preferenceVersion:preferences.version,source:'saved'});
+  }catch(e){return null;}
+}
+function saveWritingKit_(style,result) {
+  var saved=Object.assign({},result,{kind:'writing-kit-v1'});delete saved.source;
+  var value=Utilities.base64Encode(Utilities.gzip(Utilities.newBlob(JSON.stringify(saved),'application/json')).getBytes());
+  if(value.length>8000)fail_('AI_UNAVAILABLE','AI書式が保存上限を超えました。短い書式で再試行してください。');
+  props_().setProperty(writingKitKey_(style),value);
+}
+function writingState_(style,user,preferences,kit,pending) {
+  var properties=props_();return {kit:kit,pending:!!pending,configured:!!properties.getProperty('NODE_GEMINI_API_KEY')&&properties.getProperty('NODE_GEMINI_FREE_TIER_CONFIRMED')==='true',usage:aiUsage_(user.id),preferences:preferences};
+}
+function readWritingKit_(request) {
+  var session=authenticate_(request.token),accounts=readAccountStore_(),user=activeActor_(accounts,session),style=writingStyle_(request.payload===undefined?{}:request.payload),preferences=writingPreferences_();
+  var state=writingState_(style,user,preferences,writingKit_(style,preferences),aiPending_()[writingScope_(style)]);
+  snapshotActor_(accounts,request.token);return state;
+}
+function generateWritingKit_(request) {
+  var session=authenticate_(request.token),accounts=readAccountStore_(),user=activeActor_(accounts,session),style=writingStyle_(request.payload===undefined?{}:request.payload),properties=props_(),reservationId=Utilities.getUuid(),scope=writingScope_(style),preferences;
+  var ready=withLock_(function(){
+    user=writingWritable_(accounts,request.token);preferences=writingPreferences_();
+    var saved=writingKit_(style,preferences);if(saved)return writingState_(style,user,preferences,saved,false);
+    if(!properties.getProperty('NODE_GEMINI_API_KEY')||properties.getProperty('NODE_GEMINI_FREE_TIER_CONFIRMED')!=='true')fail_('AI_NOT_CONFIGURED','管理者が無料枠の専用Geminiプロジェクトを接続してください。');
+    var pending=aiPending_();if(pending[scope])return writingState_(style,user,preferences,null,true);
+    if(Object.keys(pending).length>=REVIEW_AI_LIMIT)fail_('BUSY','AIが混み合っています。少し待ってから再確認してください。');
+    var quota=aiQuota_();if(quota.total>=10||(quota.users[user.id]||0)>=3)fail_('AI_LIMIT','本日のAI利用上限です。保存済みの書式と端末内の整形は引き続き使えます。翌日0時に回数が戻ります。');
+    quota.total++;quota.users[user.id]=(quota.users[user.id]||0)+1;
+    pending[scope]={id:reservationId,signature:preferences.version,expiresAt:Date.now()+360000};
+    var updates={};updates.NODE_AI_QUOTA=JSON.stringify(quota);updates[REVIEW_AI_PENDING]=JSON.stringify(pending);properties.setProperties(updates,false);return null;
+  });
+  if(ready){snapshotActor_(accounts,request.token);return ready;}
+  try{
+    var body=generateWritingKitBody_(style,preferences,properties.getProperty('NODE_GEMINI_API_KEY'));
+    var result=Object.assign({},body,{generatedAt:new Date().toISOString(),source:'generated',style:style,preferenceVersion:preferences.version});
+    return withLock_(function(){
+      user=writingWritable_(accounts,request.token);
+      if(writingPreferences_().version!==preferences.version)fail_('VERSION_CONFLICT','共有書式が更新されました。最新の設定で再作成してください。');
+      var pending=aiPending_();if(!pending[scope]||pending[scope].id!==reservationId)fail_('BUSY','AI書式の作成状態が変わりました。結果を再取得してください。');
+      saveWritingKit_(style,result);return writingState_(style,user,preferences,result,false);
+    });
+  }finally{withLock_(function(){var pending=aiPending_();if(pending[scope]&&pending[scope].id===reservationId){delete pending[scope];properties.setProperty(REVIEW_AI_PENDING,JSON.stringify(pending));}});}
+}
+function generateWritingKitBody_(style,preferences,key) {
+  // This exact finite payload is the complete user input to Gemini. Do not add
+  // candidate attributes, notes, names, IDs, dates or categorised personal data.
+  var input={purpose:'generic_recruitment_writing_forms',style:style,settings:{tone:preferences.tone,targetLength:preferences.targetLength,includeSummary:preferences.includeSummary,sectionOrder:preferences.sectionOrder.slice()}};
+  var instruction='日本語の人材紹介業務で使う汎用の紹介文書式と面談質問集を作る。人物の入力は一切ない。架空の氏名、会社、職歴、年齢、実績、能力、適性、採否、評価や事実を作らない。sectionsは指定のsectionOrder順で全6件。idはbasic（基本条件）、experience（経歴）、results（確認済み実績）、tools（利用ツール）、availability（稼働条件）、summary（紹介概要）。各headingは32文字以下の項目名、leadは120文字以下の汎用の導入句だけ。「この候補者は優秀」等の人物の主張は禁止。未記入内容を補完しない。summaryも人物の評価ではなく、本人が確認した内容だけを整理する導入句。coachingはrequirements,experience,communication,schedule,proposal,reflectionの順に全6件。各codeにつきquestionsとactionsを1〜3個ずつ。質問140文字以下、行動180文字以下。誰に何を確認し記録するかを示す一般的な手順を作る。採用適否の判断、人物比較、機微属性の推定は禁止。standardは丁寧、conciseは短い句。settingsの口調を守る。個別事実の数字・日付・人物・会社の例示は禁止。JSONだけを返す。';
+  var response;
+  try{response=UrlFetchApp.fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent',{method:'post',contentType:'application/json',headers:{'x-goog-api-key':key},muteHttpExceptions:true,payload:JSON.stringify({systemInstruction:{parts:[{text:instruction}]},contents:[{role:'user',parts:[{text:JSON.stringify(input)}]}],generationConfig:{temperature:0.2,maxOutputTokens:4000,responseMimeType:'application/json',responseSchema:{type:'OBJECT',properties:{sections:{type:'ARRAY',items:{type:'OBJECT',properties:{id:{type:'STRING',enum:WRITING_SECTION_IDS},heading:{type:'STRING'},lead:{type:'STRING'}},required:['id','heading','lead']}},coaching:{type:'ARRAY',items:{type:'OBJECT',properties:{code:{type:'STRING',enum:WRITING_COACHING_CODES},questions:{type:'ARRAY',items:{type:'STRING'}},actions:{type:'ARRAY',items:{type:'STRING'}}},required:['code','questions','actions']}}},required:['sections','coaching']}}})});}catch(e){fail_('AI_UNAVAILABLE','AIとの通信を確認できませんでした。入力内容は送っていません。端末内の整形は引き続き使えます。');}
+  if(response.getResponseCode()===429)fail_('AI_LIMIT','Googleの無料枠の上限です。保存済みの書式と端末内の整形は引き続き使えます。');
+  if(response.getResponseCode()!==200)fail_('AI_UNAVAILABLE','AI書式を取得できませんでした。入力内容は送っていません。');
+  var body;try{var json=JSON.parse(response.getContentText());body=JSON.parse(json.candidates[0].content.parts.map(function(part){return part.text||'';}).join(''));}catch(e){fail_('AI_UNAVAILABLE','AI書式の応答形式を確認できませんでした。');}
+  return writingKitBody_(body,preferences);
+}
+/** Owner-only live probe: one generic form request, no business reads, no quota,
+ * preferences, pending reservations or application cache mutations. */
+function verifyNodeWritingAi() {
+  requireOwner_();var properties=props_(),key=properties.getProperty('NODE_GEMINI_API_KEY');
+  if(!key||properties.getProperty('NODE_GEMINI_FREE_TIER_CONFIRMED')!=='true')fail_('AI_NOT_CONFIGURED','Geminiの無料枠設定を確認してください。');
+  var preferences={version:'initial',tone:'formal',targetLength:1000,includeSummary:true,sectionOrder:WRITING_SECTION_IDS.slice()},body=generateWritingKitBody_('standard',preferences,key);
+  var encoded=Utilities.base64Encode(Utilities.gzip(Utilities.newBlob(JSON.stringify(body),'application/json')).getBytes());
+  if(encoded.length>8000)fail_('AI_VERIFICATION_FAILED','AI書式の保存サイズを確認できませんでした。');
+  var decoded=JSON.parse(Utilities.ungzip(Utilities.newBlob(Utilities.base64Decode(encoded),'application/gzip')).getDataAsString('UTF-8'));writingKitBody_(decoded,preferences);
+  var proof={success:true,model:'gemini-3.5-flash-lite',sections:body.sections.length,coaching:body.coaching.length,storageBytes:encoded.length,checked:['generic enum settings only','structured forms and all coaching topics','compressed round trip','no business sheet reads','no app quota preferences pending or cache writes']};Logger.log(JSON.stringify(proof));return proof;
 }
