@@ -5,6 +5,7 @@ import vm from "node:vm";
 import ts from "typescript";
 import {assertSnapshot, isUncertainWrite, validateEndpoint, SheetApiError} from "../lib/sheets-client.ts";
 import {matchingFields} from "../lib/management-data.ts";
+import {interviewFieldLabels,interviewStringFields,blankInterviewFields} from "../lib/candidate-intake.ts";
 
 const endpoint = "https://script.google.com/macros/s/AKfycb_TEST_DEPLOYMENT_1234567890/exec";
 const otherEndpoint = endpoint.replace("TEST_DEPLOYMENT", "OTHER_DEPLOYMENT");
@@ -61,7 +62,7 @@ function harness(handle, {storedToken, malformedSession, deadlineController, bro
   const context=vm.createContext({exports,module:{exports},AbortController,AbortSignal:deadlineSignals,JSON,Error,localStorage,sessionStorage,TEST_PRODUCTION:production,
     ...(browser || {}),
     fetch:async()=>{if(manifestFailure)throw new Error("設定取得失敗");return {ok:true,json:async()=>({endpoint:manifestEndpoint})};},
-    require:name=>name==="react" ? react : name.includes("node-data") ? {initialPlayers:[player],makeDemoActivities:()=>[]} : name.includes("management-data") ? {matchingFields} : {assertSnapshot,isUncertainWrite,validateEndpoint,SheetApiError,sheetRequest}});
+    require:name=>name==="react" ? react : name.includes("node-data") ? {initialPlayers:[player],makeDemoActivities:()=>[]} : name.includes("management-data") ? {matchingFields} : name.includes("candidate-intake") ? {interviewFieldLabels,interviewStringFields} : {assertSnapshot,isUncertainWrite,validateEndpoint,SheetApiError,sheetRequest}});
   vm.runInContext(source,context);
   const render = () => {cursor=0; const result=exports.useSheetsConnection(); while(effects.length) effects.shift()(); return result;};
   render();
@@ -448,4 +449,39 @@ test('credential operations and malformed input cannot be accepted as background
   const cyclic={};cyclic.self=cyclic;
   assert.throws(()=>h.render().submitMutation('updateRecord',cyclic,'x'),{code:'INVALID_PAYLOAD'});
   assert.equal(h.render().backgroundSave,null);assert.equal(h.calls.length,1);h.unmount();
+});
+
+test('failed private intake copy returns labelled original input only after an explicit request and preserves immutable same-ID retry',async()=>{
+ for(const action of ['saveCandidateProfile','saveActivity']){
+  const failedWrite=deferred();let attempts=0;
+  const h=harness(call=>call.action==='snapshot'?snapshot:++attempts===1?failedWrite.promise:{snapshot},{storedToken:token});await flush();
+  const originalFields={...blankInterviewFields(),age:'32',workHistory:'最初の職歴\n改行もそのまま保持',attendanceConcerns:'原文の確認事項',crmTools:['Salesforce','HubSpot'],chatTools:['Slack','Chatwork']},introduction='最初の紹介文\n改行も維持';
+  const profile={fields:originalFields,introduction,profileVersion:'private-profile-version'},input=action==='saveCandidateProfile'?{...profile,recordId:'private-record-id',rowVersion:'private-row-version',token:'not-exported-token',password:'not-exported-password'}:{activity:{candidateName:'候補者名',recordId:'private-record-id',rowVersion:'private-row-version',interviewProfile:profile,token:'not-exported-token',password:'not-exported-password'}};
+  const original=structuredClone(profile);
+  h.render().submitMutation(action,input,'original-intake-operation');assert.equal(h.render().backgroundSave.intakeInput,true);assert.throws(()=>h.render().copyBackgroundIntakeInput(),{code:'INTAKE_INPUT_UNAVAILABLE'});
+  profile.fields.workHistory='後から書き換えた職歴';profile.fields.crmTools.push('送信後の変更');profile.introduction='後から書き換えた紹介文';if(action==='saveCandidateProfile')input.introduction='後から書き換えた紹介文';
+  failedWrite.reject(new SheetApiError('VALIDATION','入力の確認が必要です'));await flush();
+  const failed=h.render();assert.equal(failed.backgroundSave.status,'failed');assert.equal(failed.backgroundSave.intakeInput,true);
+  const expected=['INSUP NODE 面談情報（保存前の入力原文）',...interviewStringFields.map(key=>`${interviewFieldLabels[key]}：${original.fields[key]}`),'CRM：Salesforce、HubSpot','チャット：Slack、Chatwork','','クライアント共有用の紹介文',introduction].join('\n');
+  assert.equal(failed.copyBackgroundIntakeInput(),expected);assert.equal(failed.copyBackgroundIntakeInput(),expected);assert.equal(h.calls.length,2,'Copying makes no request and does not retry a failed write');assert.equal(h.render().hasPendingSave,true);
+  for(const secret of ['private-record-id','private-row-version','private-profile-version','not-exported-token','not-exported-password',token,'original-intake-operation','後から書き換えた','送信後の変更'])assert.equal(expected.includes(secret),false,secret);
+  for(const secret of ['最初の職歴','原文の確認事項','最初の紹介文','HubSpot'])assert.equal(JSON.stringify(failed.backgroundSave).includes(secret),false,secret);
+  assert.equal(JSON.stringify([...h.sessionStorage.values,...h.localStorage.values]).includes('最初の職歴'),false);
+  failed.retryBackgroundSave();await flush();assert.equal(h.calls[2].options.operationId,'original-intake-operation');assert.deepEqual(h.calls[2].payload,h.calls[1].payload);assert.equal(h.render().backgroundSave.status,'saved');assert.equal(h.render().backgroundSave.intakeInput,false);assert.throws(()=>failed.copyBackgroundIntakeInput(),{code:'INTAKE_INPUT_UNAVAILABLE'});h.unmount();
+ }
+});
+
+test('ordinary failed activities never offer private intake recovery',async()=>{
+ const h=harness(call=>call.action==='snapshot'?snapshot:Promise.reject(new SheetApiError('VALIDATION','確認してください')),{storedToken:token});await flush();h.render().submitMutation('saveActivity',{activity:{candidateName:'通常の成果',memo:'通常メモ'}},'ordinary-operation');await flush();assert.equal(h.render().backgroundSave.intakeInput,false);assert.throws(()=>h.render().copyBackgroundIntakeInput(),{code:'INTAKE_INPUT_UNAVAILABLE'});h.unmount();
+});
+
+test('session expiry removes failed private input and invalidates a previously retained copy callback',async()=>{
+ const h=harness(call=>{if(call.action==='snapshot')return snapshot;if(call.action==='readInterviewAdvice')throw new SheetApiError('SESSION_EXPIRED','expired');throw new SheetApiError('VALIDATION','確認してください');},{storedToken:token});await flush();h.render().submitMutation('saveCandidateProfile',{recordId:'private-record',rowVersion:'private-version',profileVersion:'',fields:{...blankInterviewFields(),workHistory:'失効した本人の職歴'},introduction:'失効した本人の紹介文'},'expiring-private-operation');await flush();const copy=h.render().copyBackgroundIntakeInput;assert.ok(copy().includes('失効した本人の職歴'));
+ await assert.rejects(()=>h.render().readAdvice('2026-10'));assert.equal(h.render().authenticated,false);assert.equal(h.render().backgroundSave,null);assert.throws(copy,{code:'INTAKE_INPUT_UNAVAILABLE'});assert.throws(()=>h.render().copyBackgroundIntakeInput(),{code:'INTAKE_INPUT_UNAVAILABLE'});h.unmount();
+});
+
+test('dismissal logout new login and unmount never let an old recovery callback read a newer private job',async()=>{
+ const h=harness(call=>{if(call.action==='snapshot')return snapshot;if(call.action==='login')return {token:`${token}-new-login`};if(call.action==='logout')return {loggedOut:true};throw new SheetApiError('VALIDATION','確認してください');},{storedToken:token});await flush();
+ const input={recordId:'private-record',rowVersion:'private-version',profileVersion:'',fields:{...blankInterviewFields(),workHistory:'以前の職歴'},introduction:'以前の紹介文'};h.render().submitMutation('saveCandidateProfile',input,'old-private-operation');await flush();const oldCopy=h.render().copyBackgroundIntakeInput;assert.ok(oldCopy().includes('以前の職歴'));h.render().dismissBackgroundSave();assert.throws(oldCopy,{code:'INTAKE_INPUT_UNAVAILABLE'});await h.render().logout();assert.throws(oldCopy,{code:'INTAKE_INPUT_UNAVAILABLE'});
+ await h.render().login('ND-001','new-login-password');h.render().submitMutation('saveCandidateProfile',{...input,fields:{...blankInterviewFields(),workHistory:'新しいログイン後の職歴'}},'new-private-operation');await flush();assert.throws(oldCopy,{code:'STALE_SESSION'});const newCopy=h.render().copyBackgroundIntakeInput;assert.ok(newCopy().includes('新しいログイン後の職歴'));h.unmount();assert.throws(newCopy,{code:'INTAKE_INPUT_UNAVAILABLE'});
 });

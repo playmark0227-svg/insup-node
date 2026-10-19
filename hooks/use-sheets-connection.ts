@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { initialPlayers, makeDemoActivities, type Activity } from "../lib/node-data";
 import { assertSnapshot, isUncertainWrite, sheetRequest, validateEndpoint, SheetApiError, type MutationResult, type SheetSnapshot, type SheetPlayer, type InterviewAdvice, type InterviewAdviceState } from "../lib/sheets-client";
 import { matchingFields } from "../lib/management-data";
+import { interviewFieldLabels, interviewStringFields } from "../lib/candidate-intake";
 
 const ENDPOINT_KEY = "insup.node.endpoint.v1";
 const SESSION_KEY = "insup.node.session.v1";
@@ -9,9 +10,9 @@ const isExpired = (e: unknown) => e instanceof SheetApiError && ["AUTH_REQUIRED"
 export type ConnectionLoadPhase = "authenticating" | "loading" | "restoring" | null;
 export type BackgroundSaveState = {
   operationId: string; action: string; label: string; status: "saving" | "saved" | "failed";
-  details: string[]; error: string; uncertain: boolean; changeId?: string;
+  details: string[]; error: string; uncertain: boolean; changeId?: string; intakeInput?: boolean;
 };
-type BackgroundJob = { state: BackgroundSaveState; payload: unknown; endpoint: string; token: string; generation: number };
+type BackgroundJob = { state: BackgroundSaveState; payload: unknown; endpoint: string; token: string; generation: number; account: string };
 const backgroundActions = new Set(["saveCandidateProfile", "saveClient", "deleteCandidate", "updateRecord", "createCandidate", "cancelAchievement", "restoreChange", "saveActivity", "updateProfile", "updateStatus", "saveManagementRow", "saveInterviewReview"]);
 const readStorage = (storage: Storage, key: string) => { try { return storage.getItem(key); } catch { return null; } };
 const writeStorage = (storage: Storage, key: string, value: string | null) => {
@@ -272,7 +273,7 @@ export function useSheetsConnection() {
       if (!isCurrent(job.generation) || backgroundJob.current !== job) return;
       assertSnapshot(data.snapshot);
       applySnapshot(data.snapshot);
-      job.state = {...job.state, status:"saved", changeId:data.changeId};
+      job.state = {...job.state, status:"saved", changeId:data.changeId, intakeInput:false};
       // Successful jobs no longer need candidate memos in retained request data.
       job.payload = null;
       setBackgroundSave(job.state);
@@ -292,7 +293,7 @@ export function useSheetsConnection() {
     let owned: unknown;
     try { owned = JSON.parse(JSON.stringify(payload)); } catch { throw new SheetApiError("INVALID_PAYLOAD", "入力内容を確認してください。"); }
     if (!operationId || !owned || typeof owned !== "object") throw new SheetApiError("INVALID_PAYLOAD", "入力内容を確認してください。");
-    const job: BackgroundJob = {state:{operationId,action,label:label||saveLabel(action),status:"saving",details:saveDetails(action,owned,snapshot),error:"",uncertain:false},payload:owned,endpoint,token:token.current,generation:generation.current};
+    const job: BackgroundJob = {state:{operationId,action,label:label||saveLabel(action),status:"saving",details:saveDetails(action,owned,snapshot),error:"",uncertain:false,intakeInput:!!backgroundIntakeBody(action,owned)},payload:owned,endpoint,token:token.current,generation:generation.current,account:`${snapshot.self.role}:${snapshot.self.playerId}`};
     backgroundJob.current = job;
     void runBackground(job);
   };
@@ -304,6 +305,22 @@ export function useSheetsConnection() {
     // Both definite and ambiguous retries keep the original ID and input. No
     // automatic replay occurs after a timeout that might have committed a write.
     void runBackground(job);
+  };
+  // The original private input is materialized only by an explicit user action.
+  // A callback retained by an older login or view must not expose a newer job.
+  const copyGeneration = generation.current;
+  const copyBackgroundIntakeInput = (): string => {
+    const job = backgroundJob.current;
+    if (!job || job.state.status !== "failed" || !job.state.intakeInput) throw new SheetApiError("INTAKE_INPUT_UNAVAILABLE", "保存できなかった面談情報がありません。");
+    if (!authenticated || !snapshot || !isCurrent(job.generation) || job.generation !== copyGeneration || job.token !== token.current || job.endpoint !== endpoint || job.account !== `${snapshot.self.role}:${snapshot.self.playerId}`) throw new SheetApiError("STALE_SESSION", "ログイン状態が変わったため、面談情報をコピーできません。");
+    const body = backgroundIntakeBody(job.state.action, job.payload);
+    if (!body) throw new SheetApiError("INTAKE_INPUT_UNAVAILABLE", "保存できなかった面談情報がありません。");
+    const fields = body.fields as Record<string, unknown>;
+    const lines = ["INSUP NODE 面談情報（保存前の入力原文）"];
+    for (const key of interviewStringFields) lines.push(`${interviewFieldLabels[key]}：${typeof fields[key] === "string" ? fields[key] : ""}`);
+    for (const key of ["crmTools", "chatTools"] as const) lines.push(`${interviewFieldLabels[key]}：${Array.isArray(fields[key]) ? fields[key].filter((value): value is string => typeof value === "string").join("、") : ""}`);
+    lines.push("", "クライアント共有用の紹介文", typeof body.introduction === "string" ? body.introduction : "");
+    return lines.join("\n");
   };
   const dismissBackgroundSave = () => {
     const job = backgroundJob.current;
@@ -380,7 +397,7 @@ export function useSheetsConnection() {
   };
 
   return { ready, endpoint, mode, players, setPlayers, activities, setActivities, snapshot, authenticated, loadPhase, busy, error,
-    syncing, syncError, backgroundSave, hasPendingSave, submitMutation, retryBackgroundSave, dismissBackgroundSave, credentials, dismissCredentials:() => setCredentials(null), connect, login, logout, refresh, mutate, readManagement, analyzeReviews, readAdvice, analyzeInsights, readInsights, readSecurity, changePassword, showDemo };
+    syncing, syncError, backgroundSave, hasPendingSave, submitMutation, retryBackgroundSave, dismissBackgroundSave, copyBackgroundIntakeInput, credentials, dismissCredentials:() => setCredentials(null), connect, login, logout, refresh, mutate, readManagement, analyzeReviews, readAdvice, analyzeInsights, readInsights, readSecurity, changePassword, showDemo };
 }
 
 function saveLabel(action: string) {
@@ -406,4 +423,16 @@ function saveDetails(action: string, owned: unknown, snapshot: SheetSnapshot): s
 
 function isUncertainPasswordChange(e: unknown) {
   return !(e instanceof SheetApiError) || ["NETWORK", "TIMEOUT", "HTTP", "NOT_JSON", "INTERNAL", "API", "SHEET_READ_FAILED", "SHEET_WRITE_FAILED", "INVALID_RESPONSE"].includes(e.code);
+}
+
+
+/** Shape check only: no private values are copied into public save state. */
+function backgroundIntakeBody(action:string,payload:unknown):Record<string,unknown>|null {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const data=payload as Record<string,unknown>;
+  const activity=data.activity && typeof data.activity === "object" && !Array.isArray(data.activity) ? data.activity as Record<string,unknown> : null;
+  const raw=action === "saveCandidateProfile" ? data : action === "saveActivity" ? activity?.interviewProfile : null;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const body=raw as Record<string,unknown>;
+  return body.fields && typeof body.fields === "object" && !Array.isArray(body.fields) ? body : null;
 }

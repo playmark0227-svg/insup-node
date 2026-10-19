@@ -6,10 +6,10 @@ import "./background-save-status.css";
 
 export type BackgroundSaveInfo = {
  operationId:string; action:string; label:string; status:"saving"|"saved"|"failed";
- error:string; uncertain:boolean; details:string[]; changeId?:string;
+ error:string; uncertain:boolean; details:string[]; changeId?:string; intakeInput?:boolean;
 };
 
-export function BackgroundSaveStatus({save,onRetry,onDismiss,onUndo}:{save:BackgroundSaveInfo|null;onRetry:()=>void;onDismiss:()=>void;onUndo?:(changeId:string,label:string)=>void}) {
+export function BackgroundSaveStatus({save,onRetry,onDismiss,onUndo,onCopyIntakeInput}:{save:BackgroundSaveInfo|null;onRetry:()=>void;onDismiss:()=>void;onUndo?:(changeId:string,label:string)=>void;onCopyIntakeInput?:()=>string}) {
  const [open,setOpen]=useState(false),[discard,setDiscard]=useState(false);
  const container=useRef<HTMLDivElement>(null),trigger=useRef<HTMLButtonElement>(null);
  const panelId=useId();
@@ -40,6 +40,7 @@ export function BackgroundSaveStatus({save,onRetry,onDismiss,onUndo}:{save:Backg
    {!saved&&<p className="background-save-help">{saving?"保存中は、続けて変更を保存する操作とログアウトをお待ちください。":"この保存を解決するまで、新しい変更の保存とログアウトをお待ちください。"}</p>}
    {save.error&&<p className="background-save-error" role="alert">{save.error}</p>}
    {!!save.details.length&&<details className="background-save-details"><summary>保存する内容を確認</summary><ul>{save.details.map((detail,index)=><li key={index}>{detail}</li>)}</ul><button type="button" className="text-button" onClick={async()=>{try{await navigator.clipboard.writeText([save.label,...save.details].join("\n"));toast.success("保存内容をコピーしました");}catch{toast.error("コピーできませんでした。表示内容を控えてください。");}}}><Copy size={14}/>内容をコピー</button></details>}
+   {save.status==="failed"&&save.intakeInput&&onCopyIntakeInput&&<button type="button" className="secondary-button" onClick={async()=>{let input:string;try{input=onCopyIntakeInput();}catch(error){toast.error(error instanceof Error?error.message:"面談情報を取得できませんでした。");return;}try{await navigator.clipboard.writeText(input);toast.success("面談の入力原文と紹介文をコピーしました");}catch{toast.error("コピーできませんでした。入力は保持しています。ブラウザのコピー権限を確認して、もう一度お試しください。");}}}><Copy size={14}/>面談の入力原文をコピー</button>}
    <div className="background-save-actions">
     {save.status==="failed"&&<button type="button" className="primary-button" onClick={()=>{try{setDiscard(false);onRetry();}catch(error){toast.error(error instanceof Error?error.message:"再試行できませんでした。");}}}><RotateCcw size={15}/>{save.uncertain?"同じ内容で保存を確認":"同じ内容で再試行"}</button>}
     {saved&&save.changeId&&onUndo&&<button type="button" className="secondary-button" onClick={()=>{try{onUndo(save.changeId!,save.label);setOpen(false);}catch(error){toast.error(error instanceof Error?error.message:"元に戻せませんでした。");}}}><RotateCcw size={15}/>元に戻す</button>}
