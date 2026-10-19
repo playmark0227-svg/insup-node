@@ -96,6 +96,8 @@ export function InterviewIntakeEditor({ candidateName, fields, onFieldsChange, i
 
     <fieldset disabled={disabled} className="intake-section"><legend>面談可能日</legend><div className="intake-grid">{field("interviewAvailability", { multiline: true, maxLength: 400, placeholder: "候補日・時間帯・調整が必要な条件など" })}</div></fieldset>
 
+    <fieldset disabled={disabled} className="intake-section"><legend>その他・補足</legend><div className="intake-grid">{field("additionalNotes", { multiline: true, maxLength: 2000, placeholder: "他の項目に当てはまらない情報、元シートの補足など。出所の行番号もそのまま残せます。", hint: "元の記載を保存できます。内容や評価を推測して追加しません。" })}</div></fieldset>
+
     <section className="intake-introduction" aria-labelledby={`${id}-intro-heading`}><div className="intake-introduction-heading"><div><h3 id={`${id}-intro-heading`}>クライアント共有用の基本情報</h3><p>入力から整形します。文章は送る前に確認・修正できます。</p></div><button type="button" className="secondary-button" disabled={disabled} onClick={requestFormat}><FileText size={16}/>入力から整形</button></div>
       <p className="intake-privacy">この整形は端末内で行います。外部AIには送信しません。</p>
       {replaceDraft && <div className="intake-replace" role="alert"><p>現在の編集文を、入力情報から整形し直します。</p><div><button type="button" className="secondary-button" disabled={disabled} onClick={() => setReplaceDraft(false)}>編集文を残す</button><button type="button" className="primary-button" disabled={disabled} onClick={format}>整形し直す</button></div></div>}

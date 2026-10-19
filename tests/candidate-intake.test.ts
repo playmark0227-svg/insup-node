@@ -29,7 +29,7 @@ test("new candidate forms do not share tool selections and normalization retains
   assert.equal(result.desiredHourlyRate, "2,000円/時");
   assert.deepEqual(result.crmTools, ["Salesforce", "kintone"]);
   assert.equal(Object.hasOwn(result, "unknown"), false);
-  assert.equal(interviewStringFields.length, 20);
+  assert.equal(interviewStringFields.length, 21);
 });
 
 test("a factual introduction retains units and no assessment is invented from age or gender", () => {
@@ -68,10 +68,25 @@ test("long Unicode source fits the budget, keeps each populated section and expl
   assert.equal(result.truncated, true);
   assert.ok(result.omittedFields.includes("workHistory"));
   assert.ok(result.omittedFields.includes("crmOther"));
-  for (const section of ["基本情報", "営業経験・職歴", "実績・強み", "使用ツール", "面談可能日"]) assert.ok(result.text.includes(`【${section}】`));
+  for (const section of ["基本情報", "営業経験・職歴", "実績・強み", "使用ツール", "面談可能日", "補足"]) assert.ok(result.text.includes(`【${section}】`));
   assert.equal(JSON.stringify(fields), source);
   assert.doesNotMatch(result.text, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
   assert.deepEqual(composeCandidateIntroduction("架空の候補者🧑‍💻", fields), result);
+});
+
+test("unlabelled source notes remain intact and become a factual final supplement section",()=>{
+ const olderFields={workHistory:"法人営業を担当。",interviewAvailability:"平日午後"};
+ assert.equal(normalizeInterviewFields(olderFields).additionalNotes,"");
+ assert.equal(blankInterviewFields().additionalNotes,"");
+ const notes="元シート21行：本人から追加説明あり。\n元シート22行：条件は次回確認。";
+ const fields={...normalizeInterviewFields(olderFields),additionalNotes:notes};
+ const result=composeCandidateIntroduction("架空の候補者",fields);
+ assert.equal(result.truncated,false);assert.ok(result.text.endsWith(`【補足】\n${notes}`));
+ assert.equal(fields.additionalNotes,notes);assert.doesNotMatch(result.text,/おすすめ|優秀|即戦力/);
+ const long={...fields,additionalNotes:"補".repeat(2000)};
+ const shortened=composeCandidateIntroduction("架空の候補者",long);
+ assert.equal(long.additionalNotes.length,2000);assert.ok(shortened.omittedFields.includes("additionalNotes"));
+ assert.ok(unicodeLength(shortened.text)<=1000);
 });
 
 test("private candidate formatting never adds an external request or an AI execution claim", () => {

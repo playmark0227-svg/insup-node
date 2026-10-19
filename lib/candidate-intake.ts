@@ -3,7 +3,7 @@ export const interviewStringFields = [
   "age", "gender", "residence", "availableFrom", "timeWindow", "daysPerWeek",
   "monthlyHours", "sideJob", "desiredHourlyRate", "pcEnvironment", "networkEnvironment",
   "attendanceConcerns", "workHistory", "achievements", "strengths", "crmOther", "chatOther",
-  "interviewAvailability", "workStyle", "pcSkills",
+  "interviewAvailability", "workStyle", "pcSkills", "additionalNotes",
 ] as const;
 
 export type InterviewStringField = typeof interviewStringFields[number];
@@ -26,7 +26,7 @@ export const pcOptions = ["Windows", "MacBook", "PCなし", "購入予定", "そ
 export const crmOptions = ["Salesforce", "kintone", "HubSpot", "その他"] as const;
 export const chatOptions = ["Slack", "Chatwork", "その他"] as const;
 export const genderOptions = ["", "男性", "女性", "その他", "回答しない"] as const;
-export const interviewFieldLimits: Record<InterviewStringField,number> = {age:20,gender:20,residence:120,availableFrom:120,timeWindow:200,daysPerWeek:80,monthlyHours:80,sideJob:160,desiredHourlyRate:100,pcEnvironment:30,networkEnvironment:200,attendanceConcerns:600,workHistory:6000,achievements:1500,strengths:1500,crmOther:120,chatOther:120,interviewAvailability:300,workStyle:200,pcSkills:800};
+export const interviewFieldLimits: Record<InterviewStringField,number> = {age:20,gender:20,residence:120,availableFrom:120,timeWindow:200,daysPerWeek:80,monthlyHours:80,sideJob:160,desiredHourlyRate:100,pcEnvironment:30,networkEnvironment:200,attendanceConcerns:600,workHistory:6000,achievements:1500,strengths:1500,crmOther:120,chatOther:120,interviewAvailability:300,workStyle:200,pcSkills:800,additionalNotes:2000};
 export const introductionLimit = 1000;
 
 export const interviewFieldLabels: Record<keyof InterviewFields | "candidateName", string> = {
@@ -36,7 +36,7 @@ export const interviewFieldLabels: Record<keyof InterviewFields | "candidateName
   pcEnvironment: "PC環境", networkEnvironment: "通信環境", attendanceConcerns: "勤怠・稼働上の確認事項",
   workHistory: "営業経験・職歴", achievements: "実績", strengths: "強み",
   crmOther: "その他のCRM", chatOther: "その他のチャット", crmTools: "CRM",
-  chatTools: "チャット", interviewAvailability: "面談可能日", workStyle: "稼働形態", pcSkills: "PC操作・スキル",
+  chatTools: "チャット", interviewAvailability: "面談可能日", workStyle: "稼働形態", pcSkills: "PC操作・スキル", additionalNotes: "その他・補足",
 };
 
 export function blankInterviewFields(): InterviewFields {
@@ -106,6 +106,7 @@ export function composeCandidateIntroduction(candidateName: string, rawFields: I
     { title: "使用ツール", entries: [entry("pcEnvironment"), entry("networkEnvironment"), entry("pcSkills"),
       tools("crmTools", "crmOther"), tools("chatTools", "chatOther")] },
     { title: "面談可能日", entries: [{ ...entry("interviewAvailability", 2), label: "" }] },
+    { title: "補足", entries: [{ ...entry("additionalNotes", 2), label: "" }] },
   ].map(section => ({ ...section, entries: section.entries.filter(item => item.value) }))
     .filter(section => section.entries.length);
   const render = (baseLimit: number): string => sections.map(section => `【${section.title}】\n${section.entries.map(item => {

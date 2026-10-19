@@ -1684,7 +1684,7 @@ var CANDIDATE_PROFILE_TAB='_NODE_candidate_profiles';
 var CANDIDATE_PROFILE_HEADERS=['profileId','playerId','fields','introduction','version','updatedAt'];
 var CLIENT_TAB='_NODE_clients';
 var CLIENT_HEADERS=['id','name','active','version','updatedAt'];
-var INTERVIEW_FIELD_LIMITS={age:20,gender:20,residence:120,availableFrom:120,timeWindow:200,daysPerWeek:80,monthlyHours:80,sideJob:160,desiredHourlyRate:100,pcEnvironment:30,networkEnvironment:200,attendanceConcerns:600,workHistory:6000,achievements:1500,strengths:1500,crmOther:120,chatOther:120,interviewAvailability:300,workStyle:200,pcSkills:800};
+var INTERVIEW_FIELD_LIMITS={age:20,gender:20,residence:120,availableFrom:120,timeWindow:200,daysPerWeek:80,monthlyHours:80,sideJob:160,desiredHourlyRate:100,pcEnvironment:30,networkEnvironment:200,attendanceConcerns:600,workHistory:6000,achievements:1500,strengths:1500,crmOther:120,chatOther:120,interviewAvailability:300,workStyle:200,pcSkills:800,additionalNotes:2000};
 var INTERVIEW_CRM_TOOLS=['Salesforce','kintone','HubSpot','その他'];
 var INTERVIEW_CHAT_TOOLS=['Slack','Chatwork','その他'];
 function intakeText_(value,max) {

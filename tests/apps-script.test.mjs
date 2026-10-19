@@ -2559,6 +2559,16 @@ function saveIntake(f,extra={}) {
  const snapshot=assertSuccess(request(f.harness,'snapshot',{}, {token:f.player.token})),record=snapshot.records.find(r=>r.row===2),payload={recordId:record.recordId,rowVersion:record.rowVersion,profileVersion:'',fields:privateInterviewFields(),introduction:'非公開の紹介文',...extra};
  const result=assertSuccess(request(f.harness,'saveCandidateProfile',payload,{token:f.player.token,operationId:randomUUID()}));return {record,payload,result,profile:result.snapshot.candidateProfiles[0]};
 }
+test('additional intake notes default empty and preserve 2000 Unicode characters while refusing oversized notes',()=>{
+ const f=signedInFixture(),h=f.harness;
+ assert.equal(h.context.interviewFields_(privateInterviewFields()).additionalNotes,'');
+ const notes='😀'.repeat(2000),fields={...privateInterviewFields(),additionalNotes:notes};
+ const {profile}=saveIntake(f,{fields});assert.equal(profile.fields.additionalNotes,notes);
+ const row=assertSuccess(request(h,'snapshot',{}, {token:f.player.token})).records.find(r=>r.row===2);
+ h.apiCalls.length=0;
+ const rejected=request(h,'saveCandidateProfile',{recordId:row.recordId,rowVersion:row.rowVersion,profileVersion:profile.version,fields:{...fields,additionalNotes:notes+'追'},introduction:''},{token:f.player.token,operationId:randomUUID()});
+ assert.equal(assertFailure(rejected).code,'VALIDATION');assert.equal(h.apiCalls.length,0);
+});
 test('private intake creates its table and stable binding in one atomic idempotent save without a private audit copy',()=>{
  const f=signedInFixture(),h=f.harness,r=assertSuccess(request(h,'snapshot',{}, {token:f.player.token})).records.find(r=>r.row===2),operationId=randomUUID(),payload={recordId:r.recordId,rowVersion:r.rowVersion,profileVersion:'',fields:privateInterviewFields(),introduction:'非公開の紹介文'},before=clone(h.spreadsheet.getSheetById(MATCHING_SHEET_ID).values);
  const result=assertSuccess(request(h,'saveCandidateProfile',payload,{token:f.player.token,operationId})),profile=result.snapshot.candidateProfiles[0];
