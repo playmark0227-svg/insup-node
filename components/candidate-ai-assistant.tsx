@@ -14,7 +14,7 @@ type AssistantTab = "introduction" | "coaching";
 type AssistantEngine = "device" | "structure";
 type Availability = "checking" | "available" | "downloadable" | "downloading" | "unavailable";
 type Progress = { phase: "checking" | "downloading" | "generating"; downloadProgress?: number };
-type Inputs = { candidateName: string; fields: InterviewFields; memo: string; reflection: string; referenceText: string; preferences: WritingPreferences; style: WritingStyle };
+type Inputs = { candidateName: string; fields: InterviewFields; memo: string; reflection: string; preferences: WritingPreferences; style: WritingStyle };
 type Preview = {
   kind: AssistantTab; engine: AssistantEngine; fingerprint: string; introductionAtStart: string;
   draft?: string; summary?: string; questions: string[]; actions: string[]; sourceLabels: string[];
@@ -44,7 +44,7 @@ const localError = (error: unknown): string => {
   return ({ UNAVAILABLE: "このブラウザでは端末AIを利用できません。『AI文章構成』を選ぶと、候補者情報を送らずに作成できます。",
     ABORTED: "作成をキャンセルしました。入力内容と現在の文章は残っています。",
     TIMEOUT: "端末AIの応答に時間がかかっています。入力内容は残っています。少し待ってから再度お試しください。",
-    INVALID_INPUT: "入力内容を確認してください。長い参考文やメモは短くしてから、再度お試しください。",
+    INVALID_INPUT: "入力内容を確認してください。長いメモは短くしてから、再度お試しください。",
     INVALID_RESPONSE: "端末AIの文章を確認できませんでした。現在の文章は変更していません。",
     MODEL_ERROR: "端末AIを実行できませんでした。モデルの準備が終わってから再度お試しください。" } as Record<string, string>)[code]
     || "端末AIを実行できませんでした。入力内容と現在の文章は残っています。";
@@ -70,7 +70,6 @@ function CandidateAiAssistantSession({ candidateName, fields, memo = "", introdu
   const [style, setStyle] = useState<WritingStyle>("standard");
   const [memoInput, setMemoInput] = useState(fields.interviewMemo || memo);
   const [reflection, setReflection] = useState(fields.selfReflection || "");
-  const [referenceText, setReferenceText] = useState("");
   const [availability, setAvailability] = useState<Availability>("checking");
   const [kitState, setKitState] = useState<WritingKitState | null>(null);
   const [reading, setReading] = useState(false);
@@ -94,7 +93,7 @@ function CandidateAiAssistantSession({ candidateName, fields, memo = "", introdu
   readKit.current = onReadKit;
   currentIdentity.current = identityKey;
 
-  const currentInputs: Inputs = { candidateName, fields, memo: memoInput, reflection, referenceText, preferences, style };
+  const currentInputs: Inputs = { candidateName, fields, memo: memoInput, reflection, preferences, style };
   const currentFingerprint = fingerprint(currentInputs);
   const stale = !!preview && preview.fingerprint !== currentFingerprint;
   const editedAfterStart = !!preview && introduction !== preview.introductionAtStart && introduction !== preview.draft;
@@ -127,7 +126,7 @@ function CandidateAiAssistantSession({ candidateName, fields, memo = "", introdu
   useEffect(() => {
     generation.current++; readGeneration.current++; pending.current?.abort(); pending.current = null;
     setRunning(false); setProgress(null); setPreview(null); setError(""); setNotice(""); setCopied(false); setReplaceConfirm(false);
-    setMemoInput(fields.interviewMemo || memo); memoTouched.current = false; setReflection(fields.selfReflection || ""); reflectionTouched.current = false; setReferenceText("");
+    setMemoInput(fields.interviewMemo || memo); memoTouched.current = false; setReflection(fields.selfReflection || ""); reflectionTouched.current = false;
   }, [identityKey]); // A new candidate or login must never inherit private drafts or late AI results.
 
   useEffect(() => { if (!memoTouched.current) setMemoInput(fields.interviewMemo || memo); }, [memo, fields.interviewMemo]);
@@ -159,7 +158,7 @@ function CandidateAiAssistantSession({ candidateName, fields, memo = "", introdu
     const request = ++generation.current, identity = identityKey, controller = new AbortController();
     pending.current = controller;
     // Capture immutable input once; edits during generation remain separate from the result.
-    const input: Inputs = { candidateName, fields: normalizeInterviewFields(fields), memo: memoInput, reflection, referenceText,
+    const input: Inputs = { candidateName, fields: normalizeInterviewFields(fields), memo: memoInput, reflection,
       preferences: structuredClone(preferences), style };
     const kind = tab, selectedEngine = engine, originalIntroduction = introduction, signature = fingerprint(input);
     const current = () => active.current && !controller.signal.aborted && request === generation.current && currentIdentity.current === identity;
@@ -170,10 +169,10 @@ function CandidateAiAssistantSession({ candidateName, fields, memo = "", introdu
         const options = { signal: controller.signal, preparationTimeoutMs: 600000, timeoutMs: 120000, onProgress: (value: Progress) => { if (current()) setProgress(value); } };
         if (kind === "introduction") {
           const value = await generateCandidateIntroduction({ candidateName: input.candidateName, profile: input.fields,
-            memo: input.memo, referenceText: input.referenceText, preferences: input.preferences }, options);
+            memo: input.memo, preferences: input.preferences }, options);
           if (typeof value.draft !== "string" || !value.draft.trim() || unicodeLength(value.draft) > introductionLimit) throw { code: "INVALID_RESPONSE" };
           result = { kind, engine: selectedEngine, fingerprint: signature, introductionAtStart: originalIntroduction,
-            draft: value.draft, questions: [], actions: [], sourceLabels: ["入力した面談情報", ...(input.memo.trim() ? ["面談メモ"] : []), ...(input.referenceText.trim() ? ["今回の参考文"] : [])], truncated: false, applied: false };
+            draft: value.draft, questions: [], actions: [], sourceLabels: ["入力した面談情報", ...(input.memo.trim() ? ["面談メモ"] : [])], truncated: false, applied: false };
         } else {
           const value = await generateInterviewCoaching({ candidateName: input.candidateName, profile: input.fields,
             memo: input.memo, selfReflection: input.reflection }, options);
@@ -249,6 +248,7 @@ function CandidateAiAssistantSession({ candidateName, fields, memo = "", introdu
       <button type="button" aria-pressed={tab === "introduction"} className={tab === "introduction" ? "selected" : ""} onClick={() => { setTab("introduction"); setReplaceConfirm(false); }}><FileText size={16}/>紹介文</button>
       <button type="button" aria-pressed={tab === "coaching"} className={tab === "coaching" ? "selected" : ""} onClick={() => { setTab("coaching"); setReplaceConfirm(false); }}>面談準備・振り返り</button>
     </div>
+    {tab === "introduction" && <p className="candidate-ai-method">登録済みの紹介文書式を自動使用します。参考文の再入力は不要です。候補者の情報を入力して作成してください。</p>}
     <div className="candidate-ai-engine" role="group" aria-label="AIの実行方法">
       <button type="button" aria-pressed={engine === "device"} className={engine === "device" ? "selected" : ""} onClick={() => { engineTouched.current = true; setEngine("device"); }}><Monitor size={17}/><span><strong>端末AI</strong><small>対応するPCブラウザ</small></span></button>
       <button type="button" aria-pressed={engine === "structure"} className={engine === "structure" ? "selected" : ""} onClick={() => { engineTouched.current = true; setEngine("structure"); }}><Sparkles size={17}/><span><strong>AI文章構成</strong><small>PC・スマートフォン</small></span></button>
@@ -257,8 +257,7 @@ function CandidateAiAssistantSession({ candidateName, fields, memo = "", introdu
       {availability === "checking" && <p role="status">このブラウザで端末AIを使えるか確認中です。</p>}
       {availability === "unavailable" && <p className="candidate-ai-warning" role="status">この端末・ブラウザでは端末AIを利用できません。対応するPC版Chromeなどで開くか、「AI文章構成」を選んでください。候補者情報をクラウドAIへ送る切り替えは行いません。</p>}
       {(availability === "downloadable" || availability === "downloading") && <p className="candidate-ai-warning"><Download size={16}/>初回はAIモデルをダウンロードするため、準備に数分かかることがあります。途中でキャンセルできます。下の作成ボタンを押すと準備を開始します。</p>}
-      <details className="candidate-ai-reference"><summary>今回だけ参考にする紹介文（任意）</summary><label htmlFor={`${id}-reference`}>参考にする書き方<textarea id={`${id}-reference`} rows={5} maxLength={6000} value={referenceText} onChange={event => setReferenceText(event.target.value)} placeholder="参考として使ってよい文章を貼り付けてください。"/></label><p>端末AIでの紹介文作成にだけ使います。保存・共有はしません。内容を事実として転記しないように確認してください。</p></details>
-    </div> : <div className="candidate-ai-method"><p>GoogleのAIが見出しや質問例を作り、面談情報はこの端末で組み合わせます。AIに送るのは「標準／簡潔」と、口調・長さ・項目順などの共通書式の固定設定だけです。</p><p>{tab === "coaching" ? "メモのキーワードを端末内で分類し、AIが作った質問例から選びます。個別のメモをAIが読んだ助言とは区別して表示します。" : "候補者ごとの文章をAIが読んで書き直す方式ではありません。原文を保ちながら、AIが作った構成にまとめます。紹介概要は共通の導入句で、個別の事実の要約は端末AIで作れます。"}</p>
+    </div> : <div className="candidate-ai-method"><p>GoogleのAIが導入句や質問例を作り、面談情報はこの端末で組み合わせます。AIに送るのは「標準／簡潔」と、口調・長さ・項目順などの共通書式の固定設定だけです。</p><p>{tab === "coaching" ? "メモのキーワードを端末内で分類し、AIが作った質問例から選びます。個別のメモをAIが読んだ助言とは区別して表示します。" : "候補者ごとの文章をAIが読んで書き直す方式ではありません。原文を保ちながら、登録済みの見出しとAIの導入句にまとめます。紹介概要は共通の導入句で、個別の事実の要約は端末AIで作れます。"}</p>
       <label className="candidate-ai-style" htmlFor={`${id}-style`}>文章の長さ<select id={`${id}-style`} value={style} onChange={event => setStyle(event.target.value as WritingStyle)}><option value="standard">標準</option><option value="concise">簡潔</option></select></label>
       {kitState?.configured === false && !kitAvailable && <p className="candidate-ai-warning">AI文章構成の接続が未設定です。入力と端末内の整形は引き続き使えます。</p>}
       {kitState?.pending && <p className="candidate-ai-warning">この構成を別の画面で作成中です。少し待って「保存済みを再取得」を押してください。</p>}

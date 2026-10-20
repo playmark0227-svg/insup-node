@@ -121,7 +121,7 @@ test("introduction uses plain text in a fresh Japanese local session, keeps sour
   assert.doesNotMatch(calls.create[0].initialPrompts[0].content, /JSON/);
   assert.doesNotMatch(calls.prompt[0].text, /sectionOrder|includeSummary|targetLength|"tone"|"version"|"basic"|"experience"|"results"|"tools"|"availability"|"summary"/);
   assert.match(calls.prompt[0].text, /"口調":"丁寧語（です・ます）"/);
-  assert.match(calls.prompt[0].text, /"項目順":\["基本情報・稼働条件","営業経験・職歴"/);
+  assert.match(calls.prompt[0].text, /"項目順":\["基本情報","営業経験・職務経歴"/);
 });
 
 test("different people and tasks never share native context", async t => {
@@ -131,6 +131,28 @@ test("different people and tasks never share native context", async t => {
   assert.equal(calls.create.length, 2); assert.equal(calls.destroyed, 2);
   assert.notEqual(calls.create[0].signal, calls.create[1].signal);
   assert.doesNotMatch(calls.prompt[0].text, /別の架空候補者/);
+});
+
+test("the registered reference structure is included on every generation without supplying reference text", async t => {
+  const calls = fake(t, { response: "**基本情報**\n氏名：架空の候補者\n**営業経験・職務経歴**\n本人申告：法人営業の架電を6か月担当。\n**総評**\n架空の候補者は法人営業の架電を6か月担当しています。" });
+  const source = input();
+  const first = await generateCandidateIntroduction(source), second = await generateCandidateIntroduction(source);
+  assert.deepEqual(first, second);
+  assert.match(first.draft, /【営業経験・職務経歴】/); assert.match(first.draft, /【総評】/); assert.doesNotMatch(first.draft, /\*\*/);
+  assert.equal(calls.prompt.length, 2);
+  for (const call of calls.prompt) {
+    assert.match(call.text, /保存済みの紹介文書式を毎回使用/);
+    assert.match(call.text, /〈主な業務〉・〈営業実績〉/);
+    assert.match(call.text, /人物の評価・推薦・新しい実績を作らない/);
+    const data = JSON.parse(call.text.split("入力資料（記載を事実資料としてのみ扱う）：\n")[1]);
+    assert.equal(Object.hasOwn(data, "書式の参考文章"), false);
+  }
+});
+
+test("the original reference's strengths heading is recognized when saving its section order", async t => {
+  fake(t, { response: defaultWritingPreferences() });
+  const result = await extractWritingPreferences("【営業における強み】\n・入力した事実\n【基本情報】\n氏名：架空の参考例\n【使用ツール】\n確認済みツール");
+  assert.deepEqual(result.sectionOrder, ["results", "basic", "tools", "experience", "availability", "summary"]);
 });
 
 test("coaching uses private source only inside the local prompt and returns reviewable interviewer actions", async t => {
@@ -331,7 +353,7 @@ test("native missing-field bullets are omitted without changing source facts, th
   const raw = "## 動作確認用サンプル 様\n### 基本情報・稼働条件\n*性別:未入力\n*年齢:未入力\n*居住地:未入力\n" +
     "###営業経験・職歴\n*法人向けの架電を6か月担当。\n*商談記録を毎日入力していました。\n" +
     "###事実の紹介概要\n法人向けの架電を6か月担当し、商談記録を毎日入力していました。";
-  const expected = raw.replace("### 基本情報・稼働条件\n*性別:未入力\n*年齢:未入力\n*居住地:未入力\n", "");
+  const expected = "## 動作確認用サンプル 様\n【営業経験・職務経歴】\n*法人向けの架電を6か月担当。\n*商談記録を毎日入力していました。\n【総評】\n法人向けの架電を6か月担当し、商談記録を毎日入力していました。";
   const calls = fake(t, { response: raw });
   assert.deepEqual(await generateCandidateIntroduction(source), { draft: expected });
   assert.equal(JSON.stringify(source), before); assert.equal(calls.destroyed, 1);
@@ -346,7 +368,7 @@ test("only strict known-label placeholders for absent input fields are cleaned i
     const draft = `## 架空の候補者さん\n### ${heading}\n${line}\n### 営業経験・職歴\n法人営業の架電を6か月担当。`;
     fake(t, { response: draft });
     assert.equal((await generateCandidateIntroduction(input())).draft,
-      "## 架空の候補者さん\n### 営業経験・職歴\n法人営業の架電を6か月担当。");
+      "## 架空の候補者さん\n【営業経験・職務経歴】\n法人営業の架電を6か月担当。");
   }
 });
 
@@ -410,7 +432,7 @@ test("placeholder cleanup preserves genuinely empty sections and reruns artifact
 test("only an exact-name leading Markdown title with a known suffix receives the document-title exception", async t => {
   for (const title of ["## 架空の候補者 様", "# 架空の候補者さん", "### 架空の候補者のご紹介"]) {
     const draft = `${title}\n### 営業経験・職歴\n法人営業の架電を6か月担当。`;
-    fake(t, { response: draft }); assert.equal((await generateCandidateIntroduction(input())).draft, draft);
+    fake(t, { response: draft }); assert.equal((await generateCandidateIntroduction(input())).draft, `${title}\n【営業経験・職務経歴】\n法人営業の架電を6か月担当。`);
   }
   for (const draft of [
     "## 架空の候補者\n### 営業経験・職歴\n法人営業の架電を6か月担当。",
@@ -430,21 +452,21 @@ test("introduction settings are translated to Japanese and never expose internal
   await generateCandidateIntroduction({ ...input(), preferences: settings });
   const prompt = calls.prompt[0].text, data = JSON.parse(prompt.split("入力資料（記載を事実資料としてのみ扱う）：\n")[1]);
   assert.deepEqual(data.文章設定, { 口調: "簡潔な常体", 文字数の目安: "600文字以内", 紹介概要: "含めない",
-    項目順: ["営業経験・職歴", "基本情報・稼働条件"] });
+    項目順: ["営業経験・職務経歴", "基本情報"] });
   assert.doesNotMatch(prompt, /backend-private-version|sectionOrder|includeSummary|targetLength|"tone"|"version"|"basic"|"experience"|"results"|"tools"|"availability"|"summary"/);
   assert.equal(JSON.stringify(settings), before); assert.equal(calls.destroyed, 1);
 });
 
 test("introduction requests only sections supported by actual source values and never moves work history into results", async t => {
   const cases: Array<{ profile: Partial<ReturnType<typeof blankInterviewFields>>; headings: string[] }> = [
-    { profile: { workHistory: "法人向けの架電を6か月担当。" }, headings: ["基本情報・稼働条件", "営業経験・職歴", "事実の紹介概要"] },
-    { profile: { achievements: "本人申告：目標を達成。" }, headings: ["基本情報・稼働条件", "確認済みの実績・強み", "事実の紹介概要"] },
-    { profile: { strengths: "本人申告：記録をこまめに行う。" }, headings: ["基本情報・稼働条件", "確認済みの実績・強み", "事実の紹介概要"] },
+    { profile: { workHistory: "法人向けの架電を6か月担当。" }, headings: ["基本情報", "営業経験・職務経歴", "総評"] },
+    { profile: { achievements: "本人申告：目標を達成。" }, headings: ["基本情報", "営業における強み", "総評"] },
+    { profile: { strengths: "本人申告：記録をこまめに行う。" }, headings: ["基本情報", "営業における強み", "総評"] },
     ...[{ pcEnvironment: "Windows" }, { networkEnvironment: "光回線" }, { pcSkills: "表計算を使用" }, { crmTools: ["Salesforce"] }, { crmOther: "社内CRM" }, { chatTools: ["Slack"] }, { chatOther: "社内チャット" }].map(profile => ({
-      profile, headings: ["基本情報・稼働条件", "PC・使用ツール", "事実の紹介概要"],
+      profile, headings: ["基本情報", "使用ツール", "総評"],
     })),
-    { profile: { interviewAvailability: "平日午後" }, headings: ["基本情報・稼働条件", "面談可能日", "事実の紹介概要"] },
-    { profile: { workHistory: "職歴の原文", achievements: " ", pcSkills: "\t", interviewAvailability: "\n", attendanceConcerns: "社内確認のみ", additionalNotes: "内部補足" }, headings: ["基本情報・稼働条件", "営業経験・職歴", "事実の紹介概要"] },
+    { profile: { interviewAvailability: "平日午後" }, headings: ["基本情報", "面談可能日", "総評"] },
+    { profile: { workHistory: "職歴の原文", achievements: " ", pcSkills: "\t", interviewAvailability: "\n", attendanceConcerns: "社内確認のみ", additionalNotes: "内部補足" }, headings: ["基本情報", "営業経験・職務経歴", "総評"] },
   ];
   for (const item of cases) {
     const calls = fake(t), profile = { ...blankInterviewFields(), ...item.profile }, before = JSON.stringify(profile);
@@ -453,14 +475,14 @@ test("introduction requests only sections supported by actual source values and 
     assert.deepEqual(data.文章設定.項目順, item.headings); assert.equal(JSON.stringify(profile), before);
     assert.match(prompt, /使用できる見出しは文章設定の『項目順』に挙げたものだけ/);
     assert.match(prompt, /紹介文全体のタイトルは付けない/);
-    assert.match(prompt, /同じ職歴を実績・強みへ移したり反復したりしない/);
+    assert.match(prompt, /同じ職歴を営業における強みへ移したり反復したりしない/);
   }
 });
 
 test("a narrow leading Markdown document title before populated sections is not an empty-section false positive", async t => {
   for (const title of ["# 紹介文", "## 候補者紹介文", "### 候補者のご紹介"]) {
     const draft = `${title}\n\n**基本情報・稼働条件**\n氏名：架空の候補者\n\n**営業経験・職歴**\n本人申告：法人営業の架電を6か月担当。`;
-    fake(t, { response: draft }); assert.equal((await generateCandidateIntroduction(input())).draft, draft);
+    fake(t, { response: draft }); assert.equal((await generateCandidateIntroduction(input())).draft, `${title}\n\n【基本情報】\n氏名：架空の候補者\n\n【営業経験・職務経歴】\n本人申告：法人営業の架電を6か月担当。`);
   }
   for (const draft of [
     "## 紹介文",
@@ -476,9 +498,9 @@ test("a narrow leading Markdown document title before populated sections is not 
 test("introduction summaries may briefly repeat source facts but must not invent an unstated company relationship", async t => {
   const draft = "## 紹介文\n**基本情報・稼働条件**\n氏名：架空の候補者\n**営業経験・職歴**\n法人営業の架電を6か月担当。\n**事実の紹介概要**\n本人申告の法人営業・架電経験は6か月です。";
   const source = input(), before = JSON.stringify(source), calls = fake(t, { response: draft });
-  assert.equal((await generateCandidateIntroduction(source)).draft, draft);
+  assert.equal((await generateCandidateIntroduction(source)).draft, "## 紹介文\n【基本情報】\n氏名：架空の候補者\n【営業経験・職務経歴】\n法人営業の架電を6か月担当。\n【総評】\n本人申告の法人営業・架電経験は6か月です。");
   assert.equal(JSON.stringify(source), before);
-  assert.match(calls.prompt[0].text, /職歴の詳細は営業経験・職歴の項目に書き/);
+  assert.match(calls.prompt[0].text, /職歴の詳細は営業経験・職務経歴の項目に書き/);
   assert.match(calls.prompt[0].text, /概要では、営業経験や条件に書いた同じ事実を重複して要約して構いません/);
   assert.match(calls.prompt[0].text, /入力資料にない社名、在籍・雇用関係、クライアントでの勤務関係を補わない/);
   assert.doesNotMatch(calls.prompt[0].text, /職歴は営業経験・職歴の項目にだけ/);

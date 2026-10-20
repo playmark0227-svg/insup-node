@@ -1,3 +1,4 @@
+import { introductionHeadings } from "./introduction-style.ts";
 import {
   interviewFieldLabels, normalizeInterviewFields, unicodeLength,
   type InterviewFields, type IntroductionComposition,
@@ -68,7 +69,10 @@ export function composeWritingKitIntroduction(candidateName:string,raw:Interview
     availability:[entry('interviewAvailability',2)],summary:[],
   };
   // Internal notes and interviewer's reflection are not automatically shared.
-  const sections=prefs.sectionOrder.map(id=>({id,template:kit.sections.find(s=>s.id===id),entries:groups[id].filter(e=>e.value)}))
+  const sections=prefs.sectionOrder.map(id=>{
+    const template=kit.sections.find(section=>section.id===id);
+    return {id,template:template?{...template,heading:introductionHeadings[id]}:undefined,entries:groups[id].filter(e=>e.value)};
+  })
     .filter(s=>s.template&&(s.entries.length||s.id==='summary'&&prefs.includeSummary&&!!candidateName.trim()));
   const limit=Math.min(1000,prefs.targetLength,kit.style==='concise'?600:1000);
   const render=(base:number)=>sections.map(s=>{
@@ -79,8 +83,8 @@ export function composeWritingKitIntroduction(candidateName:string,raw:Interview
     return `【${s.template!.heading}】\n${[s.template!.lead.trim(),body].filter(Boolean).join('\n')}`;
   }).join('\n\n');
   if(unicodeLength(render(0))>limit){
-    const shortHeadings:Record<WritingSectionId,string>={basic:'基本情報',experience:'営業経験・職歴',results:'実績・強み',tools:'使用ツール',availability:'面談可能日',summary:'確認のお願い'};
-    sections.forEach(s=>{s.template={id:s.id,heading:shortHeadings[s.id],lead:''};});
+    const shortHeadings = introductionHeadings;
+    sections.forEach(s=>{s.template={id:s.id,heading:shortHeadings[s.id],lead:s.id==='summary'?'記載内容は本人に確認してください。':''};});
     if(unicodeLength(render(0))>limit)throw new Error('文章構成が長すぎます。入力内容は残っています。標準の書式で作成してください。');
   }
   const longest=Math.max(1,...sections.flatMap(s=>s.entries.map(e=>unicodeLength(e.value))));

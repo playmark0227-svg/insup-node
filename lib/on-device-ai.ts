@@ -1,3 +1,4 @@
+import { introductionHeadings, introductionStyleGuide, knownIntroductionHeadings, formatIntroductionHeadings } from "./introduction-style.ts";
 import { interviewFieldLabels, interviewFieldLimits, interviewStringFields, normalizeInterviewFields,
   unicodeLength, type InterviewFields } from "./candidate-intake.ts";
 
@@ -256,10 +257,7 @@ function checkedProse(value: unknown, maximum: number): string {
 }
 
 export type CandidateIntroductionInput = { candidateName: string; profile: InterviewFields; memo?: string; referenceText?: string; preferences?: WritingPreferences };
-const japaneseSectionHeadings: Record<WritingPreferences["sectionOrder"][number], string> = {
-  basic: "基本情報・稼働条件", experience: "営業経験・職歴", results: "確認済みの実績・強み",
-  tools: "PC・使用ツール", availability: "面談可能日", summary: "事実の紹介概要",
-};
+const japaneseSectionHeadings = introductionHeadings;
 const englishInternalHeading = /(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*{1,2}|__|【|\[)?\s*(?:basic|experience|results|tools|availability|summary)\s*(?:\*{1,2}|__|】|\])?\s*(?:[:：]|\n|$)/i;
 const emptyIntroductionPlaceholder = /情報なし|情報無し|記載なし|記載無し|未入力|データなし|データ無し|[（(]\s*空欄\s*[)）]/;
 const companyReferenceWords = ["貴社", "御社", "弊社", "当社", "自社", "同社"] as const;
@@ -287,7 +285,7 @@ function remainingIntroductionPlaceholder(value: string): boolean {
 function cleanIntroductionPlaceholders(value: string, rawFields: InterviewFields, memo: string): string {
   const fields = normalizeInterviewFields(rawFields), lines = value.split(/\r?\n/), removed = new Set<number>();
   const labels = new Map(Object.entries(interviewFieldLabels).map(([key, label]) => [label, key as keyof InterviewFields | "candidateName"]));
-  const knownSections = new Set(Object.values(japaneseSectionHeadings));
+  const knownSections = new Set(knownIntroductionHeadings);
   const fieldLine = (line: string) => {
     const item = line.trim().replace(/^(?:[-+•・]\s*|\*(?!\*)\s*)/, "");
     // Only exact label:value lines qualify. A placeholder embedded in a sentence must still fail.
@@ -362,16 +360,18 @@ export async function generateCandidateIntroduction(input: CandidateIntroduction
   };
   const output = await generateRaw(`クライアント共有用の紹介文の本文を${settings.targetLength}文字以内を目安に作成してください。読みやすい改行と日本語の見出しを使い、記載された事実だけを整理してください。` +
     "使用できる見出しは文章設定の『項目順』に挙げたものだけです。その順番で必要な本文を書き、紹介文全体のタイトルは付けないでください。" +
-    "職歴の詳細は営業経験・職歴の項目に書き、同じ職歴を実績・強みへ移したり反復したりしないでください。確認済みの実績・強みは、その入力がある場合だけ記載してください。" +
+    "職歴の詳細は営業経験・職務経歴の項目に書き、同じ職歴を営業における強みへ移したり反復したりしないでください。強みは、その入力がある場合だけ記載してください。" +
     "紹介概要は入力済みの事実を短く再要約してください。概要では、営業経験や条件に書いた同じ事実を重複して要約して構いません。新しい関係や評価は加えないでください。" +
     "入力資料にない社名、在籍・雇用関係、クライアントでの勤務関係を補わないでください。貴社・御社・弊社・当社などの会社参照語も、事実資料に存在しない場合は使わないでください。" +
     "氏名以外の基本情報は資料に存在する項目だけを記載し、ないものを列挙しないでください。情報のない項目は見出しごと省略し、空欄を埋めないでください。「情報なし」「記載なし」「未入力」などの穴埋めは出力しないでください。" +
     "健康・体調、家庭事情、担当者の自己反省、社内メモ、内部向け補足はクライアント向け紹介文へ含めないでください。年齢・性別等は入力された基本情報のみとして扱い、人物評価に使わないでください。" +
     "面談メモの原文、自己反省、過去のAI助言を紹介文へ引用・転載しないでください。面談メモから使う場合も、共有に必要な確認済み事実だけを整理してください。" +
     "参考文章は書式だけを参考にし、そこに出てくる別人の情報や実績を候補者へ移さないでください。氏名は省略・変更せず、紹介文の本文に含めてください。" +
+    introductionStyleGuide + "\n" +
     "紹介文の本文だけをそのまま返してください。JSON、スキーマ、型定義、英語の内部項目名、コードフェンス、出力についての説明や命令文は一切付けないでください。",
-    { 氏名: name, 面談の基本情報: profile, 面談メモ: memo, 書式の参考文章: reference, 文章設定: format }, undefined, options, 2_000);
-  const draft = checkedProse(cleanIntroductionPlaceholders(output, input.profile, memo), settings.targetLength);
+    { 氏名: name, 面談の基本情報: profile, 面談メモ: memo, ...(reference ? { 書式の参考文章: reference } : {}), 文章設定: format }, undefined, options, 2_000);
+  const cleaned = checkedProse(cleanIntroductionPlaceholders(output, input.profile, memo), settings.targetLength);
+  const draft = checkedProse(formatIntroductionHeadings(cleaned), settings.targetLength);
   if (!draft.includes(name.trim()) || englishInternalHeading.test(draft) || emptyIntroductionPlaceholder.test(draft) || remainingIntroductionPlaceholder(draft) || emptyIntroductionHeading(draft, name.trim()) || /```|~~~|[{}]\s*$/.test(draft)) throw new OnDeviceAiError("INVALID_RESPONSE");
   // Reference writing demonstrates style only, never a factual company relationship.
   const factualSource = [name, ...Object.values(profile).map(value => Array.isArray(value) ? value.join("\n") : value), memo].join("\n");
@@ -401,7 +401,7 @@ type ReferenceSection = WritingPreferences["sectionOrder"][number];
 const referenceHeadingAliases: Record<ReferenceSection, readonly string[]> = {
   basic: ["基本情報", "基本情報・稼働条件", "稼働条件", "希望条件", "基本プロフィール", "プロフィール"],
   experience: ["営業経験・職歴", "営業経験・職務経歴", "営業経験", "職歴", "職務経歴", "経歴"],
-  results: ["確認済みの実績・強み", "実績・強み", "確認済みの実績", "実績", "強み", "アピール", "アピールポイント", "営業実績"],
+  results: ["営業における強み", "確認済みの実績・強み", "実績・強み", "確認済みの実績", "実績", "強み", "アピール", "アピールポイント", "営業実績"],
   tools: ["PC・使用ツール", "PC・利用ツール", "使用ツール", "利用ツール", "PC環境", "PC・ツール", "PC", "CRM", "PCスキル", "ツール"],
   availability: ["面談可能日", "面談候補日", "面談日程", "面談可能日時", "面談候補日時", "面談可能時間"],
   summary: ["事実の紹介概要", "紹介概要", "紹介文の概要", "概要", "総評", "要約", "まとめ"],

@@ -1,3 +1,5 @@
+import { introductionHeadings } from "./introduction-style.ts";
+
 /** Candidate information is formatted in this browser. No external service is called. */
 export const interviewStringFields = [
   "age", "gender", "residence", "availableFrom", "timeWindow", "daysPerWeek",
@@ -100,14 +102,14 @@ export function composeCandidateIntroduction(candidateName: string, rawFields: I
       label: interviewFieldLabels[key], value: values.join("・"), weight: 2 };
   };
   const sections: IntroductionSection[] = [
-    { title: "基本情報", entries: [entry("candidateName"), entry("age"), entry("gender"), entry("residence"),
+    { title: introductionHeadings.basic, entries: [entry("candidateName"), entry("age"), entry("gender"), entry("residence"),
       entry("availableFrom"), entry("timeWindow"), entry("daysPerWeek"), entry("monthlyHours"),
       entry("sideJob"), entry("desiredHourlyRate"), entry("workStyle")] },
-    { title: "営業経験・職歴", entries: [{ ...entry("workHistory", 3), label: "" }] },
-    { title: "実績・強み", entries: [entry("achievements", 2), entry("strengths", 2)] },
-    { title: "使用ツール", entries: [entry("pcEnvironment"), entry("networkEnvironment"), entry("pcSkills"),
+    { title: introductionHeadings.experience, entries: [{ ...entry("workHistory", 3), label: "" }] },
+    { title: introductionHeadings.results, entries: [entry("achievements", 2), entry("strengths", 2)] },
+    { title: introductionHeadings.tools, entries: [entry("pcEnvironment"), entry("networkEnvironment"), entry("pcSkills"),
       tools("crmTools", "crmOther"), tools("chatTools", "chatOther")] },
-    { title: "面談可能日", entries: [{ ...entry("interviewAvailability", 2), label: "" }] },
+    { title: introductionHeadings.availability, entries: [{ ...entry("interviewAvailability", 2), label: "" }] },
     // Attendance concerns, internal source notes and saved AI advice stay private.
     // They remain in the profile and are never automatically put in client copy.
   ].map(section => ({ ...section, entries: section.entries.filter(item => item.value) }))

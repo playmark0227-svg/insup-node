@@ -48,9 +48,9 @@ test("a factual introduction retains units and no assessment is invented from ag
   assert.match(result.text, /希望単価：2,000円\/時/);
   assert.match(result.text, /CRM：Salesforce・HubSpot・その他：社内CRM/);
   assert.match(result.text, /本人申告：アポ3件。/);
-  assert.ok(result.text.indexOf("【基本情報】") < result.text.indexOf("【営業経験・職歴】"));
-  assert.ok(result.text.indexOf("【営業経験・職歴】") < result.text.indexOf("【実績・強み】"));
-  assert.ok(result.text.indexOf("【実績・強み】") < result.text.indexOf("【使用ツール】"));
+  assert.ok(result.text.indexOf("【基本情報】") < result.text.indexOf("【営業経験・職務経歴】"));
+  assert.ok(result.text.indexOf("【営業経験・職務経歴】") < result.text.indexOf("【営業における強み】"));
+  assert.ok(result.text.indexOf("【営業における強み】") < result.text.indexOf("【使用ツール】"));
   assert.ok(result.text.indexOf("【使用ツール】") < result.text.indexOf("【面談可能日】"));
   assert.doesNotMatch(result.text, /おすすめ|推薦|優秀|適性|即戦力|AI/);
 });
@@ -73,7 +73,7 @@ test("long Unicode source fits the budget, keeps each populated section and expl
   assert.equal(result.truncated, true);
   assert.ok(result.omittedFields.includes("workHistory"));
   assert.ok(result.omittedFields.includes("crmOther"));
-  for (const section of ["基本情報", "営業経験・職歴", "実績・強み", "使用ツール", "面談可能日"]) assert.ok(result.text.includes(`【${section}】`));
+  for (const section of ["基本情報", "営業経験・職務経歴", "営業における強み", "使用ツール", "面談可能日"]) assert.ok(result.text.includes(`【${section}】`));
   assert.equal(JSON.stringify(fields), source);
   assert.doesNotMatch(result.text, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
   assert.deepEqual(composeCandidateIntroduction("架空の候補者🧑‍💻", fields), result);

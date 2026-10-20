@@ -130,6 +130,23 @@ test("an unavailable device AI never falls back to sending private content to th
   h.unmount();
 });
 
+test("saved preferences apply to successive candidates without any daily reference input", async () => {
+  const saved = { ...preferences, version: "saved_version_123456", tone: "plain", targetLength: 600 };
+  const h = harness({ availability: "available" }); await flush();
+  h.render({ preferences: saved });
+  assert.match(h.text(), /登録済みの紹介文書式を自動使用/);
+  assert.ok(!nodes(h.render()).some(node => node.type === "textarea" && node.props.id.endsWith("-reference")));
+  h.click("端末AIで紹介文を作成"); await flush();
+  h.render({ identityKey: "account-one:next-candidate", candidateName: "次の架空候補者", preferences: saved }); await flush();
+  h.click("端末AIで紹介文を作成"); await flush();
+  assert.equal(h.calls.deviceIntroduction.length, 2);
+  for (const [input] of h.calls.deviceIntroduction) {
+    assert.equal(input.preferences.version, saved.version); assert.equal(input.preferences.tone, "plain");
+    assert.equal(input.preferences.targetLength, 600); assert.ok(!Object.hasOwn(input, "referenceText"));
+  }
+  assert.equal(h.calls.deviceIntroduction[1][0].candidateName, "次の架空候補者"); h.unmount();
+});
+
 test("device coaching uses an immutable source snapshot with the user's own reflection", async () => {
   const pending = deferred(), h = harness({ availability: "available", deviceCoaching: () => pending.promise }); await flush();
   h.click("端末AI対応するPCブラウザ"); h.click("面談準備・振り返り");

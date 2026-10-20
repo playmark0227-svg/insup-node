@@ -4,10 +4,11 @@ import { blankInterviewFields, interviewStringFields, unicodeLength, type Interv
 import { assertWritingKitState, composeWritingKitIntroduction, defaultWritingPreferences, selectWritingKitQuestions,
   validateWritingPreferences, writingSectionIds, writingTopicCodes, type WritingKit, type WritingKitState, type WritingPreferences } from '../lib/writing-ai.ts';
 
-const headings={basic:'基本条件',experience:'職務経歴',results:'確認済み実績',tools:'利用ツール',availability:'面談可能日',summary:'紹介概要'};
+const aiHeadings={basic:'基本条件',experience:'職務経歴',results:'確認済み実績',tools:'利用ツール',availability:'面談可能日',summary:'紹介概要'};
+const headings={basic:'基本情報',experience:'営業経験・職務経歴',results:'営業における強み',tools:'使用ツール',availability:'面談可能日',summary:'総評'};
 function kit(preferences:WritingPreferences=defaultWritingPreferences(),style:WritingKit['style']='standard'):WritingKit {
   return {generatedAt:'2026-10-20T02:00:00.000Z',source:'generated',style,preferenceVersion:preferences.version,
-    sections:preferences.sectionOrder.map(id=>({id,heading:headings[id],lead:'確認済みの内容を記載します。'})),
+    sections:preferences.sectionOrder.map(id=>({id,heading:aiHeadings[id],lead:'確認済みの内容を記載します。'})),
     coaching:writingTopicCodes.map(code=>({code,questions:[`${code}：本人に確認することはありますか。`],actions:[`${code}：確認した内容と未確認事項を分けて記録する。`]}))};
 }
 function state(preferences=defaultWritingPreferences()):WritingKitState {
@@ -124,14 +125,14 @@ test('standard and concise client introductions fit 1000 and 600 Unicode codepoi
 test('custom section order and summary choice affect only the composed output',()=>{
  const preferences={...defaultWritingPreferences(),includeSummary:false,sectionOrder:['availability','tools','basic','experience','results','summary'] as WritingPreferences['sectionOrder']};
  const fields={...blankInterviewFields(),workHistory:'確認済みの経験',achievements:'本人申告の実績',pcEnvironment:'MacBook',interviewAvailability:'平日午後'};
- const result=composeWritingKitIntroduction('架空の候補者',fields,kit(preferences),preferences);assert.doesNotMatch(result.text,/【紹介概要】/);
- const expected=['面談可能日','利用ツール','基本条件','職務経歴','確認済み実績'];assert.ok(expected.every((heading,index)=>index===0||result.text.indexOf(`【${expected[index-1]}】`)<result.text.indexOf(`【${heading}】`)));
+ const result=composeWritingKitIntroduction('架空の候補者',fields,kit(preferences),preferences);assert.doesNotMatch(result.text,/【総評】/);
+ const expected=['面談可能日','使用ツール','基本情報','営業経験・職務経歴','営業における強み'];assert.ok(expected.every((heading,index)=>index===0||result.text.indexOf(`【${expected[index-1]}】`)<result.text.indexOf(`【${heading}】`)));
 });
 
 test('oversized generic leads use short headings without sacrificing source fields or exceeding the length budget',()=>{
  const preferences={...defaultWritingPreferences(),targetLength:600 as const},template=kit(preferences),fields=longFields(),before=clone(template);
  for(const section of template.sections)section.lead='記載内容は本人に確認してください。'.repeat(6);
- const oversized=clone(template),result=composeWritingKitIntroduction('架空の候補者',fields,template,preferences);assert.ok(unicodeLength(result.text)<=600);assert.equal(result.truncated,true);assert.match(result.text,/【基本情報】/);assert.match(result.text,/【営業経験・職歴】/);assert.deepEqual(template,oversized);assert.notDeepEqual(template,before);
+ const oversized=clone(template),result=composeWritingKitIntroduction('架空の候補者',fields,template,preferences);assert.ok(unicodeLength(result.text)<=600);assert.equal(result.truncated,true);assert.match(result.text,/【基本情報】/);assert.match(result.text,/【営業経験・職務経歴】/);assert.deepEqual(template,oversized);assert.notDeepEqual(template,before);
 });
 
 test('local question routing selects fixed topics without echoing any private memo or profile content',()=>{
