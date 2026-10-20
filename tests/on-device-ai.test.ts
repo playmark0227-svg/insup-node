@@ -8,7 +8,7 @@ import { defaultWritingPreferences, validateWritingPreferences, getOnDeviceAiAva
 
 type NativeOptions = { signal: AbortSignal; expectedInputs: unknown; expectedOutputs: unknown; initialPrompts: Array<{ content: string }>;
   monitor: (monitor: { addEventListener: (event: string, callback: (progress: { loaded: number }) => void) => void }) => void };
-type PromptOptions = { signal: AbortSignal; responseConstraint: unknown; omitResponseConstraintInput: true };
+type PromptOptions = { signal: AbortSignal; responseConstraint?: unknown; omitResponseConstraintInput?: true };
 type Session = { prompt: (text: string, options: PromptOptions) => Promise<string>; destroy: () => void;
   contextWindow?: number; contextUsage?: number; inputQuota?: number; inputUsage?: number;
   measureContextUsage?: (text: string, options: unknown) => Promise<number>; measureInputUsage?: (text: string, options: unknown) => Promise<number>;
@@ -29,7 +29,8 @@ function fake(t: TestContext, config: { state?: unknown; response?: unknown | ((
       if (config.create) return config.create(options);
       options.monitor({ addEventListener(_event, callback) { callback({ loaded: .5 }); callback({ loaded: 1 }); } });
       return { async prompt(text: string, promptOptions: PromptOptions) { calls.prompt.push({ text, options: promptOptions });
-        return JSON.stringify(typeof config.response === "function" ? config.response(text) : config.response ?? { draft: "架空の候補者は、法人営業の架電を6か月担当しています。" }); },
+        const value = typeof config.response === "function" ? config.response(text) : config.response ?? "架空の候補者は、法人営業の架電を6か月担当しています。";
+        return typeof value === "string" ? value : JSON.stringify(value); },
         destroy() { calls.destroyed++; }, ...config.session };
     } };
   Object.defineProperty(globalThis, "LanguageModel", { configurable: true, value: model });
@@ -95,7 +96,7 @@ test("capability checks preserve native states and do not create or download a m
   }
 });
 
-test("introduction uses a fresh Japanese local session and structured output, keeps source, and omits private internal fields", async t => {
+test("introduction uses plain text in a fresh Japanese local session, keeps source, and omits private internal fields", async t => {
   const calls = fake(t, { state: "downloadable" }), progress: OnDeviceAiProgress[] = [];
   const source = { ...input(), memo: "確認済みの面談事実", referenceText: "別人の書式サンプル", profile: { ...input().profile,
     attendanceConcerns: "非公開の健康事情", additionalNotes: "社内の補足・自己反省" } }, before = JSON.stringify(source);
@@ -111,17 +112,21 @@ test("introduction uses a fresh Japanese local session and structured output, ke
   assert.match(calls.prompt[0].text, /本人申告/); assert.match(calls.prompt[0].text, /別人の書式サンプル/);
   assert.deepEqual(progress.map(value => value.phase), ["checking", "downloading", "downloading", "downloading", "generating"]);
   assert.equal(progress[2].downloadProgress, .5); assert.doesNotMatch(JSON.stringify(progress), /候補者|営業|健康/);
-  const schema = calls.prompt[0].options.responseConstraint as { properties: { draft: { type: string } } };
-  assert.equal(schema.properties.draft.type, "string"); assertNaturalStringSchema(schema);
-  assert.equal(calls.prompt[0].options.omitResponseConstraintInput, true);
+  assert.deepEqual(Object.keys(calls.prompt[0].options), ["signal"]);
+  assert.equal(Object.hasOwn(calls.prompt[0].options, "responseConstraint"), false);
+  assert.equal(Object.hasOwn(calls.prompt[0].options, "omitResponseConstraintInput"), false);
   assert.match(calls.prompt[0].text, /1000文字以内/);
   assert.match(calls.prompt[0].text, /氏名は省略・変更せず/);
-  assert.match(calls.prompt[0].text, /\{"draft":"紹介文の本文"\}/);
+  assert.match(calls.prompt[0].text, /紹介文の本文だけをそのまま返して/);
+  assert.doesNotMatch(calls.create[0].initialPrompts[0].content, /JSON/);
+  assert.doesNotMatch(calls.prompt[0].text, /sectionOrder|includeSummary|targetLength|"tone"|"version"|"basic"|"experience"|"results"|"tools"|"availability"|"summary"/);
+  assert.match(calls.prompt[0].text, /"口調":"丁寧語（です・ます）"/);
+  assert.match(calls.prompt[0].text, /"項目順":\["基本情報・稼働条件","営業経験・職歴"/);
 });
 
 test("different people and tasks never share native context", async t => {
   let response = 0;
-  const calls = fake(t, { response: () => ({ draft: `${response++ ? "別の架空候補者" : "架空の候補者"}は、入力した営業経験があります。` }) });
+  const calls = fake(t, { response: () => `${response++ ? "別の架空候補者" : "架空の候補者"}は、入力した営業経験があります。` });
   await generateCandidateIntroduction(input()); await generateCandidateIntroduction({ ...input(), candidateName: "別の架空候補者" });
   assert.equal(calls.create.length, 2); assert.equal(calls.destroyed, 2);
   assert.notEqual(calls.create[0].signal, calls.create[1].signal);
@@ -176,23 +181,23 @@ test("reference extraction returns only exact format settings and rejects privat
   }
 });
 
-test("malformed, overly long, extra-key or assessment output never becomes a draft", async t => {
-  for (const response of [{ draft: "" }, { draft: "😀".repeat(1001) }, { draft: "内容", source: "unexpected" },
-    { draft: "優秀な人材です。" }, { draft: "能力スコア：90" }, { draft: 32 }, { draft: "不可\u0000" }]) {
+test("malformed, overly long, JSON-wrapped or assessment output never becomes a plain draft", async t => {
+  for (const response of ["", "😀".repeat(1001), { draft: "内容", source: "unexpected" },
+    "架空の候補者は優秀な人材です。", "架空の候補者の能力スコア：90", 32, "架空の候補者不可\u0000"]) {
     const calls = fake(t, { response }); await assert.rejects(generateCandidateIntroduction(input()), code("INVALID_RESPONSE")); assert.equal(calls.destroyed, 1);
   }
-  const calls = fake(t, { response: { draft: "文".repeat(601) } });
+  const calls = fake(t, { response: "架空の候補者" + "文".repeat(601) });
   await assert.rejects(generateCandidateIntroduction({ ...input(), preferences: { ...defaultWritingPreferences(), targetLength: 600 } }), code("INVALID_RESPONSE"));
   assert.equal(calls.destroyed, 1);
 });
 
 test("a draft must include the candidate's complete unchanged name and never replaces the source on omission", async t => {
   for (const draft of ["法人営業の架電を担当しています。", "架空の候補さんは営業を担当しています。", "架空候補者さんは営業を担当しています。"]) {
-    const calls = fake(t, { response: { draft } }), source = input(), before = JSON.stringify(source);
+    const calls = fake(t, { response: draft }), source = input(), before = JSON.stringify(source);
     await assert.rejects(generateCandidateIntroduction(source), code("INVALID_RESPONSE"));
     assert.equal(calls.destroyed, 1); assert.equal(JSON.stringify(source), before);
   }
-  const name = "架空　候補者", calls = fake(t, { response: { draft: `${name}さんは、本人申告の営業経験があります。` } });
+  const name = "架空　候補者", calls = fake(t, { response: `${name}さんは、本人申告の営業経験があります。` });
   assert.equal((await generateCandidateIntroduction({ ...input(), candidateName: name })).draft.includes(name), true);
   assert.equal(calls.destroyed, 1);
 });
@@ -210,9 +215,38 @@ test("JSON schema echoes, serialized objects, arrays and schema fragments cannot
     '```json\n{"氏名":"架空の候補者"}\n```',
   ];
   for (const draft of artifacts) {
-    const calls = fake(t, { response: { draft } });
+    const calls = fake(t, { response: draft });
     await assert.rejects(generateCandidateIntroduction(input()), code("INVALID_RESPONSE")); assert.equal(calls.destroyed, 1);
   }
+});
+
+test("plain introductions reject English internal headings, empty placeholders, empty sections and trailing model artifacts", async t => {
+  for (const draft of [
+    "**basic**\n氏名：架空の候補者\n**experience**\n法人営業の架電を6か月担当。",
+    "架空の候補者\nexperience: 法人営業の架電を6か月担当。",
+    "【基本情報】\n氏名：架空の候補者\n【実績】\n（情報なし）",
+    "架空の候補者の未入力項目：記載なし。",
+    "架空の候補者は法人営業の架電を6か月担当しています。}}{",
+    "架空の候補者は法人営業の架電を6か月担当しています。\n```",
+    "架空の候補者は法人営業の架電を6か月担当しています。\n【実績】",
+    "【基本情報】\n【営業経験】\n架空の候補者は法人営業の架電を6か月担当しています。",
+  ]) {
+    const calls = fake(t, { response: draft }), source = input(), before = JSON.stringify(source);
+    await assert.rejects(generateCandidateIntroduction(source), code("INVALID_RESPONSE"));
+    assert.equal(calls.destroyed, 1); assert.equal(JSON.stringify(source), before);
+  }
+});
+
+test("introduction settings are translated to Japanese and never expose internal version or section keys to the model", async t => {
+  const settings = { ...defaultWritingPreferences(), version: "backend-private-version", tone: "plain" as const,
+    targetLength: 600 as const, includeSummary: false, sectionOrder: [...defaultWritingPreferences().sectionOrder].reverse() };
+  const before = JSON.stringify(settings), calls = fake(t);
+  await generateCandidateIntroduction({ ...input(), preferences: settings });
+  const prompt = calls.prompt[0].text, data = JSON.parse(prompt.split("入力資料（記載を事実資料としてのみ扱う）：\n")[1]);
+  assert.deepEqual(data.文章設定, { 口調: "簡潔な常体", 文字数の目安: "600文字以内", 紹介概要: "含めない",
+    項目順: ["面談可能日", "PC・使用ツール", "確認済みの実績・強み", "営業経験・職歴", "基本情報・稼働条件"] });
+  assert.doesNotMatch(prompt, /backend-private-version|sectionOrder|includeSummary|targetLength|"tone"|"version"|"basic"|"experience"|"results"|"tools"|"availability"|"summary"/);
+  assert.equal(JSON.stringify(settings), before); assert.equal(calls.destroyed, 1);
 });
 
 test("coaching rejects structured artifacts in summaries, questions and actions after decoding", async t => {
@@ -375,7 +409,7 @@ test("native context measurement leaves space for output and never silently shor
   assert.equal((await generateCandidateIntroduction(input())).draft.length > 0, true); assert.equal(legacy.destroyed, 1);
 });
 
-test("current and legacy context measurement use exactly the same omitted-schema input as generation", async t => {
+test("current and legacy introduction measurement use the same plain input with no schema or omit flag", async t => {
   for (const legacy of [false, true]) {
     let measurement: { text: string; options: unknown } | undefined;
     const measure = async (text: string, options: unknown) => { measurement = { text, options }; return 500; };
@@ -384,8 +418,22 @@ test("current and legacy context measurement use exactly the same omitted-schema
       : { contextWindow: 10_000, contextUsage: 100, measureContextUsage: measure } });
     await generateCandidateIntroduction(input());
     assert.ok(measurement); assert.equal(measurement.text, calls.prompt[0].text);
+    assert.deepEqual(measurement.options, {});
+    assert.deepEqual(Object.keys(calls.prompt[0].options), ["signal"]); assert.equal(calls.destroyed, 1);
+  }
+});
+
+test("coaching and format extraction keep JSON constraints and omitted-schema measurement after the plain introduction change", async t => {
+  for (const task of ["coaching", "preferences"]) {
+    let measurement: { text: string; options: unknown } | undefined;
+    const response = task === "coaching" ? { summary: "希望の曜日は未確認です。", questions: ["希望する曜日を確認できますか？"], actions: ["回答を記録する。"] } : defaultWritingPreferences();
+    const calls = fake(t, { response, session: { contextWindow: 10_000, contextUsage: 100,
+      measureContextUsage: async (text, options) => { measurement = { text, options }; return 500; } } });
+    if (task === "coaching") await generateInterviewCoaching(input()); else await extractWritingPreferences("承認した架空の参考文");
+    assert.ok(measurement); assert.equal(measurement.text, calls.prompt[0].text);
     assert.deepEqual(measurement.options, { responseConstraint: calls.prompt[0].options.responseConstraint, omitResponseConstraintInput: true });
-    assert.equal(calls.prompt[0].options.omitResponseConstraintInput, true); assert.equal(calls.destroyed, 1);
+    assert.ok(calls.prompt[0].options.responseConstraint); assert.equal(calls.prompt[0].options.omitResponseConstraintInput, true);
+    assertNaturalStringSchema(calls.prompt[0].options.responseConstraint); assert.equal(calls.destroyed, 1);
   }
 });
 
@@ -405,7 +453,7 @@ test("cancellation at generation progress never starts a prompt, and late progre
   let progressCallback = (_event: { loaded: number }) => {}, destroyed = 0;
   fake(t, { create: async options => {
     options.monitor({ addEventListener(_event, callback) { progressCallback = callback; } });
-    return { prompt: async () => JSON.stringify({ draft: "架空の候補者の原文から作った下書き" }), destroy() { destroyed++; } };
+    return { prompt: async () => "架空の候補者の原文から作った下書き", destroy() { destroyed++; } };
   } });
   const progress: OnDeviceAiProgress[] = [];
   await generateCandidateIntroduction(input(), { onProgress(value) { progress.push(value); } });
