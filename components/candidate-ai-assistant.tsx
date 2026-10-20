@@ -38,6 +38,9 @@ export type CandidateAiAssistantProps = {
 
 const localError = (error: unknown): string => {
   const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+  const phase = error && typeof error === "object" && "phase" in error ? error.phase : "";
+  if (code === "TIMEOUT" && phase === "preparation") return "AIモデルの準備に時間がかかったため、待機を終了しました。入力内容と現在の文章は残っています。もう一度作成すると、Chromeの準備状況を確認して進められます。";
+  if (code === "TIMEOUT" && phase === "generation") return "文章の作成に時間がかかったため中止しました。入力内容と現在の文章は残っています。もう一度作成できます。";
   return ({ UNAVAILABLE: "このブラウザでは端末AIを利用できません。『AI文章構成』を選ぶと、候補者情報を送らずに作成できます。",
     ABORTED: "作成をキャンセルしました。入力内容と現在の文章は残っています。",
     TIMEOUT: "端末AIの応答に時間がかかっています。入力内容は残っています。少し待ってから再度お試しください。",
@@ -164,7 +167,7 @@ function CandidateAiAssistantSession({ candidateName, fields, memo = "", introdu
     try {
       let result: Preview;
       if (selectedEngine === "device") {
-        const options = { signal: controller.signal, timeoutMs: 120000, onProgress: (value: Progress) => { if (current()) setProgress(value); } };
+        const options = { signal: controller.signal, preparationTimeoutMs: 600000, timeoutMs: 120000, onProgress: (value: Progress) => { if (current()) setProgress(value); } };
         if (kind === "introduction") {
           const value = await generateCandidateIntroduction({ candidateName: input.candidateName, profile: input.fields,
             memo: input.memo, referenceText: input.referenceText, preferences: input.preferences }, options);
@@ -239,7 +242,7 @@ function CandidateAiAssistantSession({ candidateName, fields, memo = "", introdu
     onSaveAdvice(value); setNotice("準備案を保存欄に反映しました。内容を確認し、基本情報を保存すると残せます。"); setError("");
   }
 
-  const progressLabel = progress?.phase === "downloading" ? "端末AIをダウンロード中" : progress?.phase === "generating" ? "端末AIで作成中" : runningEngine === "device" ? "端末AIを準備中" : "AI文章構成を作成中";
+  const progressLabel = progress?.phase === "downloading" ? (progress.downloadProgress === 1 ? "端末AIを起動中" : "端末AIをダウンロード中") : progress?.phase === "generating" ? "端末AIで作成中" : runningEngine === "device" ? "端末AIを準備中" : "AI文章構成を作成中";
   return <section className="candidate-ai" aria-labelledby={`${id}-title`}>
     <header className="candidate-ai-heading"><div><h3 id={`${id}-title`}><Sparkles size={18}/>紹介文と、次の面談を準備</h3><p>作成した結果は別に表示します。確認してから紹介文に反映できます。</p></div></header>
     <div className="candidate-ai-tabs" role="group" aria-label="AIで準備する内容">
@@ -253,7 +256,7 @@ function CandidateAiAssistantSession({ candidateName, fields, memo = "", introdu
     {engine === "device" ? <div className="candidate-ai-method"><p>入力した情報・メモを端末AIが読み、文章や質問を作ります。候補者情報を外部AIへ送りません。</p>
       {availability === "checking" && <p role="status">このブラウザで端末AIを使えるか確認中です。</p>}
       {availability === "unavailable" && <p className="candidate-ai-warning" role="status">この端末・ブラウザでは端末AIを利用できません。対応するPC版Chromeなどで開くか、「AI文章構成」を選んでください。候補者情報をクラウドAIへ送る切り替えは行いません。</p>}
-      {(availability === "downloadable" || availability === "downloading") && <p className="candidate-ai-warning"><Download size={16}/>初回はAIモデルのダウンロードが必要です。通信量が多くなる場合があります。下の作成ボタンを押すと準備を開始します。</p>}
+      {(availability === "downloadable" || availability === "downloading") && <p className="candidate-ai-warning"><Download size={16}/>初回はAIモデルをダウンロードするため、準備に数分かかることがあります。途中でキャンセルできます。下の作成ボタンを押すと準備を開始します。</p>}
       <details className="candidate-ai-reference"><summary>今回だけ参考にする紹介文（任意）</summary><label htmlFor={`${id}-reference`}>参考にする書き方<textarea id={`${id}-reference`} rows={5} maxLength={6000} value={referenceText} onChange={event => setReferenceText(event.target.value)} placeholder="参考として使ってよい文章を貼り付けてください。"/></label><p>端末AIでの紹介文作成にだけ使います。保存・共有はしません。内容を事実として転記しないように確認してください。</p></details>
     </div> : <div className="candidate-ai-method"><p>GoogleのAIが見出しや質問例を作り、面談情報はこの端末で組み合わせます。AIに送るのは「標準／簡潔」と、口調・長さ・項目順などの共通書式の固定設定だけです。</p><p>{tab === "coaching" ? "メモのキーワードを端末内で分類し、AIが作った質問例から選びます。個別のメモをAIが読んだ助言とは区別して表示します。" : "候補者ごとの文章をAIが読んで書き直す方式ではありません。原文を保ちながら、AIが作った構成にまとめます。紹介概要は共通の導入句で、個別の事実の要約は端末AIで作れます。"}</p>
       <label className="candidate-ai-style" htmlFor={`${id}-style`}>文章の長さ<select id={`${id}-style`} value={style} onChange={event => setStyle(event.target.value as WritingStyle)}><option value="standard">標準</option><option value="concise">簡潔</option></select></label>

@@ -13,7 +13,7 @@ export interface WritingPreferences {
 export const writingSections = ["basic", "experience", "results", "tools", "availability", "summary"] as const;
 export type OnDeviceAiAvailability = "available" | "downloadable" | "downloading" | "unavailable";
 export type OnDeviceAiProgress = { phase: "checking" | "downloading" | "generating"; downloadProgress?: number };
-export type OnDeviceAiOptions = { signal?: AbortSignal; timeoutMs?: number; onProgress?: (progress: OnDeviceAiProgress) => void };
+export type OnDeviceAiOptions = { signal?: AbortSignal; timeoutMs?: number; preparationTimeoutMs?: number; onProgress?: (progress: OnDeviceAiProgress) => void };
 export type OnDeviceAiErrorCode = "UNAVAILABLE" | "ABORTED" | "TIMEOUT" | "INVALID_INPUT" | "INVALID_RESPONSE" | "MODEL_ERROR";
 
 const errorMessages: Record<OnDeviceAiErrorCode, string> = {
@@ -27,7 +27,13 @@ const errorMessages: Record<OnDeviceAiErrorCode, string> = {
 
 export class OnDeviceAiError extends Error {
   readonly code: OnDeviceAiErrorCode;
-  constructor(code: OnDeviceAiErrorCode) { super(errorMessages[code]); this.name = "OnDeviceAiError"; this.code = code; }
+  readonly phase?: "preparation" | "generation";
+  constructor(code: OnDeviceAiErrorCode, phase?: "preparation" | "generation") {
+    super(code === "TIMEOUT" && phase === "preparation"
+      ? "AIモデルの準備に時間がかかったため、待機を終了しました。入力原文は残っています。再度作成するとChromeの準備状況を確認して進められます。"
+      : errorMessages[code]);
+    this.name = "OnDeviceAiError"; this.code = code; this.phase = phase;
+  }
 }
 
 export function defaultWritingPreferences(): WritingPreferences {
@@ -63,14 +69,14 @@ type ModelOptions = {
   expectedOutputs: Array<{ type: "text"; languages: string[] }>;
 };
 type ModelSession = {
-  prompt: (text: string, options: { signal: AbortSignal; responseConstraint: unknown }) => Promise<string>;
+  prompt: (text: string, options: { signal: AbortSignal; responseConstraint: unknown; omitResponseConstraintInput: true }) => Promise<string>;
   destroy: () => void;
   contextWindow?: number;
   contextUsage?: number;
   inputQuota?: number;
   inputUsage?: number;
-  measureContextUsage?: (text: string, options: { responseConstraint: unknown }) => Promise<number>;
-  measureInputUsage?: (text: string, options: { responseConstraint: unknown }) => Promise<number>;
+  measureContextUsage?: (text: string, options: { responseConstraint: unknown; omitResponseConstraintInput: true }) => Promise<number>;
+  measureInputUsage?: (text: string, options: { responseConstraint: unknown; omitResponseConstraintInput: true }) => Promise<number>;
   addEventListener?: (event: "contextoverflow", callback: () => void) => void;
   removeEventListener?: (event: "contextoverflow", callback: () => void) => void;
 };
@@ -85,17 +91,33 @@ function nativeModel(): NativeLanguageModel | null {
   return model && typeof model.availability === "function" && typeof model.create === "function" ? model : null;
 }
 
-function operation(options: OnDeviceAiOptions, defaultTimeout: number) {
+function operation(options: OnDeviceAiOptions, defaultTimeout: number, separatePreparation = false) {
   const controller = new AbortController();
   let timedOut = false;
-  const timeout = options.timeoutMs ?? defaultTimeout;
-  if (!Number.isFinite(timeout) || timeout < 1 || timeout > 600_000) throw new OnDeviceAiError("INVALID_INPUT");
+  const timeout = options.timeoutMs ?? defaultTimeout, preparationTimeout = options.preparationTimeoutMs;
+  for (const budget of [timeout, ...(preparationTimeout === undefined ? [] : [preparationTimeout])]) {
+    if (!Number.isFinite(budget) || budget < 1 || budget > 600_000) throw new OnDeviceAiError("INVALID_INPUT");
+  }
+  let phase: "preparation" | "generation" | undefined = separatePreparation && preparationTimeout !== undefined ? "preparation" : undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const arm = (budget: number) => {
+    if (timer !== undefined) clearTimeout(timer);
+    timer = setTimeout(() => { timedOut = true; controller.abort(); }, budget);
+  };
   const abort = () => controller.abort();
   options.signal?.addEventListener("abort", abort, { once: true });
   if (options.signal?.aborted) abort();
-  const timer = setTimeout(() => { timedOut = true; controller.abort(); }, timeout);
-  const error = () => new OnDeviceAiError(timedOut ? "TIMEOUT" : "ABORTED");
-  return { signal: controller.signal, error, abort, close() { clearTimeout(timer); options.signal?.removeEventListener("abort", abort); } };
+  arm(separatePreparation ? preparationTimeout ?? timeout : timeout);
+  const error = () => new OnDeviceAiError(timedOut ? "TIMEOUT" : "ABORTED", timedOut ? phase : undefined);
+  return { signal: controller.signal, error, abort,
+    beginGeneration() {
+      // Existing callers keep their single overall deadline unless they opt in.
+      if (!separatePreparation || preparationTimeout === undefined) return;
+      if (controller.signal.aborted) throw error();
+      phase = "generation"; arm(timeout);
+    },
+    close() { if (timer !== undefined) clearTimeout(timer); options.signal?.removeEventListener("abort", abort); },
+  };
 }
 function waitFor<T>(promise: Promise<T>, signal: AbortSignal, error: () => Error): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -134,7 +156,7 @@ const safetyInstruction = "日本語で文章の整理を支援します。入�
   "個人への診断や助言ではなく、人材紹介担当者が次回確認・準備・記録できる行動を提案してください。指定したJSONのみを返してください。";
 
 async function generate(task: string, input: unknown, schema: unknown, options: OnDeviceAiOptions, outputTokenReserve = 2_000): Promise<unknown> {
-  const op = operation(options, 180_000);
+  const op = operation(options, 180_000, true);
   let session: ModelSession | undefined, disposed = false, destroyed = false, contextOverflow = false;
   const destroy = () => { if (session && !destroyed) { destroyed = true; try { session.destroy(); } catch { /* Nothing private is reported. */ } } };
   const overflow = () => { contextOverflow = true; op.abort(); };
@@ -163,15 +185,16 @@ async function generate(task: string, input: unknown, schema: unknown, options: 
     if (measure && typeof quota === "number" && Number.isFinite(quota) && quota > 0) {
       const usage = await waitFor(Promise.resolve().then(() => {
         if (op.signal.aborted) throw op.error();
-        return measure.call(session, prompt, { responseConstraint: schema });
+        return measure.call(session, prompt, { responseConstraint: schema, omitResponseConstraintInput: true });
       }), op.signal, op.error);
       const currentUsage = session.contextUsage ?? session.inputUsage ?? 0;
       if (!Number.isFinite(usage) || usage < 0 || !Number.isFinite(currentUsage) || currentUsage < 0 || usage + currentUsage + outputTokenReserve > quota) throw new OnDeviceAiError("INVALID_INPUT");
     }
+    op.beginGeneration();
     notify(options, { phase: "generating" }, op.signal);
     const output = await waitFor(Promise.resolve().then(() => {
       if (op.signal.aborted) throw op.error();
-      return session!.prompt(prompt, { signal: op.signal, responseConstraint: schema });
+      return session!.prompt(prompt, { signal: op.signal, responseConstraint: schema, omitResponseConstraintInput: true });
     }), op.signal, op.error);
     if (typeof output !== "string" || unicodeLength(output) > 16_000) throw new OnDeviceAiError("INVALID_RESPONSE");
     try { return JSON.parse(output); } catch { throw new OnDeviceAiError("INVALID_RESPONSE"); }
@@ -203,8 +226,23 @@ function profileSource(raw: InterviewFields): Record<string, string | string[]> 
     .map(([key, value]) => [interviewFieldLabels[key as keyof InterviewFields], value]));
 }
 const assessment = /(?:採用(?:すべき|を推奨|適性|可否)|不採用(?:を推奨|にすべき)|(?:能力|適性|人物)(?:評価|スコア|点数)|\d+\s*点満点|即戦力(?:です|として|と判断)|優秀な(?:人材|候補者))/;
+const schemaArtifact = /["'](?:\$schema|properties|required|additionalProperties|responseConstraint|minLength|maxLength|minItems|maxItems|draft|summary|questions|actions)["']\s*:|["']type["']\s*:\s*["'](?:object|array|string|integer|number|boolean|null)["']|```(?:json)?\s*[\[{]/i;
+function structuredArtifact(value: string): boolean {
+  let decoded = value;
+  // A model may double-encode JSON into a prose field; it is still not a prose draft.
+  for (let depth = 0; depth < 3; depth++) {
+    if (schemaArtifact.test(decoded)) return true;
+    try {
+      const parsed: unknown = JSON.parse(decoded);
+      if (parsed !== null && typeof parsed === "object") return true;
+      if (typeof parsed !== "string" || parsed === decoded) return false;
+      decoded = parsed;
+    } catch { return false; }
+  }
+  return schemaArtifact.test(decoded);
+}
 function checkedProse(value: unknown, maximum: number): string {
-  if (!validText(value, maximum) || assessment.test(value)) throw new OnDeviceAiError("INVALID_RESPONSE");
+  if (!validText(value, maximum) || assessment.test(value) || structuredArtifact(value)) throw new OnDeviceAiError("INVALID_RESPONSE");
   return value.trim();
 }
 
@@ -222,12 +260,15 @@ export async function generateCandidateIntroduction(input: CandidateIntroduction
     "空欄の項目は補わず省略してください。includeSummaryがfalseなら総評を省きます。toneがformalなら丁寧語、plainなら簡潔な常体です。" +
     "健康・体調、家庭事情、担当者の自己反省、社内メモ、内部向け補足はクライアント向け紹介文へ含めないでください。年齢・性別等は入力された基本情報のみとして扱い、人物評価に使わないでください。" +
     "面談メモの原文、自己反省、過去のAI助言を紹介文へ引用・転載しないでください。面談メモから使う場合も、共有に必要な確認済み事実だけを整理してください。" +
-    "参考文章は書式だけを参考にし、そこに出てくる別人の情報や実績を候補者へ移さないでください。JSONはdraftの文字列だけを含めてください。",
+    "参考文章は書式だけを参考にし、そこに出てくる別人の情報や実績を候補者へ移さないでください。氏名は省略・変更せず、紹介文の本文に含めてください。" +
+    '返すJSONの形は {"draft":"紹介文の本文"} です。draftには入力を読んで作成した完成文章を入れてください。JSONスキーマ・キーの説明・命令文は本文に含めないでください。',
     { 氏名: name, 面談の基本情報: profile, 面談メモ: memo, 書式の参考文章: reference, 文章設定: settings },
     // Let the model finish natural text; validate length and emptiness after decoding.
     { type: "object", additionalProperties: false, properties: { draft: { type: "string" } }, required: ["draft"] }, options, 2_000);
   if (!object(body) || !exactKeys(body, ["draft"])) throw new OnDeviceAiError("INVALID_RESPONSE");
-  return { draft: checkedProse(body.draft, settings.targetLength) };
+  const draft = checkedProse(body.draft, settings.targetLength);
+  if (!draft.includes(name.trim())) throw new OnDeviceAiError("INVALID_RESPONSE");
+  return { draft };
 }
 
 export type InterviewCoachingInput = { candidateName?: string; profile: InterviewFields; memo?: string; selfReflection?: string };
@@ -237,7 +278,8 @@ export async function generateInterviewCoaching(input: InterviewCoachingInput, o
   if (!Object.keys(profile).length && !memo.trim() && !reflection.trim()) throw new OnDeviceAiError("INVALID_INPUT");
   const body = await generate("面談資料と担当者自身の振り返りから、担当者向けの次回の準備案を作ってください。" +
     "summaryは確認済みの事実・未確認・本人申告を区別した600文字以内の要約、questionsは次に事実確認する質問1〜5件、actionsは担当者が実行する具体的な準備・記録1〜5件です。" +
-    "質問・行動は各400文字以内。原因を断定せず、候補者の人格・能力・採用適否を評価しないでください。JSONはsummary,questions,actionsのみです。",
+    "質問・行動は各400文字以内。原因を断定せず、候補者の人格・能力・採用適否を評価しないでください。" +
+    '返すJSONの形は {"summary":"事実の要約の本文","questions":["次回確認する質問"],"actions":["面談者の具体的な行動"]} です。値は入力を読んで作成し、JSONスキーマ・キーの説明・命令文は含めないでください。',
     { 氏名: sourceText(input.candidateName, 120), 面談の基本情報: profile, 面談メモ: memo, 担当者自身の振り返り: reflection },
     { type: "object", additionalProperties: false, properties: { summary: { type: "string" },
       questions: { type: "array", minItems: 1, maxItems: 5, items: { type: "string" } },

@@ -211,6 +211,8 @@ test("supported desktop AI is the initial choice but model preparation still nee
     assert.equal(h.calls.deviceIntroduction.length, 0); assert.equal(h.calls.generate.length, 0);
     h.click(availability === "available" ? "端末AIで紹介文を作成" : "モデルを準備して作成"); await flush();
     assert.equal(h.calls.deviceIntroduction.length, 1); assert.equal(h.calls.generate.length, 0);
+    assert.equal(h.calls.deviceIntroduction[0][1].preparationTimeoutMs, 600000);
+    assert.equal(h.calls.deviceIntroduction[0][1].timeoutMs, 120000);
     assert.match(h.text(), /端末AIの紹介文/); assert.equal(h.calls.applied.length, 0); h.unmount();
   }
 });
@@ -233,4 +235,29 @@ test("a late capability check cannot switch methods after a user has already sta
   assert.equal(h.button("AI文章構成PC・スマートフォン").props["aria-pressed"], true);
   writing.resolve(state(kit)); await flush();
   assert.match(h.text(), /AIの構成＋原文を端末内で組み合わせ/); assert.equal(h.calls.deviceIntroduction.length, 0); h.unmount();
+});
+
+test("model preparation timeout keeps edited notes and offers a retry without implying the download is still running", async () => {
+  const pending = deferred(), h = harness({ availability: "downloadable", deviceIntroduction: (_input, options) => {
+    options.onProgress({ phase: "downloading", downloadProgress: .42 }); return pending.promise;
+  } }); await flush();
+  assert.match(h.text(), /準備に数分かかることがあります/); assert.match(h.text(), /途中でキャンセルできます/);
+  h.click("モデルを準備して作成"); await flush();
+  assert.ok(nodes(h.render()).some(node => node.type === "progress" && node.props.value === .42));
+  h.click("面談準備・振り返り"); h.change("-memo", "モデル準備中に追記した原文");
+  pending.reject({ code: "TIMEOUT", phase: "preparation" }); await flush();
+  assert.match(h.text(), /待機を終了しました/); assert.match(h.text(), /Chromeの準備状況を確認して進められます/);
+  assert.doesNotMatch(h.text(), /ダウンロードを継続しています|バックグラウンドでダウンロード/);
+  assert.ok(nodes(h.render()).some(node => node.type === "textarea" && node.props.value === "モデル準備中に追記した原文"));
+  assert.equal(h.calls.applied.length, 0); assert.equal(h.calls.generate.length, 0);
+  assert.equal(h.button("モデルを準備して作成").props.disabled, false); h.unmount();
+});
+
+test("generation timeout has a distinct safe message and leaves the existing introduction untouched", async () => {
+  const h = harness({ availability: "available", deviceCoaching: () => Promise.reject({ code: "TIMEOUT", phase: "generation" }) }); await flush();
+  h.click("面談準備・振り返り"); h.click("端末AIで次の対応を作成"); await flush();
+  assert.equal(h.calls.deviceCoaching[0][1].preparationTimeoutMs, 600000);
+  assert.equal(h.calls.deviceCoaching[0][1].timeoutMs, 120000);
+  assert.match(h.text(), /文章の作成に時間がかかったため中止しました/); assert.match(h.text(), /入力内容と現在の文章は残っています/);
+  assert.equal(h.calls.applied.length, 0); assert.equal(h.calls.generate.length, 0); h.unmount();
 });
