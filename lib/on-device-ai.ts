@@ -224,7 +224,8 @@ export async function generateCandidateIntroduction(input: CandidateIntroduction
     "面談メモの原文、自己反省、過去のAI助言を紹介文へ引用・転載しないでください。面談メモから使う場合も、共有に必要な確認済み事実だけを整理してください。" +
     "参考文章は書式だけを参考にし、そこに出てくる別人の情報や実績を候補者へ移さないでください。JSONはdraftの文字列だけを含めてください。",
     { 氏名: name, 面談の基本情報: profile, 面談メモ: memo, 書式の参考文章: reference, 文章設定: settings },
-    { type: "object", additionalProperties: false, properties: { draft: { type: "string", minLength: 1, maxLength: settings.targetLength } }, required: ["draft"] }, options, 2_000);
+    // Let the model finish natural text; validate length and emptiness after decoding.
+    { type: "object", additionalProperties: false, properties: { draft: { type: "string" } }, required: ["draft"] }, options, 2_000);
   if (!object(body) || !exactKeys(body, ["draft"])) throw new OnDeviceAiError("INVALID_RESPONSE");
   return { draft: checkedProse(body.draft, settings.targetLength) };
 }
@@ -238,9 +239,9 @@ export async function generateInterviewCoaching(input: InterviewCoachingInput, o
     "summaryは確認済みの事実・未確認・本人申告を区別した600文字以内の要約、questionsは次に事実確認する質問1〜5件、actionsは担当者が実行する具体的な準備・記録1〜5件です。" +
     "質問・行動は各400文字以内。原因を断定せず、候補者の人格・能力・採用適否を評価しないでください。JSONはsummary,questions,actionsのみです。",
     { 氏名: sourceText(input.candidateName, 120), 面談の基本情報: profile, 面談メモ: memo, 担当者自身の振り返り: reflection },
-    { type: "object", additionalProperties: false, properties: { summary: { type: "string", minLength: 1, maxLength: 600 },
-      questions: { type: "array", minItems: 1, maxItems: 5, items: { type: "string", minLength: 1, maxLength: 400 } },
-      actions: { type: "array", minItems: 1, maxItems: 5, items: { type: "string", minLength: 1, maxLength: 400 } } }, required: ["summary", "questions", "actions"] }, options, 4_000);
+    { type: "object", additionalProperties: false, properties: { summary: { type: "string" },
+      questions: { type: "array", minItems: 1, maxItems: 5, items: { type: "string" } },
+      actions: { type: "array", minItems: 1, maxItems: 5, items: { type: "string" } } }, required: ["summary", "questions", "actions"] }, options, 4_000);
   if (!object(body) || !exactKeys(body, ["summary", "questions", "actions"]) ||
     !Array.isArray(body.questions) || !Array.isArray(body.actions) || [body.questions, body.actions].some(items => items.length < 1 || items.length > 5)) throw new OnDeviceAiError("INVALID_RESPONSE");
   return { summary: checkedProse(body.summary, 600), questions: body.questions.map(value => checkedProse(value, 400)), actions: body.actions.map(value => checkedProse(value, 400)) };
@@ -256,7 +257,8 @@ export async function extractWritingPreferences(referenceText: string, options: 
     { 書式の参考文章: reference, 初期設定: defaultWritingPreferences() },
     { type: "object", additionalProperties: false, properties: { version: { type: "string", enum: ["initial"] }, tone: { type: "string", enum: ["formal", "plain"] },
       targetLength: { type: "integer", enum: [600, 1000] }, includeSummary: { type: "boolean" },
-      sectionOrder: { type: "array", minItems: 6, maxItems: 6, uniqueItems: true, items: { type: "string", enum: [...writingSections] } } },
+      // Chromium's grammar does not support uniqueItems; preferences() checks uniqueness.
+      sectionOrder: { type: "array", minItems: 6, maxItems: 6, items: { type: "string", enum: [...writingSections] } } },
       required: ["version", "tone", "targetLength", "includeSummary", "sectionOrder"] }, options);
   const result = preferences(body, "INVALID_RESPONSE");
   if (result.version !== "initial") throw new OnDeviceAiError("INVALID_RESPONSE");
