@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { Trash2, Plus, Search, Pencil, Minus, Undo2, ChevronRight, CalendarDays } from "lucide-react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { toast } from "sonner";
@@ -99,9 +99,37 @@ function DeleteCandidateDialog({record,records,players,save,busy,onClose}:{recor
 }
 
 function CreateCandidate({players,save,onClose,clients,knownNames}:{clients:ClientEntry[];knownNames:string[];players:Player[];save:ReturnType<typeof useManagementSave>;onClose:()=>void}) {
+ const id=useId();
  const [owner,setOwner]=useState(players[0]?.id||""),[name,setName]=useState(""),[company,setCompany]=useState(""),[position,setPosition]=useState("アポインター");
- return <Dialog open onOpenChange={open=>{if(!open&&!save.busy&&!save.uncertain)onClose();}}><DialogContent><DialogHeader><DialogTitle>候補者を追加</DialogTitle><DialogDescription>成果の日付がまだない候補者も登録できます。</DialogDescription></DialogHeader><form onSubmit={async e=>{e.preventDefault();if(await save.save("createCandidate",{playerId:owner,candidateName:name.trim(),company:company.trim(),position},`${name.trim()}を登録`))onClose();}}><fieldset disabled={save.busy||save.uncertain}><label>担当者<select value={owner} onChange={e=>setOwner(e.target.value)}>{players.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></label><label>候補者氏名<input required maxLength={60} placeholder="スペースなしで入力" value={name} onChange={e=>setName(e.target.value)}/></label><ClientNameInput label="会社名（任意）" value={company} onChange={setCompany} clients={clients} knownNames={knownNames}/><label>ポジション<select value={position} onChange={e=>setPosition(e.target.value)}>{positions.map(p=><option key={p}>{p}</option>)}</select></label></fieldset>{save.error&&<p className="form-error" role="alert">{save.error}</p>}<div className="form-actions"><button type="button" className="secondary-button" disabled={save.busy||save.uncertain} onClick={onClose}>閉じる</button><button className="primary-button" disabled={save.busy}>{save.busy?"登録中…":save.uncertain?"同じ内容で再試行":"候補者を登録"}</button></div></form></DialogContent></Dialog>;
+ return <Dialog open onOpenChange={open=>{if(!open&&!save.busy&&!save.uncertain)onClose();}}>
+  <DialogContent className="app-dialog candidate-create-dialog">
+   <DialogHeader>
+    <DialogTitle>候補者を追加</DialogTitle>
+    <DialogDescription>成果の日付がまだない候補者も登録できます。会社名は後から追加できます。</DialogDescription>
+   </DialogHeader>
+   <form className="app-form candidate-create-form" onSubmit={async e=>{e.preventDefault();if(await save.save("createCandidate",{playerId:owner,candidateName:name.trim(),company:company.trim(),position},`${name.trim()}を登録`))onClose();}}>
+    <fieldset className="candidate-create-fields" disabled={save.busy||save.uncertain}>
+     <label htmlFor={`${id}-name`}>
+      <span className="candidate-create-label">候補者氏名<span className="candidate-create-required">必須</span></span>
+      <input id={`${id}-name`} aria-describedby={`${id}-name-help`} required maxLength={60} placeholder="例：山田太郎" autoComplete="off" value={name} onChange={e=>setName(e.target.value)}/>
+      <span id={`${id}-name-help`} className="candidate-create-help">姓と名の間にスペースを入れずに入力してください。</span>
+     </label>
+     <div className="form-grid">
+      <label htmlFor={`${id}-owner`}>担当者<select id={`${id}-owner`} value={owner} onChange={e=>setOwner(e.target.value)}>{players.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></label>
+      <label htmlFor={`${id}-position`}>ポジション<select id={`${id}-position`} value={position} onChange={e=>setPosition(e.target.value)}>{positions.map(p=><option key={p}>{p}</option>)}</select></label>
+     </div>
+     <ClientNameInput label="会社名（任意）" value={company} onChange={setCompany} clients={clients} knownNames={knownNames}/>
+    </fieldset>
+    {save.error&&<p className="form-error" role="alert">{save.error}</p>}
+    <div className="form-actions">
+     <button type="button" className="secondary-button" disabled={save.busy||save.uncertain} onClick={onClose}>閉じる</button>
+     <button type="submit" className="primary-button" disabled={save.busy||!name.trim()||!owner}>{save.busy?"登録中…":save.uncertain?"同じ内容で再試行":"候補者を登録"}</button>
+    </div>
+   </form>
+  </DialogContent>
+ </Dialog>;
 }
+
 export function AchievementCorrection({target,records,players,onClose,onSave,backgroundSave,busy,live}:{target:CorrectionTarget;records:CandidateRecord[];players:Player[];onClose:()=>void;onSave:ManagementMutation;backgroundSave?:BackgroundManagementSave;busy:boolean;live:boolean}) {
  const candidates=correctionRecords(records,target.owner,target.stage,target.period),save=useManagementSave(onSave,live,backgroundSave);
  const [selected,setSelected]=useState<string|null>(null);

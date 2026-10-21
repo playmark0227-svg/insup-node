@@ -12,3 +12,21 @@
 @media(max-width:700px){.candidate-list-preferences{gap:10px}.candidate-list-preferences label{flex:1}.candidate-list-preferences select{max-width:190px}.candidate-density-compact .candidate-mobile-card{padding:10px 12px;gap:6px}.client-master{padding:16px!important}.client-master article{align-items:flex-start;flex-wrap:wrap}.client-add-form{align-items:stretch;flex-direction:column}.record-milestone-summary{grid-template-columns:repeat(3,minmax(0,1fr))}.interview-intake-details{padding:12px}.intake-dialog{padding:20px!important}}
 @media(min-width:701px){.candidate-table{min-width:0;table-layout:fixed}.candidate-table th:nth-child(1){width:22%}.candidate-table th:nth-child(2){width:18%}.candidate-table th:nth-child(3){width:20%}.candidate-table th:nth-child(4){width:10%}.candidate-table th:nth-child(5){width:18%}.candidate-table th:nth-child(6){width:12%}.candidate-table td{overflow-wrap:anywhere;padding-left:12px;padding-right:12px}.candidate-table .stage-tag{display:inline-block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle}.candidate-table td:last-child .text-button{font-size:12px;white-space:nowrap}.candidate-table td:last-child .candidate-delete-button{margin-left:0}}
 .candidate-basic-button:disabled{opacity:.55;cursor:wait}
+
+/* The create dialog is portalled outside the candidate list and needs its own form layout. */
+.candidate-create-dialog{width:min(600px,calc(100vw - 32px))!important;max-width:600px!important;max-height:calc(100dvh - 32px);overflow-y:auto;overscroll-behavior:contain}
+.candidate-create-dialog [data-slot=dialog-header]{text-align:left;padding-right:20px}
+.candidate-create-dialog [data-slot=dialog-title]{line-height:1.5}
+.candidate-create-dialog [data-slot=dialog-description]{line-height:1.8}
+.candidate-create-dialog .candidate-create-fields{display:grid;grid-template-columns:minmax(0,1fr);gap:20px;min-width:0;border:0;padding:0;margin:0}
+.candidate-create-dialog .form-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+.candidate-create-dialog label{font-weight:600;line-height:1.5}
+.candidate-create-dialog input,.candidate-create-dialog select{box-sizing:border-box;width:100%;min-width:0;min-height:46px;height:auto;border:1px solid #cbdff3;border-radius:7px;padding:11px 12px;background:#fff;color:#244c72;font:inherit;font-size:16px;font-weight:400;line-height:1.5}
+.candidate-create-dialog input::placeholder{color:#8197af;opacity:1}
+.candidate-create-dialog input:focus-visible,.candidate-create-dialog select:focus-visible,.candidate-create-dialog button:focus-visible{outline:2px solid #087fea;outline-offset:3px}
+.candidate-create-label{display:flex;align-items:center;gap:8px}
+.candidate-create-required{font-size:11px;font-weight:600;line-height:1.5;padding:2px 6px;color:#0966b7;background:#e6f3ff;border-radius:4px}
+.candidate-create-dialog .candidate-create-help,.candidate-create-dialog .panel-note{font-size:12px;font-weight:400;color:#617c98;line-height:1.7;overflow-wrap:anywhere}
+.candidate-create-dialog .form-actions{margin-top:2px;padding-top:20px;border-top:1px solid #e0ebf6;gap:12px}
+.candidate-create-dialog .form-actions button{min-height:46px}
+@media(max-width:600px){.candidate-create-dialog{width:calc(100vw - 24px)!important;max-height:calc(100dvh - 24px);padding:20px!important}.candidate-create-dialog .form-grid{grid-template-columns:minmax(0,1fr);gap:20px}.candidate-create-dialog .form-actions .primary-button{flex:1.5}}
