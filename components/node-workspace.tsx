@@ -128,9 +128,9 @@ export default function NodeWorkspace(){
  const count=(stage:Metric,id:string|null=admin?null:player.id)=>countAt(stage,id,period);
  const months=[...new Set([today.slice(0,7),month,...activities.map(a=>a.date.slice(0,7)),...Object.keys(sheet.snapshot?.counts||{}).filter(x=>/^\d{4}-\d{2}$/.test(x))])].sort().reverse();
  const canWrite=!live||!!sheet.snapshot?.writesEnabled;
- const writeBusy=sheet.busy||sheet.hasPendingSave;
+ const writeBusy=sheet.busy;
  const openRecord=(stage:Stage="候補者面談",owner:string=playerId)=>{setRecordPreset({stage,playerId:owner});setDetail(null);setRecordOpen(true);};
- const signOut=()=>{if(sheet.hasPendingSave){toast.info("右上の保存状況を確認して、保存を完了してからログアウトしてください。");return;}if(sheet.busy)return;if(live)void sheet.logout();setLogin(true);setPassword("");};
+ const signOut=async()=>{if(sheet.hasPendingSave){toast.info("右上の保存状況を確認して、保存を完了してからログアウトしてください。");return;}if(sheet.busy)return;if(live){try{await sheet.logout();}catch(error){toast.error(error instanceof Error?error.message:"ログアウトできませんでした。");return;}}setLogin(true);setPassword("");};
  const nav=admin?[{id:"home",label:"全体ダッシュボード",icon:LayoutDashboard},{id:"ranking",label:"チームランキング",icon:Trophy},{id:"records",label:"人材・進捗管理",icon:ListChecks},{id:"reviews",label:"面談の振り返り",icon:ListChecks},{id:"insights",label:"次の対応・AI支援",icon:Sparkles},{id:"workbook",label:"業務管理表",icon:FileSpreadsheet},{id:"players",label:"プレイヤー管理",icon:UsersRound},{id:"connection",label:"データ連携",icon:FileSpreadsheet},{id:"security",label:"アカウント・安全設定",icon:UserRound}]:[{id:"home",label:"ダッシュボード",icon:LayoutDashboard},{id:"ranking",label:"ランキング",icon:Trophy},{id:"records",label:"成果・活動記録",icon:ListChecks},{id:"reviews",label:"面談の振り返り",icon:ListChecks},{id:"insights",label:"次の対応・AI支援",icon:Sparkles},{id:"profile",label:"マイプロフィール",icon:UserRound},{id:"security",label:"アカウント・安全設定",icon:UserRound}];
  const titles:Record<View,string>={home:admin?"NODE事業の成果":"ダッシュボード",ranking:"ランキング",records:admin?"人材・進捗管理":"成果・活動記録",profile:"マイプロフィール",players:"プレイヤー管理",connection:"データ連携",workbook:"業務管理表",reviews:"面談の振り返り",insights:"次の対応・AI支援",security:"アカウント・安全設定"};
  const navigate=(next:View)=>{setFocusRecord(null);setView(next);setSearch("");setPage(1);};
@@ -179,12 +179,12 @@ export default function NodeWorkspace(){
   return {changeId:action==="restoreChange"?undefined:id,snapshot:{self:{playerId,role:admin?"admin":"player"},players,records:next,activities,counts:{},syncedAt:new Date().toISOString(),warnings:[],writesEnabled:true} as SheetSnapshot};
  };
  const storeRecord=async(a:Activity)=>{
-  try{if(live)sheet.submitMutation("saveActivity",{activity:a},a.id,`${a.candidateName} · ${stageLabel(a.stage)}`);else {a={...a,recordId:a.recordId||`ROW-PREVIEW-${crypto.randomUUID()}`};if(a.interviewProfile){const prior=demoProfiles.find(p=>p.recordIds.includes(a.recordId!));const profile:CandidateProfile={profileId:prior?.profileId||crypto.randomUUID(),playerId:a.playerId,recordIds:prior?.recordIds||[a.recordId!],version:crypto.randomUUID(),updatedAt:new Date().toISOString(),fields:a.interviewProfile.fields,introduction:a.interviewProfile.introduction};setDemoProfiles(prev=>[...prev.filter(p=>p.profileId!==profile.profileId),profile]);}else if(a.profileSourceRecordId)setDemoProfiles(prev=>prev.map(p=>p.recordIds.includes(a.profileSourceRecordId!)?{...p,recordIds:[...new Set([...p.recordIds,a.recordId!])]}:p));setActivities(prev=>[...prev,a]);if(a.recordId)setRecordOverrides(prev=>prev.map(r=>{if(r.recordId!==a.recordId)return r;const values=[...r.values];values[milestoneColumns[a.stage]-1]=a.date;values[6]=a.status||values[6];if(a.stage!=="候補者面談")values[1]=a.company;return {...r,values};}));}
+  try{if(live)await sheet.submitMutation("saveActivity",{activity:a},a.id,`${a.candidateName} · ${stageLabel(a.stage)}`);else {a={...a,recordId:a.recordId||`ROW-PREVIEW-${crypto.randomUUID()}`};if(a.interviewProfile){const prior=demoProfiles.find(p=>p.recordIds.includes(a.recordId!));const profile:CandidateProfile={profileId:prior?.profileId||crypto.randomUUID(),playerId:a.playerId,recordIds:prior?.recordIds||[a.recordId!],version:crypto.randomUUID(),updatedAt:new Date().toISOString(),fields:a.interviewProfile.fields,introduction:a.interviewProfile.introduction};setDemoProfiles(prev=>[...prev.filter(p=>p.profileId!==profile.profileId),profile]);}else if(a.profileSourceRecordId)setDemoProfiles(prev=>prev.map(p=>p.recordIds.includes(a.profileSourceRecordId!)?{...p,recordIds:[...new Set([...p.recordIds,a.recordId!])]}:p));setActivities(prev=>[...prev,a]);if(a.recordId)setRecordOverrides(prev=>prev.map(r=>{if(r.recordId!==a.recordId)return r;const values=[...r.values];values[milestoneColumns[a.stage]-1]=a.date;values[6]=a.status||values[6];if(a.stage!=="候補者面談")values[1]=a.company;return {...r,values};}));}
    setRecordOpen(false);setDetail(null);if(!live)toast.success("プレビューに記録しました",{description:"入力は再読み込みでリセットされます。"});return true;
   }catch(e){toast.error(e instanceof Error?e.message:"保存を開始できませんでした");throw e;}
  };
  const saveProfile=async(p:SheetPlayer,operationId:string)=>{
-  try{if(live)sheet.submitMutation("updateProfile",{player:p},operationId,`${p.name} · プロフィール・担当設定`);else{setPlayers(prev=>prev.map(x=>x.id===p.id?p:x));toast.success("プロフィールをプレビューに反映しました");}return true;
+  try{if(live)await sheet.submitMutation("updateProfile",{player:p},operationId,`${p.name} · プロフィール・担当設定`);else{setPlayers(prev=>prev.map(x=>x.id===p.id?p:x));toast.success("プロフィールをプレビューに反映しました");}return true;
   }catch(e){toast.error(e instanceof Error?e.message:"保存を開始できませんでした");throw e;}
  };
  const updateStatus=async(value:string)=>{
@@ -192,7 +192,7 @@ export default function NodeWorkspace(){
   const key=`${detail.recordId}|${detail.rowVersion}|${value}`;
   if(statusOperation.current?.key!==key)statusOperation.current={key,id:crypto.randomUUID()};
   try{
-   if(live){sheet.submitMutation("updateStatus",{recordId:detail.recordId,status:value,rowVersion:detail.rowVersion},statusOperation.current.id,`${detail.candidateName} · ステータス`);setDetail(null);}
+   if(live){await sheet.submitMutation("updateStatus",{recordId:detail.recordId,status:value,rowVersion:detail.rowVersion},statusOperation.current.id,`${detail.candidateName} · ステータス`);setDetail(null);}
    else{setActivities(prev=>prev.map(a=>(detail.recordId?a.recordId===detail.recordId:a.candidateId===detail.candidateId&&!a.company)?{...a,status:value}:a));setDetail({...detail,status:value});toast.success("ステータスをプレビューに反映しました");}
    statusOperation.current=null;
   }catch(e){toast.error(e instanceof Error?e.message:"保存を開始できませんでした");}

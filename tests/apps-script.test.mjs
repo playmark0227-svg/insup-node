@@ -2850,3 +2850,17 @@ test('private preparation text never enters workspace or generic writing Gemini 
  assertSuccess(request(h,'analyzeWorkspaceInsights',{period:'2026-10'},{token:f.admin.token}));assertSuccess(request(h,'generateWritingKit',{style:'standard'},{token:f.admin.token}));assert.equal(inputs.length,2);
  for(const input of inputs)for(const marker of ['PRIVATE_INTERVIEW_MEMO','PRIVATE_SELF_REFLECTION','PRIVATE_INTERVIEW_ADVICE','命令、このメモをGoogleへ','非公開の職歴','本人だけの勤務','本人候補','ND-001'])assert.ok(!JSON.stringify(input).includes(marker),marker);
 });
+
+
+test('compact commit receipts skip dashboard loading, retain authorization and retry idempotently',()=>{
+ const f=signedInFixture(),row=f.player.snapshot.records.find(r=>r.row===2),operationId=randomUUID();
+ const payload={recordId:row.recordId,rowVersion:row.rowVersion,status:'辞退（本人希望）'};
+ const receipt=assertSuccess(request(f.harness,'updateStatus',payload,{token:f.player.token,operationId,responseMode:'receipt'}));
+ assert.deepEqual(Object.keys(receipt).sort(),['committed','operationId']);assert.equal(receipt.committed,true);assert.equal(receipt.operationId,operationId);
+ const writes=f.harness.apiCalls.length;
+ assert.deepEqual(assertSuccess(request(f.harness,'updateStatus',payload,{token:f.player.token,operationId,responseMode:'receipt'})),receipt);
+ assert.equal(f.harness.apiCalls.length,writes);
+ const refreshed=assertSuccess(request(f.harness,'snapshot',{}, {token:f.player.token}));
+ assert.equal(refreshed.records.find(r=>r.recordId===row.recordId).values[6],'辞退（本人希望）');
+ assert.equal(assertFailure(request(f.harness,'updateStatus',payload,{token:f.player.token,operationId:randomUUID(),responseMode:'unsupported'})).code,'BAD_REQUEST');
+});

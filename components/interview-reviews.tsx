@@ -38,8 +38,10 @@ export function InterviewReviews({records,reviews,players,period,businessDay,liv
   if(saving||busy||!record)return;setSaveError("");
   const payload=pending.current||{recordId:record.recordId,rowVersion:draft?.rowVersion||record.rowVersion,reviewVersion:draft?.reviewVersion??review?.version??"",...form};
   if(backgroundSave){
-   try{backgroundSave("saveInterviewReview",payload,operation.current,`${record.candidateName}の振り返りを保存`);operation.current=crypto.randomUUID();pending.current=null;setDrafts(prev=>{const next={...prev};delete next[selected];return next;});setSelected("");setSaved(false);}
+   setSaving(true);
+   try{await backgroundSave("saveInterviewReview",payload,operation.current,`${record.candidateName}の振り返りを保存`);operation.current=crypto.randomUUID();pending.current=null;setDrafts(prev=>{const next={...prev};delete next[selected];return next;});setSelected("");setSaved(false);}
    catch(e){setSaveError(e instanceof Error?e.message:"保存を開始できませんでした。");}
+   finally{setSaving(false);}
    return;
   }
   setSaving(true);pending.current=payload;

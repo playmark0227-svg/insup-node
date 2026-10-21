@@ -119,6 +119,7 @@ function withLock_(fn) {
 }
 function nodeHandle_(request) {
   if (!request || typeof request !== 'object' || Array.isArray(request) || request.version !== 1 || typeof request.action !== 'string') fail_('BAD_REQUEST', 'APIバージョンと操作を確認してください。');
+  if (request.responseMode !== undefined && request.responseMode !== 'receipt') fail_('BAD_REQUEST', '応答形式を確認してください。');
   var action = request.action;
   if (action === 'health') return health_();
   if (action === 'login') return login_(request.payload || {});
@@ -163,7 +164,7 @@ function nodeHandle_(request) {
     var previous = operation_(store, operationId);
     if (previous) {
       if (previous.actorId !== user.id || previous.action !== action || previous.payloadHash !== payloadHash) fail_('OPERATION_CONFLICT', '同じ保存IDを別の内容に使うことはできません。');
-      return { user:user, result:previous.result, operationId:operationId };
+      return { user:user, result:previous.result, operationId:operationId, config:store.config };
     }
     var plan;
     if (action === 'saveInterviewReview') plan = planInterviewReview_(store,user,payload);
@@ -180,9 +181,18 @@ function nodeHandle_(request) {
     if (action === 'restoreChange') plan = planRestoreChange_(store,user,payload);
     if (action === 'saveManagementRow') plan = planManagementRow_(store,user,payload);
     commit_(store, user, action, operationId, payloadHash, plan, request.token);
-    return { user:user, result:plan.result || {}, operationId:operationId };
+    return { user:user, result:plan.result || {}, operationId:operationId, config:store.config };
   });
   if (action === 'logout') return committed;
+  if (request.responseMode === 'receipt' && action !== 'createPlayer') {
+    // The atomic batch and its idempotency record have completed. Return a
+    // receipt without making the caller wait for a second business-table scan.
+    var accounts = readAccountStore_(), actor = activeActor_(accounts, authenticate_(request.token));
+    if (actor.id !== committed.user.id || actor.role !== committed.user.role || stableJson_(accounts.config) !== stableJson_(committed.config)) fail_('INTERNAL', '保存結果を再確認してください。同じ内容で再試行できます。');
+    var receipt = { committed:true, operationId:committed.operationId };
+    if (committed.result.undo) receipt.changeId=committed.operationId;
+    return receipt;
+  }
   // The atomic write is complete. Do not make other writers wait for a fresh
   // dashboard read, and do not fetch thousands of formula-only template rows.
   var freshStore = readStore_({ readOnly:true });
@@ -676,7 +686,7 @@ function rowUpdateRequest_(sheetId, row, cells) { return { updateCells: { range:
 function commit_(store, user, action, operationId, payloadHash, plan, token) {
   if(!store.schemaCompatible)fail_('SCHEMA_MISMATCH','入力対象19列の見出しが一致しません。');
   if (store.book.getSpreadsheetTimeZone() !== 'Asia/Tokyo') fail_('TIMEZONE', '接続先スプレッドシートのタイムゾーンがAsia/Tokyoであることを確認してください。');
-  var requests = [], businessSheet = store.matching;
+  var requests = [], businessSheet = store.matching, checkedValues, checkedFormulas;
   if (plan.row) {
     if (businessSheet.getSheetId() !== Number(store.config.matchingSheetId) || businessSheet.getSheetId() === Number(store.config.kpiSheetId)) fail_('PROTECTED_SHEET', 'このタブは書き込めません。');
     if (plan.record) {
@@ -685,14 +695,21 @@ function commit_(store, user, action, operationId, payloadHash, plan, token) {
       currentRow = Number(currentRow);
       var currentRange = businessSheet.getRange(currentRow, 1, 1, 26), currentValues = currentRange.getValues()[0], currentFormulas = currentRange.getFormulas()[0], currentSources = currentMetadata[NODE.sourceKey];
       if (rowVersion_(plan.recordId, currentValues, currentFormulas, currentSources[currentRow] ? currentSources[currentRow].value : '') !== plan.record.version || currentRow !== plan.row) fail_('CONFLICT', '対象行が更新・並べ替えされています。同期してから再入力してください。');
+      checkedValues = currentValues; checkedFormulas = currentFormulas;
     }
     var maxRows = sheetRowCount_(businessSheet);
     if (plan.row > maxRows) requests.push({ appendDimension: { sheetId: businessSheet.getSheetId(), dimension: 'ROWS', length: plan.row - maxRows } });
+    // Validate one fresh row together. Per-cell service calls made large forms
+    // wait for the same row dozens of times; formula and blank-cell guards stay intact.
+    if (plan.row <= maxRows && !checkedValues) {
+      var targetRange = businessSheet.getRange(plan.row, 1, 1, 26);
+      checkedValues = targetRange.getValues()[0]; checkedFormulas = targetRange.getFormulas()[0];
+    }
     Object.keys(plan.patches).forEach(function (columnText) {
       var column = Number(columnText);
       if ((action==='updateRecord' ? Array.from({length:26},function(_,i){return i+1;}) : NODE.inputColumns).indexOf(column) < 0) fail_('PROTECTED_COLUMN', 'この列は書き込めません。');
-      if (plan.row <= maxRows && businessSheet.getRange(plan.row, column).getFormula()) fail_('FORMULA_PROTECTED', '入力先に数式があります。元の数式は上書きしません。');
-      if (!plan.record && plan.row <= maxRows && businessSheet.getRange(plan.row, column).getValue() !== '') fail_('CONFLICT', '入力先が更新されています。同期してください。');
+      if (plan.row <= maxRows && checkedFormulas[column - 1]) fail_('FORMULA_PROTECTED', '入力先に数式があります。元の数式は上書きしません。');
+      if (!plan.record && plan.row <= maxRows && checkedValues[column - 1] !== '') fail_('CONFLICT', '入力先が更新されています。同期してください。');
       var value = plan.patches[column];
       requests.push({ updateCells: { range: { sheetId: businessSheet.getSheetId(), startRowIndex: plan.row - 1, endRowIndex: plan.row, startColumnIndex: column - 1, endColumnIndex: column }, rows: [{ values: [cell_(value)] }], fields: value instanceof Date ? 'userEnteredValue,userEnteredFormat.numberFormat' : 'userEnteredValue' } });
     });

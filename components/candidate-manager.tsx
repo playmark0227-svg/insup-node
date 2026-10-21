@@ -13,7 +13,7 @@ import { InterviewIntakeEditor } from "@/components/candidate-intake";
 import { blankInterviewFields, type CandidateProfile, type InterviewFields } from "@/lib/candidate-intake";
 import { ClientNameInput, ClientMaster } from "@/components/client-selector";
 export type ManagementMutation = (action:string,payload:unknown,id:string)=>Promise<MutationResult>;
-export type BackgroundManagementSave = (action:string,payload:unknown,operationId:string,label?:string)=>void;
+export type BackgroundManagementSave = (action:string,payload:unknown,operationId:string,label?:string)=>void|Promise<void>;
 export type CorrectionTarget = {owner:string;stage:Stage;period:string};
 
 export function useManagementSave(onSave:ManagementMutation,live=true,backgroundSave?:BackgroundManagementSave) {
@@ -23,8 +23,8 @@ export function useManagementSave(onSave:ManagementMutation,live=true,background
  async function save(action:string,payload:unknown,label?:string) {
   if(running.current)return false;
   if(backgroundSave){
-   running.current=true;setError("");
-   try{backgroundSave(action,payload,crypto.randomUUID(),label);pending.current=null;setUncertain(false);return true;}
+   running.current=true;setBusy(true);setError("");
+   try{await backgroundSave(action,payload,crypto.randomUUID(),label);pending.current=null;setUncertain(false);return true;}
    catch(e){setError(e instanceof Error?e.message:"保存を開始できませんでした。");return false;}
    finally{running.current=false;setBusy(false);}
   }

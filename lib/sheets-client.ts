@@ -43,6 +43,14 @@ export type MutationResult = {
   credentials?: { id: string; password: string };
   changeId?: string;
 };
+export type MutationReceipt = { committed: true; operationId: string; changeId?: string };
+export function assertMutationReceipt(value: unknown, operationId: string): asserts value is MutationReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new SheetApiError("INVALID_RESPONSE", "保存結果を確認できませんでした。同じ内容で再試行してください。");
+  const receipt = value as Record<string, unknown>;
+  if (receipt.committed !== true || receipt.operationId !== operationId ||
+      Object.keys(receipt).some(key => !["committed", "operationId", "changeId"].includes(key)) ||
+      (receipt.changeId !== undefined && receipt.changeId !== operationId)) throw new SheetApiError("INVALID_RESPONSE", "保存結果を確認できませんでした。同じ内容で再試行してください。");
+}
 
 export class SheetApiError extends Error {
   code: string;
@@ -150,13 +158,13 @@ export async function sheetRequest<T>(
   endpoint: string,
   action: string,
   payload: unknown = {},
-  options: { token?: string; operationId?: string; signal?: AbortSignal } = {},
+  options: { token?: string; operationId?: string; signal?: AbortSignal; responseMode?: "receipt" } = {},
 ): Promise<T> {
   const target = validateEndpoint(endpoint);
   const timeout = AbortSignal.timeout(45_000);
   const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
   const readOnly = ["snapshot","health","managementTables","managementTable","readInterviewAdvice","readWorkspaceInsights","readWritingKit","readWritingPreferences"].includes(action);
-  const body = JSON.stringify({ version: 1, action, payload, token: options.token, operationId: options.operationId });
+  const body = JSON.stringify({ version: 1, action, payload, token: options.token, operationId: options.operationId, ...(options.responseMode ? { responseMode: options.responseMode } : {}) });
   for (let attempt = 0; attempt < (readOnly ? 2 : 1); attempt++) {
     let recoveringResult = false;
     try {

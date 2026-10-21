@@ -6,10 +6,10 @@ import "./background-save-status.css";
 
 export type BackgroundSaveInfo = {
  operationId:string; action:string; label:string; status:"saving"|"saved"|"failed";
- error:string; uncertain:boolean; details:string[]; changeId?:string; intakeInput?:boolean;
+ error:string; uncertain:boolean; details:string[]; changeId?:string; intakeInput?:boolean;refreshing?:boolean;localSaved?:boolean;pendingCount?:number;
 };
 
-export function BackgroundSaveStatus({save,onRetry,onDismiss,onUndo,onCopyIntakeInput}:{save:BackgroundSaveInfo|null;onRetry:()=>void;onDismiss:()=>void;onUndo?:(changeId:string,label:string)=>void;onCopyIntakeInput?:()=>string}) {
+export function BackgroundSaveStatus({save,onRetry,onDismiss,onUndo,onCopyIntakeInput}:{save:BackgroundSaveInfo|null;onRetry:()=>void;onDismiss:()=>void|Promise<void>;onUndo?:(changeId:string,label:string)=>void|Promise<void>;onCopyIntakeInput?:()=>string}) {
  const [open,setOpen]=useState(false),[discard,setDiscard]=useState(false);
  const container=useRef<HTMLDivElement>(null),trigger=useRef<HTMLButtonElement>(null);
  const panelId=useId();
@@ -25,9 +25,9 @@ export function BackgroundSaveStatus({save,onRetry,onDismiss,onUndo,onCopyIntake
  },[open]);
  if(!save)return null;
  const saving=save.status==="saving",saved=save.status==="saved";
- const title=saving?"保存中…":saved?"保存しました":save.uncertain?"保存結果を要確認":"保存できませんでした";
+ const title=saving?save.localSaved?`端末に保存済み・同期中${(save.pendingCount||0)>1?` ${save.pendingCount}件`:""}`:"端末へ保存中…":saved?save.refreshing?"シートへ保存済み":"保存しました":save.uncertain?"保存結果を要確認":"保存できませんでした";
  const Icon=saving?LoaderCircle:saved?CheckCircle2:AlertCircle;
- const dismiss=()=>{try{onDismiss();setOpen(false);}catch(error){toast.error(error instanceof Error?error.message:"保存状態を確認してください。");}};
+ const dismiss=async()=>{try{await onDismiss();setOpen(false);}catch(error){toast.error(error instanceof Error?error.message:"保存状態を確認してください。");}};
  return <div ref={container} className={`background-save background-save-${save.status}`}>
   <span className="background-save-announcement" role="status" aria-live="polite" aria-atomic="true">{save.label}：{title}</span>
   <button ref={trigger} type="button" className="background-save-trigger" aria-expanded={open} aria-controls={panelId} aria-label={`${title} 保存状況を確認`} onClick={()=>setOpen(value=>!value)}>
@@ -36,14 +36,14 @@ export function BackgroundSaveStatus({save,onRetry,onDismiss,onUndo,onCopyIntake
   {open&&<section id={panelId} aria-label="保存状況" className="background-save-panel">
    <div className="background-save-heading"><div><Icon size={19} className={saving?"background-save-spinner":""}/><strong>{title}</strong></div><button type="button" aria-label="保存状況を閉じる" onClick={()=>{setOpen(false);trigger.current?.focus();}}><X size={17}/></button></div>
    <p className="background-save-label">{save.label}</p>
-   <p className="background-save-help">{saving?"別の画面へ移動できます。スプレッドシートの保存完了後に数字を更新します。":saved?"スプレッドシートへの保存と、アプリの表示更新が完了しました。":save.uncertain?"通信が途切れ、保存結果を確認できませんでした。保存内容は保持しています。同じ内容で再試行して、重複を防ぎながら結果を確認してください。":"保存内容は保持しています。理由を確認して再試行してください。修正する場合は、内容を控えてからこの保存を取り消してください。"}</p>
-   {!saved&&<p className="background-save-help">{saving?"保存中は、続けて変更を保存する操作とログアウトをお待ちください。":"この保存を解決するまで、新しい変更の保存とログアウトをお待ちください。"}</p>}
+   <p className="background-save-help">{saving?"入力はこの端末のブラウザに保存済みです。スプレッドシートへ順番に自動同期しています。別の候補者の入力や画面の移動を続けられます。":saved?save.refreshing?"スプレッドシートへの保存は完了しました。最新の数字は別処理で取得しています。入力中の画面は上書きしません。":"スプレッドシートへの保存と、アプリの表示更新が完了しました。":save.uncertain?"通信が途切れ、保存結果を確認できませんでした。保存内容は保持しています。同じ内容で再試行して、重複を防ぎながら結果を確認してください。":"保存内容は保持しています。理由を確認して再試行してください。修正する場合は、内容を控えてからこの保存を取り消してください。"}</p>
+   {!saved&&<p className="background-save-help">{saving?"同じ候補者・項目の再編集とログアウトは、同期完了後にできます。実績の数字はシートへの反映後に更新します。":"入力は端末に残っています。右上から同じ内容で再試行できます。"}</p>}
    {save.error&&<p className="background-save-error" role="alert">{save.error}</p>}
    {!!save.details.length&&<details className="background-save-details"><summary>保存する内容を確認</summary><ul>{save.details.map((detail,index)=><li key={index}>{detail}</li>)}</ul><button type="button" className="text-button" onClick={async()=>{try{await navigator.clipboard.writeText([save.label,...save.details].join("\n"));toast.success("保存内容をコピーしました");}catch{toast.error("コピーできませんでした。表示内容を控えてください。");}}}><Copy size={14}/>内容をコピー</button></details>}
    {save.status==="failed"&&save.intakeInput&&onCopyIntakeInput&&<button type="button" className="secondary-button" onClick={async()=>{let input:string;try{input=onCopyIntakeInput();}catch(error){toast.error(error instanceof Error?error.message:"面談情報を取得できませんでした。");return;}try{await navigator.clipboard.writeText(input);toast.success("面談の入力原文と紹介文をコピーしました");}catch{toast.error("コピーできませんでした。入力は保持しています。ブラウザのコピー権限を確認して、もう一度お試しください。");}}}><Copy size={14}/>面談の入力原文をコピー</button>}
    <div className="background-save-actions">
     {save.status==="failed"&&<button type="button" className="primary-button" onClick={()=>{try{setDiscard(false);onRetry();}catch(error){toast.error(error instanceof Error?error.message:"再試行できませんでした。");}}}><RotateCcw size={15}/>{save.uncertain?"同じ内容で保存を確認":"同じ内容で再試行"}</button>}
-    {saved&&save.changeId&&onUndo&&<button type="button" className="secondary-button" onClick={()=>{try{onUndo(save.changeId!,save.label);setOpen(false);}catch(error){toast.error(error instanceof Error?error.message:"元に戻せませんでした。");}}}><RotateCcw size={15}/>元に戻す</button>}
+    {saved&&save.changeId&&onUndo&&<button type="button" className="secondary-button" onClick={async()=>{try{await onUndo(save.changeId!,save.label);setOpen(false);}catch(error){toast.error(error instanceof Error?error.message:"元に戻せませんでした。");}}}><RotateCcw size={15}/>元に戻す</button>}
     {saved&&<button type="button" className="secondary-button" onClick={dismiss}>確認しました</button>}
     {save.status==="failed"&&!save.uncertain&&!discard&&<button type="button" className="text-button" onClick={()=>setDiscard(true)}>この保存を取り消す</button>}
    </div>

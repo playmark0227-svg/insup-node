@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import vm from "node:vm";
 import ts from "typescript";
-import {assertSnapshot, isUncertainWrite, validateEndpoint, SheetApiError} from "../lib/sheets-client.ts";
+import {assertSnapshot, assertMutationReceipt, isUncertainWrite, validateEndpoint, SheetApiError} from "../lib/sheets-client.ts";
+import {pendingSaveResources} from "../lib/pending-saves.ts";
 import {matchingFields} from "../lib/management-data.ts";
 import {interviewFieldLabels,interviewStringFields,blankInterviewFields} from "../lib/candidate-intake.ts";
 import {assertWritingKitState,validateWritingPreferences,defaultWritingPreferences,writingSectionIds,writingTopicCodes} from "../lib/writing-ai.ts";
@@ -27,11 +28,11 @@ function deferred() {
   const promise = new Promise((yes, no) => { resolve=yes; reject=no; });
   return {promise,resolve,reject};
 }
-async function flush() { for (let i=0; i<12; i++) await Promise.resolve(); }
+async function flush() { for (let i=0; i<35; i++) await Promise.resolve(); }
 
 // Execute the actual hook against a small deterministic hook runtime. This
 // exposes races and state restoration without adding a browser/test dependency.
-function harness(handle, {storedToken, malformedSession, deadlineController, browser, manifestEndpoint=endpoint, storedEndpoint=endpoint, manifestFailure=false, production=false} = {}) {
+function harness(handle, {storedToken, malformedSession, deadlineController, browser, manifestEndpoint=endpoint, storedEndpoint=endpoint, manifestFailure=false, production=false, pendingSaves=[], persistLocal} = {}) {
   const slots = [], effects = [], calls = [];
   let cursor = 0, stateUpdates = 0;
   const localStorage = storage({[ENDPOINT_KEY]:storedEndpoint});
@@ -57,17 +58,21 @@ function harness(handle, {storedToken, malformedSession, deadlineController, bro
     const call={target,action,payload,options}; calls.push(call);
     return handle(call);
   };
+  const pendingStore = new Map(pendingSaves.map(save=>[save.operationId,structuredClone(save)]));
+  const pendingApi={pendingSaveResources,readPendingSaves:async()=>[...pendingStore.values()].map(value=>structuredClone(value)),
+    persistPendingSave:async(_endpoint,_account,value)=>{if(persistLocal)await persistLocal(value);pendingStore.set(value.operationId,structuredClone(value));},
+    removePendingSave:async(_endpoint,_account,id)=>{pendingStore.delete(id);}};
   const exports={};
   const timeoutDurations=[];
   const deadlineSignals=deadlineController ? {any:signals=>AbortSignal.any(signals),timeout:ms=>{timeoutDurations.push(ms); return deadlineController.signal;}} : AbortSignal;
   const context=vm.createContext({exports,module:{exports},AbortController,AbortSignal:deadlineSignals,JSON,Error,localStorage,sessionStorage,TEST_PRODUCTION:production,
     ...(browser || {}),
     fetch:async()=>{if(manifestFailure)throw new Error("設定取得失敗");return {ok:true,json:async()=>({endpoint:manifestEndpoint})};},
-    require:name=>name==="react" ? react : name.includes("node-data") ? {initialPlayers:[player],makeDemoActivities:()=>[]} : name.includes("management-data") ? {matchingFields} : name.includes("candidate-intake") ? {interviewFieldLabels,interviewStringFields} : name.includes("writing-ai") ? {assertWritingKitState,validateWritingPreferences} : {assertSnapshot,isUncertainWrite,validateEndpoint,SheetApiError,sheetRequest}});
+    require:name=>name==="react" ? react : name.includes("pending-saves") ? pendingApi : name.includes("node-data") ? {initialPlayers:[player],makeDemoActivities:()=>[]} : name.includes("management-data") ? {matchingFields} : name.includes("candidate-intake") ? {interviewFieldLabels,interviewStringFields} : name.includes("writing-ai") ? {assertWritingKitState,validateWritingPreferences} : {assertSnapshot,assertMutationReceipt,isUncertainWrite,validateEndpoint,SheetApiError,sheetRequest}});
   vm.runInContext(source,context);
   const render = () => {cursor=0; const result=exports.useSheetsConnection(); while(effects.length) effects.shift()(); return result;};
   render();
-  return {calls,localStorage,sessionStorage,timeoutDurations,render,updates:()=>stateUpdates,unmount:()=>slots.forEach(slot=>slot.cleanup?.())};
+  return {calls,pendingStore,localStorage,sessionStorage,timeoutDurations,render,updates:()=>stateUpdates,unmount:()=>slots.forEach(slot=>slot.cleanup?.())};
 }
 
 test("a token is persisted before data loads and no submitted password is stored",async()=>{
@@ -364,7 +369,7 @@ test('background save accepts immutable input immediately, without a foreground 
   const h=harness(call=>call.action==='snapshot'?snapshot:response.promise,{storedToken:token,browser});
   await flush();
   const input={activity:{candidateName:'保存テスト候補者',stage:'提案',date:'2026-10-14',interviewScheduledDate:'2026-10-20',clientInterviewScheduledTime:'18:35',offerScheduledDate:'2026-10-21',memo:'元の入力'}};
-  assert.equal(h.render().submitMutation('saveActivity',input,'background-original-id'),undefined);
+  await h.render().submitMutation('saveActivity',input,'background-original-id');await flush();
   input.activity.memo='送信後に書き換えた入力';
   const active=h.render();
   assert.equal(active.busy,false);assert.equal(active.hasPendingSave,true);assert.equal(active.backgroundSave.status,'saving');
@@ -373,10 +378,9 @@ test('background save accepts immutable input immediately, without a foreground 
   assert.ok(active.backgroundSave.details.includes('C面談予定日：2026-10-20'));
   assert.ok(active.backgroundSave.details.includes('C面談予定開始時刻：18:35'));
   assert.ok(active.backgroundSave.details.includes('オファー予定日：2026-10-21'));
-  assert.equal(browser.listeners.has('beforeunload'),true);
-  let prevented=false;const event={preventDefault(){prevented=true;},returnValue:null};
-  browser.listeners.get('beforeunload')(event);assert.equal(prevented,true);assert.equal(event.returnValue,'');
-  assert.throws(()=>active.submitMutation('saveActivity',input,'duplicate-new-id'),{code:'MUTATION_PENDING'});
+  assert.equal(browser.listeners.has('beforeunload'),false);
+  assert.equal(h.pendingStore.size,1);assert.equal(active.backgroundSave.localSaved,true);
+  await assert.rejects(()=>active.submitMutation('saveActivity',input,'duplicate-new-id'),{code:'MUTATION_PENDING'});
   await active.refresh(true);assert.equal(h.calls.length,2);
   await assert.rejects(()=>active.logout(),{code:'MUTATION_PENDING'});
   await assert.rejects(()=>active.changePassword('old','new'),/保存が完了/);
@@ -386,7 +390,7 @@ test('background save accepts immutable input immediately, without a foreground 
   assert.equal(done.backgroundSave.changeId,'undo-this-change');assert.equal(done.hasPendingSave,false);
   assert.equal(browser.listeners.has('beforeunload'),false);assert.equal(done.busy,false);
   assert.ok(!JSON.stringify([...h.sessionStorage.values,...h.localStorage.values]).includes('元の入力'));
-  done.dismissBackgroundSave();assert.equal(h.render().backgroundSave,null);h.unmount();
+  await done.dismissBackgroundSave();assert.equal(h.render().backgroundSave,null);h.unmount();
 });
 
 test('unknown background outcome survives view rerenders and retries exact input and operation ID once',async()=>{
@@ -396,11 +400,11 @@ test('unknown background outcome survives view rerenders and retries exact input
     if(++attempts===1)throw new SheetApiError('TIMEOUT','結果が未確認です');
     return response.promise;
   },{storedToken:token});
-  await flush();h.render().submitMutation('updateStatus',{recordId:'retained-record',status:'提案'},'retained-operation');await flush();
+  await flush();await h.render().submitMutation('updateStatus',{recordId:'retained-record',status:'提案'},'retained-operation');await flush();
   const failed=h.render();assert.equal(failed.backgroundSave.status,'failed');assert.equal(failed.backgroundSave.uncertain,true);
   assert.equal(failed.hasPendingSave,true);assert.equal(failed.busy,false);
   for(let i=0;i<3;i++)assert.equal(h.render().backgroundSave.operationId,'retained-operation');
-  assert.throws(()=>failed.dismissBackgroundSave(),{code:'MUTATION_PENDING'});
+  await assert.rejects(()=>failed.dismissBackgroundSave(),{code:'MUTATION_PENDING'});
   await assert.rejects(()=>failed.mutate('createPlayer',{},'other-operation'),{code:'MUTATION_PENDING'});
   failed.retryBackgroundSave();h.render().retryBackgroundSave();await flush();
   assert.equal(attempts,2);assert.equal(h.calls[1].options.operationId,h.calls[2].options.operationId);
@@ -410,18 +414,18 @@ test('unknown background outcome survives view rerenders and retries exact input
 
 test('definite background failure retains the draft for inspection until explicit dismissal',async()=>{
   const h=harness(call=>{if(call.action==='snapshot')return snapshot;throw new SheetApiError('ROW_CONFLICT','別の画面で変更されています');},{storedToken:token});
-  await flush();h.render().submitMutation('updateRecord',{recordId:'a',changes:{2:'保持する会社名',13:'保持する詳細メモ'}},'conflict-id');await flush();
+  await flush();await h.render().submitMutation('updateRecord',{recordId:'a',changes:{2:'保持する会社名',13:'保持する詳細メモ'}},'conflict-id');await flush();
   const failed=h.render();assert.equal(failed.backgroundSave.status,'failed');assert.equal(failed.backgroundSave.uncertain,false);
   assert.ok(failed.backgroundSave.details.includes('会社名：保持する会社名'));
   assert.ok(failed.backgroundSave.details.includes('メモ：保持する詳細メモ'));
-  failed.dismissBackgroundSave();assert.equal(h.render().hasPendingSave,false);assert.equal(h.render().backgroundSave,null);h.unmount();
+  await failed.dismissBackgroundSave();assert.equal(h.render().hasPendingSave,false);assert.equal(h.render().backgroundSave,null);h.unmount();
 });
 
 test('background session expiry removes private drafts and no late previous-account result is applied',async()=>{
   const write=deferred(),ai=deferred();
   const h=harness(call=>call.action==='snapshot'?snapshot:call.action==='readInterviewAdvice'?ai.promise:write.promise,{storedToken:token});
   await flush();const reading=h.render().readAdvice('2026-10');
-  h.render().submitMutation('saveActivity',{activity:{candidateName:'private candidate',memo:'private memo'}},'private-operation');
+  await h.render().submitMutation('saveActivity',{activity:{candidateName:'private candidate',memo:'private memo'}},'private-operation');
   ai.reject(new SheetApiError('SESSION_EXPIRED','expired'));await assert.rejects(reading);await flush();
   assert.equal(h.render().backgroundSave,null);assert.equal(h.render().snapshot,null);
   const updates=h.updates();write.resolve({snapshot});await flush();assert.equal(h.updates(),updates);
@@ -430,7 +434,7 @@ test('background session expiry removes private drafts and no late previous-acco
 
 test('unmount discards pending private jobs and never updates detached state',async()=>{
   const response=deferred();const h=harness(call=>call.action==='snapshot'?snapshot:response.promise,{storedToken:token});
-  await flush();h.render().submitMutation('updateProfile',{player:{id:'ND-001',bio:'private draft'}},'unmount-op');
+  await flush();await h.render().submitMutation('updateProfile',{player:{id:'ND-001',bio:'private draft'}},'unmount-op');
   h.unmount();const updates=h.updates();response.resolve({snapshot});await flush();assert.equal(h.updates(),updates);
 });
 
@@ -438,7 +442,7 @@ test('background save invalidates earlier reads and never applies an old snapsho
   let reads=0;const read=deferred(),write=deferred();
   const h=harness(call=>call.action==='snapshot'?(++reads===1?snapshot:read.promise):write.promise,{storedToken:token});
   await flush();const refreshing=h.render().refresh(true);
-  h.render().submitMutation('updateStatus',{recordId:'a',status:'提案'},'newer-operation');
+  await h.render().submitMutation('updateStatus',{recordId:'a',status:'提案'},'newer-operation');
   assert.equal(h.calls[1].options.signal.aborted,true);
   const committed={...snapshot,syncedAt:'2026-10-14T14:00:00Z'};write.resolve({snapshot:committed});await flush();
   read.resolve(snapshot);await refreshing;assert.equal(h.render().snapshot,committed);h.unmount();
@@ -446,9 +450,9 @@ test('background save invalidates earlier reads and never applies an old snapsho
 
 test('credential operations and malformed input cannot be accepted as background jobs',async()=>{
   const h=harness(()=>snapshot,{storedToken:token});await flush();
-  assert.throws(()=>h.render().submitMutation('resetPassword',{password:'private'},'x'),{code:'INVALID_ACTION'});
+  await assert.rejects(()=>h.render().submitMutation('resetPassword',{password:'private'},'x'),{code:'INVALID_ACTION'});
   const cyclic={};cyclic.self=cyclic;
-  assert.throws(()=>h.render().submitMutation('updateRecord',cyclic,'x'),{code:'INVALID_PAYLOAD'});
+  await assert.rejects(()=>h.render().submitMutation('updateRecord',cyclic,'x'),{code:'INVALID_PAYLOAD'});
   assert.equal(h.render().backgroundSave,null);assert.equal(h.calls.length,1);h.unmount();
 });
 
@@ -459,7 +463,7 @@ test('failed private intake copy returns labelled original input only after an e
   const originalFields={...blankInterviewFields(),age:'32',workHistory:'最初の職歴\n改行もそのまま保持',attendanceConcerns:'原文の確認事項',crmTools:['Salesforce','HubSpot'],chatTools:['Slack','Chatwork']},introduction='最初の紹介文\n改行も維持';
   const profile={fields:originalFields,introduction,profileVersion:'private-profile-version'},input=action==='saveCandidateProfile'?{...profile,recordId:'private-record-id',rowVersion:'private-row-version',token:'not-exported-token',password:'not-exported-password'}:{activity:{candidateName:'候補者名',recordId:'private-record-id',rowVersion:'private-row-version',interviewProfile:profile,token:'not-exported-token',password:'not-exported-password'}};
   const original=structuredClone(profile);
-  h.render().submitMutation(action,input,'original-intake-operation');assert.equal(h.render().backgroundSave.intakeInput,true);assert.throws(()=>h.render().copyBackgroundIntakeInput(),{code:'INTAKE_INPUT_UNAVAILABLE'});
+  await h.render().submitMutation(action,input,'original-intake-operation');assert.equal(h.render().backgroundSave.intakeInput,true);assert.throws(()=>h.render().copyBackgroundIntakeInput(),{code:'INTAKE_INPUT_UNAVAILABLE'});
   profile.fields.workHistory='後から書き換えた職歴';profile.fields.crmTools.push('送信後の変更');profile.introduction='後から書き換えた紹介文';if(action==='saveCandidateProfile')input.introduction='後から書き換えた紹介文';
   failedWrite.reject(new SheetApiError('VALIDATION','入力の確認が必要です'));await flush();
   const failed=h.render();assert.equal(failed.backgroundSave.status,'failed');assert.equal(failed.backgroundSave.intakeInput,true);
@@ -473,18 +477,18 @@ test('failed private intake copy returns labelled original input only after an e
 });
 
 test('ordinary failed activities never offer private intake recovery',async()=>{
- const h=harness(call=>call.action==='snapshot'?snapshot:Promise.reject(new SheetApiError('VALIDATION','確認してください')),{storedToken:token});await flush();h.render().submitMutation('saveActivity',{activity:{candidateName:'通常の成果',memo:'通常メモ'}},'ordinary-operation');await flush();assert.equal(h.render().backgroundSave.intakeInput,false);assert.throws(()=>h.render().copyBackgroundIntakeInput(),{code:'INTAKE_INPUT_UNAVAILABLE'});h.unmount();
+ const h=harness(call=>call.action==='snapshot'?snapshot:Promise.reject(new SheetApiError('VALIDATION','確認してください')),{storedToken:token});await flush();await h.render().submitMutation('saveActivity',{activity:{candidateName:'通常の成果',memo:'通常メモ'}},'ordinary-operation');await flush();assert.equal(h.render().backgroundSave.intakeInput,false);assert.throws(()=>h.render().copyBackgroundIntakeInput(),{code:'INTAKE_INPUT_UNAVAILABLE'});h.unmount();
 });
 
 test('session expiry removes failed private input and invalidates a previously retained copy callback',async()=>{
- const h=harness(call=>{if(call.action==='snapshot')return snapshot;if(call.action==='readInterviewAdvice')throw new SheetApiError('SESSION_EXPIRED','expired');throw new SheetApiError('VALIDATION','確認してください');},{storedToken:token});await flush();h.render().submitMutation('saveCandidateProfile',{recordId:'private-record',rowVersion:'private-version',profileVersion:'',fields:{...blankInterviewFields(),workHistory:'失効した本人の職歴'},introduction:'失効した本人の紹介文'},'expiring-private-operation');await flush();const copy=h.render().copyBackgroundIntakeInput;assert.ok(copy().includes('失効した本人の職歴'));
+ const h=harness(call=>{if(call.action==='snapshot')return snapshot;if(call.action==='readInterviewAdvice')throw new SheetApiError('SESSION_EXPIRED','expired');throw new SheetApiError('VALIDATION','確認してください');},{storedToken:token});await flush();await h.render().submitMutation('saveCandidateProfile',{recordId:'private-record',rowVersion:'private-version',profileVersion:'',fields:{...blankInterviewFields(),workHistory:'失効した本人の職歴'},introduction:'失効した本人の紹介文'},'expiring-private-operation');await flush();const copy=h.render().copyBackgroundIntakeInput;assert.ok(copy().includes('失効した本人の職歴'));
  await assert.rejects(()=>h.render().readAdvice('2026-10'));assert.equal(h.render().authenticated,false);assert.equal(h.render().backgroundSave,null);assert.throws(copy,{code:'INTAKE_INPUT_UNAVAILABLE'});assert.throws(()=>h.render().copyBackgroundIntakeInput(),{code:'INTAKE_INPUT_UNAVAILABLE'});h.unmount();
 });
 
 test('dismissal logout new login and unmount never let an old recovery callback read a newer private job',async()=>{
  const h=harness(call=>{if(call.action==='snapshot')return snapshot;if(call.action==='login')return {token:`${token}-new-login`};if(call.action==='logout')return {loggedOut:true};throw new SheetApiError('VALIDATION','確認してください');},{storedToken:token});await flush();
- const input={recordId:'private-record',rowVersion:'private-version',profileVersion:'',fields:{...blankInterviewFields(),workHistory:'以前の職歴'},introduction:'以前の紹介文'};h.render().submitMutation('saveCandidateProfile',input,'old-private-operation');await flush();const oldCopy=h.render().copyBackgroundIntakeInput;assert.ok(oldCopy().includes('以前の職歴'));h.render().dismissBackgroundSave();assert.throws(oldCopy,{code:'INTAKE_INPUT_UNAVAILABLE'});await h.render().logout();assert.throws(oldCopy,{code:'INTAKE_INPUT_UNAVAILABLE'});
- await h.render().login('ND-001','new-login-password');h.render().submitMutation('saveCandidateProfile',{...input,fields:{...blankInterviewFields(),workHistory:'新しいログイン後の職歴'}},'new-private-operation');await flush();assert.throws(oldCopy,{code:'STALE_SESSION'});const newCopy=h.render().copyBackgroundIntakeInput;assert.ok(newCopy().includes('新しいログイン後の職歴'));h.unmount();assert.throws(newCopy,{code:'INTAKE_INPUT_UNAVAILABLE'});
+ const input={recordId:'private-record',rowVersion:'private-version',profileVersion:'',fields:{...blankInterviewFields(),workHistory:'以前の職歴'},introduction:'以前の紹介文'};await h.render().submitMutation('saveCandidateProfile',input,'old-private-operation');await flush();const oldCopy=h.render().copyBackgroundIntakeInput;assert.ok(oldCopy().includes('以前の職歴'));await h.render().dismissBackgroundSave();assert.throws(oldCopy,{code:'INTAKE_INPUT_UNAVAILABLE'});await h.render().logout();assert.throws(oldCopy,{code:'INTAKE_INPUT_UNAVAILABLE'});
+ await h.render().login('ND-001','new-login-password');await h.render().submitMutation('saveCandidateProfile',{...input,fields:{...blankInterviewFields(),workHistory:'新しいログイン後の職歴'}},'new-private-operation');await flush();assert.throws(oldCopy,{code:'STALE_SESSION'});const newCopy=h.render().copyBackgroundIntakeInput;assert.ok(newCopy().includes('新しいログイン後の職歴'));h.unmount();assert.throws(newCopy,{code:'INTAKE_INPUT_UNAVAILABLE'});
 });
 
 const writingAdminSnapshot={...snapshot,self:{playerId:'ADMIN',role:'admin'},writingFeature:true,writingPreferences:defaultWritingPreferences()};
@@ -610,4 +614,48 @@ test('background snapshot refresh keeps a pending writing result valid and prefe
  const saved={...defaultWritingPreferences(),version:'confirmed-after-refresh'};pending.resolve({preferences:saved});await save;
  assert.equal(h.render().snapshot.syncedAt,refreshed.syncedAt);assert.deepEqual(h.render().snapshot.writingPreferences,saved);
  assert.equal(h.render().snapshot.players,refreshed.players);h.unmount();
+});
+
+
+test('a local commit completes while Google is stalled and independent saves queue in order',async()=>{
+ const first=deferred(),second=deferred();let writes=0;
+ const h=harness(call=>call.action==='snapshot'?snapshot:(++writes===1?first.promise:second.promise),{storedToken:token});await flush();
+ await h.render().submitMutation('updateRecord',{recordId:'one',changes:{13:'first'}},'queued-operation-one');await flush();
+ await h.render().submitMutation('updateRecord',{recordId:'two',changes:{13:'second'}},'queued-operation-two');await flush();
+ assert.equal(h.pendingStore.size,2);assert.equal(writes,1);assert.equal(h.render().backgroundSave.pendingCount,2);assert.equal(h.render().busy,false);
+ assert.equal(h.render().backgroundSave.localSaved,true);
+ first.resolve({snapshot});await flush();assert.equal(writes,2);assert.equal(h.pendingStore.size,1);assert.equal(h.calls[2].payload.recordId,'two');
+ second.resolve({snapshot});await flush();assert.equal(h.pendingStore.size,0);assert.equal(h.render().hasPendingSave,false);h.unmount();
+});
+
+test('acceptance waits for the local transaction and local storage failure leaves Google untouched',async()=>{
+ const local=deferred();const h=harness(call=>call.action==='snapshot'?snapshot:new Promise(()=>{}),{storedToken:token,persistLocal:()=>local.promise});await flush();
+ let accepted=false;const saving=h.render().submitMutation('updateRecord',{recordId:'one',changes:{13:'kept input'}},'local-operation-one').then(()=>{accepted=true;});await flush();
+ assert.equal(accepted,false);assert.equal(h.calls.length,1);local.resolve();await saving;await flush();assert.equal(accepted,true);assert.equal(h.pendingStore.size,1);h.unmount();
+ const broken=harness(()=>snapshot,{storedToken:token,persistLocal:async()=>{throw new Error('端末の容量不足');}});await flush();
+ await assert.rejects(broken.render().submitMutation('updateRecord',{recordId:'one',changes:{13:'keep in form'}},'local-operation-two'),/容量不足/);
+ assert.equal(broken.calls.length,1);assert.equal(broken.render().hasPendingSave,false);assert.equal(broken.pendingStore.size,0);broken.unmount();
+});
+
+test('an interrupted previous send restores privately without replaying until the user confirms the same operation',async()=>{
+ const saved={operationId:'restored-operation-one',action:'updateRecord',payload:{recordId:'restored-row',changes:{13:'original private memo'}},label:'元の変更',details:['元の入力'],createdAt:1,attempted:true};
+ const response=deferred();const h=harness(call=>call.action==='snapshot'?snapshot:response.promise,{storedToken:token,pendingSaves:[saved]});await flush();h.render();await flush();
+ assert.equal(h.calls.length,1);assert.equal(h.render().backgroundSave.status,'failed');assert.equal(h.render().backgroundSave.uncertain,true);
+ h.render().retryBackgroundSave();await flush();assert.equal(h.calls[1].options.operationId,saved.operationId);assert.deepEqual(h.calls[1].payload,saved.payload);
+ response.resolve({snapshot});await flush();assert.equal(h.pendingStore.size,0);h.unmount();
+});
+
+test('a confirmed receipt releases saving before the separate dashboard read and read failures never replay the write',async()=>{
+ let reads=0,writes=0;const refresh=deferred();
+ const h=harness(call=>call.action==='snapshot'?(++reads===1?snapshot:refresh.promise):(writes++,{committed:true,operationId:call.options.operationId}),{storedToken:token});await flush();
+ await h.render().submitMutation('updateRecord',{recordId:'one',changes:{13:'saved'}},'receipt-operation-one');await flush();
+ assert.equal(h.render().backgroundSave.status,'saved');assert.equal(h.render().backgroundSave.refreshing,true);assert.equal(h.render().hasPendingSave,false);
+ assert.equal(h.render().snapshot,snapshot);assert.equal(h.pendingStore.size,0);assert.equal(h.calls[1].options.responseMode,'receipt');assert.equal(reads,2);
+ refresh.reject(new SheetApiError('NETWORK','read failed'));await flush();assert.equal(writes,1);assert.equal(h.render().backgroundSave.status,'saved');assert.match(h.render().syncError,/自動同期/);h.unmount();
+});
+
+test('a mismatched commit receipt cannot confirm another write or remove its local input',async()=>{
+ const h=harness(call=>call.action==='snapshot'?snapshot:{committed:true,operationId:'another-operation-id'},{storedToken:token});await flush();
+ await h.render().submitMutation('updateRecord',{recordId:'one',changes:{13:'must remain'}},'receipt-operation-two');await flush();
+ assert.equal(h.render().backgroundSave.status,'failed');assert.equal(h.render().backgroundSave.uncertain,true);assert.equal(h.pendingStore.size,1);h.unmount();
 });
