@@ -1,0 +1,44 @@
+.work-panel-overlay{background:rgb(20 43 65 / 24%)!important}
+.work-panel[data-slot=dialog-content][data-presentation=panel]{
+ --work-panel-width:min(800px,calc((100dvh - 32px) * .8),calc(100vw - 32px));
+ box-sizing:border-box;position:fixed;left:auto!important;right:16px!important;top:50%!important;bottom:auto!important;
+ width:var(--work-panel-width)!important;height:calc(var(--work-panel-width) * 1.25)!important;aspect-ratio:4/5;
+ max-width:none!important;max-height:none!important;min-width:0;min-height:0;
+ translate:none!important;transform:translate(0,-50%);padding:0!important;gap:0!important;
+ display:flex;flex-direction:column;overflow:hidden!important;border-radius:12px!important;
+ background:#fff!important;box-shadow:0 12px 55px #18374e33;container-type:inline-size;
+}
+.work-panel[data-presentation=panel][data-state=open]{animation:work-panel-in .24s cubic-bezier(.22,.7,.25,1) both!important}
+.work-panel[data-presentation=panel][data-state=closed]{animation:work-panel-out .18s ease-in both!important}
+.work-panel[data-presentation=panel]>[data-slot=dialog-header]{flex:none;padding:22px 50px 17px 24px;border-bottom:1px solid #e1ebf4;text-align:left;min-width:0}
+.work-panel[data-presentation=panel] [data-slot=dialog-title]{font-size:18px;line-height:1.5}
+.work-panel[data-presentation=panel] [data-slot=dialog-description]{font-size:12px;line-height:1.8;color:#607d99}
+.work-panel[data-presentation=panel]>form{display:flex;flex-direction:column;flex:1;min-height:0;min-width:0;overflow:hidden;margin:0!important;padding:0!important;gap:0!important}
+.work-panel[data-presentation=panel]>form>fieldset{display:grid;align-content:start;gap:18px;flex:1;min-width:0;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;border:0;margin:0!important;padding:22px 24px!important}
+.work-panel[data-presentation=panel]>form>fieldset.candidate-create-fields{display:grid;align-content:start}
+.work-panel[data-presentation=panel]>form>.form-actions{flex:none;display:flex;justify-content:flex-end;gap:12px;margin:0!important;padding:15px 24px!important;border-top:1px solid #dce8f2;background:#fff}
+.work-panel[data-presentation=panel]>form>.form-actions button{min-height:42px}
+.work-panel[data-presentation=panel]>form>.form-error{flex:none;max-height:76px;overflow:auto;margin:0!important;padding:8px 24px!important;font-size:12px}
+.work-panel[data-presentation=panel] .form-grid,.work-panel[data-presentation=panel] .record-field-grid,.work-panel[data-presentation=panel] .intake-grid{grid-template-columns:repeat(2,minmax(0,1fr));min-width:0}
+.work-panel[data-presentation=panel] .record-milestone-summary{grid-template-columns:repeat(2,minmax(0,1fr));margin:0}
+.work-panel[data-presentation=panel] .record-milestone-toolbar{align-items:flex-start}
+.work-panel[data-presentation=panel] .record-milestone-toolbar .primary-button{display:none}
+.work-panel[data-presentation=panel] .performance-stage-picker{grid-template-columns:repeat(3,minmax(0,1fr))}
+.work-panel[data-presentation=panel]>.achievement-confirm{flex:none;max-height:150px;overflow:auto;margin:0 24px 15px}
+@container (max-width:460px){
+ .work-panel[data-presentation=panel] .form-grid,.work-panel[data-presentation=panel] .record-field-grid{grid-template-columns:minmax(0,1fr)}
+ .work-panel[data-presentation=panel] .performance-stage-picker{grid-template-columns:repeat(2,minmax(0,1fr))}
+ .work-panel[data-presentation=panel] .intake-grid{grid-template-columns:minmax(0,1fr)}
+}
+@media(max-width:600px){
+ .work-panel[data-presentation=panel]>[data-slot=dialog-header]{padding:15px 42px 12px 16px}
+ .work-panel[data-presentation=panel] [data-slot=dialog-title]{font-size:16px}
+ .work-panel[data-presentation=panel] [data-slot=dialog-description]{font-size:11px;line-height:1.6}
+ .work-panel[data-presentation=panel]>form>fieldset{padding:16px!important}
+ .work-panel[data-presentation=panel]>form>.form-actions{padding:11px 16px!important;gap:8px}
+ .work-panel[data-presentation=panel]>form>.form-actions button{font-size:12px;min-height:40px;min-width:0}
+ .work-panel[data-presentation=panel] .record-milestone-summary{grid-template-columns:minmax(0,1fr)}
+}
+@keyframes work-panel-in{from{transform:translate(calc(100% + 32px),-50%)}to{transform:translate(0,-50%)}}
+@keyframes work-panel-out{from{transform:translate(0,-50%)}to{transform:translate(calc(100% + 32px),-50%)}}
+@media(prefers-reduced-motion:reduce){.work-panel[data-presentation=panel][data-state]{animation:none!important}}
