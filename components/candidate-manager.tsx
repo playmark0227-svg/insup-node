@@ -6,7 +6,8 @@ import { toast } from "sonner";
 import { positions, statuses, stages, type Player, type Stage } from "@/lib/node-data";
 import { matchingFields, recordDateColumns, recordTimeColumns, milestoneColumns, correctionRecords, valueAt, sortCandidateRecords, statusTone, type CandidateSort } from "@/lib/management-data";
 import { performanceMetrics, stageLabel, activityInputMetrics } from "@/lib/performance-metrics";
-import { isUncertainWrite, type CandidateRecord, type MutationResult, type SheetPlayer, type DeletedCandidate, type ClientEntry } from "@/lib/sheets-client";
+import { businessToday, isUncertainWrite, type CandidateRecord, type MutationResult, type SheetPlayer, type DeletedCandidate, type ClientEntry } from "@/lib/sheets-client";
+import { mutationDateErrors } from "@/lib/save-correction";
 import "@/app/management.css";
 import type { CandidateAiConnection } from "@/lib/writing-ai";
 import { InterviewIntakeEditor } from "@/components/candidate-intake";
@@ -72,18 +73,31 @@ function BasicInfoDialog({record,profile,save,disabled,onClose,ai}:{record:Candi
 }
 
 function RecordEditor({record,players,admin,disabled,live,save,onClose}:{record:CandidateRecord;players:SheetPlayer[];admin:boolean;disabled:boolean;live:boolean;save:ReturnType<typeof useManagementSave>;onClose:()=>void}) {
+ const id=useId(),today=businessToday();
  const [changes,setChanges]=useState<Record<string,string>>({});
  const [cancelStage,setCancelStage]=useState<Stage|null>(null);
  const value=(col:number)=>changes[col]??valueAt(record,col);
  const set=(col:number,v:string)=>setChanges(prev=>({...prev,[col]:v}));
  const locked=disabled||save.busy||save.uncertain;
- async function commit(){const dirty=Object.fromEntries(Object.entries(changes).filter(([k,v])=>v!==valueAt(record,Number(k))).map(([k,v])=>[k,typeof record.values[Number(k)-1]==="boolean"?v==="true":v]));if(await save.save("updateRecord",{recordId:record.recordId,rowVersion:record.rowVersion,changes:dirty},`${record.candidateName}の進捗を保存`))onClose();}
+ const dateErrors=mutationDateErrors("updateRecord",{changes}),invalid=Object.keys(dateErrors).length>0;
+ const hasChanges=Object.entries(changes).some(([col,v])=>v!==valueAt(record,Number(col)));
+ const reset=(col:number)=>setChanges(previous=>{const next={...previous};delete next[col];return next;});
+ async function commit(){if(disabled||save.busy||invalid)return;const dirty=Object.fromEntries(Object.entries(changes).filter(([k,v])=>v!==valueAt(record,Number(k))).map(([k,v])=>[k,typeof record.values[Number(k)-1]==="boolean"?v==="true":v]));if(!Object.keys(dirty).length&&!save.uncertain)return;if(await save.save("updateRecord",{recordId:record.recordId,rowVersion:record.rowVersion,changes:dirty},`${record.candidateName}の進捗を保存`))onClose();}
  return <Dialog open onOpenChange={open=>{if(!open&&!save.busy&&!save.uncertain)onClose();}}><DialogContent className="management-dialog"><DialogHeader><DialogTitle>{record.candidateName}</DialogTitle><DialogDescription>候補者の進捗・予定・成果を編集します。{live?"保存先は2期目マッチングDBです。":"サンプルの編集です。"}</DialogDescription></DialogHeader>
-  <div className="record-milestone-summary">{activityInputMetrics.map(m=><div key={m.stage}><span>{m.label}</span><strong>{valueAt(record,milestoneColumns[m.stage])||"未登録"}</strong><button className="text-button" disabled={locked||!valueAt(record,milestoneColumns[m.stage])} onClick={()=>setCancelStage(m.stage)}><Minus size={14}/>取り消す</button></div>)}</div>
-  <form onSubmit={e=>{e.preventDefault();void commit();}}><fieldset disabled={locked}><div className="record-field-grid">{matchingFields.map((label,i)=>{const col=i+1,v=value(col),readonly=record.formulaColumns.includes(col)||col===4&&!admin;
+  <form noValidate onSubmit={e=>{e.preventDefault();void commit();}}><fieldset disabled={locked}>
+  <div className="record-milestone-toolbar"><p className="record-milestone-help">実績の日付をここから直接入力できます。詳細欄の変更もまとめて保存します。</p><button type="submit" className="primary-button" aria-label="実績カードの変更を保存" disabled={save.busy||disabled||invalid||(!hasChanges&&!save.uncertain)}><Pencil size={15}/>{save.busy?"保存中…":save.uncertain?"同じ内容で再試行":"変更を保存"}</button></div>
+  <div className="record-milestone-summary">{activityInputMetrics.map(m=>{
+   const col=milestoneColumns[m.stage],v=value(col),original=valueAt(record,col),edited=v!==original,readonly=record.formulaColumns.includes(col),error=dateErrors[col],inputId=`${id}-milestone-${col}`;
+   return <div key={m.stage} className={edited?"is-edited":""}>
+    <label htmlFor={inputId}><span>{m.label}</span><input id={inputId} aria-label={`${m.label}の日付`} aria-invalid={!!error} aria-describedby={error?`${inputId}-error`:undefined} type="date" max={today} value={/^\d{4}-\d{2}-\d{2}$/.test(v)?v:""} disabled={readonly||locked} onChange={e=>set(col,e.target.value)}/></label>
+    {error?<small id={`${inputId}-error`} className="record-milestone-error">{error}</small>:readonly?<small>自動計算・閲覧のみ</small>:v&&!/^\d{4}-\d{2}-\d{2}$/.test(v)?<small>現在の値：{v}</small>:<small>{edited?"変更あり・未保存":v?"登録済み":"未登録"}</small>}
+    <button type="button" className="text-button" disabled={locked||readonly||!edited&&!original} onClick={()=>edited?reset(col):setCancelStage(m.stage)}>{edited?<Undo2 size={14}/>:<Minus size={14}/>} {edited?"入力を戻す":"取り消す"}</button>
+   </div>;
+  })}</div>
+  <div className="record-field-grid">{matchingFields.map((label,i)=>{const col=i+1,v=value(col),readonly=record.formulaColumns.includes(col)||col===4&&!admin;
    const options=typeof record.values[col-1]==="boolean"?["true","false"]:col===4?players.flatMap(p=>p.sheetNames?.length?p.sheetNames:[p.id]):col===5?["新規","再販（離脱等）"]:col===6?positions:col===7?statuses:col===12?["Aヨミ","Bヨミ","Cヨミ","Dヨミ"]:null;
    return <label key={col} className={[13,19].includes(col)?"wide":""}><span>{label}{readonly&&<small>自動計算・閲覧のみ</small>}</span>{readonly?<div className="readonly-field">{v||"—"}</div>:options?<select aria-label={label} value={v} onChange={e=>set(col,e.target.value)}><option value="">未設定</option>{[...new Set([...options,...(v?[v]:[])])].map(o=><option key={o}>{o}</option>)}</select>:[13,19].includes(col)?<textarea aria-label={label} rows={3} value={v} onChange={e=>set(col,e.target.value)} maxLength={12000}/>:<input aria-label={label} type={recordDateColumns.includes(col)&&(!v||/^\d{4}-\d{2}-\d{2}$/.test(v))?"date":recordTimeColumns.includes(col)&&(!v||/^\d{2}:\d{2}$/.test(v))?"time":"text"} value={v} maxLength={12000} onChange={e=>set(col,e.target.value)}/>}</label>;
-  })}</div><p className="panel-note">紹介元：{record.source||"未登録"} · 管理行 {record.row} · 数式は保護されます。</p></fieldset>{save.error&&<p className="form-error" role="alert">{save.error}</p>}<div className="form-actions"><button type="button" className="secondary-button" disabled={save.busy||save.uncertain} onClick={onClose}>閉じる</button><button className="primary-button" disabled={save.busy||disabled||(!Object.keys(changes).length&&!save.uncertain)}><Pencil size={16}/>{save.busy?"保存中…":save.uncertain?"同じ内容で再試行":"変更を保存"}</button></div></form>
+  })}</div><p className="panel-note">紹介元：{record.source||"未登録"} · 管理行 {record.row} · 数式は保護されます。</p></fieldset>{invalid&&<p className="form-error" role="alert">{Object.values(dateErrors)[0]}</p>}{save.error&&<p className="form-error" role="alert">{save.error}</p>}<div className="form-actions"><button type="button" className="secondary-button" disabled={save.busy||save.uncertain} onClick={onClose}>閉じる</button><button className="primary-button" disabled={save.busy||disabled||invalid||(!hasChanges&&!save.uncertain)}><Pencil size={16}/>{save.busy?"保存中…":save.uncertain?"同じ内容で再試行":"変更を保存"}</button></div></form>
   {cancelStage&&<div className="achievement-confirm" role="alert"><strong>{stageLabel(cancelStage)}の {valueAt(record,milestoneColumns[cancelStage])} を取り消します。</strong><p>候補者情報と他の工程は残ります。{cancelStage==="候補者面談"&&"同じ候補者・担当・日付の面談を全提案行から解除します。"}</p><div><button className="secondary-button" disabled={save.busy||save.uncertain} onClick={()=>setCancelStage(null)}>戻る</button><button className="primary-button" disabled={save.busy||disabled} onClick={async()=>{if(await save.save("cancelAchievement",{recordId:record.recordId,rowVersion:record.rowVersion,stage:cancelStage},`${record.candidateName}の${stageLabel(cancelStage)}を取り消す`))onClose();}}>{save.busy?"処理中…":save.uncertain?"同じ取り消しを再試行":"この成果を取り消す"}</button></div></div>}
  </DialogContent></Dialog>;
 }
