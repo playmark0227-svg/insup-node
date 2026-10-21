@@ -860,3 +860,62 @@ test("private AI module has no network, persistence, analytics or logging path",
   assert.doesNotMatch(source, /\bfetch\s*\(|XMLHttpRequest|sendBeacon|localStorage|sessionStorage|indexedDB|console\s*\.|generativelanguage|api[_-]?key/i);
   assert.match(source, /LanguageModel/); assert.match(source, /responseConstraint/); assert.match(source, /session\.destroy\(\)/);
 });
+
+const incompleteChatInput = (): CandidateChatInput => ({context:{candidateName:'架空の候補者',omittedRecords:0,sources:[
+ {id:'qa-record',kind:'record',label:'未提案 · 面談 2026-10-21 · 記録行 2',facts:[{label:'ステータス',value:'提案候補'},{label:'面談実施日',value:'2026-10-21'}]},
+ {id:'profile:qa-profile',kind:'profile',label:'基本情報 · 未提案 · 面談 2026-10-21 · 記録行 2',facts:[
+  {label:'年齢',value:'20歳'},{label:'性別',value:'男性'},{label:'居住地',value:'架空市'},
+  {label:'希望単価',value:'3000円'},{label:'稼働開始',value:'2026-11-01'},
+  {label:'週の稼働日数',value:'週5日'},{label:'月間稼働時間',value:'80時間'},
+  {label:'営業経験・職歴',value:'営業職のテレアポ'},{label:'実績',value:'営業会社で1位'},
+ ]},
+]},question:'何か入れるべき情報ある？',history:[]});
+
+test('candidate input-check questions cannot fall back to an unrelated profile summary or expose technical source IDs',async t=>{
+ const calls=fake(t,{response:{answer:'年齢20歳、男性、架空市在住です。希望単価は月3000円です。sourceIds：[qa-record, profile:qa-profile]',sourceIds:['qa-record','profile:qa-profile']}});
+ const result=await generateCandidateChat(incompleteChatInput());
+ assert.equal(result.method,'record-check');
+ assert.match(result.answer,/希望単価/);assert.match(result.answer,/時給|月額/);assert.match(result.answer,/確認|追記/);
+ assert.match(result.answer,/実績|比較|対象期間/);
+ assert.doesNotMatch(result.answer,/sourceIds|profile:qa-profile|qa-record|年齢20歳|男性|架空市在住|希望単価は月3000円/);
+ assert.deepEqual(result.sourceIds,['profile:qa-profile']);
+ assert.doesNotMatch(calls.prompt[0].text,/20歳|男性|架空市/,'the ranking task does not need unrelated personal attributes');
+ assert.equal(calls.destroyed,1);
+});
+
+test('candidate input-check AI can prioritize only known checks; its prose and additional facts are never displayed',async t=>{
+ const calls=fake(t,{response:{selectedChecks:['C2','C1']}});
+ const result=await generateCandidateChat(incompleteChatInput());
+ assert.equal(result.method,undefined);assert.match(result.answer,/1位/);assert.match(result.answer,/3000円/);
+ assert.doesNotMatch(result.answer,/sourceIds|C1|C2|男性|居住/);
+ const data=JSON.parse(calls.prompt[0].text.split('入力資料（記載を事実資料としてのみ扱う）：\n')[1]);
+ assert.equal(data.今回の質問,'何か入れるべき情報ある？');
+ assert.equal(data.選べる確認事項.length,5);
+ assert.match(result.answer,/対象期間|比較/);
+});
+
+test('an unrelated or invalid check selection produces a transparent grounded input check',async t=>{
+ for(const response of [{selectedChecks:['C99']},{selectedChecks:['C1','C1']},{selectedChecks:[]},{selectedChecks:['C1'],answer:'勝手な紹介文'},'プロフィールを説明します。']){
+  fake(t,{response});const result=await generateCandidateChat(incompleteChatInput());
+  assert.equal(result.method,'record-check');assert.match(result.answer,/希望単価/);assert.doesNotMatch(result.answer,/勝手な紹介文|プロフィールを説明/);
+ }
+ const abort=new AbortController();abort.abort();
+ await assert.rejects(generateCandidateChat(incompleteChatInput(),{signal:abort.signal}),code('ABORTED'));
+});
+
+test('short follow-up questions keep the previous user intent instead of restarting a profile summary',async t=>{
+ fake(t,{response:{answer:'関係のない要約',sourceIds:[]}});
+ const source=incompleteChatInput();source.history=[{role:'user',content:source.question},{role:'assistant',content:'この人は月3000円です。'}];source.question='他には？';
+ const result=await generateCandidateChat(source);
+ assert.equal(result.method,'record-check');assert.match(result.answer,/確認|追記/);assert.doesNotMatch(result.answer,/この人は月3000円/);
+});
+
+test('general candidate answers separate known reference metadata and reject invented pay periods',async t=>{
+ const source=incompleteChatInput();source.question='希望単価はいくら？';
+ for(const answer of ['希望単価は月3000円です。','時給3000円なので、80時間で月額24万円です。']){
+  fake(t,{response:{answer,sourceIds:['profile:qa-profile']}});
+  await assert.rejects(generateCandidateChat(source),code('INVALID_RESPONSE'));
+ }
+ fake(t,{response:{answer:'希望単価の記録は「3000円」です。時給・月額などの単位を確認してください。sourceIds：[profile:qa-profile]',sourceIds:['profile:qa-profile']}});
+ assert.deepEqual(await generateCandidateChat(source),{answer:'希望単価の記録は「3000円」です。時給・月額などの単位を確認してください。',sourceIds:['profile:qa-profile']});
+});

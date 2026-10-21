@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import vm from "node:vm";
 import ts from "typescript";
-import { unicodeLength } from "../lib/candidate-intake.ts";
+import { blankInterviewFields, unicodeLength } from "../lib/candidate-intake.ts";
 import * as chat from "../lib/candidate-chat.ts";
 import { valueAt } from "../lib/management-data.ts";
 
@@ -23,6 +23,12 @@ function record(id, company, row) {
 }
 const initialGroup = () => ({ key: '["assigned","ND-001","架空候補者"]', name: "架空候補者", playerId: "ND-001",
   records: [record("record-a", "架空会社A", 2), record("record-b", "架空会社B", 3)] });
+const profileWithAmbiguities = () => ({ profileId: "profile-a", playerId: "ND-001", recordIds: ["record-a"],
+  version: "profile-version", updatedAt: "2026-10-21T10:00:00Z", introduction: "",
+  fields: { ...blankInterviewFields(), age: "20", gender: "男性", residence: "北海道札幌市",
+    availableFrom: "2026-11-01", daysPerWeek: "週5日", monthlyHours: "80時間", desiredHourlyRate: "3000円",
+    workHistory: "営業職でテレアポを担当", achievements: "営業会社で1位", strengths: "コミュニケーション能力・Adobe・Claude",
+    pcEnvironment: "MacBook", networkEnvironment: "光回線", crmTools: ["Salesforce", "kintone"], chatTools: ["Chatwork"] } });
 
 // Execute the real panel and its event handlers. Only the native inference and
 // capability boundary are mocked; delayed results exercise cancellation safely.
@@ -100,6 +106,88 @@ test("opening checks capability without inference and device answers retain thei
   assert.match(text(answer), /架空会社A/); assert.doesNotMatch(text(answer), /架空会社B/);
   h.click("コピー"); await flush();
   assert.match(h.calls.copied[0], /端末AIが記録から整理した回答\n\n参照：架空会社A/); h.unmount();
+});
+
+test("a native record-check response is labelled accurately and retains record citations when copied", async () => {
+  const answer = "はい。希望単価の単位と、稼働できる曜日・時間帯を確認してください。";
+  const h = harness({ device: () => Promise.resolve({ answer, sourceIds: ["record-b"], method: "record-check" }) }); await flush();
+  h.change("何か入れるべき情報ある？"); h.submit(); await flush();
+  assert.equal(h.calls.device.length, 1); assert.equal(h.calls.facts.length, 0);
+  const message = h.assistant()[0];
+  assert.equal(text(nodes(message).find(node => node.type === "strong")), "入力内容のチェック（AI未使用）");
+  assert.match(text(message), /参照した記録（1）/); assert.match(text(message), /架空会社B/);
+  assert.doesNotMatch(text(message), /架空会社A|sourceIds|record-b/);
+  h.click("コピー"); await flush();
+  assert.equal(h.calls.copied[0], `${answer}\n\n参照：架空会社B · 面談 2026-10-01 · 記録行 3`);
+  assert.doesNotMatch(h.calls.copied[0], /sourceIds|record-b/); h.unmount();
+});
+
+test("the missing-information suggestion asks a useful input question directly instead of requesting a summary", async () => {
+  const h = harness({ availability: "unavailable", props: { profiles: [profileWithAmbiguities()] } }); await flush();
+  assert.ok(h.button("追加入力したほうがいい情報は？"));
+  assert.equal(h.button("現在の状況は？"), undefined);
+  h.click("追加入力したほうがいい情報は？"); await flush();
+  assert.equal(h.calls.facts.length, 1); assert.equal(h.calls.device.length, 0);
+  assert.equal(h.calls.facts[0][1], "追加入力したほうがいい情報は？");
+  assert.match(text(h.assistant()[0]), /入力内容のチェック（AI未使用）/); h.unmount();
+});
+
+test("the reported missing-information question returns specific checks rather than a profile recap in record mode", async () => {
+  const h = harness({ availability: "unavailable", props: { profiles: [profileWithAmbiguities()] } }); await flush();
+  h.change("何か入れるべき情報ある？"); h.submit(); await flush();
+  assert.equal(h.calls.device.length, 0); assert.equal(h.calls.facts.length, 1);
+  const message = h.assistant()[0], body = nodes(message).find(node => node.props.className === "candidate-chat-answer");
+  assert.match(text(message), /入力内容のチェック（AI未使用）/);
+  assert.match(text(body), /希望単価/); assert.match(text(body), /時給・月額・件単価/);
+  assert.match(text(body), /実績/); assert.match(text(body), /対象期間/);
+  assert.match(text(body), /希望時間帯/); assert.match(text(body), /確認する質問/);
+  assert.doesNotMatch(text(body), /年齢20歳|男性|北海道札幌市|現在の状況をご説明|sourceIds|profile-a/);
+  assert.match(text(message), /基本情報 · 架空会社A/); h.unmount();
+});
+
+test("short follow-ups pass the preceding user intent to the real record helper", async () => {
+  const h = harness({ availability: "unavailable", props: { profiles: [profileWithAmbiguities()] } }); await flush();
+  h.change("何か入れるべき情報ある？"); h.submit(); await flush();
+  h.change("他には？"); h.submit(); await flush();
+  assert.equal(h.calls.facts.length, 2);
+  const history = h.calls.facts[1][2];
+  assert.equal(history.length, 2); assert.equal(history[0].role, "user");
+  assert.equal(history[0].content, "何か入れるべき情報ある？");
+  assert.equal(history[1].role, "assistant");
+  assert.equal(history.some(message => message.role === "user" && message.content === "他には？"), false);
+  const reply = h.assistant()[1]; assert.ok(reply);
+  assert.match(text(reply), /入力内容のチェック（AI未使用）/);
+  assert.match(text(reply), /確認する質問/); assert.doesNotMatch(text(reply), /その項目に対応する記録は見つかりません/); h.unmount();
+});
+
+test("native retries exclude the last repeated user question while preserving earlier context", async () => {
+  let count = 0;
+  const h = harness({ device: () => ++count === 2 ? Promise.reject(new Error("temporary model failure"))
+    : Promise.resolve({ answer: "参照した記録の回答", sourceIds: ["record-a"] }) }); await flush();
+  h.change("現在の状況を教えて"); h.submit(); await flush();
+  h.change("希望時間帯は？"); h.submit(); await flush();
+  assert.match(h.text(), /回答を作成できませんでした/);
+  h.click("再試行"); await flush();
+  assert.equal(h.calls.device.length, 3);
+  const request = h.calls.device[2][0];
+  assert.equal(request.question, "希望時間帯は？");
+  assert.equal(request.history.length, 2);
+  assert.deepEqual(JSON.parse(JSON.stringify(request.history.map(message => message.role))), ["user", "assistant"]);
+  assert.equal(request.history[0].content, "現在の状況を教えて");
+  assert.equal(request.history.some(message => message.role === "user" && message.content === request.question), false);
+  assert.equal(nodes(h.render()).filter(node => node.type === "article" && String(node.props.className).includes("is-user") && text(node).includes("希望時間帯は？")).length, 1);
+  h.unmount();
+});
+
+test("switching a failed native question to record lookup does not duplicate that question in history", async () => {
+  const h = harness({ props: { profiles: [profileWithAmbiguities()] }, device: () => Promise.reject(new Error("temporary model failure")) }); await flush();
+  h.change("何か入れるべき情報ある？"); h.submit(); await flush();
+  h.click("登録情報で確認"); await flush();
+  assert.equal(h.calls.device.length, 1); assert.equal(h.calls.facts.length, 1);
+  assert.equal(h.calls.facts[0][1], "何か入れるべき情報ある？");
+  assert.equal(h.calls.facts[0][2].length, 0);
+  assert.match(text(h.assistant()[0]), /入力内容のチェック（AI未使用）/);
+  assert.match(text(h.assistant()[0]), /希望単価/); h.unmount();
 });
 
 test("the same send handler cannot launch overlapping native model calls", async () => {

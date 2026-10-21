@@ -10,9 +10,9 @@ import { answerCandidateFacts, buildCandidateChatContext, type CandidateChatSour
 import { generateCandidateChat, getOnDeviceAiAvailability, type OnDeviceAiAvailability, type OnDeviceAiProgress } from "@/lib/on-device-ai";
 import "./candidate-chat.css";
 
-type ChatMessage = {id:string;role:"user"|"assistant";content:string;engine:"device"|"records";fingerprint:string;sources:CandidateChatSource[]};
+type ChatMessage = {id:string;role:"user"|"assistant";content:string;engine:"device"|"records"|"record-check";fingerprint:string;sources:CandidateChatSource[]};
 type Props = {group:CandidateGroup;profiles:CandidateProfile[];reviews:InterviewReview[];identityKey:string;open:boolean;onClose:()=>void};
-const prompts=["現在の状況を教えて","提案先ごとの進捗は？","次に確認することは？","希望条件と職歴を整理して"];
+const prompts=["追加入力したほうがいい情報は？","提案先ごとの進捗は？","次に確認することは？","希望条件と職歴を整理して"];
 const errorMessage=(error:unknown)=>{
  const code=error&&typeof error==="object"&&"code" in error?String(error.code):"";
  return ({UNAVAILABLE:"このブラウザでは端末内AIを使えません。「登録情報を確認」へ切り替えると記録を調べられます。",TIMEOUT:"AIの準備・回答に時間がかかったため中止しました。質問は残っています。",INVALID_INPUT:"一度に参照する情報が長すぎる可能性があります。参照する記録を1件選ぶか、質問を短くしてください。",INVALID_RESPONSE:"根拠を確認できる回答を取得できませんでした。再試行するか、登録情報から確認してください。",ABORTED:"回答を中止しました。",MODEL_ERROR:"端末内AIを実行できませんでした。登録情報の確認は引き続き使えます。"} as Record<string,string>)[code]||"回答を作成できませんでした。質問は残っています。";
@@ -53,10 +53,12 @@ function CandidateChatSession({group,profiles,reviews,open,onClose}:Props){
   const current=()=>mounted.current&&!controller.signal.aborted&&request===generation.current&&signature===currentFingerprint.current;
   setRunning(true);setProgress(selectedEngine==="device"?{phase:"checking"}:null);
   try{
-   const answer=selectedEngine==="device"?await generateCandidateChat({context,question:q,history:messages.filter(message=>message.fingerprint===signature).slice(-10).map(message=>({role:message.role,content:unicodeLength(message.content)>3000?`${Array.from(message.content).slice(0,2970).join("")}\n（履歴の続きは省略）`:message.content}))},{signal:controller.signal,timeoutMs:120000,preparationTimeoutMs:600000,onProgress:value=>{if(current())setProgress(value);}}):answerCandidateFacts(context,q);
+   const history=messages.filter(message=>message.fingerprint===signature).slice(-10).map(message=>({role:message.role,content:unicodeLength(message.content)>3000?`${Array.from(message.content).slice(0,2970).join("")}\n（履歴の続きは省略）`:message.content}));
+   if(retry&&history.at(-1)?.role==="user"&&history.at(-1)?.content===q)history.pop();
+   const answer=selectedEngine==="device"?await generateCandidateChat({context,question:q,history},{signal:controller.signal,timeoutMs:120000,preparationTimeoutMs:600000,onProgress:value=>{if(current())setProgress(value);}}):answerCandidateFacts(context,q,history);
    if(current()){
     const content="answer" in answer?answer.answer:answer.text;
-    setMessages(previous=>[...previous,{id:crypto.randomUUID(),role:"assistant",content,engine:selectedEngine,fingerprint:signature,sources:context.sources.filter(source=>answer.sourceIds.includes(source.id))} satisfies ChatMessage].slice(-40));
+    setMessages(previous=>[...previous,{id:crypto.randomUUID(),role:"assistant",content,engine:answer.method==="record-check"?"record-check":selectedEngine,fingerprint:signature,sources:context.sources.filter(source=>answer.sourceIds.includes(source.id))} satisfies ChatMessage].slice(-40));
     setRetryQuestion("");if(selectedEngine==="device")setAvailability("available");
    }
   }catch(value){if(current())setError(errorMessage(value));}
@@ -81,7 +83,7 @@ function CandidateChatSession({group,profiles,reviews,open,onClose}:Props){
   </div>
   <div className="candidate-chat-conversation" ref={conversation} role="log" aria-label="候補者との相談履歴" aria-live="polite" aria-relevant="additions text">
    {!messages.length&&<div className="candidate-chat-welcome"><MessageCircle size={27}/><h3>この候補者について確認する</h3><p>進捗・予定・希望条件・面談メモをもとに相談できます。未登録の情報は補わず、回答の下に参照した記録を表示します。</p><div className="candidate-chat-prompts">{prompts.map(prompt=><button type="button" key={prompt} disabled={running} onClick={()=>void ask(prompt)}>{prompt}<Send size={13}/></button>)}</div></div>}
-   {messages.map(message=><article key={message.id} className={`candidate-chat-message is-${message.role}${message.fingerprint!==fingerprint?" is-stale":""}`}><header><strong>{message.role==="user"?"あなた":message.engine==="device"?"端末内AI":"登録情報から確認（AI未使用）"}</strong>{message.fingerprint!==fingerprint&&<span>更新前の参照情報</span>}</header><div className="candidate-chat-answer">{message.content}</div>{message.role==="assistant"&&<footer>{message.sources.length>0&&<details className="candidate-chat-sources"><summary>参照した記録（{message.sources.length}）</summary>{message.sources.map(source=><details key={source.id}><summary>{source.label}</summary><dl>{source.facts.map((fact,index)=><div key={`${fact.label}-${index}`}><dt>{fact.label}</dt><dd>{fact.value}</dd></div>)}</dl></details>)}</details>}<button type="button" className="text-button" disabled={message.fingerprint!==fingerprint} aria-label="この回答をコピー" onClick={()=>void copy(message)}>{copied===message.id?<Check size={14}/>:<Copy size={14}/>} {copied===message.id?"コピー済み":"コピー"}</button></footer>}</article>)}
+   {messages.map(message=><article key={message.id} className={`candidate-chat-message is-${message.role}${message.fingerprint!==fingerprint?" is-stale":""}`}><header><strong>{message.role==="user"?"あなた":message.engine==="device"?"端末内AI":message.engine==="record-check"?"入力内容のチェック（AI未使用）":"登録情報から確認（AI未使用）"}</strong>{message.fingerprint!==fingerprint&&<span>更新前の参照情報</span>}</header><div className="candidate-chat-answer">{message.content}</div>{message.role==="assistant"&&<footer>{message.sources.length>0&&<details className="candidate-chat-sources"><summary>参照した記録（{message.sources.length}）</summary>{message.sources.map(source=><details key={source.id}><summary>{source.label}</summary><dl>{source.facts.map((fact,index)=><div key={`${fact.label}-${index}`}><dt>{fact.label}</dt><dd>{fact.value}</dd></div>)}</dl></details>)}</details>}<button type="button" className="text-button" disabled={message.fingerprint!==fingerprint} aria-label="この回答をコピー" onClick={()=>void copy(message)}>{copied===message.id?<Check size={14}/>:<Copy size={14}/>} {copied===message.id?"コピー済み":"コピー"}</button></footer>}</article>)}
    {running&&<div className="candidate-chat-running" role="status"><LoaderCircle size={17}/><span>{engine==="device"?runningLabel:"登録情報を確認しています…"}</span><button type="button" className="text-button" onClick={()=>{cancel();setNotice("回答を中止しました。質問は会話に残っています。");}}><Square size={12}/>中止</button></div>}
    {error&&<div className="candidate-chat-error" role="alert"><p>{error}</p><div><button type="button" className="text-button" disabled={running} onClick={()=>void ask(retryQuestion,true)}><RotateCcw size={14}/>再試行</button>{engine==="device"&&<button type="button" className="text-button" onClick={()=>{changeEngine("records");void ask(retryQuestion,true,"records");}}>登録情報で確認</button>}</div></div>}
    {notice&&<p className="candidate-chat-notice" role="status">{notice}</p>}

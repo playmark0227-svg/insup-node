@@ -2,6 +2,7 @@ import type { CandidateGroup } from "./candidate-groups.ts";
 import { interviewFieldLabels, interviewStringFields, type CandidateProfile } from "./candidate-intake.ts";
 import { matchingFields, valueAt } from "./management-data.ts";
 import type { CandidateRecord, InterviewReview } from "./sheets-client.ts";
+import { buildCandidateChatGuidance, renderCandidateChatChecks } from "./candidate-chat-guidance.ts";
 
 export type CandidateChatSource = {
   id: string;
@@ -10,7 +11,7 @@ export type CandidateChatSource = {
   facts: { label: string; value: string }[];
 };
 export type CandidateChatContext = { candidateName: string; sources: CandidateChatSource[]; omittedRecords: number };
-export type CandidateFactAnswer = { text: string; sourceIds: string[] };
+export type CandidateFactAnswer = { text: string; sourceIds: string[]; method?: "record-check" };
 
 const CONTEXT_LIMIT = 28_000;
 const normalizeName = (value: string) => value.replace(/[\s\u3000]/g, "");
@@ -145,13 +146,15 @@ function specificConditionLabels(query: string): Set<string> {
 }
 
 /** A deterministic record lookup fallback, not an AI response or a hiring recommendation. */
-export function answerCandidateFacts(context: CandidateChatContext, question: string): CandidateFactAnswer {
+export function answerCandidateFacts(context: CandidateChatContext, question: string, history:Array<{role:"user"|"assistant";content:string}> = []): CandidateFactAnswer {
   const query = question.trim();
   if (!query) return { text: "確認したいことを入力してください。", sourceIds: [] };
   if (/採用(?:すべき|して|した方)|不採用|合否を(?:決|判)|向いて|適性|優秀|評価して|点数|順位/.test(query)) {
     return { text: "記録だけで採用判断や人物評価は行いません。会社ごとの進捗、希望条件、面談で確認した事実を質問してください。", sourceIds: [] };
   }
   if (!context.sources.length) return { text: "この候補者について、回答の根拠にできる記録はありません。", sourceIds: [] };
+  const guidance=buildCandidateChatGuidance(context,query,history);
+  if(guidance.intent==="missing-information")return {...renderCandidateChatChecks(guidance),method:"record-check"};
   const requested = new Set<string>();
   const specificConditions = specificConditionLabels(query);
   let mode: "facts" | "summary" | "checks" = "facts";
