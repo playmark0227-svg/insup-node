@@ -4,6 +4,7 @@ import fs from "node:fs";
 import vm from "node:vm";
 import ts from "typescript";
 import {assertSnapshot, assertMutationReceipt, isUncertainWrite, validateEndpoint, SheetApiError} from "../lib/sheets-client.ts";
+import {correctionFields,correctedPayload,mutationDateErrors} from "../lib/save-correction.ts";
 import {pendingSaveResources} from "../lib/pending-saves.ts";
 import {matchingFields} from "../lib/management-data.ts";
 import {interviewFieldLabels,interviewStringFields,blankInterviewFields} from "../lib/candidate-intake.ts";
@@ -32,7 +33,7 @@ async function flush() { for (let i=0; i<35; i++) await Promise.resolve(); }
 
 // Execute the actual hook against a small deterministic hook runtime. This
 // exposes races and state restoration without adding a browser/test dependency.
-function harness(handle, {storedToken, malformedSession, deadlineController, browser, manifestEndpoint=endpoint, storedEndpoint=endpoint, manifestFailure=false, production=false, pendingSaves=[], persistLocal} = {}) {
+function harness(handle, {storedToken, malformedSession, deadlineController, browser, manifestEndpoint=endpoint, storedEndpoint=endpoint, manifestFailure=false, production=false, pendingSaves=[], persistLocal, replaceLocal} = {}) {
   const slots = [], effects = [], calls = [];
   let cursor = 0, stateUpdates = 0;
   const localStorage = storage({[ENDPOINT_KEY]:storedEndpoint});
@@ -61,14 +62,15 @@ function harness(handle, {storedToken, malformedSession, deadlineController, bro
   const pendingStore = new Map(pendingSaves.map(save=>[save.operationId,structuredClone(save)]));
   const pendingApi={pendingSaveResources,readPendingSaves:async()=>[...pendingStore.values()].map(value=>structuredClone(value)),
     persistPendingSave:async(_endpoint,_account,value)=>{if(persistLocal)await persistLocal(value);pendingStore.set(value.operationId,structuredClone(value));},
+    replacePendingSave:async(_endpoint,_account,id,value)=>{if(replaceLocal)await replaceLocal(value);if(!pendingStore.has(id))throw new Error("old input missing");pendingStore.set(value.operationId,structuredClone(value));pendingStore.delete(id);},
     removePendingSave:async(_endpoint,_account,id)=>{pendingStore.delete(id);}};
   const exports={};
   const timeoutDurations=[];
   const deadlineSignals=deadlineController ? {any:signals=>AbortSignal.any(signals),timeout:ms=>{timeoutDurations.push(ms); return deadlineController.signal;}} : AbortSignal;
-  const context=vm.createContext({exports,module:{exports},AbortController,AbortSignal:deadlineSignals,JSON,Error,localStorage,sessionStorage,TEST_PRODUCTION:production,
+  const context=vm.createContext({exports,module:{exports},AbortController,AbortSignal:deadlineSignals,JSON,Error,localStorage,sessionStorage,TEST_PRODUCTION:production,crypto,
     ...(browser || {}),
     fetch:async()=>{if(manifestFailure)throw new Error("設定取得失敗");return {ok:true,json:async()=>({endpoint:manifestEndpoint})};},
-    require:name=>name==="react" ? react : name.includes("pending-saves") ? pendingApi : name.includes("node-data") ? {initialPlayers:[player],makeDemoActivities:()=>[]} : name.includes("management-data") ? {matchingFields} : name.includes("candidate-intake") ? {interviewFieldLabels,interviewStringFields} : name.includes("writing-ai") ? {assertWritingKitState,validateWritingPreferences} : {assertSnapshot,assertMutationReceipt,isUncertainWrite,validateEndpoint,SheetApiError,sheetRequest}});
+    require:name=>name==="react" ? react : name.includes("save-correction") ? {correctionFields,correctedPayload,mutationDateErrors} : name.includes("pending-saves") ? pendingApi : name.includes("node-data") ? {initialPlayers:[player],makeDemoActivities:()=>[]} : name.includes("management-data") ? {matchingFields} : name.includes("candidate-intake") ? {interviewFieldLabels,interviewStringFields} : name.includes("writing-ai") ? {assertWritingKitState,validateWritingPreferences} : {assertSnapshot,assertMutationReceipt,isUncertainWrite,validateEndpoint,SheetApiError,sheetRequest}});
   vm.runInContext(source,context);
   const render = () => {cursor=0; const result=exports.useSheetsConnection(); while(effects.length) effects.shift()(); return result;};
   render();
@@ -658,4 +660,43 @@ test('a mismatched commit receipt cannot confirm another write or remove its loc
  const h=harness(call=>call.action==='snapshot'?snapshot:{committed:true,operationId:'another-operation-id'},{storedToken:token});await flush();
  await h.render().submitMutation('updateRecord',{recordId:'one',changes:{13:'must remain'}},'receipt-operation-two');await flush();
  assert.equal(h.render().backgroundSave.status,'failed');assert.equal(h.render().backgroundSave.uncertain,true);assert.equal(h.pendingStore.size,1);h.unmount();
+});
+
+test("definite rejection can be corrected atomically with a fresh operation and preserved revision",async()=>{
+ const head=deferred(),tail=deferred();let writes=0;
+ const h=harness(call=>{if(call.action==="snapshot")return snapshot;if(++writes===1)throw new SheetApiError("VALIDATION","会社名を確認してください");return writes===2?head.promise:tail.promise;},{storedToken:token});await flush();
+ const original={recordId:"record-one",rowVersion:"original-version",changes:{2:"間違い",13:"残す原文"}};
+ await h.render().submitMutation("updateRecord",original,"first_operation_123456");await flush();
+ assert.equal(h.render().backgroundSave.uncertain,false);assert.equal(h.render().backgroundSave.editable,true);
+ const stale=h.render().readBackgroundSaveCorrection,draft=stale("first_operation_123456");draft.fields[0].value="do not mutate retained input";
+ assert.equal(h.render().readBackgroundSaveCorrection("first_operation_123456").fields[0].value,"間違い");
+ await h.render().submitMutation("updateRecord",{recordId:"other",changes:{13:"別の候補者"}},"second_operation_123456");
+ await h.render().correctBackgroundSave("first_operation_123456",{"2":"修正会社"});await flush();
+ const sent=h.calls.filter(call=>call.action==="updateRecord");assert.equal(sent.length,2);assert.notEqual(sent[1].options.operationId,sent[0].options.operationId);
+ assert.equal(sent[1].payload.rowVersion,"original-version");assert.equal(sent[1].payload.changes[13],"残す原文");assert.equal(sent[1].payload.changes[2],"修正会社");assert.equal(h.pendingStore.size,2);assert.ok(!h.pendingStore.has("first_operation_123456"));
+ assert.throws(()=>stale("first_operation_123456"),/保存状況/);
+ head.resolve({committed:true,operationId:sent[1].options.operationId});await flush();assert.equal(h.calls.filter(call=>call.action==="updateRecord").length,3);
+ tail.resolve({committed:true,operationId:"second_operation_123456"});await flush();assert.equal(h.pendingStore.size,0);h.unmount();
+});
+
+test("a failed corrective local transaction retains the previous payload and accepts a later retry",async()=>{
+ let attempts=0;const h=harness(call=>call.action==="snapshot"?snapshot:Promise.reject(new SheetApiError("VALIDATION","入力エラー")),{storedToken:token,replaceLocal:async()=>{if(!attempts++)throw new Error("端末の保存に失敗");}});await flush();
+ await h.render().submitMutation("createCandidate",{candidateName:"元の名前",company:"元会社",position:"アポインター"},"correct_local_12345678");await flush();
+ await assert.rejects(h.render().correctBackgroundSave("correct_local_12345678",{company:"修正会社"}),/端末の保存/);
+ assert.equal(h.pendingStore.size,1);assert.equal(h.pendingStore.get("correct_local_12345678").payload.company,"元会社");assert.equal(h.render().backgroundSave.operationId,"correct_local_12345678");assert.equal(h.calls.filter(call=>call.action==="createCandidate").length,1);
+ await h.render().correctBackgroundSave("correct_local_12345678",{company:"修正会社"});await flush();assert.equal(h.calls.filter(call=>call.action==="createCandidate").length,2);h.unmount();
+});
+
+test("unknown network outcomes cannot be edited and require same-ID confirmation",async()=>{
+ const h=harness(call=>call.action==="snapshot"?snapshot:Promise.reject(new SheetApiError("TIMEOUT","結果未確認")),{storedToken:token});await flush();
+ await h.render().submitMutation("createCandidate",{candidateName:"架空候補者",company:"架空会社"},"uncertain_edit_123456");await flush();
+ assert.throws(()=>h.render().readBackgroundSaveCorrection("uncertain_edit_123456"),/未確認/);
+ await assert.rejects(h.render().correctBackgroundSave("uncertain_edit_123456",{company:"修正"}),/未確認/);
+ assert.equal(h.pendingStore.size,1);h.render().retryBackgroundSave();await flush();assert.ok(h.calls.filter(call=>call.action==="createCandidate").every(call=>call.options.operationId==="uncertain_edit_123456"));h.unmount();
+});
+
+test("future actual dates fail before local acceptance or Google transmission",async()=>{
+ const h=harness(()=>snapshot,{storedToken:token});await flush();
+ await assert.rejects(h.render().submitMutation("updateRecord",{changes:{17:"2099-01-01"}},"future_date_12345678"),/今日/);
+ assert.equal(h.pendingStore.size,0);assert.ok(h.calls.every(call=>call.action==="snapshot"));h.unmount();
 });

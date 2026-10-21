@@ -25,7 +25,25 @@
 .background-save-discard{margin-top:13px;border-top:1px solid #e4ecf4;padding-top:12px;color:#825631;font-size:12px;line-height:1.8}
 .background-save-discard>div{display:flex;gap:8px;margin-top:10px}
 .background-save-spinner{animation:background-save-spin 1.1s linear infinite}
+.background-save-edit-button{width:100%;margin-top:14px;min-height:40px;font-size:13px}
+.background-save-panel.is-correcting{width:430px;display:flex;flex-direction:column;overflow:hidden}
+.background-save-panel.is-correcting>*{flex-shrink:0}
+.background-save-panel.is-correcting>.save-correction-form{flex:1 1 auto}
+.save-correction-form{margin-top:16px;padding-top:14px;border-top:1px solid #dde9f3;display:flex;flex-direction:column;min-height:0}
+.save-correction-form h3{font-size:14px;font-weight:700;color:#21496e;margin:0}
+.save-correction-form>p{font-size:12px;line-height:1.8;color:#607b94;margin-top:6px}
+.save-correction-form fieldset{border:0;padding:0 5px 0 0;margin:14px 0 0;min-width:0;min-height:0;overflow:auto}
+.save-correction-fields{display:grid;gap:13px}
+.save-correction-fields label{display:grid;gap:6px;min-width:0;font-size:12px;font-weight:600;color:#345b7d}
+.save-correction-fields input,.save-correction-fields select,.save-correction-fields textarea{display:block;width:100%;min-width:0;box-sizing:border-box;border:1px solid #cbddec;border-radius:6px;background:white;padding:9px 10px;min-height:40px;font:inherit;font-size:13px;color:#24486d}
+.save-correction-fields textarea{resize:vertical;line-height:1.7}
+.save-correction-fields input:focus,.save-correction-fields select:focus,.save-correction-fields textarea:focus{outline:2px solid #7cc8fa;outline-offset:1px}
+.save-correction-fields [aria-invalid=true]{border-color:#c67237;background:#fffaf6}
+.save-correction-field-error{font-size:11px;line-height:1.6;color:#a04b1c;font-weight:500}
+.save-correction-form>h3,.save-correction-form>p{flex-shrink:0}
+.save-correction-form .background-save-actions{flex-shrink:0;background:#fff;border-top:1px solid #e1ebf3;padding:13px 0 4px;box-shadow:0 -7px 12px #ffffffdd}
 @keyframes background-save-spin{to{transform:rotate(360deg)}}
 @media(max-width:767px){.topbar-right.has-background-save{gap:8px}.topbar-right.has-background-save .preview-chip{display:none}.topbar:has(.background-save) .breadcrumbs{min-width:0}.topbar:has(.background-save) .breadcrumbs strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.background-save-trigger{gap:5px;padding:0 7px;font-size:11px}.background-save-trigger>svg:last-child{display:none}.background-save-panel{position:fixed;top:69px;right:12px;width:370px;max-width:calc(100vw - 24px);max-height:calc(100dvh - 160px)}.background-save-actions .primary-button{width:100%;min-height:42px}}
 @media(max-width:380px){.topbar-right.has-background-save>button{display:none}.background-save-trigger{padding:0 6px}}
+@media(max-width:767px){.background-save-panel,.background-save-panel.is-correcting{left:12px;right:12px;width:auto;max-width:none}}
 @media(prefers-reduced-motion:reduce){.background-save-spinner{animation:none}}

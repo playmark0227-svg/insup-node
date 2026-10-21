@@ -2,7 +2,7 @@ import "fake-indexeddb/auto";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { persistPendingSave, readPendingSaves, removePendingSave, pendingSaveResources, type PendingSave } from "../lib/pending-saves.ts";
+import { persistPendingSave, readPendingSaves, removePendingSave, replacePendingSave, pendingSaveResources, type PendingSave } from "../lib/pending-saves.ts";
 import type { SheetSnapshot } from "../lib/sheets-client.ts";
 const endpoint = "https://script.google.com/macros/s/TEST_OUTBOX_ENDPOINT_123456/exec";
 const input = (): PendingSave => ({operationId:randomUUID(),action:"updateRecord",label:"秘密の候補者の変更",details:["メモ：非公開の原文"],payload:{recordId:"ROW-one",changes:{13:"非公開の原文"}},createdAt:Date.now(),attempted:false});
@@ -54,4 +54,19 @@ test("related records and shared profiles are reserved together while independen
   assert.ok(pendingSaveResources("updateRecord",{recordId:"two"},snapshot).some(key=>first.includes(key)));
   assert.ok(!pendingSaveResources("updateRecord",{recordId:"other"},snapshot).some(key=>first.includes(key)));
   assert.deepEqual(pendingSaveResources("restoreChange",{},snapshot),["*"]);
+});
+
+
+test("replacing a rejected save commits the new ciphertext and removes the old one together",async()=>{
+ const account=randomUUID(),old=input(),next={...old,operationId:randomUUID(),payload:{...old.payload as object,changes:{13:"修正した原文"}}};
+ await persistPendingSave(endpoint,account,old);await replacePendingSave(endpoint,account,old.operationId,next);
+ assert.deepEqual(await readPendingSaves(endpoint,account),[next]);
+ await assert.rejects(replacePendingSave(endpoint,account,old.operationId,{...next,operationId:randomUUID()}));
+ assert.deepEqual(await readPendingSaves(endpoint,account),[next]);
+});
+
+test("an aborted replacement preserves both the original input and the existing new-ID entry",async()=>{
+ const account=randomUUID(),old=input(),existing=input();await persistPendingSave(endpoint,account,old);await persistPendingSave(endpoint,account,existing);
+ await assert.rejects(replacePendingSave(endpoint,account,old.operationId,{...existing,payload:{changes:{13:"must not overwrite"}}}));
+ const rows=await readPendingSaves(endpoint,account);assert.equal(rows.length,2);assert.deepEqual(rows.find(row=>row.operationId===old.operationId),old);assert.deepEqual(rows.find(row=>row.operationId===existing.operationId),existing);
 });

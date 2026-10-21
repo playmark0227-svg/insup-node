@@ -96,6 +96,19 @@ export async function removePendingSave(endpoint: string, account: string, opera
   tx.objectStore("saves").delete(`${scope}:${operationId}`); await done;
 }
 
+/** Replace a rejected draft atomically: a failed local commit must retain the old input. */
+export async function replacePendingSave(endpoint:string,account:string,operationId:string,save:PendingSave):Promise<void> {
+  validate(save);
+  if(save.operationId===operationId||save.attempted)throw storageError();
+  const db=await database(),scope=await scopeFor(endpoint,account),key=await encryptionKey(db,scope);
+  const id=`${scope}:${save.operationId}`,iv=crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext=await crypto.subtle.encrypt({name:"AES-GCM",iv,additionalData:new TextEncoder().encode(id)},key,new TextEncoder().encode(JSON.stringify(save)));
+  const tx=db.transaction("saves","readwrite"),done=completed(tx),store=tx.objectStore("saves");
+  const old=store.get(`${scope}:${operationId}`);
+  old.onsuccess=()=>{if(!old.result){tx.abort();return;}store.add({id,scope,iv,ciphertext} satisfies EncryptedSave);store.delete(`${scope}:${operationId}`);};
+  await done;
+}
+
 /** Block overlapping edits until their server revisions arrive. Never silently rebase a draft. */
 export function pendingSaveResources(action: string, payload: unknown, snapshot: SheetSnapshot): string[] {
   const data = payload as Record<string, unknown>;

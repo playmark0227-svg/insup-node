@@ -1,4 +1,5 @@
-import { persistPendingSave, readPendingSaves, removePendingSave, pendingSaveResources, type PendingSave } from "../lib/pending-saves";
+import { persistPendingSave, readPendingSaves, removePendingSave, replacePendingSave, pendingSaveResources, type PendingSave } from "../lib/pending-saves";
+import { correctionFields, correctedPayload, mutationDateErrors, type SaveCorrectionDraft } from "../lib/save-correction";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { initialPlayers, makeDemoActivities, type Activity } from "../lib/node-data";
 import { assertSnapshot, assertMutationReceipt, isUncertainWrite, sheetRequest, validateEndpoint, SheetApiError, type MutationResult, type MutationReceipt, type SheetSnapshot, type SheetPlayer, type InterviewAdvice, type InterviewAdviceState } from "../lib/sheets-client";
@@ -12,7 +13,7 @@ const isExpired = (e: unknown) => e instanceof SheetApiError && ["AUTH_REQUIRED"
 export type ConnectionLoadPhase = "authenticating" | "loading" | "restoring" | null;
 export type BackgroundSaveState = {
   operationId: string; action: string; label: string; status: "saving" | "saved" | "failed";
-  details: string[]; error: string; uncertain: boolean; changeId?: string; intakeInput?: boolean; refreshing?: boolean; localSaved?: boolean; pendingCount?: number;
+  details: string[]; error: string; uncertain: boolean; changeId?: string; intakeInput?: boolean; refreshing?: boolean; localSaved?: boolean; pendingCount?: number; editable?: boolean;
 };
 type BackgroundJob = { state: BackgroundSaveState; payload: unknown; endpoint: string; token: string; generation: number; account: string; savedInput: PendingSave; resources: string[] };
 const backgroundActions = new Set(["saveCandidateProfile", "saveClient", "deleteCandidate", "updateRecord", "createCandidate", "cancelAchievement", "restoreChange", "saveActivity", "updateProfile", "updateStatus", "saveManagementRow", "saveInterviewReview"]);
@@ -40,6 +41,7 @@ export function useSheetsConnection() {
   const backgroundJob = useRef<BackgroundJob | null>(null);
   const backgroundQueue = useRef<BackgroundJob[]>([]);
   const admissions = useRef(0);
+  const correctionRunning = useRef<string|null>(null);
   const outboxLoad = useRef<{generation:number;promise:Promise<void>} | null>(null);
   const latestSnapshot = useRef(snapshot); latestSnapshot.current = snapshot;
   const hasPendingBackground = () => backgroundQueue.current.length > 0 || admissions.current > 0;
@@ -304,7 +306,7 @@ export function useSheetsConnection() {
     } catch (e) {
       if (!isCurrent(job.generation) || backgroundQueue.current[0] !== job) return;
       if (isExpired(e)) { clearSession(); setError("ログインの有効期限が切れました。入力はこの端末に残っています。再ログインすると未同期の入力を確認できます。"); return; }
-      job.state = {...job.state, status:"failed", error:e instanceof Error?e.message:"保存結果を確認できませんでした。", uncertain:posted&&isUncertainWrite(e)};
+      job.state = {...job.state, status:"failed", error:e instanceof Error?e.message:"保存結果を確認できませんでした。", uncertain:posted&&isUncertainWrite(e),editable:!!latestSnapshot.current&&correctionFields(job.state.action,job.payload,latestSnapshot.current).length>0};
       publishQueue();
     } finally {
       if (isCurrent(job.generation)) {
@@ -348,6 +350,8 @@ export function useSheetsConnection() {
     let owned: unknown;
     try { owned = JSON.parse(JSON.stringify(payload)); } catch { throw new SheetApiError("INVALID_PAYLOAD", "入力内容を確認してください。"); }
     if (!operationId || !owned || typeof owned !== "object") throw new SheetApiError("INVALID_PAYLOAD", "入力内容を確認してください。");
+    const dateErrors=mutationDateErrors(action,owned);
+    if(Object.keys(dateErrors).length)throw new SheetApiError("INVALID_DATE",Object.values(dateErrors)[0]);
     const g=generation.current, savedToken=token.current, account=`${current.self.role}:${current.self.playerId}`;
     const resources=pendingSaveResources(action,owned,current);
     admissions.current++; setLocalSaving(true);
@@ -374,13 +378,42 @@ export function useSheetsConnection() {
 
   const retryBackgroundSave = () => {
     const job = backgroundQueue.current[0];
-    if (!job || job.state.status !== "failed" || mutationRunning.current) return;
+    if (!job || job.state.status !== "failed" || mutationRunning.current || correctionRunning.current) return;
     if (!isCurrent(job.generation) || job.token !== token.current || job.endpoint !== endpoint) throw new SheetApiError("STALE_SESSION", "再ログインして保存結果を確認してください。");
     void runBackground(job);
   };
   // The original private input is materialized only by an explicit user action.
   // A callback retained by an older login or view must not expose a newer job.
   const copyGeneration = generation.current, copyOperation = backgroundSave?.operationId;
+  const correctionJob = (operationId:string) => {
+    const job=backgroundQueue.current[0],current=latestSnapshot.current;
+    if(!job||!current||!authenticated||!isCurrent(copyGeneration)||!isCurrent(job.generation)||job.token!==token.current||job.endpoint!==endpoint||job.account!==`${current.self.role}:${current.self.playerId}`)throw new SheetApiError("STALE_SESSION","ログイン状態が変わりました。保存状況を開き直してください。");
+    if(job.state.operationId!==operationId||operationId!==copyOperation||job.state.status!=="failed")throw new SheetApiError("STALE_SAVE","保存状況が変わりました。メニューを開き直してください。");
+    if(job.state.uncertain)throw new SheetApiError("MUTATION_PENDING","保存結果が未確認です。先に同じ内容で保存を確認してください。");
+    if(mutationRunning.current||correctionRunning.current)throw new SheetApiError("MUTATION_PENDING","修正内容を保存中です。");
+    return {job,current};
+  };
+  const readBackgroundSaveCorrection = (operationId:string):SaveCorrectionDraft => {
+    const {job,current}=correctionJob(operationId);
+    return {operationId,fields:correctionFields(job.state.action,job.payload,current)};
+  };
+  const correctBackgroundSave = async (operationId:string,values:Record<string,string>):Promise<void> => {
+    const {job,current}=correctionJob(operationId);
+    if(!current.writesEnabled)throw new SheetApiError("READ_ONLY","現在は読み取り接続です。");
+    const owned=correctedPayload(job.state.action,job.payload,values,current),resources=pendingSaveResources(job.state.action,owned,current);
+    if(backgroundQueue.current.slice(1).some(other=>resources.includes("*")||other.resources.includes("*")||other.resources.some(key=>resources.includes(key))))throw new SheetApiError("MUTATION_PENDING","修正先の候補者・項目に別の未同期の入力があります。そちらの同期後に修正してください。");
+    const nextId=crypto.randomUUID(),input:PendingSave={...job.savedInput,operationId:nextId,payload:owned,details:saveDetails(job.state.action,owned,current),attempted:false};
+    const previousResources=job.resources;job.resources=[...new Set([...previousResources,...resources])];
+    correctionRunning.current=operationId;admissions.current++;setLocalSaving(true);
+    try {
+      await replacePendingSave(job.endpoint,job.account,operationId,input);
+      if(!isCurrent(job.generation)||backgroundQueue.current[0]!==job||job.token!==token.current)throw new SheetApiError("STALE_SESSION","ログイン状態が変わりました。修正内容は端末に保存しています。");
+      job.payload=owned;job.savedInput=input;job.resources=resources;
+      job.state={...job.state,operationId:nextId,details:input.details,status:"saving",error:"",uncertain:false,localSaved:true};publishQueue();
+      void runBackground(job);
+    } catch(error){job.resources=previousResources;throw error;}
+    finally{if(correctionRunning.current===operationId)correctionRunning.current=null;admissions.current--;if(isCurrent(job.generation)&&admissions.current===0)setLocalSaving(false);}
+  };
   const copyBackgroundIntakeInput = (): string => {
     const job = backgroundJob.current;
     if (!job || job.state.status !== "failed" || !job.state.intakeInput) throw new SheetApiError("INTAKE_INPUT_UNAVAILABLE", "保存できなかった面談情報がありません。");
@@ -396,6 +429,7 @@ export function useSheetsConnection() {
     return lines.join("\n");
   };
   const dismissBackgroundSave = async () => {
+    if(correctionRunning.current)throw new SheetApiError("MUTATION_PENDING","修正内容を保存中です。");
     const job = backgroundQueue.current[0] || backgroundJob.current;
     if (job?.state.status === "saving" || job?.state.uncertain) throw new SheetApiError("MUTATION_PENDING", "同期結果が未確認です。同じ内容で再試行してください。");
     if (job && job.state.status === "failed") {
@@ -508,7 +542,7 @@ export function useSheetsConnection() {
   };
 
   return { ready, endpoint, mode, players, setPlayers, activities, setActivities, snapshot, authenticated, loadPhase, busy, error,
-    syncing, syncError, backgroundSave, hasPendingSave, submitMutation, retryBackgroundSave, dismissBackgroundSave, copyBackgroundIntakeInput, credentials, dismissCredentials:() => setCredentials(null), connect, login, logout, refresh, mutate, readManagement, analyzeReviews, readAdvice, analyzeInsights, readInsights, readWritingKit, generateWritingKit, readWritingPreferences, saveWritingPreferences, readSecurity, changePassword, showDemo };
+    syncing, syncError, backgroundSave, hasPendingSave, submitMutation, retryBackgroundSave, dismissBackgroundSave, readBackgroundSaveCorrection, correctBackgroundSave, copyBackgroundIntakeInput, credentials, dismissCredentials:() => setCredentials(null), connect, login, logout, refresh, mutate, readManagement, analyzeReviews, readAdvice, analyzeInsights, readInsights, readWritingKit, generateWritingKit, readWritingPreferences, saveWritingPreferences, readSecurity, changePassword, showDemo };
 }
 
 function saveLabel(action: string) {
