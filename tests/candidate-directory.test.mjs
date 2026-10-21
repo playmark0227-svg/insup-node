@@ -133,6 +133,27 @@ test("desktop and mobile expansion controls have unique content IDs", () => {
   assert.notEqual(desktop.props["aria-controls"], mobile.props["aria-controls"]);
 });
 
+test("desktop and mobile AI actions precede history and route the exact candidate group key", () => {
+  const called = [], groups = candidateGroups.groupCandidates([
+    record("first-person", "架空会社A", 2), record("other-person", "架空会社B", 3, "ND-002", "別の架空候補者"),
+  ], "registration-desc");
+  const h = harness({ groups, onChat: key => called.push(key) });
+  for (const mode of ["desktop", "mobile"]) {
+    const buttons = nodes(h.surface(mode)).filter(node => node.type === "button" &&
+      (text(node) === "AIに相談" || typeof node.props["aria-expanded"] === "boolean"));
+    assert.equal(buttons.length, groups.length * 2);
+    groups.forEach((group, index) => {
+      const ai = buttons[index * 2], history = buttons[index * 2 + 1];
+      assert.equal(text(ai), "AIに相談", `${mode}: AI precedes its own history action`);
+      assert.equal(history.props["aria-expanded"], false);
+      assert.equal(ai.props["aria-label"], `${group.name}についてAIに相談`);
+      h.click(ai);
+      assert.equal(called.at(-1), group.key, "the display group key is used rather than name or first record ID");
+    });
+  }
+  assert.deepEqual(called, [...groups.map(group => group.key), ...groups.map(group => group.key)]);
+});
+
 test("a refreshed or reordered directory keeps expansion on the candidate key and preserves exact record actions", () => {
   const first = record("first-person", "架空会社A", 2);
   const second = record("other-person", "架空会社B", 3, "ND-001", "別の架空候補者");

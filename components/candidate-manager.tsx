@@ -6,7 +6,7 @@ import { toast } from "sonner";
 import { positions, statuses, stages, type Player, type Stage } from "@/lib/node-data";
 import { matchingFields, recordDateColumns, recordTimeColumns, milestoneColumns, correctionRecords, valueAt, type CandidateSort } from "@/lib/management-data";
 import { performanceMetrics, stageLabel, activityInputMetrics } from "@/lib/performance-metrics";
-import { businessToday, isUncertainWrite, type CandidateRecord, type MutationResult, type SheetPlayer, type DeletedCandidate, type ClientEntry } from "@/lib/sheets-client";
+import { businessToday, isUncertainWrite, type CandidateRecord, type MutationResult, type SheetPlayer, type DeletedCandidate, type ClientEntry, type InterviewReview } from "@/lib/sheets-client";
 import { mutationDateErrors } from "@/lib/save-correction";
 import "@/app/management.css";
 import type { CandidateAiConnection } from "@/lib/writing-ai";
@@ -15,6 +15,7 @@ import { blankInterviewFields, type CandidateProfile, type InterviewFields } fro
 import { ClientNameInput, ClientMaster } from "@/components/client-selector";
 import { groupCandidates, filterCandidateGroups } from "@/lib/candidate-groups";
 import { CandidateDirectory } from "@/components/candidate-directory";
+import { CandidateChat } from "@/components/candidate-chat";
 export type ManagementMutation = (action:string,payload:unknown,id:string)=>Promise<MutationResult>;
 export type BackgroundManagementSave = (action:string,payload:unknown,operationId:string,label?:string)=>void|Promise<void>;
 export type CorrectionTarget = {owner:string;stage:Stage;period:string};
@@ -39,15 +40,16 @@ export function useManagementSave(onSave:ManagementMutation,live=true,background
  return {save,busy,error,uncertain,undo,restore:async()=>{if(undo&&await save("restoreChange",{changeId:undo}))setUndo(null);}};
 }
 
-export function CandidateManager({records,players,admin,busy,canWrite,live,onSave,backgroundSave,initialRecordId,initialRecordRequest,canDelete=false,deletedCandidates=[],intakeEnabled=false,profiles=[],clients=[],ai}:{records:CandidateRecord[];players:SheetPlayer[];admin:boolean;busy:boolean;canWrite:boolean;live:boolean;onSave:ManagementMutation;backgroundSave?:BackgroundManagementSave;initialRecordId?:string|null;initialRecordRequest?:number;canDelete?:boolean;deletedCandidates?:DeletedCandidate[];intakeEnabled?:boolean;profiles?:CandidateProfile[];clients?:ClientEntry[];ai?:CandidateAiConnection}) {
+export function CandidateManager({records,players,admin,busy,canWrite,live,onSave,backgroundSave,initialRecordId,initialRecordRequest,canDelete=false,deletedCandidates=[],intakeEnabled=false,profiles=[],clients=[],reviews=[],ai}:{records:CandidateRecord[];players:SheetPlayer[];admin:boolean;busy:boolean;canWrite:boolean;live:boolean;onSave:ManagementMutation;backgroundSave?:BackgroundManagementSave;initialRecordId?:string|null;initialRecordRequest?:number;canDelete?:boolean;deletedCandidates?:DeletedCandidate[];intakeEnabled?:boolean;profiles?:CandidateProfile[];clients?:ClientEntry[];reviews?:InterviewReview[];ai?:CandidateAiConnection}) {
  const [search,setSearch]=useState(""),[owner,setOwner]=useState("all"),[status,setStatus]=useState("all"),[page,setPage]=useState(1),[selected,setSelected]=useState<string|null>(initialRecordId||null),[create,setCreate]=useState(false);
  const [deleting,setDeleting]=useState<string|null>(null),[showDeleted,setShowDeleted]=useState(false),[showClients,setShowClients]=useState(false),[basicRecord,setBasicRecord]=useState<string|null>(null);
+ const [chatKey,setChatKey]=useState<string|null>(null),[chatOpen,setChatOpen]=useState(false);
  const [sort,setSort]=useState<CandidateSort>("interview-desc"),[density,setDensity]=useState<"normal"|"compact">(()=>{try{return localStorage.getItem("node-list-density")==="compact"?"compact":"normal";}catch{return "normal";}});
  const pageSize=density==="compact"?30:15;
  useEffect(()=>{try{localStorage.setItem("node-list-density",density);}catch{}setPage(1);},[density]);
  const save=useManagementSave(onSave,live,backgroundSave);
  useEffect(()=>{if(initialRecordId)setSelected(initialRecordId);},[initialRecordId,initialRecordRequest]);
- const filtered=filterCandidateGroups(groupCandidates(records,sort),{owner,status,search});
+ const groups=groupCandidates(records,sort),filtered=filterCandidateGroups(groups,{owner,status,search}),chatGroup=groups.find(group=>group.key===chatKey);
  const rows=filtered.slice((page-1)*pageSize,page*pageSize),record=records.find(r=>r.recordId===selected);
  useEffect(()=>setPage(1),[search,owner,status,sort]);
  useEffect(()=>setPage(p=>Math.min(p,Math.max(1,Math.ceil(filtered.length/pageSize)))),[filtered.length,pageSize]);
@@ -56,7 +58,7 @@ export function CandidateManager({records,players,admin,busy,canWrite,live,onSav
   <div className="candidate-view-tabs"><button className={!showDeleted&&!showClients?"selected":""} onClick={()=>{setShowDeleted(false);setShowClients(false);}}>候補者</button>{canDelete&&<button className={showDeleted?"selected":""} onClick={()=>{setShowDeleted(true);setShowClients(false);}}><Trash2 size={14}/>削除済み <span>{deletedCandidates.length}</span></button>}{intakeEnabled&&<button className={showClients?"selected":""} onClick={()=>{setShowClients(true);setShowDeleted(false);}}>取引先</button>}</div>
   {showClients?<ClientMaster clients={clients} knownNames={records.map(r=>valueAt(r,2))} busy={busy||save.busy||!canWrite} onSave={payload=>save.save("saveClient",payload,"取引先マスターを保存")}/>:!showDeleted?<div className="card"><div className="management-filters"><label className="management-search"><Search size={17}/><input aria-label="候補者・会社・メモを検索" placeholder="候補者名、会社、メモで検索" value={search} onChange={e=>setSearch(e.target.value)}/></label><select aria-label="進捗の絞り込み" value={status} onChange={e=>setStatus(e.target.value)}><option value="all">すべての進捗</option>{[...new Set([...statuses,...records.map(r=>valueAt(r,7)).filter(Boolean)])].map(s=><option key={s}>{s}</option>)}</select>{admin&&<select aria-label="候補者の担当者" value={owner} onChange={e=>setOwner(e.target.value)}><option value="all">すべての担当者</option><option value="unassigned">担当者の対応が未設定</option>{players.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select>}</div>
   <div className="management-list-caption"><strong>{filtered.length.toLocaleString()}名の候補者 <span className="candidate-directory-total">· {filtered.reduce((total,group)=>total+group.records.length,0).toLocaleString()}件の提案・記録</span></strong><div className="candidate-list-preferences"><label>並び順<select aria-label="候補者の並び順" value={sort} onChange={e=>setSort(e.target.value as CandidateSort)}><option value="interview-desc">面談が新しい順</option><option value="interview-asc">面談が古い順</option><option value="registration-desc">シートの登録行が新しい順</option></select></label><label>行の間隔<select aria-label="候補者一覧の行の間隔" value={density} onChange={e=>setDensity(e.target.value as "normal"|"compact")}><option value="normal">標準</option><option value="compact">コンパクト</option></select></label></div></div>
-  <CandidateDirectory groups={rows} players={players} busy={busy||save.busy} intakeEnabled={intakeEnabled} canDelete={canDelete&&canWrite} onEdit={setSelected} onBasic={setBasicRecord} onDelete={setDeleting}/>
+  <CandidateDirectory groups={rows} players={players} busy={busy||save.busy} intakeEnabled={intakeEnabled} canDelete={canDelete&&canWrite} onEdit={setSelected} onBasic={setBasicRecord} onDelete={setDeleting} onChat={key=>{setChatKey(key);setChatOpen(true);}}/>
   {!filtered.length&&<div className="empty-state"><Search size={28}/><h3>該当する候補者はいません</h3><p>検索条件を変えるか、新しく候補者を追加してください。</p></div>}
   <div className="pagination"><span>{filtered.length?`${(page-1)*pageSize+1}〜${Math.min(page*pageSize,filtered.length)} / ${filtered.length}名`:"0名"}</span><button disabled={page<=1} onClick={()=>setPage(p=>p-1)}>前へ</button><button disabled={page*pageSize>=filtered.length} onClick={()=>setPage(p=>p+1)}>次へ</button></div></div>:<div className="card candidate-deleted-list"><h3>削除済みの候補者・提案</h3><p className="panel-note">間違えて削除した候補者を復元できます。登録済みの成果と集計も元に戻ります。</p>{!deletedCandidates.length&&<p className="empty-state">削除済みの候補者はいません。</p>}{deletedCandidates.map(item=><article key={item.changeId}><div><strong>{item.candidateName}</strong><span>{item.companies.join('・')||'未提案'} · {item.recordCount}件</span><small>{new Date(item.deletedAt).toLocaleString('ja-JP',{timeZone:'Asia/Tokyo'})} 削除 · {players.find(p=>p.id===item.playerId)?.name||'担当未設定'}</small></div><button className="secondary-button" disabled={busy||save.busy||!canWrite} onClick={()=>void save.save('restoreChange',{changeId:item.changeId},`${item.candidateName}の削除を元に戻す`)}><Undo2 size={15}/>元に戻す</button></article>)}</div>}
   {save.undo&&<div className="management-undo"><span>直前の情報修正を取り消せます。</span><button className="text-button" disabled={save.busy||busy} onClick={()=>void save.restore()}><Undo2 size={15}/>元に戻す</button></div>}{save.error&&<p className="form-error" role="alert">{save.error}</p>}
@@ -64,6 +66,7 @@ export function CandidateManager({records,players,admin,busy,canWrite,live,onSav
   {deleting&&records.find(r=>r.recordId===deleting)&&<DeleteCandidateDialog record={records.find(r=>r.recordId===deleting)!} records={records} players={players} save={save} busy={busy} onClose={()=>setDeleting(null)}/>}
   {basicRecord&&records.find(r=>r.recordId===basicRecord)&&<BasicInfoDialog ai={ai?{...ai,identityKey:`${ai.identityKey}:${basicRecord}`}:undefined} key={basicRecord} record={records.find(r=>r.recordId===basicRecord)!} profile={profiles.find(p=>p.recordIds.includes(basicRecord))} save={save} disabled={busy||!canWrite} onClose={()=>setBasicRecord(null)}/>}
   {create&&<CreateCandidate clients={clients} knownNames={records.map(r=>valueAt(r,2))} players={players} save={save} onClose={()=>setCreate(false)}/>}
+  {chatGroup&&<CandidateChat group={chatGroup} profiles={profiles} reviews={reviews} identityKey={ai?.identityKey||`${live?"live":"demo"}:${admin?"admin":"player"}`} open={chatOpen} onClose={()=>setChatOpen(false)}/>}
  </section>;
 }
 

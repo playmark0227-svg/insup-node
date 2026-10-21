@@ -1,9 +1,9 @@
 .candidate-directory-table{min-width:0;table-layout:fixed}
-.candidate-directory-table th:nth-child(1){width:22%}
-.candidate-directory-table th:nth-child(2){width:22%}
-.candidate-directory-table th:nth-child(3){width:24%}
-.candidate-directory-table th:nth-child(4){width:15%}
-.candidate-directory-table th:nth-child(5){width:17%}
+.candidate-directory-table th:nth-child(1){width:18%}
+.candidate-directory-table th:nth-child(2){width:18%}
+.candidate-directory-table th:nth-child(3){width:22%}
+.candidate-directory-table th:nth-child(4){width:14%}
+.candidate-directory-table th:nth-child(5){width:28%}
 .candidate-directory-table .candidate-directory-row>td{vertical-align:middle;padding-top:19px;padding-bottom:19px}
 .candidate-directory-row.is-open{background:#f2f9ff}
 .candidate-directory-companies{display:grid;gap:5px;font-size:12px;line-height:1.6}
@@ -34,5 +34,5 @@
 .candidate-directory-table td .candidate-appointment-overdue,.candidate-directory-mobile .candidate-appointment-overdue{color:#ab681f}
 .candidate-density-compact .candidate-directory-table .candidate-directory-row>td{padding-top:10px;padding-bottom:10px}
 .candidate-density-compact .candidate-directory-table .candidate-directory-detail>td{padding:0 12px 12px}
-@media(min-width:701px) and (max-width:1100px){.candidate-history-dates{grid-template-columns:repeat(4,minmax(0,1fr))}.candidate-directory-table th:nth-child(1){width:21%}.candidate-directory-table th:nth-child(2){width:22%}.candidate-directory-table th:nth-child(3){width:23%}.candidate-directory-table th:nth-child(4){width:16%}.candidate-directory-table th:nth-child(5){width:18%}}
+@media(min-width:701px) and (max-width:1100px){.candidate-history-dates{grid-template-columns:repeat(4,minmax(0,1fr))}.candidate-directory-table th:nth-child(1){width:19%}.candidate-directory-table th:nth-child(2){width:20%}.candidate-directory-table th:nth-child(3){width:20%}.candidate-directory-table th:nth-child(4){width:16%}.candidate-directory-table th:nth-child(5){width:25%}}
 @media(max-width:700px){.candidate-directory-mobile .candidate-mobile-card{overflow:hidden}.candidate-directory-mobile .candidate-directory-statuses{flex-direction:row;flex-wrap:wrap}.candidate-directory-mobile .candidate-history-record>header{flex-direction:column;gap:8px}.candidate-directory-mobile .candidate-history-record{padding:12px}.candidate-directory-mobile .candidate-history-dates{grid-template-columns:repeat(2,minmax(0,1fr));margin-top:12px;gap:6px}.candidate-directory-mobile .candidate-history-record>footer{gap:8px;justify-content:flex-start}.candidate-directory-mobile .candidate-history-record>footer .text-button{font-size:12px}.candidate-directory-mobile .candidate-history-schedule{gap:6px}.candidate-directory-mobile .candidate-mobile-card .candidate-history-help{font-size:11px}.candidate-directory-mobile .candidate-history-record>header .stage-tag{max-width:100%;white-space:normal}}
