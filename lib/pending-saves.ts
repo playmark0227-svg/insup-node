@@ -21,10 +21,13 @@ function database(): Promise<IDBDatabase> {
   if (opened) return opened;
   opened = new Promise<IDBDatabase>((resolve, reject) => {
     if (typeof indexedDB === "undefined" || !globalThis.crypto?.subtle) { reject(storageError()); return; }
-    const request = indexedDB.open(databaseName, 1);
+    // The v2 upgrade closes deployed v1 tabs before legacy keys can be removed.
+    // Their in-flight encryption then cannot commit, and they cannot reopen v1.
+    const request = indexedDB.open(databaseName, 2);
     request.onupgradeneeded = () => {
-      request.result.createObjectStore("keys");
-      request.result.createObjectStore("saves", { keyPath: "id" }).createIndex("scope", "scope");
+      const db = request.result;
+      if (!db.objectStoreNames.contains("keys")) db.createObjectStore("keys");
+      if (!db.objectStoreNames.contains("saves")) db.createObjectStore("saves", { keyPath: "id" }).createIndex("scope", "scope");
     };
     request.onerror = request.onblocked = () => reject(storageError());
     request.onsuccess = () => {

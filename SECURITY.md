@@ -57,6 +57,12 @@ Googleの請求設定をアプリが自動検知する権限はない。課金�
 
 参照: [Gemini利用規約](https://ai.google.dev/gemini-api/terms)、[Apps Script Webアプリ](https://developers.google.com/apps-script/guides/web)、[CSP](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Security-Policy)。
 
+## 2026-10-30 公開時の確認事項
+
+端末内の未同期入力は、同じIndexedDB名のバージョン2へ移行する。既存のストアと未同期入力を保持し、旧版のタブの接続を閉じてから暗号鍵を移行する。旧版が暗号化の途中だった場合、その保存は失敗として返し、失われた旧鍵で読めない入力を保存完了にしない。公開後は各タブを再読み込みする。別タブでキューが空になってもsaltは削除しない。
+
+Apps Scriptでの認証計算の測定は、500回で1262ms、現在の2000回では約5048msの推定だった。これはKDF部分の推定で、ログイン全体の所要時間ではない。認証計算の高速化は未対応で、公開によりこの遅延が解消するわけではない。
+
 ## 2026-10-14 Google側の公開反映
 
 既存のウェブアプリをバージョン7へ更新した。実行者・アクセス範囲・公開URLを変えていない。Googleで保存後に表示された関数一覧と、デプロイ完了画面で新しいバージョンを確認した。

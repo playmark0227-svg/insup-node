@@ -1,4 +1,5 @@
 import "fake-indexeddb/auto";
+import { IDBFactory } from "fake-indexeddb";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
@@ -7,7 +8,7 @@ import type { SheetSnapshot } from "../lib/sheets-client.ts";
 const endpoint = "https://script.google.com/macros/s/TEST_OUTBOX_ENDPOINT_123456/exec";
 const input = (): PendingSave => ({operationId:randomUUID(),action:"updateRecord",label:"秘密の候補者の変更",details:["メモ：非公開の原文"],payload:{recordId:"ROW-one",changes:{13:"非公開の原文"}},createdAt:Date.now(),attempted:false});
 const read = <T>(request: IDBRequest<T>):Promise<T> => new Promise((resolve,reject)=>{request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(request.error);});
-const open = async () => await read(indexedDB.open("insup.node.pending-saves.v1",1));
+const open = async () => await read(indexedDB.open("insup.node.pending-saves.v1",2));
 const secret = "A".repeat(43), otherSecret = "B".repeat(43);
 const unlocked = (account: string, module = { unlockPendingSaves }) => { module.unlockPendingSaves(endpoint, account, secret); module.unlockPendingSaves(endpoint + "other", account, secret); module.unlockPendingSaves(endpoint, `${account}-other`, secret); return account; };
 
@@ -125,4 +126,166 @@ test("version 1 drafts are migrated to the server-bound key and the stored legac
   db=await open();const raw=await read(db.transaction("saves").objectStore("saves").get(id)),key=await read(db.transaction("keys").objectStore("keys").get(scope));db.close();
   assert.equal(raw.v,2);assert.equal(key,undefined);
   assert.deepEqual(await readPendingSaves(endpoint,account),[save]);
+});
+
+
+// Deployed 3d67580 module through persistPendingSave, with only TypeScript types removed.
+// Kept inline so shallow CI checkouts can reproduce the old tab without git or network access.
+const deployedV1OutboxSource = `
+const databaseName = "insup.node.pending-saves.v1";
+let opened;
+const storageError = ()=>new Error("この端末に入力を保存できませんでした。入力は画面に残っています。ブラウザの保存容量・設定を確認してください。");
+function database() {
+    if (opened) return opened;
+    opened = new Promise((resolve, reject)=>{
+        if (typeof indexedDB === "undefined" || !globalThis.crypto?.subtle) {
+            reject(storageError());
+            return;
+        }
+        const request = indexedDB.open(databaseName, 1);
+        request.onupgradeneeded = ()=>{
+            request.result.createObjectStore("keys");
+            request.result.createObjectStore("saves", {
+                keyPath: "id"
+            }).createIndex("scope", "scope");
+        };
+        request.onerror = request.onblocked = ()=>reject(storageError());
+        request.onsuccess = ()=>{
+            const db = request.result;
+            db.onversionchange = ()=>{
+                db.close();
+                opened = undefined;
+            };
+            resolve(db);
+        };
+    }).catch((error)=>{
+        opened = undefined;
+        throw error;
+    });
+    return opened;
+}
+function completed(tx) {
+    return new Promise((resolve, reject)=>{
+        tx.oncomplete = ()=>resolve();
+        tx.onerror = tx.onabort = ()=>reject(storageError());
+    });
+}
+function result(request) {
+    return new Promise((resolve, reject)=>{
+        request.onsuccess = ()=>resolve(request.result);
+        request.onerror = ()=>reject(storageError());
+    });
+}
+async function scopeFor(endpoint, account) {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(\`\${endpoint}|\${account}\`));
+    return Array.from(new Uint8Array(digest), (byte)=>byte.toString(16).padStart(2, "0")).join("");
+}
+async function encryptionKey(db, scope) {
+    const read = db.transaction("keys", "readonly"), readDone = completed(read);
+    const [existing] = await Promise.all([
+        result(read.objectStore("keys").get(scope)),
+        readDone
+    ]);
+    if (existing) return existing;
+    const generated = await crypto.subtle.generateKey({
+        name: "AES-GCM",
+        length: 256
+    }, false, [
+        "encrypt",
+        "decrypt"
+    ]);
+    const tx = db.transaction("keys", "readwrite"), done = completed(tx), store = tx.objectStore("keys");
+    const chosen = new Promise((resolve, reject)=>{
+        const request = store.get(scope);
+        request.onerror = ()=>reject(storageError());
+        request.onsuccess = ()=>{
+            const found = request.result;
+            if (!found) store.put(generated, scope);
+            resolve(found || generated);
+        };
+    });
+    const [key] = await Promise.all([
+        chosen,
+        done
+    ]);
+    return key;
+}
+function validate(save) {
+    if (!save || !/^[A-Za-z0-9_-]{16,128}$/.test(save.operationId) || typeof save.action !== "string" || typeof save.label !== "string" || !Array.isArray(save.details) || save.details.some((value)=>typeof value !== "string") || !Number.isFinite(save.createdAt) || typeof save.attempted !== "boolean" || !save.payload || typeof save.payload !== "object" || JSON.stringify(save.payload).length > 32768) throw storageError();
+}
+export async function persistPendingSave(endpoint, account, save) {
+    validate(save);
+    const db = await database(), scope = await scopeFor(endpoint, account), key = await encryptionKey(db, scope);
+    const id = \`\${scope}:\${save.operationId}\`, iv = crypto.getRandomValues(new Uint8Array(12));
+    const ciphertext = await crypto.subtle.encrypt({
+        name: "AES-GCM",
+        iv,
+        additionalData: new TextEncoder().encode(id)
+    }, key, new TextEncoder().encode(JSON.stringify(save)));
+    const tx = db.transaction("saves", "readwrite"), done = completed(tx);
+    tx.objectStore("saves").put({
+        id,
+        scope,
+        iv,
+        ciphertext
+    });
+    await done;
+}
+`;
+
+test("the version 2 upgrade fences old tabs before legacy keys are migrated or removed", async () => {
+  // A separate factory represents a browser that still has only the deployed v1 database.
+  const originalIndexedDB = globalThis.indexedDB;
+  const originalEncrypt = crypto.subtle.encrypt;
+  globalThis.indexedDB = new IDBFactory();
+  let releaseEncryption: (() => void) | undefined;
+  let pending: Promise<void> | undefined;
+  try {
+    const oldTab = await import(`data:text/javascript;base64,${Buffer.from(deployedV1OutboxSource).toString("base64")}#${randomUUID()}`);
+    const account = randomUUID(), queued = input(), inFlight = input();
+    await oldTab.persistPendingSave(endpoint, account, queued);
+    const oldDatabase = await read(indexedDB.open("insup.node.pending-saves.v1", 1));
+    assert.equal(oldDatabase.version, 1);
+    // This inspection handle also observes the real versionchange/close protocol.
+    oldDatabase.onversionchange = () => oldDatabase.close();
+    let reachedEncryption: () => void = () => {};
+    const reached = new Promise<void>(resolve => { reachedEncryption = resolve; });
+    const gate = new Promise<void>(resolve => { releaseEncryption = resolve; });
+    crypto.subtle.encrypt = async function (algorithm, key, data) {
+      const aes = algorithm as AesGcmParams;
+      if (new TextDecoder().decode(aes.additionalData).endsWith(inFlight.operationId)) {
+        reachedEncryption();
+        await gate;
+      }
+      return originalEncrypt.call(this, algorithm, key, data);
+    };
+    // The old module has already read its usable legacy key, but has not opened
+    // its save transaction. This is the destructive rollout race without v2.
+    pending = oldTab.persistPendingSave(endpoint, account, inFlight);
+    await reached;
+    const newTab = await import(`../lib/pending-saves.ts?upgrade=${randomUUID()}`);
+    unlocked(account, newTab);
+    assert.deepEqual(await newTab.readPendingSaves(endpoint, account), [queued]);
+    const db = await open();
+    assert.equal(db.version, 2);
+    const rows = await read(db.transaction("saves").objectStore("saves").getAll());
+    const migrated = rows.find(row => row.id.endsWith(queued.operationId));
+    assert.equal(migrated.v, 2, "An existing queued v1 draft migrates without losing its input");
+    assert.equal(await read(db.transaction("keys").objectStore("keys").get(migrated.scope)), undefined);
+    releaseEncryption();
+    await assert.rejects(pending, "The old in-flight writer cannot commit with the deleted legacy key");
+    assert.equal(await read(db.transaction("saves").objectStore("saves").get(`${migrated.scope}:${inFlight.operationId}`)), undefined);
+    await assert.rejects(oldTab.persistPendingSave(endpoint, account, input()), /この端末に入力を保存できませんでした/,
+      "The old module cannot reopen database version 1 after its connection closes");
+    await assert.rejects(read(indexedDB.open("insup.node.pending-saves.v1", 1)), error => error instanceof Error && error.name === "VersionError");
+    const reloadedTab = await import(`../lib/pending-saves.ts?afterUpgrade=${randomUUID()}`);
+    unlocked(account, reloadedTab);
+    assert.deepEqual(await reloadedTab.readPendingSaves(endpoint, account), [queued]);
+    db.close();
+  } finally {
+    releaseEncryption?.();
+    await pending?.catch(() => {});
+    crypto.subtle.encrypt = originalEncrypt;
+    globalThis.indexedDB = originalIndexedDB;
+  }
 });
