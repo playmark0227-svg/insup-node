@@ -149,9 +149,9 @@ export default function NodeWorkspace(){
  const navIcons={home:LayoutDashboard,ranking:Trophy,records:ListChecks,reviews:ListChecks,insights:Sparkles,workbook:FileSpreadsheet,players:UsersRound,connection:FileSpreadsheet,security:ShieldCheck,profile:UserRound};
  const nav=allowedWorkspaceViews(admin).map(id=>({id,label:workspacePurpose(id,admin).title,icon:navIcons[id]}));
  const titles=Object.fromEntries(nav.map(item=>[item.id,item.label])) as Record<View,string>;
- const navigate=(next:View)=>{if(!allowedWorkspaceViews(admin).includes(next))return;setFocusRecord(null);setReviewFocus(null);setCreateRequested(false);setView(next);setSearch("");setPage(1);setMobileMenuOpen(false);};
+ const navigate=(next:View)=>{if(!allowedWorkspaceViews(admin).includes(next))return;setFocusRecord(null);setReviewFocus(null);setCreateRequested(false);setView(next);setSearch("");setPage(1);setMobileMenuOpen(false);window.scrollTo({top:0,left:0,behavior:"auto"});};
  const returnToDraft=()=>{setConfirmLogout(false);navigate(reviewDirty?"reviews":"insights");if(reviewDirty)setReviewDraftRequest(value=>value+1);if(!reviewDirty&&writingDirty)requestAnimationFrame(()=>{const panel=document.getElementById("workspace-writing-settings");panel?.scrollIntoView({block:"start"});panel?.focus({preventScroll:true});});};
- const createCandidate=()=>{if(writeBusy||!canWrite)return;setFocusRecord(null);setView("records");setCreateRequested(true);};
+ const createCandidate=()=>{if(writeBusy||!canWrite)return;navigate("records");setCreateRequested(true);};
  const placements=latestPlacements(activities,admin?(memberFilter==="all"?null:memberFilter):playerId);
  const filtered=placements.filter(a=>a.events.some(e=>inPeriod(e,period))&&(stageFilter==="all"||(a.status||statusForStage[a.stage])===stageFilter)&&`${a.candidateName} ${a.company} ${a.position} ${players.find(p=>p.id===a.playerId)?.name}`.toLowerCase().includes(search.toLowerCase()));
  const unproposed=[...new Map(activities.filter(a=>a.stage==="候補者面談"&&(admin?(memberFilter==="all"||a.playerId===memberFilter):a.playerId===playerId)&&inPeriod(a,period)&&!placements.some(p=>p.candidateId===a.candidateId)).map(a=>[a.candidateId,a])).values()];
