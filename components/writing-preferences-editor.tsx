@@ -13,6 +13,7 @@ export type WritingPreferencesEditorProps = {
   disabled?: boolean;
   onRead: () => Promise<WritingPreferences>;
   onSave: (preferences: WritingPreferences) => Promise<WritingPreferences>;
+  onDirtyChange?: (dirty: boolean) => void;
 };
 
 const sectionLabels = introductionHeadings;
@@ -38,7 +39,7 @@ export function WritingPreferencesEditor(props: WritingPreferencesEditorProps) {
   return <WritingPreferencesEditorSession key={props.identityKey} {...props}/>;
 }
 
-function WritingPreferencesEditorSession({ preferences, disabled = false, onRead, onSave }: WritingPreferencesEditorProps) {
+function WritingPreferencesEditorSession({ preferences, disabled = false, onRead, onSave, onDirtyChange }: WritingPreferencesEditorProps) {
   const id = useId();
   const [baseline, setBaseline] = useState(() => validateWritingPreferences(preferences));
   const [draft, setDraft] = useState(() => validateWritingPreferences(preferences));
@@ -60,12 +61,17 @@ function WritingPreferencesEditorSession({ preferences, disabled = false, onRead
   const latestRead = useRef(onRead); latestRead.current = onRead;
   const latestSave = useRef(onSave); latestSave.current = onSave;
   const dirty = contentKey(draft) !== contentKey(baseline);
+  const hasUnsavedInput = dirty || reference.length > 0 || preview !== null;
+  const dirtyListener = useRef(onDirtyChange); dirtyListener.current = onDirtyChange;
   const seenPropVersion = useRef(preferences.version);
   const current = useRef({ dirty, baselineVersion: baseline.version }); current.current = { dirty, baselineVersion: baseline.version };
   const changedElsewhere = remoteVersion !== null && remoteVersion !== baseline.version;
   const controlsDisabled = disabled || operation !== null;
   const supported = availability !== "checking" && availability !== "unavailable";
   const referenceStale = !!preview && preview.referenceRevision !== referenceRevision.current;
+
+  useEffect(() => { dirtyListener.current?.(hasUnsavedInput); }, [hasUnsavedInput]);
+  useEffect(() => () => { dirtyListener.current?.(false); }, []);
 
   useEffect(() => {
     mounted.current = true;
@@ -172,7 +178,7 @@ function WritingPreferencesEditorSession({ preferences, disabled = false, onRead
       <div className="writing-preferences-order"><h4>項目の順序</h4><p>上下のボタンで並び替えます。未入力の項目は文章から省略します。</p><ol>{draft.sectionOrder.map((section, index) => <li key={section}><span className="writing-preferences-number">{index + 1}</span><span className="writing-preferences-section-label">{sectionLabels[section]}{section === "summary" && !draft.includeSummary && <small>文章には含めない</small>}</span><div><button type="button" className="writing-preferences-move" disabled={index === 0 || controlsDisabled} aria-label={`${sectionLabels[section]}を上へ`} onClick={() => move(index, -1)}><ArrowUp size={16}/></button><button type="button" className="writing-preferences-move" disabled={index === draft.sectionOrder.length - 1 || controlsDisabled} aria-label={`${sectionLabels[section]}を下へ`} onClick={() => move(index, 1)}><ArrowDown size={16}/></button></div></li>)}</ol></div>
     </fieldset>
     <div className="writing-preferences-save"><button type="button" className="primary-button" disabled={controlsDisabled || !dirty} onClick={() => void save()}>{operation === "saving" ? <LoaderCircle size={16} className="review-spinner"/> : <Save size={16}/>}{operation === "saving" ? "保存中…" : "共通ルールを保存"}</button><span>{dirty ? "未保存の変更があります" : "この書き方を毎回自動使用・参考文の再入力は不要"}</span></div>
-    <details className="writing-preferences-reference"><summary><Monitor size={17}/>書き方を変更するときだけ参考文を取り込む <small>一度保存すれば自動使用</small></summary><p>参考文は一度取り込んで書き方を保存すれば完了です。口調・長さ・項目順・総評の有無を共通設定として保存します。元の参考文に含まれる候補者情報は保存せず、書式だけを今後の紹介文に使います。</p><label htmlFor={`${id}-reference`}>参考にする紹介文<textarea id={`${id}-reference`} rows={6} maxLength={12000} value={reference} disabled={disabled} readOnly={operation !== null} placeholder="普段使っている紹介文を貼り付けてください。一度取り込んで保存すると、毎回の貼り付けは不要になります。" onChange={event => { referenceRevision.current++; setReference(event.target.value); setNotice(""); }}/></label><div className="writing-preferences-reference-actions"><span>{Array.from(reference).length.toLocaleString()} / 12,000文字</span><button type="button" className="text-button" disabled={!reference || operation !== null} onClick={() => { referenceRevision.current++; setReference(""); setPreview(null); }}>参考文を消去</button></div>
+    <details className="writing-preferences-reference"><summary><Monitor size={17}/>書き方を変更するときだけ参考文を取り込む <small>一度保存すれば自動使用</small></summary><p>参考文は一度取り込んで書き方を保存すれば完了です。口調・長さ・項目順・総評の有無を共通設定として保存します。元の参考文に含まれる候補者情報は保存せず、書式だけを今後の紹介文に使います。</p><label htmlFor={`${id}-reference`}>参考にする紹介文<textarea id={`${id}-reference`} rows={6} maxLength={12000} value={reference} disabled={disabled} readOnly={operation !== null} placeholder="普段使っている紹介文を貼り付けてください。一度取り込んで保存すると、毎回の貼り付けは不要になります。" onChange={event => { referenceRevision.current++; setReference(event.target.value); setNotice(""); }}/></label><div className="writing-preferences-reference-actions"><span>{Array.from(reference).length.toLocaleString()} / 12,000文字</span><button type="button" className="text-button" disabled={(!reference && !preview) || operation !== null} onClick={() => { referenceRevision.current++; setReference(""); setPreview(null); }}>参考文を消去</button></div>
       {availability === "checking" ? <p className="writing-preferences-capability">端末内AIが使えるか確認しています…</p> : availability === "unavailable" ? <p className="writing-preferences-capability">この端末・ブラウザでは端末内AIを利用できません。対応するPC版Chromeでお試しください。上の設定は手動でも調整できます。</p> : <p className="writing-preferences-capability">{availability === "downloadable" || availability === "downloading" ? "初回はブラウザのAIモデルをダウンロードするため、準備に数分かかることがあります。途中で中止できます。" : "この端末のAIで書式を抽出できます。"} 参考文をクラウドAIへ送信することはありません。</p>}
       <div className="writing-preferences-extract-actions"><button type="button" className="secondary-button" disabled={controlsDisabled || !reference.trim() || !supported} onClick={() => void extract()}>{operation === "extracting" ? <LoaderCircle size={16} className="review-spinner"/> : availability === "downloadable" ? <Download size={16}/> : <Sparkles size={16}/>}{operation === "extracting" ? "書式を抽出中…" : "参考文から書式案を作る"}</button>{operation === "extracting" && <button type="button" className="secondary-button" onClick={() => extraction.current?.abort()}><X size={16}/>中止</button>}</div>
       {progress && <div className="writing-preferences-progress" role="status"><span>{progress.phase === "checking" ? "端末内AIを確認しています…" : progress.phase === "generating" ? "参考文の書式を読み取っています…" : progress.downloadProgress === 1 ? "ダウンロード完了。端末AIを起動しています…" : `AIモデルを準備しています${typeof progress.downloadProgress === "number" ? `… ${Math.round(progress.downloadProgress * 100)}%` : "…"}`}</span>{progress.phase === "downloading" && <progress max={1} value={progress.downloadProgress} aria-label="AIモデルのダウンロード進捗"/>}</div>}

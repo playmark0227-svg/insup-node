@@ -30,11 +30,11 @@ var NODE = Object.freeze({
   loginAttemptsPerMinute: 60,
   // Login takes the write lock only for short counter and session sections, and gives up sooner than business writes.
   loginLockMs: 5000,
-  // Stretched password hash rounds (PBKDF2-HMAC-SHA256, one Utilities HMAC call per round).
-  // 2000 is deliberately conservative because the per-call HMAC cost on Apps Script has not
-  // been measured. The owner should time benchmarkNodePasswordHash in the editor and may raise
-  // it: every record stores its own round count, so raising this is safe and older records
-  // upgrade on their next login. Keep this exact line form; the tests override the number.
+  // Stretched password hash rounds (PBKDF2-HMAC-SHA256). The byte-identical JS implementation
+  // avoids a Utilities service call for every round; the pepper prehash still uses Utilities.
+  // The owner should measure benchmarkNodePasswordHash in Apps Script before raising this.
+  // Every record keeps its own round count and older records upgrade on their next login.
+  // Keep this exact line form; the tests override the number. Do not lower it for speed.
   kdfIterations: 2000,
   stages: ['候補者面談','提案','C面談予約','クライアント面談','内定','内定承諾','稼働開始予定','稼働開始'],
   stageColumns: [1,8,9,17,21,22,23,24],
@@ -270,12 +270,19 @@ function passwordHash_(password, salt) { return hmac_(String(password) + '|' + s
 /* pbkdf2p1: PBKDF2-HMAC-SHA256, one 32-byte block, keyed by HMAC(pepper, password), so a copy of
  * the records alone cannot be attacked without the pepper. Salts written here are ASCII. */
 function stretchedHash_(password, salt, iterations) {
-  var key=Utilities.computeHmacSha256Signature('kdf-v2|'+String(password),pepper_(),Utilities.Charset.UTF_8),block=[];
-  for(var i=0;i<salt.length;i++)block.push(salt.charCodeAt(i));
-  var u=Utilities.computeHmacSha256Signature(block.concat([0,0,0,1]),key),t=[];
-  for(var k=0;k<32;k++)t.push(u[k]);
-  for(var n=1;n<iterations;n++){u=Utilities.computeHmacSha256Signature(u,key);for(var j=0;j<32;j++)t[j]^=u[j];}
-  return Utilities.base64EncodeWebSafe(t).replace(/=+$/,'');
+  var signedKey=Utilities.computeHmacSha256Signature('kdf-v2|'+String(password),pepper_(),Utilities.Charset.UTF_8);
+  var key=new Uint8Array(signedKey),saltBytes=new Uint8Array(salt.length),derived,signedOutput=[];
+  for(var i=0;i<salt.length;i++)saltBytes[i]=salt.charCodeAt(i);
+  try {
+    derived=NODE_PASSWORD_KDF.derive(key,saltBytes,iterations);
+    // Apps Script Byte[] uses signed bytes. Preserve the existing base64url encoding exactly.
+    for(var j=0;j<derived.length;j++)signedOutput.push(derived[j]>127?derived[j]-256:derived[j]);
+    return Utilities.base64EncodeWebSafe(signedOutput).replace(/=+$/,'');
+  } finally {
+    key.fill(0);if(derived)derived.fill(0);
+    for(var k=0;k<signedKey.length;k++)signedKey[k]=0;
+    for(var n=0;n<signedOutput.length;n++)signedOutput[n]=0;
+  }
 }
 /* Records keep their own round count, so a corrupted value is bounded, yet a later lower constant never rejects a stronger record. */
 function kdfMaxIterations_() { return Math.max(100000, NODE.kdfIterations * 10); }
@@ -293,7 +300,8 @@ function forcedPasswordChange_() { return props_().getProperty(NODE.forceChangeK
 function makeGeneratedAuth_(secret, issued) { var salt = random256_(), auth = { salt: salt, hash: passwordHash_(secret, salt) }; if (issued === true) { auth.version = random256_(); if (forcedPasswordChange_()) auth.mustChange = true; } return auth; }
 function passwordMatches_(password, auth) { return constantEqual_(auth.kdf === undefined ? passwordHash_(password, auth.salt) : stretchedHash_(password, auth.salt, auth.iter), auth.hash); }
 /* Login verify. Unknown IDs, legacy records and current stretched records all cost one legacy HMAC
- * plus one stretch at NODE.kdfIterations, so response time does not tell them apart. The legacy
+ * plus one stretch at NODE.kdfIterations. This equalizes KDF work, not total response timing;
+ * the fresh-salt branches still perform additional UUID/digest work. The legacy
  * branch's stretch (fresh salt) is the record that replaces it after a successful login.
  * A stretched record below the constant pays its upgrade stretch whether or not the password is
  * right: it runs before the locked limits, so a correct guess that is then RATE_LIMITED must not
@@ -304,15 +312,17 @@ function verifyPassword_(password, auth) {
   var upgrade = makeAuth_(password);
   return auth && constantEqual_(legacy, auth.hash) ? { valid: true, upgrade: upgrade } : { valid: false, upgrade: null };
 }
-/** Owner-only, editor-run before changing kdfIterations. Logs only timings; no secret leaves the function.
- * suggested never goes below the 2000-round floor, so the measured fit and the current constant's cost are
- * reported as well, with a warning when the constant is already over the target. */
+/** Owner-only, editor-run before changing kdfIterations. Measure both the 500-round sample and
+ * the actual current round count; do not extrapolate currentMs from the sample. No secret leaves
+ * this function. The log contains numeric measurements only; overTarget is encoded as 0 or 1.
+ * suggested keeps the existing 2000-round floor and never changes the configured constant. */
 function benchmarkNodePasswordHash() {
-  requireOwner_(); var sample=500,target=500,started=Date.now();stretchedHash_(random256_(),random256_(),sample);
-  var ms=Math.max(1,Date.now()-started),fit=Math.floor(target*sample/ms/500)*500,suggested=Math.max(2000,Math.min(20000,fit)),currentMs=Math.round(ms*NODE.kdfIterations/sample),over=currentMs>target;
-  Logger.log('kdf '+sample+' rounds: '+ms+' ms; current kdfIterations '+NODE.kdfIterations+' costs about '+currentMs+' ms per login check; suggested kdfIterations for about '+target+' ms: '+suggested+' (rounds that fit the target: '+fit+')');
-  if(over)Logger.log('warning: the current kdfIterations is over the '+target+' ms target (about '+currentMs+' ms, and a password change runs two checks). The suggestion is held at the 2000-round floor; lowering the constant is safe for existing records, which keep their own round count.');
-  return {sampleRounds:sample,ms:ms,suggested:suggested,current:NODE.kdfIterations,roundsForTarget:fit,currentMs:currentMs,overTarget:over};
+  requireOwner_(); var sample=500,target=500,password=random256_(),salt=random256_(),started=Date.now();
+  stretchedHash_(password,salt,sample);var ms=Math.max(1,Date.now()-started);
+  var currentStarted=Date.now();stretchedHash_(password,salt,NODE.kdfIterations);
+  var currentMs=Math.max(1,Date.now()-currentStarted),fit=Math.floor(target*NODE.kdfIterations/currentMs/500)*500,suggested=Math.max(2000,Math.min(20000,fit)),over=currentMs>target;
+  Logger.log(JSON.stringify({sampleRounds:sample,sampleMs:ms,currentRounds:NODE.kdfIterations,currentMs:currentMs,targetMs:target,suggestedRounds:suggested,roundsForTarget:fit,overTarget:over?1:0}));
+  return {sampleRounds:sample,ms:ms,suggested:suggested,current:NODE.kdfIterations,roundsForTarget:fit,currentMs:currentMs,targetMs:target,overTarget:over};
 }
 function constantEqual_(a, b) {
   a = String(a || ''); b = String(b || ''); var diff = a.length ^ b.length;
@@ -2244,3 +2254,968 @@ function verifyNodeWritingAi() {
   var decoded=JSON.parse(Utilities.ungzip(Utilities.newBlob(Utilities.base64Decode(encoded),'application/gzip')).getDataAsString('UTF-8'));writingKitBody_(decoded,preferences);
   var proof={success:true,model:'gemini-3.5-flash-lite',sections:body.sections.length,coaching:body.coaching.length,storageBytes:encoded.length,checked:['generic enum settings only','structured forms and all coaching topics','compressed round trip','no business sheet reads','no app quota preferences pending or cache writes']};Logger.log(JSON.stringify(proof));return proof;
 }
+
+/* BEGIN GENERATED PASSWORD KDF */
+/* @noble/hashes 2.4.0; generated by scripts/generate-password-kdf.mjs
+The MIT License (MIT)
+
+Copyright (c) 2022 Paul Miller (https://paulmillr.com)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the “Software”), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+*/
+var NODE_PASSWORD_KDF = (function(exports) {
+
+Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' });
+	const fromNumH = (n) => n / 2 ** 32 | 0;
+	const fromNumL = (n) => n >>> 0;
+	function setU64FromNum(view, byteOffset, n, isLE) {
+		const h = fromNumH(n);
+		const l = fromNumL(n);
+		view.setUint32(byteOffset, isLE ? l : h, isLE);
+		view.setUint32(byteOffset + 4, isLE ? h : l, isLE);
+	}
+
+/**
+	* Checks if something is Uint8Array. Be careful: nodejs Buffer will return true.
+	* @param a - value to test
+	* @returns `true` when the value is a Uint8Array-compatible view.
+	* @example
+	* Check whether a value is a Uint8Array-compatible view.
+	* ```ts
+	* isBytes(new Uint8Array([1, 2, 3]));
+	* ```
+	*/
+	function isBytes(a) {
+		return a instanceof Uint8Array || ArrayBuffer.isView(a) && a.constructor.name === "Uint8Array" && "BYTES_PER_ELEMENT" in a && a.BYTES_PER_ELEMENT === 1;
+	}
+	const atitle = (title) => title ? `"${title}" ` : "";
+	/**
+	* Asserts something is a non-negative integer.
+	* @param n - number to validate
+	* @param title - label included in thrown errors
+	* @returns The validated number.
+	* @throws On wrong argument types. {@link TypeError}
+	* @throws On wrong argument ranges or values. {@link RangeError}
+	* @example
+	* Validate a non-negative integer option.
+	* ```ts
+	* anumber(32, 'length');
+	* ```
+	*/
+	function anumber(n, title = "") {
+		if (typeof n !== "number") throw new TypeError(atitle(title) + "expected number, got " + typeof n);
+		if (!Number.isSafeInteger(n) || n < 0) throw new RangeError(atitle(title) + "expected integer >= 0, got " + n);
+		return n;
+	}
+	/**
+	* Asserts something is Uint8Array.
+	* @param value - value to validate
+	* @param length - optional exact length constraint
+	* @param title - label included in thrown errors
+	* @returns The validated byte array.
+	* @throws On wrong argument types. {@link TypeError}
+	* @throws On wrong argument ranges or values. {@link RangeError}
+	* @example
+	* Validate that a value is a byte array.
+	* ```ts
+	* abytes(new Uint8Array([1, 2, 3]));
+	* ```
+	*/
+	function abytes(value, length, title = "") {
+		if (isBytes(value) && (length === void 0 || value.length === length)) return value;
+		if (length !== void 0) anumber(length, "length");
+		const bytes = isBytes(value);
+		const ofLen = length !== void 0 ? ` of length ${length}` : "";
+		const got = bytes ? `length=${value.length}` : `type=${typeof value}`;
+		const message = atitle(title) + "expected Uint8Array" + ofLen + ", got " + got;
+		if (!bytes) throw new TypeError(message);
+		throw new RangeError(message);
+	}
+	/**
+	* Asserts something is a wrapped hash constructor.
+	* @param h - hash constructor to validate
+	* @throws On wrong argument types or invalid hash wrapper shape. {@link TypeError}
+	* @throws On invalid hash metadata ranges or values. {@link RangeError}
+	* @throws If the hash metadata allows empty outputs or block sizes. {@link Error}
+	* @example
+	* Validate a callable hash wrapper.
+	* ```ts
+	* import { ahash } from '@noble/hashes/utils.js';
+	* import { sha256 } from '@noble/hashes/sha2.js';
+	* ahash(sha256);
+	* ```
+	*/
+	function ahash(h) {
+		if (typeof h !== "function" || typeof h.create !== "function") throw new TypeError("expected hash wrapped by utils.createHasher");
+		anumber(h.outputLen);
+		anumber(h.blockLen);
+		if (h.outputLen < 1 || h.blockLen < 1) throw new Error("hash blockLen / outputLen must be >= 1");
+	}
+	const aobject = (value, label) => {
+		if (value === null || typeof value !== "object" || Array.isArray(value)) throw new TypeError((label === "object" ? "" : `"${label}" `) + "expected object, got type=" + typeof value);
+	};
+	const aopts = (value, label) => {
+		aobject(value, label);
+		const proto = Object.getPrototypeOf(value);
+		if (proto !== Object.prototype && proto !== null) throw new TypeError(`"${label}" expected plain object`);
+		if (Object.prototype.hasOwnProperty.call(value, "__proto__")) throw new TypeError(`"${label}.__proto__" is not allowed`);
+	};
+	/**
+	* Asserts a hash instance has not been destroyed or finished.
+	* @param instance - hash instance to validate
+	* @param checkFinished - whether to reject finalized instances
+	* @throws If the hash instance has already been destroyed or finalized. {@link Error}
+	* @example
+	* Validate that a hash instance is still usable.
+	* ```ts
+	* import { aexists } from '@noble/hashes/utils.js';
+	* import { sha256 } from '@noble/hashes/sha2.js';
+	* const hash = sha256.create();
+	* aexists(hash);
+	* ```
+	*/
+	function aexists(instance, checkFinished = true) {
+		if (instance.destroyed) throw new Error("hash was destroyed");
+		if (checkFinished && instance.finished) throw new Error("digest() was already called");
+	}
+	/**
+	* Asserts output is a sufficiently-sized byte array.
+	* @param out - destination buffer
+	* @param instance - hash instance providing output length
+	* Oversized buffers are allowed; downstream code only promises to fill the first `outputLen` bytes.
+	* @throws On wrong argument types. {@link TypeError}
+	* @throws On wrong argument ranges or values. {@link RangeError}
+	* @example
+	* Validate a caller-provided digest buffer.
+	* ```ts
+	* import { aoutput } from '@noble/hashes/utils.js';
+	* import { sha256 } from '@noble/hashes/sha2.js';
+	* const hash = sha256.create();
+	* aoutput(new Uint8Array(hash.outputLen), hash);
+	* ```
+	*/
+	function aoutput(out, instance) {
+		abytes(out, void 0, "output");
+		const min = instance.outputLen;
+		if (!(out.length >= min)) throw new RangeError("\"output\" expected length >= " + min);
+	}
+	/**
+	* Zeroizes typed arrays in place. Warning: JS provides no guarantees.
+	* @param arrays - arrays to overwrite with zeros
+	* @example
+	* Zeroize sensitive buffers in place.
+	* ```ts
+	* clean(new Uint8Array([1, 2, 3]));
+	* ```
+	*/
+	function clean(...arrays) {
+		for (let i = 0; i < arrays.length; i++) arrays[i].fill(0);
+	}
+	/**
+	* Creates a DataView for byte-level manipulation.
+	* @param arr - source typed array
+	* @returns DataView over the same buffer region.
+	* @example
+	* Create a DataView over an existing buffer.
+	* ```ts
+	* createView(new Uint8Array(4));
+	* ```
+	*/
+	function createView(arr) {
+		return new DataView(arr.buffer, arr.byteOffset, arr.byteLength);
+	}
+	/**
+	* Rotate-right operation for uint32 values.
+	* @param word - source word
+	* @param shift - shift amount in bits
+	* @returns Rotated word.
+	* @example
+	* Rotate a 32-bit word to the right.
+	* ```ts
+	* rotr(0x12345678, 8);
+	* ```
+	*/
+	function rotr(word, shift) {
+		return word << 32 - shift | word >>> shift;
+	}
+	/**
+	* Helper for KDFs: consumes Uint8Array or string.
+	* String inputs are UTF-8 encoded; byte-array inputs stay aliased to the caller buffer.
+	* @param data - user-provided KDF input
+	* @param errorTitle - label included in thrown errors
+	* @returns Byte representation of the input.
+	* @throws On wrong argument types. {@link TypeError}
+	* @example
+	* Normalize KDF input to bytes.
+	* ```ts
+	* kdfInputToBytes('password');
+	* ```
+	*/
+	function kdfInputToBytes(data, errorTitle = "") {
+		return abytes(data, void 0, errorTitle);
+	}
+	/**
+	* Merges default options and passed options.
+	* @param defaults - base option object
+	* @param opts - user overrides
+	* @param title - label included in thrown override errors
+	* @returns Fresh merged option object with a null prototype.
+	* @throws On wrong argument types. {@link TypeError}
+	* @example
+	* Merge user overrides onto default options.
+	* ```ts
+	* checkOpts({ dkLen: 32 }, { asyncTick: 10 });
+	* ```
+	*/
+	function checkOpts(defaults, opts, title = "opts") {
+		aopts(defaults, "defaults");
+		if (opts !== void 0) aopts(opts, title);
+		return Object.assign(Object.create(null), defaults, opts);
+	}
+	/**
+	* Creates a callable hash function from a stateful class constructor.
+	* @param hashCons - hash constructor or factory
+	* @param info - optional metadata such as DER OID
+	* @returns Frozen callable hash wrapper with `.create()`.
+	*   Wrapper construction eagerly calls `hashCons(undefined)` once to read
+	*   `outputLen` / `blockLen`, so constructor side effects happen at module
+	*   init time.
+	* @throws On wrong argument types. {@link TypeError}
+	* @example
+	* Wrap a stateful hash constructor into a callable helper.
+	* ```ts
+	* import { createHasher } from '@noble/hashes/utils.js';
+	* import { sha256 } from '@noble/hashes/sha2.js';
+	* const wrapped = createHasher(sha256.create, { oid: sha256.oid });
+	* wrapped(new Uint8Array([1]));
+	* ```
+	*/
+	function createHasher(hashCons, info = {}) {
+		if (typeof hashCons !== "function") throw new TypeError("\"hashCons\" expected function, got type=" + typeof hashCons);
+		info = checkOpts({}, info, "info");
+		const hashC = (msg, opts) => hashCons(opts).update(msg).digest();
+		const tmp = hashCons(void 0);
+		hashC.outputLen = tmp.outputLen;
+		hashC.blockLen = tmp.blockLen;
+		hashC.canXOF = tmp.canXOF;
+		hashC.create = (opts) => hashCons(opts);
+		Object.assign(hashC, info);
+		return Object.freeze(hashC);
+	}
+	/**
+	* Creates OID metadata for NIST hashes with prefix `06 09 60 86 48 01 65 03 04 02`.
+	* @param suffix - final OID byte for the selected hash.
+	*   The helper accepts any byte even though only the documented NIST hash
+	*   suffixes are meaningful downstream.
+	* @returns Object containing the DER-encoded OID.
+	* @example
+	* Build OID metadata for a NIST hash.
+	* ```ts
+	* oidNist(0x01);
+	* ```
+	*/
+	const oidNist = (suffix) => ({ oid: Uint8Array.from([
+		6,
+		9,
+		96,
+		134,
+		72,
+		1,
+		101,
+		3,
+		4,
+		2,
+		suffix
+	]) });
+
+/**
+	* Internal Merkle-Damgard hash utils.
+	* @module
+	*/
+	/**
+	* Shared 32-bit conditional boolean primitive reused by SHA-256, SHA-1, and MD5 `F`.
+	* Returns bits from `b` when `a` is set, otherwise from `c`.
+	* The XOR form is equivalent to MD5's `F(X,Y,Z) = XY v not(X)Z` because the masked terms never
+	* set the same bit.
+	* @param a - selector word
+	* @param b - word chosen when selector bit is set
+	* @param c - word chosen when selector bit is clear
+	* @returns Mixed 32-bit word.
+	* @example
+	* Combine three words with the shared 32-bit choice primitive.
+	* ```ts
+	* Chi(0xffffffff, 0x12345678, 0x87654321);
+	* ```
+	*/
+	function Chi(a, b, c) {
+		return a & b ^ ~a & c;
+	}
+	/**
+	* Shared 32-bit majority primitive reused by SHA-256 and SHA-1.
+	* Returns bits shared by at least two inputs.
+	* @param a - first input word
+	* @param b - second input word
+	* @param c - third input word
+	* @returns Mixed 32-bit word.
+	* @example
+	* Combine three words with the shared 32-bit majority primitive.
+	* ```ts
+	* Maj(0xffffffff, 0x12345678, 0x87654321);
+	* ```
+	*/
+	function Maj(a, b, c) {
+		return a & b ^ a & c ^ b & c;
+	}
+	/**
+	* Merkle-Damgard hash construction base class.
+	* Could be used to create MD5, RIPEMD, SHA1, SHA2.
+	* Accepts only byte-aligned `Uint8Array` input, even when the underlying spec describes bit
+	* strings with partial-byte tails.
+	* @param blockLen - internal block size in bytes
+	* @param outputLen - digest size in bytes
+	* @param padOffset - trailing length field size in bytes
+	* @param isLE - whether length and state words are encoded in little-endian
+	* @example
+	* Use a concrete subclass to get the shared Merkle-Damgard update/digest flow.
+	* ```ts
+	* import { _SHA1 } from '@noble/hashes/legacy.js';
+	* const hash = new _SHA1();
+	* hash.update(new Uint8Array([97, 98, 99]));
+	* hash.digest();
+	* ```
+	*/
+	var HashMD = class {
+		constructor(blockLen, outputLen, padOffset, isLE) {
+			Object.defineProperty(this, "blockLen", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: void 0
+			});
+			Object.defineProperty(this, "outputLen", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: void 0
+			});
+			Object.defineProperty(this, "canXOF", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: false
+			});
+			Object.defineProperty(this, "padOffset", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: void 0
+			});
+			Object.defineProperty(this, "isLE", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: void 0
+			});
+			Object.defineProperty(this, "buffer", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: void 0
+			});
+			Object.defineProperty(this, "view", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: void 0
+			});
+			Object.defineProperty(this, "finished", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: false
+			});
+			Object.defineProperty(this, "length", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: 0
+			});
+			Object.defineProperty(this, "pos", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: 0
+			});
+			Object.defineProperty(this, "destroyed", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: false
+			});
+			this.blockLen = blockLen;
+			this.outputLen = outputLen;
+			this.padOffset = padOffset;
+			this.isLE = isLE;
+			this.buffer = new Uint8Array(blockLen);
+			this.view = createView(this.buffer);
+		}
+		update(data) {
+			aexists(this);
+			abytes(data);
+			const { view, buffer, blockLen } = this;
+			const len = data.length;
+			let processed = false;
+			for (let pos = 0; pos < len;) {
+				const take = Math.min(blockLen - this.pos, len - pos);
+				if (take === blockLen) {
+					const dataView = createView(data);
+					for (; blockLen <= len - pos; pos += blockLen) this.process(dataView, pos);
+					processed = true;
+					continue;
+				}
+				buffer.set(pos === 0 && take === len ? data : data.subarray(pos, pos + take), this.pos);
+				this.pos += take;
+				pos += take;
+				if (this.pos === blockLen) {
+					this.process(view, 0);
+					this.pos = 0;
+					processed = true;
+				}
+			}
+			this.length += data.length;
+			if (processed) this.roundClean();
+			return this;
+		}
+		digestInto(out) {
+			aexists(this);
+			aoutput(out, this);
+			this.finished = true;
+			const { buffer, view, blockLen, isLE } = this;
+			let { pos } = this;
+			buffer[pos++] = 128;
+			buffer.fill(0, pos);
+			if (this.padOffset > blockLen - pos) {
+				this.process(view, 0);
+				buffer.fill(0);
+			}
+			setU64FromNum(view, blockLen - 8, this.length * 8, isLE);
+			this.process(view, 0);
+			this.roundClean();
+			const oview = out === buffer ? view : createView(out);
+			const len = this.outputLen;
+			const outLen = len / 4;
+			const state = this.get();
+			if (len % 4 || outLen > state.length) throw new Error("invalid outputLen");
+			for (let i = 0; i < outLen; i++) oview.setUint32(4 * i, state[i], isLE);
+		}
+		digest() {
+			const { buffer, outputLen } = this;
+			this.digestInto(buffer);
+			const res = buffer.slice(0, outputLen);
+			this.destroy();
+			return res;
+		}
+		_cloneIntoMeta(to) {
+			const { buffer, length, finished, destroyed, pos } = this;
+			to.destroyed = destroyed;
+			to.finished = finished;
+			to.length = length;
+			to.pos = pos;
+			if (pos) to.buffer.set(buffer);
+			return to;
+		}
+		clone() {
+			return this._cloneInto();
+		}
+	};
+	/**
+	* Initial SHA-2 state: fractional parts of square roots of first 16 primes 2..53.
+	* Check out `test/misc/sha2-gen-iv.js` for recomputation guide.
+	*/
+	/** Initial SHA256 state from RFC 6234 §6.1: the first 32 bits of the fractional parts of the
+	* square roots of the first eight prime numbers. Exported as a shared table; callers must treat
+	* it as read-only because constructors copy words from it by index. */
+	const SHA256_IV = /* @__PURE__ */ Uint32Array.from([
+		1779033703,
+		3144134277,
+		1013904242,
+		2773480762,
+		1359893119,
+		2600822924,
+		528734635,
+		1541459225
+	]);
+
+/**
+	* SHA2 hash function. A.k.a. sha256, sha384, sha512, sha512_224, sha512_256.
+	* SHA256 is the fastest hash implementable in JS, even faster than Blake3.
+	* Check out {@link https://www.rfc-editor.org/rfc/rfc4634 | RFC 4634} and
+	* {@link https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.180-4.pdf | FIPS 180-4}.
+	* @module
+	*/
+	/**
+	* SHA-224 / SHA-256 round constants from RFC 6234 §5.1: the first 32 bits
+	* of the cube roots of the first 64 primes (2..311).
+	*/
+	const SHA256_K = /* @__PURE__ */ Uint32Array.from([
+		1116352408,
+		1899447441,
+		3049323471,
+		3921009573,
+		961987163,
+		1508970993,
+		2453635748,
+		2870763221,
+		3624381080,
+		310598401,
+		607225278,
+		1426881987,
+		1925078388,
+		2162078206,
+		2614888103,
+		3248222580,
+		3835390401,
+		4022224774,
+		264347078,
+		604807628,
+		770255983,
+		1249150122,
+		1555081692,
+		1996064986,
+		2554220882,
+		2821834349,
+		2952996808,
+		3210313671,
+		3336571891,
+		3584528711,
+		113926993,
+		338241895,
+		666307205,
+		773529912,
+		1294757372,
+		1396182291,
+		1695183700,
+		1986661051,
+		2177026350,
+		2456956037,
+		2730485921,
+		2820302411,
+		3259730800,
+		3345764771,
+		3516065817,
+		3600352804,
+		4094571909,
+		275423344,
+		430227734,
+		506948616,
+		659060556,
+		883997877,
+		958139571,
+		1322822218,
+		1537002063,
+		1747873779,
+		1955562222,
+		2024104815,
+		2227730452,
+		2361852424,
+		2428436474,
+		2756734187,
+		3204031479,
+		3329325298
+	]);
+	/** Reusable SHA-224 / SHA-256 message schedule buffer `W_t` from RFC 6234 §6.2 step 1. */
+	const SHA256_W = /* @__PURE__ */ new Uint32Array(64);
+	/** Internal SHA-224 / SHA-256 compression engine from RFC 6234 §6.2. */
+	var SHA2_32B = class extends HashMD {
+		constructor(outputLen, IV) {
+			super(64, outputLen, 8, false);
+			Object.defineProperty(this, "A", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: 0
+			});
+			Object.defineProperty(this, "B", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: 0
+			});
+			Object.defineProperty(this, "C", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: 0
+			});
+			Object.defineProperty(this, "D", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: 0
+			});
+			Object.defineProperty(this, "E", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: 0
+			});
+			Object.defineProperty(this, "F", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: 0
+			});
+			Object.defineProperty(this, "G", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: 0
+			});
+			Object.defineProperty(this, "H", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: 0
+			});
+			this.A = IV[0] | 0;
+			this.B = IV[1] | 0;
+			this.C = IV[2] | 0;
+			this.D = IV[3] | 0;
+			this.E = IV[4] | 0;
+			this.F = IV[5] | 0;
+			this.G = IV[6] | 0;
+			this.H = IV[7] | 0;
+		}
+		get() {
+			const { A, B, C, D, E, F, G, H } = this;
+			return [
+				A,
+				B,
+				C,
+				D,
+				E,
+				F,
+				G,
+				H
+			];
+		}
+		set(A, B, C, D, E, F, G, H) {
+			this.A = A | 0;
+			this.B = B | 0;
+			this.C = C | 0;
+			this.D = D | 0;
+			this.E = E | 0;
+			this.F = F | 0;
+			this.G = G | 0;
+			this.H = H | 0;
+		}
+		_cloneInto(to) {
+			(to || (to = new this.constructor())).set(...this.get());
+			return this._cloneIntoMeta(to);
+		}
+		process(view, offset) {
+			for (let i = 0; i < 16; i++, offset += 4) SHA256_W[i] = view.getUint32(offset, false);
+			for (let i = 16; i < 64; i++) {
+				const W15 = SHA256_W[i - 15];
+				const W2 = SHA256_W[i - 2];
+				const s0 = rotr(W15, 7) ^ rotr(W15, 18) ^ W15 >>> 3;
+				const s1 = rotr(W2, 17) ^ rotr(W2, 19) ^ W2 >>> 10;
+				SHA256_W[i] = s1 + SHA256_W[i - 7] + s0 + SHA256_W[i - 16] | 0;
+			}
+			let { A, B, C, D, E, F, G, H } = this;
+			for (let i = 0; i < 64; i++) {
+				const sigma1 = rotr(E, 6) ^ rotr(E, 11) ^ rotr(E, 25);
+				const T1 = H + sigma1 + Chi(E, F, G) + SHA256_K[i] + SHA256_W[i] | 0;
+				const T2 = (rotr(A, 2) ^ rotr(A, 13) ^ rotr(A, 22)) + Maj(A, B, C) | 0;
+				H = G;
+				G = F;
+				F = E;
+				E = D + T1 | 0;
+				D = C;
+				C = B;
+				B = A;
+				A = T1 + T2 | 0;
+			}
+			A = A + this.A | 0;
+			B = B + this.B | 0;
+			C = C + this.C | 0;
+			D = D + this.D | 0;
+			E = E + this.E | 0;
+			F = F + this.F | 0;
+			G = G + this.G | 0;
+			H = H + this.H | 0;
+			this.set(A, B, C, D, E, F, G, H);
+		}
+		roundClean() {
+			clean(SHA256_W);
+		}
+		destroy() {
+			this.destroyed = true;
+			this.set(0, 0, 0, 0, 0, 0, 0, 0);
+			clean(this.buffer);
+		}
+	};
+	/** Internal SHA-256 hash class grounded in RFC 6234 §6.2. */
+	var _SHA256 = class extends SHA2_32B {
+		constructor() {
+			super(32, SHA256_IV);
+		}
+	};
+	/**
+	* SHA2-256 hash function from RFC 4634. In JS it's the fastest: even faster than Blake3. Some info:
+	*
+	* - Trying 2^128 hashes would get 50% chance of collision, using birthday attack.
+	* - BTC network is doing 2^70 hashes/sec (2^95 hashes/year) as per 2025.
+	* - Each sha256 hash is executing 2^18 bit operations.
+	* - Good 2024 ASICs can do 200Th/sec with 3500 watts of power, corresponding to 2^36 hashes/joule.
+	* @param msg - message bytes to hash
+	* @param opts - Reserved hash options.
+	* @returns Digest bytes.
+	* @example
+	* Hash a message with SHA2-256.
+	* ```ts
+	* sha256(new Uint8Array([97, 98, 99]));
+	* ```
+	*/
+	const sha256 = /* @__PURE__ */ createHasher(() => new _SHA256(), /* @__PURE__ */ oidNist(1));
+
+/**
+	* HMAC: RFC2104 message authentication code.
+	* @module
+	*/
+	/**
+	* Internal class for HMAC.
+	* Accepts any byte key, although RFC 2104 §3 recommends keys at least
+	* `HashLen` bytes long.
+	*/
+	var _HMAC = class {
+		constructor(hash, key) {
+			Object.defineProperty(this, "oHash", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: void 0
+			});
+			Object.defineProperty(this, "iHash", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: void 0
+			});
+			Object.defineProperty(this, "blockLen", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: void 0
+			});
+			Object.defineProperty(this, "outputLen", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: void 0
+			});
+			Object.defineProperty(this, "canXOF", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: false
+			});
+			Object.defineProperty(this, "finished", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: false
+			});
+			Object.defineProperty(this, "destroyed", {
+				enumerable: true,
+				configurable: true,
+				writable: true,
+				value: false
+			});
+			ahash(hash);
+			abytes(key, void 0, "key");
+			this.iHash = hash.create();
+			if (typeof this.iHash.update !== "function") throw new Error("expected Hash instance");
+			this.blockLen = this.iHash.blockLen;
+			this.outputLen = this.iHash.outputLen;
+			const blockLen = this.blockLen;
+			const pad = new Uint8Array(blockLen);
+			pad.set(key.length > blockLen ? hash.create().update(key).digest() : key);
+			for (let i = 0; i < pad.length; i++) pad[i] ^= 54;
+			this.iHash.update(pad);
+			this.oHash = hash.create();
+			for (let i = 0; i < pad.length; i++) pad[i] ^= 106;
+			this.oHash.update(pad);
+			clean(pad);
+		}
+		update(buf) {
+			aexists(this);
+			this.iHash.update(buf);
+			return this;
+		}
+		digestInto(out) {
+			aexists(this);
+			aoutput(out, this);
+			this.finished = true;
+			const buf = out.subarray(0, this.outputLen);
+			this.iHash.digestInto(buf);
+			this.oHash.update(buf);
+			this.oHash.digestInto(buf);
+			this.destroy();
+		}
+		digest() {
+			const out = new Uint8Array(this.oHash.outputLen);
+			this.digestInto(out);
+			return out;
+		}
+		_cloneInto(to) {
+			to || (to = Object.create(Object.getPrototypeOf(this), {}));
+			const { oHash, iHash, finished, destroyed, blockLen, outputLen, canXOF } = this;
+			to = to;
+			to.finished = finished;
+			to.destroyed = destroyed;
+			to.blockLen = blockLen;
+			to.outputLen = outputLen;
+			to.canXOF = canXOF;
+			to.oHash = oHash._cloneInto(to.oHash);
+			to.iHash = iHash._cloneInto(to.iHash);
+			return to;
+		}
+		clone() {
+			return this._cloneInto();
+		}
+		destroy() {
+			this.destroyed = true;
+			this.oHash.destroy();
+			this.iHash.destroy();
+		}
+	};
+	const hmac = /* @__PURE__ */ (() => {
+		const hmac_ = ((hash, key, message) => new _HMAC(hash, key).update(message).digest());
+		hmac_.create = (hash, key) => new _HMAC(hash, key);
+		return hmac_;
+	})();
+
+/**
+	* PBKDF (RFC 2898). Can be used to create a key from password and salt.
+	* @module
+	*/
+	function pbkdf2Init(hash, _password, _salt, _opts) {
+		ahash(hash);
+		const { c, dkLen, asyncTick } = checkOpts({
+			dkLen: 32,
+			asyncTick: 10
+		}, _opts);
+		anumber(c, "c");
+		anumber(dkLen, "dkLen");
+		anumber(asyncTick, "asyncTick");
+		if (c < 1) throw new Error("\"c\" (iterations) must be >= 1");
+		if (dkLen < 1) throw new Error("\"dkLen\" must be >= 1");
+		if (dkLen > (2 ** 32 - 1) * hash.outputLen) throw new Error("derived key too long");
+		const p = kdfInputToBytes(_password, "password");
+		try {
+			const s = kdfInputToBytes(_salt, "salt");
+			try {
+				const DK = new Uint8Array(dkLen);
+				const { iHash, oHash, outputLen } = hmac.create(hash, p);
+				return {
+					c,
+					dkLen,
+					asyncTick,
+					DK,
+					outputLen,
+					eng: pbkdf2Engine(iHash, oHash, s, new Uint8Array(outputLen))
+				};
+			} finally {
+				if (typeof _salt === "string") clean(s);
+			}
+		} finally {
+			if (typeof _password === "string") clean(p);
+		}
+	}
+	function pbkdf2Engine(iHash, oHash, salt, u) {
+		const counter = /* @__PURE__ */ new Uint8Array(4);
+		const view = createView(counter);
+		const salted = iHash._cloneInto().update(salt);
+		const work = oHash._cloneInto();
+		const iClone = iHash._cloneInto;
+		const oClone = oHash._cloneInto;
+		return {
+			u1: (ti, Ti) => {
+				view.setInt32(0, ti, false);
+				salted._cloneInto(work).update(counter).digestInto(u);
+				oHash._cloneInto(work).update(u).digestInto(u);
+				Ti.set(u.subarray(0, Ti.length));
+			},
+			rounds: (c, Ti) => {
+				for (let ui = 1; ui < c; ui++) {
+					iClone.call(iHash, work).update(u).digestInto(u);
+					oClone.call(oHash, work).update(u).digestInto(u);
+					for (let i = 0; i < Ti.length; i++) Ti[i] ^= u[i];
+				}
+			},
+			output: (DK) => {
+				iHash.destroy();
+				oHash.destroy();
+				salted.destroy();
+				work.destroy();
+				clean(u);
+				return DK;
+			}
+		};
+	}
+	/**
+	* PBKDF2-HMAC: RFC 8018 key derivation function.
+	* @param hash - hash function that would be used e.g. sha256
+	* @param password - password from which a derived key is generated;
+	*   JS string inputs are UTF-8 encoded first
+	* @param salt - cryptographic salt; JS string inputs are UTF-8 encoded first
+	* @param opts - PBKDF2 work factor and output settings. `dkLen`, if provided,
+	*   must be `>= 1` per RFC 8018 §5.2. See {@link Pbkdf2Opt}.
+	* @returns Derived key bytes.
+	* @throws If the PBKDF2 iteration count or derived-key settings are invalid. {@link Error}
+	* @example
+	* PBKDF2-HMAC: RFC 2898 key derivation function.
+	* ```ts
+	* import { pbkdf2 } from '@noble/hashes/pbkdf2.js';
+	* import { sha256 } from '@noble/hashes/sha2.js';
+	* const key = pbkdf2(sha256, 'password', 'salt', { dkLen: 32, c: Math.pow(2, 18) });
+	* ```
+	*/
+	function pbkdf2(hash, password, salt, opts) {
+		const { c, dkLen, DK, outputLen, eng } = pbkdf2Init(hash, password, salt, opts);
+		for (let ti = 1, pos = 0; pos < dkLen; ti++, pos += outputLen) {
+			const Ti = DK.subarray(pos, pos + outputLen);
+			eng.u1(ti, Ti);
+			eng.rounds(c, Ti);
+		}
+		return eng.output(DK);
+	}
+
+	function derive(key, salt, iterations) {
+		return pbkdf2(sha256, key, salt, {
+			c: iterations,
+			dkLen: 32
+		});
+	}
+
+exports.derive = derive;
+return exports;
+})({});
+/* END GENERATED PASSWORD KDF */

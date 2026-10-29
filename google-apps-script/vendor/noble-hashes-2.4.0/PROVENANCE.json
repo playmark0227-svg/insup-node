@@ -1,0 +1,34 @@
+{
+  "name": "@noble/hashes",
+  "version": "2.4.0",
+  "repository": "https://github.com/paulmillr/noble-hashes",
+  "tag": "2.4.0",
+  "tarball": "https://registry.npmjs.org/@noble/hashes/-/hashes-2.4.0.tgz",
+  "tarballIntegrity": "sha512-X5XaVWZIBCT7HHZGm5I7ZQXDwLG+bGXuSrMQAW+7Zvl87h1kmc1ZB1VSRJcpUfoUrGQp4Fkoxm5kZ+Ms+aW+eA==",
+  "license": "MIT",
+  "upstreamFilesSha256": {
+    "upstream/_u64.js": "b09da8c07fe8187c07649494cdb7cd0bcf13df90b506a9473d19e4d5f8c2e102",
+    "upstream/_md.js": "60cf3010fda89e3e4d3f0e7ff1ce249e9c467f34b4fd41b6fd6101d9f69be763",
+    "upstream/utils.js": "037ad49adb78168b6b699598fd33f85f7877456b1d28b4d032e2a1a16807947c",
+    "upstream/sha2.js": "471746bba6ec4c6238ca41358d1d3b40b6ff31cf3363f0b4d550c649c1a8e83b",
+    "upstream/hmac.js": "fec9f8f3aeda785ea2de91cc4c059d54ef98196261c026c43f48341007ae52c9",
+    "upstream/pbkdf2.js": "62b75b5465a89af052a80bdebe7e0383ba01648b12f64877ce285a2e9896c713",
+    "LICENSE": "4f221aee6e072336700c408c68ab3b96a3fc09f6aebe6f48f1bd99e5ef13faec"
+  },
+  "adaptations": [
+    "kdfInputToBytes accepts Uint8Array only; UTF-8 password prehash stays in existing Apps Script Utilities",
+    "Object.hasOwn uses Object.prototype.hasOwnProperty.call for ES2020 runtime compatibility",
+    "TypeScript lowers class fields with useDefineForClassFields=true; SHA256, HMAC and PBKDF2 algorithms are unchanged"
+  ],
+  "build": {
+    "generator": "scripts/generate-password-kdf.mjs",
+    "typescript": "5.9.3",
+    "rolldown": "1.2.13",
+    "target": "ES2020",
+    "format": "IIFE",
+    "minified": false
+  },
+  "bundleFile": "password-kdf.gs",
+  "bundleSha256": "41a446116b78eb2879fe804b8edf32e7cf812a76f0243e660981cc9e9ba577fd",
+  "gitHead": "663c2aeeffc308ac0cded59bd32f7c212adacfc2"
+}

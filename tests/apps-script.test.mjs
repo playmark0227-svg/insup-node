@@ -3,6 +3,7 @@ import { createHash, createHmac, pbkdf2Sync, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { gzipSync, gunzipSync } from "node:zlib";
+import { execFileSync } from "node:child_process";
 import vm from "node:vm";
 import test from "node:test";
 
@@ -277,7 +278,7 @@ class MockSpreadsheet {
   }
 }
 
-export function createHarness({ spreadsheetId = "test-spreadsheet", sheets = [], properties = {}, now = "2026-10-07T06:00:00.000Z", code, kdfIterations = 64 } = {}) {
+export function createHarness({ spreadsheetId = "test-spreadsheet", sheets = [], properties = {}, now = "2026-10-07T06:00:00.000Z", code, kdfIterations = 64, unavailableGlobals = [] } = {}) {
   const writes = [];
   const spreadsheet = new MockSpreadsheet(spreadsheetId, sheets, writes);
   const propertyStore = { ...properties };
@@ -397,6 +398,7 @@ export function createHarness({ spreadsheetId = "test-spreadsheet", sheets = [],
       source = source.replace(/\n  kdfIterations: \d+,\n/, `\n  kdfIterations: ${kdfIterations},\n`);
     }
   }
+  for (const name of unavailableGlobals) Object.defineProperty(context, name, { get() { throw new Error(`Unavailable Apps Script API: ${name}`); }, configurable: false });
   vm.runInContext(source, context, { filename: CODE_PATH, timeout: 5000 });
   return {
     context, spreadsheet, writes, apiCalls, metadataReads, sheetReads, properties: propertyStore, logs, locks, clock,
@@ -2982,8 +2984,10 @@ function legacyRecord(harness, password, salt = harness.context.random256_(), ex
 }
 function countHmac(harness) {
   const utilities = harness.context.Utilities, original = utilities.computeHmacSha256Signature;
-  const counter = { calls: 0, locked: 0, restore() { utilities.computeHmacSha256Signature = original; } };
+  const kdf = harness.context.NODE_PASSWORD_KDF, originalDerive = kdf.derive;
+  const counter = { calls: 0, locked: 0, kdfCalls: 0, kdfRounds: 0, restore() { utilities.computeHmacSha256Signature = original; kdf.derive = originalDerive; } };
   utilities.computeHmacSha256Signature = (...args) => { counter.calls++; if (harness.locks.held) counter.locked++; return original(...args); };
+  kdf.derive = (key, salt, iterations) => { counter.kdfCalls++; counter.kdfRounds += iterations; if (harness.locks.held) counter.locked++; return originalDerive(key, salt, iterations); };
   return counter;
 }
 const sessionCount = harness => Object.keys(harness.properties).filter(key => /^NODE_SESSION_[A-Za-z0-9_-]{43}$/.test(key)).length;
@@ -2993,7 +2997,7 @@ const loginAs = (harness, id, password, extra = {}) => request(harness, "login",
 test("stretched password hashes are PBKDF2-HMAC-SHA256 keyed by the pepper at the production round count", () => {
   const harness = createHarness({ properties: { NODE_PEPPER: "vector-pepper" }, kdfIterations: null });
   const rounds = harness.context.NODE.kdfIterations, salt = "S".repeat(43), password = "パスワード|with 記号";
-  assert.equal(rounds, 2000, "Conservative until the owner times it on Apps Script");
+  assert.equal(rounds, 2000, "The fast path preserves the production work factor");
   const key = createHmac("sha256", "vector-pepper").update(`kdf-v2|${password}`).digest();
   assert.equal(harness.context.stretchedHash_(password, salt, rounds), pbkdf2Sync(key, salt, rounds, 32, "sha256").toString("base64url"));
   const record = JSON.parse(JSON.stringify(harness.context.makeAuth_(password)));
@@ -3005,6 +3009,92 @@ test("stretched password hashes are PBKDF2-HMAC-SHA256 keyed by the pepper at th
   assert.equal(harness.context.passwordMatches_(password, record), true);
   assert.equal(harness.context.passwordMatches_(`${password} `, record), false);
   assert.equal(createHarness().context.NODE.kdfIterations, 64, "The suite runs fewer rounds unless asked otherwise");
+});
+
+test("the pinned server KDF bundle and inline copy reproduce with no source drift", () => {
+  execFileSync(process.execPath, [fileURLToPath(new URL("../scripts/generate-password-kdf.mjs", import.meta.url)), "--check"], {
+    cwd: fileURLToPath(new URL("../", import.meta.url)), timeout: 30000, stdio: "pipe",
+  });
+});
+
+// Frozen pre-fast-path Utilities loop: new hashes must also verify after a
+// rollback to the earlier server, independently of Node's PBKDF2 reference.
+function previousUtilitiesKdf(password, salt, iterations, utilities, pepper) {
+  const key = utilities.computeHmacSha256Signature(`kdf-v2|${String(password)}`, pepper, utilities.Charset.UTF_8), block = [];
+  for (let i = 0; i < salt.length; i++) block.push(salt.charCodeAt(i));
+  let u = utilities.computeHmacSha256Signature(block.concat([0, 0, 0, 1]), key), t = [...u];
+  for (let n = 1; n < iterations; n++) { u = utilities.computeHmacSha256Signature(u, key); for (let j = 0; j < 32; j++) t[j] ^= u[j]; }
+  return utilities.base64EncodeWebSafe(t).replace(/=+$/, "");
+}
+
+test("the fast path is byte-identical to the previous Utilities loop and Node PBKDF2 across 338 vectors", () => {
+  const pepper = "public-vector-pepper-日", harness = createHarness({ properties: { NODE_PEPPER: pepper }, kdfIterations: null });
+  const passwords = ["", "a", "ASCII-public-test", "パスワード|with 記号", "🙂e\u0301é全角ｶﾀｶﾅ", "x".repeat(200), "\u0000\ud800\udfff"];
+  const salts = ["S".repeat(43), "-_".repeat(21) + "A", ...Array.from({ length: 6 }, (_, index) => createHash("sha256").update(`public-vector-salt-${index}`).digest("base64url"))];
+  let vectors = 0;
+  const verify = (password, salt, rounds) => {
+    const key = createHmac("sha256", pepper).update(`kdf-v2|${password}`).digest();
+    const expected = pbkdf2Sync(key, salt, rounds, 32, "sha256").toString("base64url");
+    assert.equal(harness.context.stretchedHash_(password, salt, rounds), expected);
+    assert.equal(previousUtilitiesKdf(password, salt, rounds, harness.context.Utilities, pepper), expected);
+    vectors++;
+  };
+  for (const password of passwords) for (const salt of salts) for (const rounds of [1, 2, 3, 64, 500, 2000]) verify(password, salt, rounds);
+  for (const rounds of [20000, 100000]) verify("public-larger-round-vector", "S".repeat(43), rounds);
+  assert.equal(vectors, 338);
+});
+
+test("one native pepper HMAC retains all 2000 JavaScript rounds and clears transient wrapper keys", () => {
+  const harness = createHarness({ properties: { NODE_PEPPER: "public-native-call-vector" }, kdfIterations: null });
+  const baseline = countHmac(harness);
+  const previous = previousUtilitiesKdf("public-password-vector", "S".repeat(43), 2000, harness.context.Utilities, harness.properties.NODE_PEPPER);
+  baseline.restore();
+  assert.equal(baseline.calls, 2001); assert.equal(baseline.kdfCalls, 0);
+  const kdf = harness.context.NODE_PASSWORD_KDF, originalDerive = kdf.derive;
+  const utilities = harness.context.Utilities, originalEncode = utilities.base64EncodeWebSafe;
+  utilities.base64EncodeWebSafe = value => {
+    assert.ok(Array.isArray(value) && value.every(byte => Number.isInteger(byte) && byte >= -128 && byte <= 127), "The native encoder receives a signed Byte[]");
+    return originalEncode(value);
+  };
+  let observedKey, observedOutput;
+  kdf.derive = (key, salt, rounds) => { observedKey = key; observedOutput = originalDerive(key, salt, rounds); return observedOutput; };
+  const counter = countHmac(harness);
+  const actual = harness.context.stretchedHash_("public-password-vector", "S".repeat(43), 2000);
+  counter.restore(); kdf.derive = originalDerive; utilities.base64EncodeWebSafe = originalEncode;
+  assert.equal(actual, previous);
+  assert.match(actual, /^[A-Za-z0-9_-]{43}$/);
+  assert.equal(counter.calls, 1, "The former 2001 service HMAC calls become one pepper prehash");
+  assert.equal(counter.kdfCalls, 1); assert.equal(counter.kdfRounds, 2000);
+  assert.equal(counter.locked, 0);
+  assert.ok(observedKey.every(byte => byte === 0)); assert.ok(observedOutput.every(byte => byte === 0));
+  assert.deepEqual(harness.logs, []);
+});
+
+test("the server KDF loads and runs without unavailable platform globals or Object.hasOwn", () => {
+  const harness = createHarness({ properties: { NODE_PEPPER: "public-runtime-vector" }, unavailableGlobals: [
+    "crypto", "SubtleCrypto", "TextEncoder", "TextDecoder", "Buffer", "process", "require", "setTimeout", "setInterval", "fetch", "window", "navigator", "performance",
+  ] });
+  harness.evaluate("Object.hasOwn = undefined");
+  const key = createHmac("sha256", "public-runtime-vector").update("kdf-v2|端末環境に依存しないパスワード").digest();
+  assert.equal(harness.context.stretchedHash_("端末環境に依存しないパスワード", "S".repeat(43), 2000), pbkdf2Sync(key, "S".repeat(43), 2000, 32, "sha256").toString("base64url"));
+  assert.throws(() => harness.context.NODE_PASSWORD_KDF.derive("a string is not a byte key", new Uint8Array(43), 64), error => error.name === "TypeError");
+});
+
+test("existing production-round Unicode credentials log in without reissue and changed passwords remain rollback-compatible", () => {
+  const { harness } = signedInFixture({ kdfIterations: null });
+  const password = "パスワード".repeat(40), next = "新しい".repeat(66) + "秘密", salt = "S".repeat(43);
+  assert.equal(password.length, 200); assert.equal(next.length, 200);
+  const auth = { salt, hash: previousUtilitiesKdf(password, salt, 2000, harness.context.Utilities, harness.properties.NODE_PEPPER), kdf: "pbkdf2p1", iter: 2000, version: "previous-server-version" };
+  const raw = JSON.stringify(auth); harness.properties["NODE_AUTH_ND-001"] = raw;
+  const login = assertSuccess(loginAs(harness, "ND-001", password));
+  assert.equal(harness.properties["NODE_AUTH_ND-001"], raw, "The fast path does not rewrite existing compatible credentials");
+  assertSuccess(request(harness, "changePassword", { currentPassword: password, newPassword: next }, { token: login.token }));
+  const stored = JSON.parse(harness.properties["NODE_AUTH_ND-001"]);
+  assert.equal(stored.kdf, "pbkdf2p1"); assert.equal(stored.iter, 2000);
+  assert.equal(stored.hash, previousUtilitiesKdf(next, stored.salt, stored.iter, harness.context.Utilities, harness.properties.NODE_PEPPER));
+  assert.notEqual(stored.version, auth.version);
+  assert.equal(assertFailure(loginAs(harness, "ND-001", password)).code, "INVALID_CREDENTIALS");
+  assertSuccess(loginAs(harness, "ND-001", next));
 });
 
 test("legacy records verify unchanged, upgrade once on login and keep sessions and device tokens valid", () => {
@@ -3041,20 +3131,23 @@ test("unknown, legacy and stretched logins cost the same KDF work and never hash
     const counter = countHmac(harness);
     try { const result = loginAs(harness, id, password); if (ok) assertSuccess(result); else assertFailure(result); } finally { counter.restore(); }
     assert.equal(counter.locked, 0, `${id}: no HMAC runs under the write lock`);
+    assert.equal(counter.kdfCalls, 1, `${id}: one full KDF for every admitted guess`);
+    assert.equal(counter.kdfRounds, rounds, `${id}: JavaScript retains the complete configured work factor`);
     return counter.calls;
   };
-  assert.equal(cost("UNKNOWN-ID", "wrong-password", false), rounds + 2);
-  assert.equal(cost("ND-001", "wrong-password", false), rounds + 2);
-  assert.equal(cost("ND-002", "wrong-password", false), rounds + 2);
-  assert.equal(cost("ND-001", "correct-test-password", true), rounds + 3, "Success adds only the device signature");
-  assert.equal(cost("ND-002", "legacy-password-123", true), rounds + 3, "The legacy branch's stretch is the upgrade record");
+  assert.equal(cost("UNKNOWN-ID", "wrong-password", false), 2);
+  assert.equal(cost("ND-001", "wrong-password", false), 2);
+  assert.equal(cost("ND-002", "wrong-password", false), 2);
+  assert.equal(cost("ND-001", "correct-test-password", true), 3, "Success adds only the device signature");
+  assert.equal(cost("ND-002", "legacy-password-123", true), 3, "The legacy branch's stretch is the upgrade record");
   assert.equal(JSON.parse(harness.properties["NODE_AUTH_ND-002"]).kdf, "pbkdf2p1");
-  assert.equal(cost("ND-002", "wrong-password", false), rounds + 2);
+  assert.equal(cost("ND-002", "wrong-password", false), 2);
   for (const auth of [null, JSON.parse(harness.properties["NODE_AUTH_ND-001"]), legacyRecord(harness, "x-password-123")]) {
     const counter = countHmac(harness);
     harness.context.verifyPassword_("probe-password", auth);
     counter.restore();
-    assert.equal(counter.calls, rounds + 2);
+    assert.equal(counter.calls, 2);
+    assert.equal(counter.kdfCalls, 1); assert.equal(counter.kdfRounds, rounds);
   }
 });
 
@@ -3065,17 +3158,20 @@ test("invented IDs share a per-minute KDF budget so a flood cannot buy unbounded
   for (let i = 0; i < budget + 20; i++) codes.push(assertFailure(loginAs(harness, `INVENTED-${i}`, "guess-password")).code);
   counter.restore();
   assert.ok(codes.every(code => code === "INVALID_CREDENTIALS"), codes.join(","));
-  assert.equal(counter.calls, budget * (rounds + 2), "Only the budgeted attempts run the KDF");
+  assert.equal(counter.calls, budget * 2, "Only the budgeted attempts run the KDF");
+  assert.equal(counter.kdfCalls, budget); assert.equal(counter.kdfRounds, budget * rounds);
   assert.equal(JSON.parse(harness.properties.NODE_LOGIN_RATE).attempts, globalBefore + 5, "Invented IDs still cannot exhaust the login budget of real accounts");
   const account = countHmac(harness);
   assert.equal(assertFailure(loginAs(harness, "ND-001", "wrong-password")).code, "INVALID_CREDENTIALS");
   account.restore();
-  assert.equal(account.calls, rounds + 2, "Real accounts are not affected by the invented-ID budget");
+  assert.equal(account.calls, 2, "Real accounts are not affected by the invented-ID budget");
+  assert.equal(account.kdfCalls, 1); assert.equal(account.kdfRounds, rounds);
   harness.clock.milliseconds += 60 * 1000;
   const refilled = countHmac(harness);
   assertFailure(loginAs(harness, "INVENTED-NEXT", "guess-password"));
   refilled.restore();
-  assert.equal(refilled.calls, rounds + 2, "The budget refills each minute");
+  assert.equal(refilled.calls, 2, "The budget refills each minute");
+  assert.equal(refilled.kdfCalls, 1); assert.equal(refilled.kdfRounds, rounds);
 });
 
 test("malformed stretched records fail closed at the same cost, and the round bound follows the constant", () => {
@@ -3088,7 +3184,8 @@ test("malformed stretched records fail closed at the same cost, and the round bo
     const counter = countHmac(harness);
     assert.equal(assertFailure(loginAs(harness, "ND-001", "correct-test-password")).code, "INVALID_CREDENTIALS");
     counter.restore();
-    assert.equal(counter.calls, rounds + 2, "A malformed record costs what an unknown ID costs");
+    assert.equal(counter.calls, 2, "A malformed record costs what an unknown ID costs");
+    assert.equal(counter.kdfCalls, 1); assert.equal(counter.kdfRounds, rounds);
     harness.clock.milliseconds += 15 * 60 * 1000;
   }
   harness.properties["NODE_AUTH_ND-001"] = JSON.stringify(legacyRecord(harness, "legacy-password-123", "塩|salt"));
@@ -3140,11 +3237,13 @@ test("password change stretches outside the lock, accepts a legacy current passw
   assert.equal(assertFailure(request(harness, "changePassword", { currentPassword: "correct-test-password", newPassword: "brand-new-password" }, { token: "A".repeat(43) })).code, "UNAUTHENTICATED");
   counter.restore();
   assert.equal(counter.calls, 0);
+  assert.equal(counter.kdfCalls, 0);
   counter = countHmac(harness);
   assertSuccess(request(harness, "changePassword", { currentPassword: "correct-test-password", newPassword: "brand-new-password" }, { token: player.token }));
   counter.restore();
   assert.equal(counter.locked, 0, "No KDF run holds the write lock");
-  assert.equal(counter.calls, rounds + 2, "One legacy check and one stretch of the new password");
+  assert.equal(counter.calls, 2, "One legacy check and one pepper prehash of the new password");
+  assert.equal(counter.kdfCalls, 1); assert.equal(counter.kdfRounds, rounds);
   const stored = JSON.parse(harness.properties["NODE_AUTH_ND-001"]);
   assert.equal(stored.kdf, "pbkdf2p1"); assert.equal(stored.iter, rounds); assert.match(stored.version, /^[A-Za-z0-9_-]{43}$/);
   assertSuccess(loginAs(harness, "ND-001", "brand-new-password"));
@@ -3172,7 +3271,7 @@ test("server-generated passwords stay single-HMAC records and upgrade on first l
   const counter = countHmac(harness);
   assert.equal(harness.context.rotateAllNodePasswords().rotated, 8);
   counter.restore();
-  assert.ok(counter.calls < harness.context.NODE.kdfIterations, `Bulk issuance runs no KDF under the lock (${counter.calls} HMAC calls)`);
+  assert.equal(counter.kdfCalls, 0, "Bulk issuance runs no KDF under the lock");
   for (const id of ids) assert.deepEqual(Object.keys(JSON.parse(harness.properties[`NODE_AUTH_${id}`])), ["salt", "hash", "version", "mustChange"]);
   const issued = shown[0].find(row => row.id === "ND-002"), issuedVersion = JSON.parse(harness.properties["NODE_AUTH_ND-002"]).version;
   assertSuccess(loginAs(harness, "ND-002", issued.password));
@@ -3202,7 +3301,8 @@ test("login hashes, verifies devices and reads the roster unlocked; only counter
   api.setProperty = set; api.deleteProperty = del; counter.restore();
   assert.equal(rosterReads, 3);
   assert.equal(counter.locked, 0);
-  assert.equal(counter.calls, 5 * (rounds + 2) + 4, "Two failures, three successes with device signatures, one trusted-device check");
+  assert.equal(counter.calls, 5 * 2 + 4, "Two failures, three successes with device signatures, one trusted-device check");
+  assert.equal(counter.kdfCalls, 5); assert.equal(counter.kdfRounds, 5 * rounds);
   assert.equal(harness.locks.held, false);
 });
 
@@ -3216,13 +3316,13 @@ test("full failure buckets and an exhausted global budget answer without the loc
   for (let i = 0; i < 50; i++) assert.equal(assertFailure(loginAs(harness, `INVENTED-${i}`, "guess-password")).code, "INVALID_CREDENTIALS");
   let counter = countHmac(harness);
   assert.equal(assertFailure(loginAs(harness, "ND-001", "correct-test-password")).code, "RATE_LIMITED");
-  counter.restore(); assert.equal(counter.calls, 0);
+  counter.restore(); assert.equal(counter.calls, 0); assert.equal(counter.kdfCalls, 0);
   harness.properties.NODE_LOGIN_RATE = JSON.stringify({ start: now, attempts: 60 });
   harness.properties["NODE_AUTH_ND-002"] = JSON.stringify(harness.context.makeAuth_("correct-test-password"));
   counter = countHmac(harness);
   assert.equal(assertFailure(loginAs(harness, "ND-002", "wrong-password")).code, "RATE_LIMITED");
   assert.equal(assertFailure(loginAs(harness, "INVENTED-LATE", "guess-password")).code, "RATE_LIMITED");
-  counter.restore(); assert.equal(counter.calls, 0);
+  counter.restore(); assert.equal(counter.calls, 0); assert.equal(counter.kdfCalls, 0);
   assert.equal(harness.locks.calls, lockCalls, "Rejected logins never touch the lock");
   const after = clone(harness.properties); delete after.NODE_LOGIN_RATE; delete after["NODE_AUTH_ND-002"];
   const expected = clone(before); delete expected.NODE_LOGIN_RATE;
@@ -3960,10 +4060,12 @@ test("a correct guess for an older stretched record that loses the race costs wh
   const salt = harness.context.random256_(), weak = { salt, hash: harness.context.stretchedHash_("correct-test-password", salt, 32), kdf: "pbkdf2p1", iter: 32 };
   assert.ok(weak.iter < harness.context.NODE.kdfIterations);
   harness.properties["NODE_AUTH_ND-001"] = JSON.stringify(weak);
-  const verify = password => { const counter = countHmac(harness); const result = harness.context.verifyPassword_(password, harness.context.authRecord_("ND-001")); counter.restore(); return { valid: result.valid, upgraded: !!result.upgrade, calls: counter.calls }; };
+  const verify = password => { const counter = countHmac(harness); const result = harness.context.verifyPassword_(password, harness.context.authRecord_("ND-001")); counter.restore(); return { valid: result.valid, upgraded: !!result.upgrade, calls: counter.calls, kdfCalls: counter.kdfCalls, kdfRounds: counter.kdfRounds }; };
   const right = verify("correct-test-password"), wrong = verify("wrong-password");
   assert.deepEqual([right.valid, right.upgraded, wrong.valid, wrong.upgraded], [true, true, false, false]);
   assert.equal(right.calls, wrong.calls, "The upgrade stretch runs for every guess, not only a correct one");
+  assert.equal(right.kdfCalls, 2); assert.equal(wrong.kdfCalls, 2);
+  assert.equal(right.kdfRounds, weak.iter + harness.context.NODE.kdfIterations); assert.equal(right.kdfRounds, wrong.kdfRounds);
   // The race through the login path: the bucket fills during the unlocked check.
   const rateKey = accountRateKey(harness, "ND-001"), now = harness.clock.milliseconds, raced = password => {
     harness.properties[rateKey] = JSON.stringify({ start: now, failures: 4 });
@@ -4022,20 +4124,31 @@ test("a due activity refresh deferred by a busy lock is reported, so the client 
   assert.match(assertFailure(request(harness, "touch", {}, { token: player.token, background: true })).message, /操作がなかった/);
 });
 
-test("the hash benchmark warns when the current round count is already over its target", () => {
+test("the owner hash benchmark measures sample and current rounds directly and logs numeric results only", () => {
   const harness = createHarness({ properties: { NODE_PEPPER: "bench-pepper", NODE_CONFIG: JSON.stringify({ ownerEmail: "owner@example.test" }) }, kdfIterations: null });
-  const utilities = harness.context.Utilities, original = utilities.computeHmacSha256Signature;
-  utilities.computeHmacSha256Signature = (...args) => { harness.clock.milliseconds += 1; return original(...args); };
+  const kdf = harness.context.NODE_PASSWORD_KDF, original = kdf.derive, observed = [];
+  // Deliberately non-linear timing: the current measurement must not be 4x the sample.
+  kdf.derive = (key, salt, rounds) => { observed.push(rounds); harness.clock.milliseconds += rounds === 500 ? 20 : 2100; return original(key, salt, rounds); };
   const slow = harness.context.benchmarkNodePasswordHash();
-  utilities.computeHmacSha256Signature = original;
+  kdf.derive = original;
+  assert.deepEqual(observed, [500, 2000]);
+  assert.equal(slow.ms, 20); assert.equal(slow.currentMs, 2100);
   assert.equal(slow.suggested, 2000, "The suggestion keeps its floor");
-  assert.equal(slow.roundsForTarget, 0); assert.equal(slow.overTarget, true); assert.ok(slow.currentMs > 1900);
-  assert.ok(harness.logs.some(args => /warning: the current kdfIterations is over the 500 ms target/.test(String(args[0]))));
+  assert.equal(slow.roundsForTarget, 0); assert.equal(slow.overTarget, true);
+  const logged = JSON.parse(harness.logs[0][0]);
+  assert.deepEqual(logged, { sampleRounds: 500, sampleMs: 20, currentRounds: 2000, currentMs: 2100, targetMs: 500, suggestedRounds: 2000, roundsForTarget: 0, overTarget: 1 });
+  assert.ok(Object.values(logged).every(value => typeof value === "number" && Number.isFinite(value)));
   assert.ok(!JSON.stringify(harness.logs).includes("bench-pepper"));
+  assert.equal(harness.context.NODE.kdfIterations, 2000, "Benchmarking never changes configured rounds");
   harness.logs.length = 0;
-  utilities.computeHmacSha256Signature = (...args) => { harness.clock.milliseconds += 0.05; return original(...args); };
+  kdf.derive = (key, salt, rounds) => { harness.clock.milliseconds += rounds * 0.05; return original(key, salt, rounds); };
   const fast = harness.context.benchmarkNodePasswordHash();
-  utilities.computeHmacSha256Signature = original;
+  kdf.derive = original;
+  assert.equal(fast.ms, 25); assert.equal(fast.currentMs, 100);
   assert.equal(fast.overTarget, false); assert.ok(fast.suggested > 2000);
-  assert.ok(!harness.logs.some(args => /warning/.test(String(args[0]))));
+  assert.equal(JSON.parse(harness.logs[0][0]).overTarget, 0);
+  const before = clone(harness.properties), logs = clone(harness.logs);
+  harness.context.Session = { getActiveUser: () => ({ getEmail: () => "someone-else@example.test" }), getEffectiveUser: () => ({ getEmail: () => "owner@example.test" }) };
+  assert.throws(() => harness.context.benchmarkNodePasswordHash(), error => error.nodeCode === "FORBIDDEN");
+  assert.deepEqual(harness.properties, before); assert.deepEqual(harness.logs, logs);
 });

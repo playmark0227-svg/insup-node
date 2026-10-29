@@ -1,9 +1,9 @@
 .candidate-directory-table{min-width:0;table-layout:fixed}
-.candidate-directory-table th:nth-child(1){width:18%}
-.candidate-directory-table th:nth-child(2){width:18%}
-.candidate-directory-table th:nth-child(3){width:22%}
-.candidate-directory-table th:nth-child(4){width:14%}
-.candidate-directory-table th:nth-child(5){width:28%}
+.candidate-directory-table.candidate-table th:nth-child(1){width:17%}
+.candidate-directory-table.candidate-table th:nth-child(2){width:16%}
+.candidate-directory-table.candidate-table th:nth-child(3){width:20%}
+.candidate-directory-table.candidate-table th:nth-child(4){width:25%}
+.candidate-directory-table.candidate-table th:nth-child(5){width:22%}
 .candidate-directory-table .candidate-directory-row>td{vertical-align:middle;padding-top:19px;padding-bottom:19px}
 .candidate-directory-row.is-open{background:#f2f9ff}
 .candidate-directory-companies{display:grid;gap:5px;font-size:12px;line-height:1.6}
@@ -36,3 +36,55 @@
 .candidate-density-compact .candidate-directory-table .candidate-directory-detail>td{padding:0 12px 12px}
 @media(min-width:701px) and (max-width:1100px){.candidate-history-dates{grid-template-columns:repeat(4,minmax(0,1fr))}.candidate-directory-table th:nth-child(1){width:19%}.candidate-directory-table th:nth-child(2){width:20%}.candidate-directory-table th:nth-child(3){width:20%}.candidate-directory-table th:nth-child(4){width:16%}.candidate-directory-table th:nth-child(5){width:25%}}
 @media(max-width:700px){.candidate-directory-mobile .candidate-mobile-card{overflow:hidden}.candidate-directory-mobile .candidate-directory-statuses{flex-direction:row;flex-wrap:wrap}.candidate-directory-mobile .candidate-history-record>header{flex-direction:column;gap:8px}.candidate-directory-mobile .candidate-history-record{padding:12px}.candidate-directory-mobile .candidate-history-dates{grid-template-columns:repeat(2,minmax(0,1fr));margin-top:12px;gap:6px}.candidate-directory-mobile .candidate-history-record>footer{gap:8px;justify-content:flex-start}.candidate-directory-mobile .candidate-history-record>footer .text-button{font-size:12px}.candidate-directory-mobile .candidate-history-schedule{gap:6px}.candidate-directory-mobile .candidate-mobile-card .candidate-history-help{font-size:11px}.candidate-directory-mobile .candidate-history-record>header .stage-tag{max-width:100%;white-space:normal}}
+
+/* Keep the next step beside the company record it opens. */
+.candidate-follow-up{display:flex;align-items:center;justify-content:space-between;gap:7px;max-width:100%;margin-top:9px;padding:6px 0;border:0;background:transparent;color:#096bb8;font-size:12px;font-weight:650;line-height:1.6;text-align:left;cursor:pointer}
+.candidate-follow-up span{min-width:0;overflow-wrap:anywhere}
+.candidate-follow-up svg{flex:none}
+.candidate-follow-up:hover span{text-decoration:underline;text-underline-offset:3px}
+.candidate-follow-up.is-complete{color:#6c849c;font-weight:500}
+.candidate-follow-up:disabled{opacity:.5;cursor:wait}
+.candidate-appointment-date{font-weight:650;font-variant-numeric:tabular-nums}
+.candidate-history-next{display:grid;grid-template-columns:auto minmax(0,1fr);gap:5px 10px;align-items:baseline;padding:12px 0;margin:9px 0 13px;border-bottom:1px solid #e4edf6}
+.candidate-history-next>span{color:#6685a3;font-size:11px}
+.candidate-history-next>strong{color:#225d90;font-size:12px;line-height:1.7}
+.candidate-history-next>small{grid-column:2;color:#6c88a1;font-size:11px;line-height:1.7}
+.candidate-history-achievements>strong{color:#537796;font-size:11px!important;font-weight:550!important}
+.candidate-history-achievements .candidate-history-dates{margin-top:8px}
+.candidate-history-schedule{align-items:center;line-height:1.7}
+.candidate-history-schedule>svg{flex:none}
+.candidate-mobile-next{border-top:1px solid #e5edf6;padding-top:10px}
+.candidate-directory-table .candidate-directory-actions{display:flex;align-items:flex-start;flex-direction:column;gap:9px}
+.candidate-result-count{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.candidate-result-count .text-button{font-size:11px;min-height:28px}
+.candidate-search-clear{display:flex;align-items:center;justify-content:center;flex:none;min-height:28px;min-width:28px;border:0;border-radius:4px;background:transparent;color:#65839d;cursor:pointer}
+.candidate-search-clear:hover{background:#e9f3fc}
+.candidate-filter-note{margin:0;padding:0 22px 15px;font-size:11px;line-height:1.8;color:#6a87a2}
+.candidate-empty-state p{max-width:450px;line-height:1.9;margin:8px auto 17px}
+.candidate-empty-state .primary-button,.candidate-empty-state .secondary-button{display:inline-flex}
+.candidate-management .management-list-caption{gap:18px;align-items:center;flex-wrap:wrap}
+.candidate-management .management-filters select{max-width:100%;min-width:0}
+.candidate-management .candidate-view-tabs{margin:0;flex-wrap:wrap}
+.record-purpose-section{display:grid;gap:15px;min-width:0;padding-bottom:22px;border-bottom:1px solid #dfeaf4}
+.record-purpose-section>header h3{margin:0;font-size:14px;font-weight:700;line-height:1.6;color:#174f80}
+.record-purpose-section>header p{margin:5px 0 0;font-size:11px;color:#65809b;line-height:1.8}
+.record-purpose-section .record-milestone-toolbar{margin:0}
+.record-purpose-section .record-field-grid{gap:17px 16px}
+.record-purpose-section .record-field-grid label>.record-milestone-error{color:#a95322;font-size:11px;line-height:1.6}
+.record-date-details{min-width:0;border:1px solid #d9e7f4;border-radius:7px;padding:13px}
+.record-date-details>summary{font-size:12px;font-weight:600;color:#356c9c;cursor:pointer;line-height:1.7}
+.record-date-details[open]>summary{margin-bottom:12px}
+.record-unsaved-count{margin-right:auto;font-size:11px;line-height:1.7;color:#577995;align-self:center}
+.management-dialog.work-panel>.form-actions,.management-dialog.work-panel>form>.form-actions{flex-wrap:wrap}
+.record-discard-confirm{border-color:#d9bf83;background:#fff9ed;color:#79591f}
+.record-discard-confirm>div{flex-wrap:wrap}
+.candidate-duplicate-note,.candidate-registration-next{padding:13px 14px;border:1px solid #d8e8f6;border-radius:7px;background:#f4f9fe;color:#315d83;font-size:12px;line-height:1.8}
+.candidate-duplicate-note{border-color:#e8cd97;background:#fffbf1;color:#7b602b}
+.candidate-duplicate-note strong,.candidate-registration-next strong{font-size:12px;font-weight:650}
+.candidate-duplicate-note p,.candidate-registration-next p{margin:4px 0 0;font-size:12px;font-weight:400;line-height:1.8}
+.candidate-duplicate-note .text-button{font-size:12px;min-height:34px;max-width:100%;white-space:normal;text-align:left}
+.candidate-history-toggle:focus-visible,.candidate-follow-up:focus-visible,.candidate-search-clear:focus-visible,.candidate-basic-button:focus-visible,.candidate-management .candidate-view-tabs>button:focus-visible,.record-date-details>summary:focus-visible{outline:2px solid #167ec8;outline-offset:3px}
+@container (max-width:460px){.management-dialog .record-unsaved-count{flex-basis:100%;margin:0}.record-purpose-section .record-milestone-toolbar{display:block}.record-purpose-section .record-field-grid{gap:15px}.record-discard-confirm>div{justify-content:flex-start}}
+@media(max-width:700px){.candidate-directory-mobile .candidate-history-next{grid-template-columns:minmax(0,1fr);gap:3px}.candidate-directory-mobile .candidate-history-next>small{grid-column:auto}.candidate-directory-mobile .candidate-history-next>strong{font-size:12px}.candidate-filter-note{padding:0 15px 13px}.candidate-history-schedule{align-items:flex-start}.candidate-history-schedule>svg{display:none}.candidate-history-schedule>span{width:100%}.candidate-management .management-list-caption{align-items:stretch;gap:12px}.candidate-management .management-search{flex-basis:100%}.candidate-management .management-filters select{font-size:12px}.candidate-empty-state{padding:26px 18px}.candidate-empty-state h3{font-size:15px;line-height:1.7}.candidate-mobile-next .candidate-follow-up{margin-top:5px;min-height:34px}.record-purpose-section{gap:13px;padding-bottom:18px}}
+.intake-dialog.work-panel>form>.form-actions{flex-wrap:wrap}
+@container (max-width:460px){.intake-dialog .record-unsaved-count{flex-basis:100%;margin:0}}
