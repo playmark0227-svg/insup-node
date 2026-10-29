@@ -7,7 +7,7 @@ import ts from "typescript";
 import * as data from "../lib/node-data.ts";
 import * as management from "../lib/management-data.ts";
 import * as metrics from "../lib/performance-metrics.ts";
-import { blankInterviewFields } from "../lib/candidate-intake.ts";
+import { blankInterviewFields, linkedCandidateProfile } from "../lib/candidate-intake.ts";
 import { isUncertainWrite } from "../lib/sheets-client.ts";
 
 const workspace = ts.createSourceFile("node-workspace.tsx", fs.readFileSync(new URL("../components/node-workspace.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
@@ -35,7 +35,7 @@ function harness() {
   const window = { addEventListener(name, fn) { if (name === "beforeunload") listeners.add(fn); }, removeEventListener(name, fn) { if (name === "beforeunload") listeners.delete(fn); } };
   const guard = {}; vm.runInNewContext(guardSource, { exports: guard, module: { exports: guard }, require, window });
   const exports = {}, components = Object.fromEntries(["Dialog", "DialogContent", "DialogHeader", "DialogTitle", "DialogDescription", "Picker", "Input", "Checkbox", "ClientNameInput", "InterviewIntakeEditor", "CheckCircle2", "Plus"].map(name => [name, name]));
-  vm.runInNewContext(dialogSource, { exports, module: { exports }, require, crypto: { randomUUID }, ...components, ...data, ...management, ...metrics, blankInterviewFields, isUncertainWrite,
+  vm.runInNewContext(dialogSource, { exports, module: { exports }, require, crypto: { randomUUID }, ...components, ...data, ...management, ...metrics, blankInterviewFields, linkedCandidateProfile, isUncertainWrite,
     useUnsavedFormGuard: guard.useUnsavedFormGuard, UnsavedWorkPrompt: guard.UnsavedWorkPrompt, toast: { info() {}, error() {} },
   });
   const props = { today: "2026-10-30", open: true, activities: [], records: [], playerId: "ND-001", players: [{ id: "ND-001", name: "架空担当", team: "架空チーム", color: "blue", target: 20, bio: "" }], admin: false, detail: null, live: true, intakeEnabled: true, profiles: [], clients: [],
@@ -103,6 +103,15 @@ function profile(record) {
 }
 const candidateSelect = h => nodes(h.render()).find(node => node.type === "select" && node.props["aria-label"] === "登録済みの候補者");
 const picker = (h, label) => nodes(h.render()).find(node => node.type === "Picker" && node.props.label === label);
+
+test("candidate selection prefills only the exact owned profile instead of the first linked document",()=>{
+ const h=harness(),item=waitingRecord('A'),current=profile(item);
+ const stale={...current,profileId:'stale-profile',introduction:'古い紐づけから混入してはいけない文章'};
+ const foreign={...current,playerId:'ND-002',introduction:'別担当から混入してはいけない文章'};
+ h.render({records:[item],profiles:[stale,foreign,current]});candidateSelect(h).props.onChange({target:{value:item.candidateId}});
+ assert.equal(h.editor().props.introduction,current.introduction);assert.equal(h.editor().props.fields.workHistory,current.fields.workHistory);
+ assert.equal(h.saved.length,0);h.unmount();
+});
 
 test("candidate or owner changes preserve interview drafts until explicit replacement, and native close shows only the close prompt", () => {
   for (const target of ["candidate", "owner"]) {

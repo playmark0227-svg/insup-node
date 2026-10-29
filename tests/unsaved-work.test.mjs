@@ -31,7 +31,7 @@ function harness(overrides = {}) {
   });
   const props = { locked: false, onClose: () => closed++, ...overrides };
   const render = (next = {}) => { Object.assign(props, next); cursor = 0; const result = exports.useUnsavedFormGuard(props); while (effects.length) effects.shift()(); return result; };
-  return { render, exports, closed: () => closed, listenerCount: () => listeners.size, changes: () => ({ added, removed }),
+  return { render, renderWarning(dirty) { cursor = 0; exports.useUnsavedChangesWarning(dirty); while (effects.length) effects.shift()(); }, exports, closed: () => closed, listenerCount: () => listeners.size, changes: () => ({ added, removed }),
     unload() { const event = { prevented: false, returnValue: undefined, preventDefault() { this.prevented = true; } }; for (const listener of listeners) listener(event); return event; },
     unmount() { for (const slot of slots) slot.cleanup?.(); },
   };
@@ -82,4 +82,14 @@ test("reset makes a reopened form clean and unload protection stays stable only 
   reopened.reset(); reopened.markChanged(); reopened.requestClose();
   assert.equal(h.render().confirming, true); assert.equal(h.closed(), 1); assert.equal(h.listenerCount(), 1);
   h.unmount(); assert.equal(h.listenerCount(), 0);
+});
+
+
+test("actual-difference warning disappears when values are reverted and removes its listener on unmount", () => {
+  const h = harness();
+  h.renderWarning(false); assert.equal(h.listenerCount(), 0);
+  h.renderWarning(true); assert.equal(h.listenerCount(), 1); assert.equal(h.unload().prevented, true);
+  const changes = h.changes(); h.renderWarning(true); assert.deepEqual(h.changes(), changes);
+  h.renderWarning(false); assert.equal(h.listenerCount(), 0); assert.equal(h.unload().prevented, false);
+  h.renderWarning(true); h.unmount(); assert.equal(h.listenerCount(), 0);
 });

@@ -7,6 +7,7 @@ import * as management from "../lib/management-data.ts";
 import * as performance from "../lib/performance-metrics.ts";
 import * as candidateGroups from "../lib/candidate-groups.ts";
 import { businessToday } from "../lib/sheets-client.ts";
+import { linkedCandidateProfile } from "../lib/candidate-intake.ts";
 
 const source = ts.transpileModule(fs.readFileSync(new URL("../components/candidate-directory.tsx", import.meta.url), "utf8"), {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX },
@@ -268,25 +269,30 @@ const managerSource = ts.transpileModule(fs.readFileSync(new URL("../components/
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX },
 }).outputText + "\nexports.RecordEditor = RecordEditor; exports.CreateCandidate = CreateCandidate; exports.BasicInfoDialog = BasicInfoDialog;";
 
+const unsavedSource = ts.transpileModule(fs.readFileSync(new URL("../components/unsaved-work.tsx", import.meta.url), "utf8"), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX } }).outputText;
+
 function managerHarness(component, overrides = {}) {
   let cursor = 0, closed = 0, consumed = 0;
-  const slots = [], effects = [], calls = [];
+  const slots = [], effects = [], calls = [], listeners = new Set();
   const react = {
     useState(initial) { const i = cursor++; const slot = slots[i] ||= { value: typeof initial === "function" ? initial() : initial }; return [slot.value, value => { slot.value = typeof value === "function" ? value(slot.value) : value; }]; },
     useRef(initial) { const i = cursor++; return slots[i] ||= { current: initial }; },
     useId() { const i = cursor++; return slots[i] ||= `candidate-manager-${i}`; },
-    useEffect(fn, deps) { const i = cursor++, previous = slots[i]; if (!previous || !deps || deps.some((value, index) => !Object.is(value, previous[index]))) { slots[i] = deps; effects.push(fn); } },
+    useEffect(fn, deps) { const i = cursor++, previous = slots[i]; if (!previous || !deps || deps.some((value, index) => !Object.is(value, previous[index]))) { slots[i] = deps; effects.push(() => { previous?.cleanup?.(); deps.cleanup = fn(); }); } },
   };
   const exports = {}, jsx = (type, props, key) => ({ type, props: props || {}, key });
+  const unsaved = {};
+  vm.runInNewContext(unsavedSource, { exports: unsaved, module: { exports: unsaved }, window: { addEventListener: (_, fn) => listeners.add(fn), removeEventListener: (_, fn) => listeners.delete(fn) }, require: name => name === "react" ? react : name === "react/jsx-runtime" ? { jsx, jsxs: jsx } : {} });
   vm.runInNewContext(managerSource, {
     exports, module: { exports }, Error,
     require: name => name === "react" ? react : name === "react/jsx-runtime" ? { jsx, jsxs: jsx }
-      : name.includes("management-data") ? management
+      : name.includes("unsaved-work") ? unsaved
+        : name.includes("management-data") ? management
         : name.includes("performance-metrics") ? performance
           : name.includes("sheets-client") ? { businessToday }
             : name.includes("save-correction") ? { mutationDateErrors: () => ({}) }
               : name.includes("candidate-groups") ? candidateGroups
-                : name.includes("candidate-intake") && !name.includes("components") ? { blankInterviewFields: () => ({ workHistory: "" }) }
+                : name.includes("candidate-intake") && !name.includes("components") ? { linkedCandidateProfile,blankInterviewFields: () => ({ workHistory: "" }) }
                   : name.includes("node-data") ? { statuses: ["提案候補"], positions: ["アポインター", "FS"] }
                     : new Proxy({}, { get: (_, key) => key }),
   });
@@ -304,8 +310,71 @@ function managerHarness(component, overrides = {}) {
   const click = label => { const found = button(label); assert.ok(found, label); assert.ok(!found.props.disabled, `${label} is enabled`); found.props.onClick(); };
   const input = label => nodes(render()).find(node => node.type === "input" && node.props["aria-label"] === label);
   const change = (label, value) => { const found = input(label); assert.ok(found, label); found.props.onChange({ target: { value } }); };
-  return { render, props, button, click, input, change, calls, closed: () => closed, consumed: () => consumed };
+  return { render, props, button, click, input, change, calls, listenerCount: () => listeners.size, unload() { const event = { prevented: false, preventDefault() { this.prevented = true; } }; listeners.forEach(listener => listener(event)); return event; }, closed: () => closed, consumed: () => consumed };
 }
+
+test("new candidates choose only active players and a later deactivation cannot submit the stale owner",async()=>{
+ const stopped={id:'ND-000',name:'停止した担当',active:false,sheetNames:['停止した担当']},active={id:'ND-001',name:'有効な担当',sheetNames:['有効な担当']};
+ const h=managerHarness('CreateCandidate',{players:[stopped,active]});
+ const owner=()=>nodes(h.render()).find(node=>node.type==='select'&&node.props.id.endsWith('-owner'));
+ assert.equal(owner().props.value,active.id);assert.deepEqual(nodes(owner()).filter(node=>node.type==='option').map(node=>node.props.value),[active.id]);
+ const name=nodes(h.render()).find(node=>node.type==='input'&&node.props.id?.endsWith('-name'));name.props.onChange({target:{value:'合成人物'}});
+ h.render({players:[stopped,{...active,active:false}]});assert.equal(h.button('候補者を登録').props.disabled,true);
+ await nodes(h.render()).find(node=>node.type==='form').props.onSubmit({preventDefault(){}});assert.equal(h.calls.length,0);
+ assert.match(text(h.render()),/有効な担当者がいません/);
+ h.render({players:[stopped,active]});await nodes(h.render()).find(node=>node.type==='form').props.onSubmit({preventDefault(){}});
+ assert.equal(h.calls.length,1);assert.equal(h.calls[0][1].playerId,active.id);
+});
+
+test("inactive current owners remain visible while administrators can transfer only to active owners",async()=>{
+ const stopped={id:'ND-001',name:'停止した担当',active:false,sheetNames:['停止した担当']},active={id:'ND-002',name:'有効な担当',sheetNames:['有効な担当']};
+ const item=record('inactive-owned-record','合成会社',2);item.values[3]=stopped.sheetNames[0];
+ const h=managerHarness('RecordEditor',{record:item,players:[stopped,active]});
+ const owner=()=>nodes(h.render()).find(node=>node.type==='select'&&node.props['aria-label']===management.matchingFields[3]);
+ const options=nodes(owner()).filter(node=>node.type==='option');
+ assert.equal(owner().props.value,stopped.sheetNames[0]);assert.equal(options.find(node=>text(node).includes(stopped.name)).props.disabled,true);
+ assert.match(text(owner()),/利用停止中・現在の担当/);assert.equal(options.find(node=>text(node)===active.name).props.disabled,false);
+ owner().props.onChange({target:{value:active.name}});await nodes(h.render()).find(node=>node.type==='form').props.onSubmit({preventDefault(){}});
+ assert.equal(h.calls.length,1);assert.equal(h.calls[0][1].changes[4],active.name);
+ const readonly=managerHarness('RecordEditor',{record:item,players:[stopped,active],admin:false});
+ assert.equal(nodes(readonly.render()).some(node=>node.type==='select'&&node.props['aria-label']===management.matchingFields[3]),false);
+ assert.match(text(readonly.render()),/停止した担当（利用停止中）/);
+});
+
+test("a transfer target deactivated while editing blocks the update without losing the draft",async()=>{
+ const first={id:'ND-001',name:'元の担当',sheetNames:['元の担当']},second={id:'ND-002',name:'移管先',sheetNames:['移管先']};
+ const h=managerHarness('RecordEditor',{players:[first,second]});
+ const owner=()=>nodes(h.render()).find(node=>node.type==='select'&&node.props['aria-label']===management.matchingFields[3]);
+ owner().props.onChange({target:{value:second.name}});h.render({players:[first,{...second,active:false}]});
+ await nodes(h.render()).find(node=>node.type==='form').props.onSubmit({preventDefault(){}});
+ assert.equal(h.calls.length,0);assert.equal(owner().props.value,second.name);assert.match(text(h.render()),/有効な担当者を選び直して/);
+});
+
+test("a deactivated draft owner does not block explicit same-operation confirmation after an uncertain result",async()=>{
+ const active={id:'ND-001',name:'検証担当',sheetNames:['検証担当']};
+ const h=managerHarness('CreateCandidate',{players:[active]});
+ const name=nodes(h.render()).find(node=>node.type==='input'&&node.props.id?.endsWith('-name'));name.props.onChange({target:{value:'合成人物'}});
+ h.props.save.uncertain=true;h.render({players:[{...active,active:false}]});
+ assert.equal(h.button('同じ内容で再試行').props.disabled,false);
+ await nodes(h.render()).find(node=>node.type==='form').props.onSubmit({preventDefault(){}});assert.equal(h.calls.length,1);
+ assert.equal(h.calls[0][1].playerId,active.id);
+});
+
+test("historical candidate filtering retains inactive owners",()=>{
+ const h=managerHarness('CandidateManager',{players:[{id:'ND-001',name:'停止した担当',active:false}]});
+ const filter=nodes(h.render()).find(node=>node.type==='select'&&node.props['aria-label']==='候補者の担当者');
+ assert.ok(nodes(filter).some(node=>node.type==='option'&&node.props.value==='ND-001'));
+});
+
+test("basic information opens the authoritative owned profile instead of the first stale link",()=>{
+ const item={...record('current-record','合成会社',2),profileId:'current'};
+ const make=(profileId,playerId='ND-001')=>({profileId,playerId,recordIds:[item.recordId],version:profileId,updatedAt:'2026-10-30T00:00:00Z',fields:{workHistory:profileId},introduction:''});
+ const stale=make('stale'),foreign=make('current','ND-002'),current=make('current');
+ const h=managerHarness('CandidateManager',{records:[item],profiles:[stale,foreign,current],intakeEnabled:true});
+ nodes(h.render()).find(node=>node.type==='CandidateDirectory').props.onBasic(item.recordId);
+ const panel=nodes(h.render()).find(node=>typeof node.type==='function'&&node.type.name==='BasicInfoDialog');
+ assert.ok(panel);assert.equal(panel.props.profile,current);
+});
 
 test("progress editing retains every business field and asks before discarding unsaved input", () => {
   const h = managerHarness("RecordEditor");
@@ -366,6 +435,10 @@ test("candidate registration warns about an existing same-owner person and can o
   name.props.onChange({ target: { value: "架空 候補者" } });
   assert.match(text(h.render()), /同じ担当者に同名の登録があります/);
   h.click("架空会社の記録を確認");
+  assert.deepEqual(h.calls, [], "opening an existing proposal cannot discard registration input silently");
+  h.click("入力を続ける");
+  assert.equal(nodes(h.render()).find(node => node.type === "input" && node.props.required).props.value, "架空 候補者");
+  h.click("架空会社の記録を確認"); h.click("入力を破棄して記録を確認");
   assert.deepEqual(h.calls, [["existing", "current-record"]]);
 });
 
@@ -409,4 +482,42 @@ test("an already open discard confirmation cannot close any panel after a save s
       h.props.save[state] = false;
     }
   }
+});
+
+
+test("candidate panels warn about reload only while values actually differ from the original", () => {
+  for (const component of ["RecordEditor", "BasicInfoDialog", "CreateCandidate"]) {
+    const h = managerHarness(component); h.render(); assert.equal(h.listenerCount(), 0, component);
+    const change = value => {
+      if (component === "RecordEditor") h.change("C面談予定日", value);
+      else if (component === "BasicInfoDialog") nodes(h.render()).find(node => node.type === "InterviewIntakeEditor").props.onIntroductionChange(value);
+      else nodes(h.render()).find(node => node.type === "input" && node.props.required).props.onChange({ target: { value } });
+    };
+    change(component === "RecordEditor" ? "2099-01-01" : "保存前の入力"); h.render();
+    assert.equal(h.listenerCount(), 1, component); assert.equal(h.unload().prevented, true, component);
+    change(""); h.render(); assert.equal(h.listenerCount(), 0, component); assert.equal(h.unload().prevented, false, component);
+    h.click("閉じる"); assert.equal(h.closed(), 1, component);
+  }
+});
+
+test("switching candidate tabs keeps the client component mounted and reports its real draft state", () => {
+  const dirty = [], h = managerHarness("CandidateManager", { intakeEnabled: true, onDirtyChange: value => dirty.push(value) });
+  const master = () => nodes(h.render()).find(node => node.type === "ClientMaster");
+  assert.ok(master(), "the hidden client editor owns drafts across tab switches");
+  master().props.onDirtyChange(true); h.render(); assert.equal(dirty.at(-1), true);
+  h.click("取引先の管理"); assert.ok(master());
+  h.click("候補者 1"); assert.ok(master()); assert.equal(dirty.at(-1), true);
+  master().props.onDirtyChange(false); h.render(); assert.equal(dirty.at(-1), false);
+});
+
+
+test("a progress draft keeps its original version across refresh and cannot lose other input through achievement cancellation", async () => {
+  const h = managerHarness("RecordEditor");
+  h.change("C面談予定日", "2099-01-01");
+  h.render({ record: { ...h.props.record, rowVersion: "arrived-later-row" } });
+  const cancellations = nodes(h.render()).filter(node => node.type === "button" && text(node).trim() === "取り消す");
+  assert.ok(cancellations.length); assert.ok(cancellations.every(node => node.props.disabled));
+  assert.match(text(h.render()), /入力中の変更を保存するか戻してから/);
+  await nodes(h.render()).find(node => node.type === "form").props.onSubmit({ preventDefault() {} });
+  assert.equal(h.calls[0][0], "updateRecord"); assert.equal(h.calls[0][1].rowVersion, "version-current-record");
 });

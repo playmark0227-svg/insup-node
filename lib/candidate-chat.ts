@@ -10,7 +10,10 @@ export type CandidateChatSource = {
   kind: "record" | "profile" | "review";
   facts: { label: string; value: string }[];
 };
-export type CandidateChatContext = { candidateName: string; sources: CandidateChatSource[]; omittedRecords: number };
+export type CandidateChatContext = { candidateName: string; sources: CandidateChatSource[]; omittedRecords: number;
+  identityIssue?: {code:"IDENTITY_SELECTION_REQUIRED"; message:string};
+};
+export type CandidateChatProfileChoice = {profileId:string; label:string; recordIds:string[]};
 export type CandidateFactAnswer = { text: string; sourceIds: string[]; method?: "record-check" };
 
 const CONTEXT_LIMIT = 28_000;
@@ -39,6 +42,26 @@ function ownedRecords(group: CandidateGroup): CandidateRecord[] {
   });
 }
 
+/** A name group is only a display convenience. Explicitly linked profile IDs are separate
+ * identity scopes until a person selects one; company names cannot prove they are one person. */
+export function candidateChatProfileChoices(group:CandidateGroup,profiles:CandidateProfile[]):CandidateChatProfileChoice[] {
+  const records=ownedRecords(group),choices=new Map<string,{records:CandidateRecord[];updatedAt:string}>();
+  for(const record of records)if(record.profileId) {
+    const choice=choices.get(record.profileId)||{records:[],updatedAt:""};choice.records.push(record);choices.set(record.profileId,choice);
+  }
+  for(const profile of profiles) {
+    if(!profile.profileId||profile.playerId!==group.playerId)continue;
+    const linked=records.filter(record=>profile.recordIds.includes(record.recordId)&&(!record.profileId||record.profileId===profile.profileId));
+    if(!linked.length)continue;
+    const choice=choices.get(profile.profileId)||{records:[],updatedAt:""};
+    for(const record of linked)if(!choice.records.some(item=>item.recordId===record.recordId))choice.records.push(record);
+    if(profile.updatedAt>choice.updatedAt)choice.updatedAt=profile.updatedAt;
+    choices.set(profile.profileId,choice);
+  }
+  return [...choices].map(([profileId,choice],index)=>({profileId,recordIds:choice.records.map(record=>record.recordId),
+    label:short(`基本情報 ${index+1} · ${recordLabel(choice.records[0])}${choice.records.length>1?` ほか${choice.records.length-1}件`:""}${choice.updatedAt?` · 更新 ${choice.updatedAt.slice(0,10)}`:""}`,200)}));
+}
+
 /** Keep the source ID exact. Large source fields are excerpts with an explicit notice. */
 function fitSource(source: CandidateChatSource, budget: number): CandidateChatSource | null {
   if (source.id.length > 200 || budget < 250) return null;
@@ -59,10 +82,15 @@ function fitSource(source: CandidateChatSource, budget: number): CandidateChatSo
 }
 
 /** No network or browser dependency. Generated introductions and saved AI advice are not evidence. */
-export function buildCandidateChatContext({ group, profiles, reviews = [] }: {
-  group: CandidateGroup; profiles: CandidateProfile[]; reviews?: InterviewReview[];
+export function buildCandidateChatContext({ group, profiles, reviews = [], selectedProfileId }: {
+  group: CandidateGroup; profiles: CandidateProfile[]; reviews?: InterviewReview[]; selectedProfileId?:string;
 }): CandidateChatContext {
-  const owned = ownedRecords(group);
+  let owned = ownedRecords(group);
+  const choices=candidateChatProfileChoices(group,profiles),selected=selectedProfileId?choices.find(choice=>choice.profileId===selectedProfileId):undefined;
+  if(selectedProfileId&&!selected||!selectedProfileId&&choices.length>1)return {candidateName:short(group.name,120),sources:[],omittedRecords:0,
+    identityIssue:{code:"IDENTITY_SELECTION_REQUIRED",message:selectedProfileId?"選択した基本情報を参照できなくなりました。参照する記録・基本情報を選び直してください。":"同じ名前に複数の基本情報が紐づいています。別の人の情報を混ぜないため、参照する記録または基本情報を1つ選んでください。"}};
+  if(selected)owned=owned.filter(record=>selected.recordIds.includes(record.recordId));
+  const totalRecords=selected?owned.length:group.records.length;
   const records = owned.filter(record => record.recordId.length <= 200).slice(0, 30);
   const ids = new Set(records.map(record => record.recordId));
   const recordSources: CandidateChatSource[] = records.map(record => ({
@@ -74,7 +102,7 @@ export function buildCandidateChatContext({ group, profiles, reviews = [] }: {
   const seenProfiles = new Set<string>();
   const linkedRecords = (profile: CandidateProfile) => records.filter(record => profile.recordIds.includes(record.recordId) && (!record.profileId || record.profileId === profile.profileId));
   const eligibleProfiles = profiles.filter(profile => {
-    if (!profile.profileId || seenProfiles.has(profile.profileId) || profile.playerId !== group.playerId || !linkedRecords(profile).length) return false;
+    if (!profile.profileId || seenProfiles.has(profile.profileId) || profile.playerId !== group.playerId || selectedProfileId&&profile.profileId!==selectedProfileId || !linkedRecords(profile).length) return false;
     seenProfiles.add(profile.profileId); return true;
   });
   const profileSources: CandidateChatSource[] = eligibleProfiles.slice(0, 20).map(profile => ({
@@ -95,7 +123,7 @@ export function buildCandidateChatContext({ group, profiles, reviews = [] }: {
     // nextAction may contain an earlier generated AI recommendation; do not re-ground it as fact.
     facts: [fact("C面談実施日", review.interviewDate), fact("記録された未マッチ理由", review.category), fact("確認した理由・事実", review.memo)].filter(nonempty),
   }));
-  const context: CandidateChatContext = { candidateName: short(group.name, 120), sources: [], omittedRecords: group.records.length };
+  const context: CandidateChatContext = { candidateName: short(group.name, 120), sources: [], omittedRecords: totalRecords };
   const profileBudget = profileSources.length ? 7_000 : 0;
   const reviewBudget = reviewSources.length ? 2_500 : 0;
   const buckets: [CandidateChatSource[], number][] = [
@@ -112,7 +140,7 @@ export function buildCandidateChatContext({ group, profiles, reviews = [] }: {
       remaining -= JSON.stringify(packed).length;
     }
   }
-  context.omittedRecords = group.records.length - context.sources.filter(source => source.kind === "record").length;
+  context.omittedRecords = totalRecords - context.sources.filter(source => source.kind === "record").length;
   const omittedProfiles = eligibleProfiles.length - context.sources.filter(source => source.kind === "profile").length;
   const omittedReviews = eligibleReviews.length - context.sources.filter(source => source.kind === "review").length;
   if ((omittedProfiles || omittedReviews) && context.sources[0]) {
@@ -149,6 +177,7 @@ function specificConditionLabels(query: string): Set<string> {
 export function answerCandidateFacts(context: CandidateChatContext, question: string, history:Array<{role:"user"|"assistant";content:string}> = []): CandidateFactAnswer {
   const query = question.trim();
   if (!query) return { text: "確認したいことを入力してください。", sourceIds: [] };
+  if (context.identityIssue) return {text:context.identityIssue.message,sourceIds:[]};
   if (/採用(?:すべき|して|した方)|不採用|合否を(?:決|判)|向いて|適性|優秀|評価して|点数|順位/.test(query)) {
     return { text: "記録だけで採用判断や人物評価は行いません。会社ごとの進捗、希望条件、面談で確認した事実を質問してください。", sourceIds: [] };
   }

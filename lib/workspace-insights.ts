@@ -39,7 +39,7 @@ export type FollowUpTask = {
   candidateName: string;
   companyName: string;
   playerId: string;
-  kind: "interview_overdue" | "interview_today" | "result_waiting" | "start_overdue" | "missing_review";
+  kind: "interview_overdue" | "interview_today" | "result_waiting" | "start_overdue" | "missing_review" | "schedule_missing";
   urgency: "overdue" | "today" | "followup";
   title: string;
   evidence: string;
@@ -88,7 +88,7 @@ export function buildFollowUpTasks(snapshot: SheetSnapshot, today = insightToday
   for (const record of scopedInsightRecords(snapshot)) {
     if (seen.has(record.recordId)) continue;
     seen.add(record.recordId);
-    const interviewed = valueAt(record, 17), scheduled = valueAt(record, 10), plannedStart = valueAt(record, 23), offered = valueAt(record, 21), matched = valueAt(record, 22);
+    const proposed = valueAt(record, 8), interviewed = valueAt(record, 17), scheduled = valueAt(record, 10), plannedStart = valueAt(record, 23), offered = valueAt(record, 21), matched = valueAt(record, 22);
     const base = { recordId: record.recordId, candidateName: record.candidateName, companyName: valueAt(record, 2), playerId: record.playerId };
     const add = (task: Omit<FollowUpTask, keyof typeof base | "id">) => tasks.push({ ...base, ...task, id: `${record.recordId}:${task.kind}` });
     if (!finishedRecord(record)) {
@@ -96,6 +96,8 @@ export function buildFollowUpTasks(snapshot: SheetSnapshot, today = insightToday
         add({ kind: "start_overdue", urgency: "overdue", title: "稼働開始の状況を確認", evidence: `稼働予定 ${plannedStart} · 開始日は未記録`, suggestedAction: "実際の開始日、または予定の変更を確認して記録する。", date: plannedStart });
       } else if (validInsightDate(scheduled) && !validInsightDate(interviewed) && scheduled <= today) {
         add({ kind: scheduled === today ? "interview_today" : "interview_overdue", urgency: scheduled === today ? "today" : "overdue", title: scheduled === today ? "今日のC面談を確認" : "C面談の実施状況を確認", evidence: `C面談予定 ${scheduled}${valueAt(record, 11) ? ` ${valueAt(record, 11)}` : ""} · 実施日は未記録`, suggestedAction: scheduled === today ? "参加意思と日時を確認し、面談後に実施日を記録する。" : "実施、延期、辞退のいずれかを確認し、日付と進捗を更新する。", date: scheduled });
+      } else if (validInsightDate(proposed) && proposed <= today && !scheduled && !interviewed && !offered && !matched && !plannedStart && !/^(提案なし|面談実施|合格|マッチ|稼働予定)/.test(valueAt(record, 7))) {
+        add({ kind: "schedule_missing", urgency: "followup", title: "C面談の予定日時を確認", evidence: `提案完了 ${proposed} · C面談の予定日は未登録`, suggestedAction: "クライアントと候補者に面談日時を確認し、決まった予定を登録する。", date: proposed });
       } else if (validInsightDate(interviewed) && interviewed <= today && !validInsightDate(offered) && !validInsightDate(matched)) {
         const deadline = valueAt(record, 18);
         const deadlineDue = validInsightDate(deadline) && deadline <= today;
@@ -137,7 +139,10 @@ export function buildWorkspaceInsightAggregate(snapshot: SheetSnapshot, period: 
     period,
     asOf: today,
     metrics: insightMetrics.map(metric => ({ key: metric.key, count: count(period, metric.stage), previousCount: previous ? count(previous, metric.stage) : null })),
-    proposalTarget: period.length === 7 ? members.reduce((total, member) => total + (Number.isSafeInteger(member.target) && member.target > 0 && member.target <= 9999 ? member.target : 0), 0) : null,
+    proposalTarget: period.length !== 7 ? null : snapshot.monthlyGoalsFeature
+      ? members.every(member => (snapshot.monthlyGoals || []).some(goal => goal.playerId === member.id && goal.month === period))
+        ? members.reduce((total, member) => total + (snapshot.monthlyGoals || []).find(goal => goal.playerId === member.id && goal.month === period)!.target, 0) : null
+      : members.reduce((total, member) => total + (Number.isSafeInteger(member.target) && member.target > 0 && member.target <= 9999 ? member.target : 0), 0),
     memberCount: members.length,
     pipeline: {
       interviewsToday: tasks.filter(task => task.kind === "interview_today").length,
@@ -172,7 +177,7 @@ export function workspaceEvidenceLabel(key: WorkspaceEvidenceKey, aggregate: Wor
   const metric = insightMetrics.find(item => item.key === key);
   if (metric) return `${metric.label} ${aggregate.metrics.find(item => item.key === key)?.count ?? 0}件`;
   const labels = { interviewsToday: "今日のC面談", interviewsOverdue: "予定日を過ぎたC面談・実施日未記録", resultsWaiting: "結果の確認対象", startsOverdue: "稼働予定日を過ぎた・開始日未記録", missingReviews: "不成立の振り返り未記録" };
-  if (key === "proposalTarget") return aggregate.proposalTarget === null ? "月間目標の対象外" : `月間提案目標 ${aggregate.proposalTarget}件`;
+  if (key === "proposalTarget") return aggregate.proposalTarget === null ? "月別目標は未確定または集計対象外" : `月間提案目標 ${aggregate.proposalTarget}件`;
   if (key === "reviewReasons") return aggregate.reviewReasons.length ? aggregate.reviewReasons.map(reason => `${reason.category} ${reason.count}件`).join(" / ") : "理由の記録なし";
   return `${labels[key as keyof typeof labels]} ${aggregate.pipeline[key as keyof WorkspaceInsightAggregate["pipeline"]]}件`;
 }

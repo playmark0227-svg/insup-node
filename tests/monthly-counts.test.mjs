@@ -113,16 +113,22 @@ test("introduction uniqueness is scoped to each month and cumulative unique cand
   assert.equal(liveCount(counts, "all", "紹介人数", "ND-001"), 1);
 });
 
-test("monthly rankings include zero-count active players without exposing inactive or admin counts", () => {
-  const counts = count([
+test("admin monthly counts retain stopped players while player rankings expose only active members", () => {
+  const rows = [
     ...recorded,
     activity("提案", "2026-10-01", {playerId: "ND-003", recordId: "inactive-row"}),
     activity("提案", "2026-10-01", {playerId: "ADMIN", recordId: "admin-row"}),
-  ]);
-  assert.equal(liveCount(counts, "2026-10", "提案", "ND-002"), 0);
-  assert.equal(counts["2026-10"]["ND-003"], undefined);
-  assert.equal(counts["2026-10"].ADMIN, undefined);
-  assert.equal(liveCount(counts, "2026-10", "提案", null), 1);
+  ];
+  const adminCounts = count(rows);
+  assert.equal(liveCount(adminCounts, "2026-10", "提案", "ND-003"), 1, "Stopping login does not erase historical work");
+  assert.equal(adminCounts["2026-10"].ADMIN, undefined);
+  assert.equal(liveCount(adminCounts, "2026-10", "提案", null), 2);
+  // buildSnapshot_ passes active members only for a player-facing ranking.
+  const playerCounts = backend.countActivities_(rows, players.filter(player => player.active));
+  assert.equal(liveCount(playerCounts, "2026-10", "提案", "ND-002"), 0);
+  assert.equal(playerCounts["2026-10"]["ND-003"], undefined);
+  assert.equal(playerCounts["2026-10"].ADMIN, undefined);
+  assert.equal(liveCount(playerCounts, "2026-10", "提案", null), 1);
 });
 
 test("a current status label and a planned start do not invent next-month actual outcomes", () => {

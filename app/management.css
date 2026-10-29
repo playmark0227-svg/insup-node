@@ -49,3 +49,6 @@
 .candidate-create-dialog .form-actions{margin-top:2px;padding-top:20px;border-top:1px solid #e0ebf6;gap:12px}
 .candidate-create-dialog .form-actions button{min-height:46px}
 @media(max-width:600px){.candidate-create-dialog{width:calc(100vw - 24px)!important;max-height:calc(100dvh - 24px);padding:20px!important}.candidate-create-dialog .form-grid{grid-template-columns:minmax(0,1fr);gap:20px}.candidate-create-dialog .form-actions .primary-button{flex:1.5}}
+
+.client-draft-status,.client-discard-confirm{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;padding:12px 14px;border:1px solid #e5d2a0;border-radius:7px;background:#fffaf0;color:#705724;font-size:12px;line-height:1.7}.client-discard-confirm{align-items:flex-start;flex-direction:column}.client-discard-confirm p{margin:0}.client-discard-confirm>div{display:flex;gap:8px;flex-wrap:wrap}.client-edit-name{flex:1;min-width:min(100%,200px)}.client-master small.client-draft-label{color:#8b641e;overflow-wrap:anywhere}
+.client-master article.client-is-editing{flex-direction:column;align-items:stretch}.client-master article.client-is-editing .client-discard-confirm>div{display:flex;gap:8px;flex-wrap:wrap}

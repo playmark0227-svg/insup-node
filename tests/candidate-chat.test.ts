@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { answerCandidateFacts, buildCandidateChatContext, type CandidateChatContext } from "../lib/candidate-chat.ts";
+import { answerCandidateFacts, buildCandidateChatContext, candidateChatProfileChoices, type CandidateChatContext } from "../lib/candidate-chat.ts";
 import { groupCandidates, type CandidateGroup } from "../lib/candidate-groups.ts";
 import { blankInterviewFields, type CandidateProfile } from "../lib/candidate-intake.ts";
 import type { CandidateRecord, InterviewReview } from "../lib/sheets-client.ts";
@@ -42,18 +42,19 @@ test("normalized names do not let a distinct candidate or an unassigned owner al
   assert.equal(context.candidateName, "山田太郎");
 });
 
-test("distinct explicitly linked profiles retain their own facts instead of becoming one profile", () => {
+test("distinct linked profiles require an explicit choice before any facts enter an AI context", () => {
   const second = row("r2", "山田太郎", "ND-001", "Beta社"); second.row = 3;
   const a = profile(), b = profile("p2", ["r2"]), outside = profile("p3", ["r9"]);
   a.fields.desiredHourlyRate = "1,500円"; b.fields.desiredHourlyRate = "2,000円";
   outside.fields.desiredHourlyRate = "他の人物の単価";
   const context = buildCandidateChatContext({ group: group([row(), second]), profiles: [a, b, outside] });
-  const sources = context.sources.filter(source => source.kind === "profile");
-  assert.equal(sources.length, 2);
-  assert.match(sources.find(source => source.id === "profile:p1")!.label, /Alpha社/);
-  assert.match(sources.find(source => source.id === "profile:p2")!.label, /Beta社/);
-  assert.deepEqual(sources.map(source => source.facts.find(entry => entry.label === "希望単価")?.value), ["1,500円", "2,000円"]);
-  assert.doesNotMatch(serialized(context), /他の人物の単価/);
+  assert.equal(context.identityIssue?.code,"IDENTITY_SELECTION_REQUIRED");assert.deepEqual(context.sources,[]);
+  assert.doesNotMatch(serialized(context),/1,500円|2,000円|他の人物の単価/);
+  assert.match(answerCandidateFacts(context,"希望条件を教えて").text,/別の人の情報を混ぜない.*1つ選んで/);
+  const selected=buildCandidateChatContext({group:group([row(),second]),profiles:[a,b,outside],selectedProfileId:'p2'});
+  assert.deepEqual(selected.sources.filter(source=>source.kind==='record').map(source=>source.id),['r2']);
+  assert.deepEqual(selected.sources.filter(source=>source.kind==='profile').map(source=>source.id),['profile:p2']);
+  assert.match(serialized(selected),/2,000円/);assert.doesNotMatch(serialized(selected),/1,500円|他の人物の単価|Alpha社/);
 });
 
 test("a contradictory record.profileId rejects a stale profile even when recordIds includes the row", () => {
@@ -62,13 +63,57 @@ test("a contradictory record.profileId rejects a stale profile even when recordI
   const current = profile("current", ["r1", "r2"]), stale = profile("old", ["r1"]), separate = profile("separate", ["r2"]);
   current.fields.desiredHourlyRate = "現在の条件"; stale.fields.desiredHourlyRate = "混入してはいけない以前の条件";
   separate.fields.desiredHourlyRate = "別資料に記録した条件";
-  const context = buildCandidateChatContext({ group: group([a, b]), profiles: [stale, current, separate] });
+  const context = buildCandidateChatContext({ group: group([a, b]), profiles: [stale, current, separate],selectedProfileId:'current' });
   assert.doesNotMatch(serialized(context), /混入してはいけない/);
   const source = context.sources.find(entry => entry.id === "profile:current")!;
   assert.match(source.label, /Alpha社.*2026-10-21.*記録行 2/);
   assert.doesNotMatch(source.label, /Beta社/);
-  assert.match(context.sources.find(entry => entry.id === "profile:separate")!.label, /Beta社.*記録行 3/);
-  assert.equal(context.sources.filter(entry => entry.kind === "profile").length, 2);
+  assert.doesNotMatch(serialized(context),/別資料に記録した条件/);
+  assert.equal(context.sources.filter(entry => entry.kind === "profile").length, 1);
+});
+
+test("explicit identities block a same-name group even when profile documents are unavailable",()=>{
+ const first={...row(),profileId:'person-a'},second={...row('r2'),profileId:'person-b'};
+ const grouped=group([first,second]),context=buildCandidateChatContext({group:grouped,profiles:[]});
+ assert.equal(context.identityIssue?.code,'IDENTITY_SELECTION_REQUIRED');assert.deepEqual(context.sources,[]);
+ const choices=candidateChatProfileChoices(grouped,[]);assert.deepEqual(choices.map(choice=>choice.profileId),['person-a','person-b']);
+ const selected=buildCandidateChatContext({group:grouped,profiles:[],selectedProfileId:'person-b'});
+ assert.equal(selected.identityIssue,undefined);assert.deepEqual(selected.sources.map(source=>source.id),['r2']);
+});
+
+test("profile choices exclude foreign owners, outside records, and stale contradictory links",()=>{
+ const record={...row(),profileId:'current'},another=row('r2','山田太郎','ND-002','別担当の会社');
+ const grouped={...group([record]),records:[record,another]};
+ const profiles=[profile('current'),profile('stale'),profile('foreign',['r1'],'ND-002'),profile('outside',['outside'])];
+ assert.deepEqual(candidateChatProfileChoices(grouped,profiles).map(choice=>choice.profileId),['current']);
+ const context=buildCandidateChatContext({group:grouped,profiles});assert.equal(context.identityIssue,undefined);
+ assert.deepEqual(context.sources.map(source=>source.id),['r1']);
+ const rejected=buildCandidateChatContext({group:grouped,profiles,selectedProfileId:'foreign'});
+ assert.deepEqual(rejected.sources,[]);assert.equal(rejected.identityIssue?.code,'IDENTITY_SELECTION_REQUIRED');
+});
+
+test("choosing one profile excludes unlinked rows and another person's review or conditions",()=>{
+ const first={...row(),profileId:'person-a'},second={...row('r2','山田太郎','ND-001','Beta社'),profileId:'person-b'},unknown=row('r3');
+ const a=profile('person-a',['r1']),b=profile('person-b',['r2']);a.fields.workHistory='人物A限定の職歴';b.fields.workHistory='人物B限定の職歴';
+ const context=buildCandidateChatContext({group:group([first,second,unknown]),profiles:[a,b],reviews:[review('r1'),{...review('r2'),memo:'人物B限定の振り返り'}],selectedProfileId:'person-a'});
+ assert.deepEqual(context.sources.map(source=>source.id),['r1','profile:person-a','review:r1']);
+ assert.match(serialized(context),/人物A限定/);assert.doesNotMatch(serialized(context),/人物B限定|Beta社|r3/);
+ assert.equal(context.omittedRecords,0);
+});
+
+test("one record with multiple linked profiles still requires choosing a profile",()=>{
+ const a=profile(),b=profile('p2');a.fields.age='20';b.fields.age='40';
+ const context=buildCandidateChatContext({group:group(),profiles:[a,b]});assert.deepEqual(context.sources,[]);
+ const selected=buildCandidateChatContext({group:group(),profiles:[a,b],selectedProfileId:'p2'});
+ assert.deepEqual(selected.sources.filter(source=>source.kind==='profile').map(source=>source.id),['profile:p2']);
+ assert.match(serialized(selected),/40/);assert.doesNotMatch(serialized(selected),/"value":"20"/);
+});
+
+test("multiple proposals sharing one profile remain usable without an unnecessary selection guard",()=>{
+ const first={...row(),profileId:'shared'},second={...row('r2'),profileId:'shared'},p=profile('shared',['r1','r2']);p.fields.age='20';
+ const context=buildCandidateChatContext({group:group([first,second]),profiles:[p,{...p}]});
+ assert.equal(context.identityIssue,undefined);assert.deepEqual(context.sources.map(source=>source.id),['r1','r2','profile:shared']);
+ assert.equal(candidateChatProfileChoices(group([first,second]),[p]).length,1);
 });
 
 test("single long field truncation and omitted profile documents have an explicit omission fact", () => {
@@ -77,7 +122,7 @@ test("single long field truncation and omitted profile documents have an explici
   assert.equal(one.omittedRecords, 0);
   assert.ok(one.sources.some(source => source.facts.some(entry => entry.label === "省略")));
   const many = buildCandidateChatContext({ group: group(), profiles: Array.from({ length: 25 }, (_, index) => profile(`p${index}`)) });
-  assert.match(serialized(many), /基本情報 25件/);
+  assert.equal(many.identityIssue?.code,'IDENTITY_SELECTION_REQUIRED');assert.deepEqual(many.sources,[]);
   assert.ok(serialized(many).length <= 28_000);
 });
 
@@ -113,7 +158,7 @@ test("context budgets are explicit and bounded even for many very long records a
   const records = Array.from({ length: 40 }, (_, index) => {
     const r = row(`r${index}`); r.row = index + 2; r.values[12] = "非常に長いメモ".repeat(3_000); return r;
   });
-  const profiles = records.map(r => { const p = profile(`p-${r.recordId}`, [r.recordId]); p.fields.workHistory = "長い職歴".repeat(3_000); return p; });
+  const profiles = [profile('shared-profile',records.map(record=>record.recordId))];profiles[0].fields.workHistory="長い職歴".repeat(3_000);
   const context = buildCandidateChatContext({ group: group(records), profiles, reviews: records.map(r => review(r.recordId)) });
   assert.ok(serialized(context).length <= 28_000);
   assert.ok(context.sources.length <= 80);
@@ -151,7 +196,7 @@ test("company-specific conditions use that company's explicitly linked profile o
   const a = row(), b = row("r2", "山田太郎", "ND-001", "Alpha社第二支店"); b.row = 3;
   const p = profile(), second = profile("p2", ["r2"]);
   p.fields.desiredHourlyRate = "1,500円"; second.fields.desiredHourlyRate = "2,000円";
-  const context = buildCandidateChatContext({ group: group([a, b]), profiles: [p, second] });
+  const context = buildCandidateChatContext({ group: group([a, b]), profiles: [p, second],selectedProfileId:'p2' });
   const answer = answerCandidateFacts(context, "Alpha社第二支店の希望条件は？");
   assert.match(answer.text, /2,000円/); assert.doesNotMatch(answer.text, /1,500円/);
   assert.deepEqual(answer.sourceIds, ["profile:p2"]);

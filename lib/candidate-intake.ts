@@ -25,6 +25,14 @@ export type CandidateProfile = {
   introduction: string;
 };
 
+/** Only an exact, unambiguous record relationship may prefill an editor or AI input.
+ * A same-name match or a stale recordIds entry cannot override its owner/profile ID. */
+export function linkedCandidateProfile(profiles:readonly CandidateProfile[],record:{recordId:string;playerId:string;profileId?:string}|undefined):CandidateProfile|undefined {
+  if(!record)return undefined;
+  const linked=profiles.filter(profile=>profile.playerId===record.playerId&&profile.recordIds.includes(record.recordId)&&(!record.profileId||profile.profileId===record.profileId));
+  return linked.length===1?linked[0]:undefined;
+}
+
 export const pcOptions = ["Windows", "MacBook", "PCなし", "購入予定", "その他"] as const;
 export const crmOptions = ["Salesforce", "kintone", "HubSpot", "その他"] as const;
 export const chatOptions = ["Slack", "Chatwork", "その他"] as const;

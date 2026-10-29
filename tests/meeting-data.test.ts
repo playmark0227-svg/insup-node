@@ -39,3 +39,12 @@ test("CSV export quotes multiline names and neutralizes editable spreadsheet for
   assert.equal(meetingCsvFilename("../../bad"), "insup-node-meeting-period.csv");
   assert.equal(meetingCsvFilename("2026-10"), "insup-node-meeting-2026-10.csv");
 });
+
+
+test("monthly CSV distinguishes confirmed zero, unset and provisional standard without calculating provisional attainment",()=>{
+ const row={id:"ND-001",name:"合成担当",target:0,counts:{"提案":4},previous:{"提案":0}};
+ const metrics=[{stage:"提案" as const,label:"提案数"}];
+ const zero=meetingCsv([{...row,goalStatus:"confirmed"}],metrics,"2026-10");assert.match(zero,/"0","対象外（目標0件）"/);
+ const unset=meetingCsv([{...row,goalStatus:"unset"}],metrics,"2026-10");assert.match(unset,/"未設定","未確定"/);
+ const standard=meetingCsv([{...row,target:20,goalStatus:"standard"}],metrics,"2026-10");assert.match(standard,/"標準目標・未確定","未確定"/);assert.doesNotMatch(standard,/"20%"/);
+});

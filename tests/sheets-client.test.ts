@@ -568,3 +568,47 @@ test("writing AI connection failures explain saved-result recovery without repla
  await assert.rejects(()=>sheetRequest(endpoint,"generateWritingKit",{style:"standard"},{token:"test-token"}),error=>error instanceof SheetApiError&&error.code==="NETWORK"&&/保存済みの構成を再取得/.test(error.message));
  assert.equal(calls,1);
 });
+
+test("older browsers enforce the same 45-second request deadline and caller cancellation without replay",async t=>{
+ t.mock.timers.enable({apis:["setTimeout"]});
+ for(const [target,key] of [[AbortSignal,"any"],[AbortSignal,"timeout"],[AbortSignal.prototype,"throwIfAborted"]] as const) {
+  const descriptor=Object.getOwnPropertyDescriptor(target,key)!;
+  Object.defineProperty(target,key,{...descriptor,value:undefined});t.after(()=>Object.defineProperty(target,key,descriptor));
+ }
+ const signals:AbortSignal[]=[];
+ t.mock.method(globalThis,"fetch",async(_url:string|URL|Request,init?:RequestInit)=>{
+  const signal=init?.signal as AbortSignal;signals.push(signal);
+  return new Promise<Response>((_,reject)=>signal.addEventListener("abort",()=>reject(signal.reason),{once:true}));
+ });
+ const timed=assert.rejects(sheetRequest(endpoint,"saveActivity",{},{operationId:"fallback-timeout"}),{code:"TIMEOUT"});
+ await flushMicrotasks();t.mock.timers.tick(44_999);assert.equal(signals[0].aborted,false);
+ t.mock.timers.tick(1);await timed;assert.equal(signals.length,1);assert.equal(signals[0].aborted,true);
+ const caller=new AbortController();
+ const cancelled=assert.rejects(sheetRequest(endpoint,"snapshot",{},{signal:caller.signal}),{name:"AbortError"});
+ await flushMicrotasks();caller.abort();await cancelled;
+ t.mock.timers.tick(45_000);await flushMicrotasks();assert.equal(signals.length,2);
+});
+
+test("fallback request deadlines are cleaned after success or payload serialization failure",async t=>{
+ t.mock.timers.enable({apis:["setTimeout"]});
+ const descriptor=Object.getOwnPropertyDescriptor(AbortSignal,"timeout")!;
+ Object.defineProperty(AbortSignal,"timeout",{...descriptor,value:undefined});t.after(()=>Object.defineProperty(AbortSignal,"timeout",descriptor));
+ const caller=new AbortController();let sentSignal:AbortSignal|undefined,calls=0;
+ t.mock.method(globalThis,"fetch",async(_url:string|URL|Request,init?:RequestInit)=>{
+  calls++;sentSignal=init?.signal as AbortSignal;return new Response(JSON.stringify({ok:true,data:{saved:true}}));
+ });
+ assert.deepEqual(await sheetRequest(endpoint,"saveActivity",{},{signal:caller.signal}),{saved:true});
+ caller.abort();t.mock.timers.tick(45_000);assert.equal(sentSignal?.aborted,false);assert.equal(calls,1);
+ const unserializable:Record<string,unknown>={};unserializable.self=unserializable;
+ await assert.rejects(sheetRequest(endpoint,"saveActivity",unserializable),{name:"TypeError"});
+ t.mock.timers.tick(45_000);assert.equal(calls,1);
+});
+
+test("operations and monthly goals snapshots preserve zero, reject cross-owner and malformed month data",()=>{
+ const goal={playerId:player.id,month:"2026-10",target:0,version:"confirmed",updatedAt:"2026-10-30T00:00:00Z"};
+ const value={...structuredClone(snapshot),operationsFeature:true,monthlyGoalsFeature:true,monthlyGoals:[goal]};assert.doesNotThrow(()=>assertSnapshot(value));
+ for(const override of [{target:-1},{target:10000},{target:1.5},{month:"2026-13"},{playerId:"ND-002"},{version:""}])assert.throws(()=>assertSnapshot({...value,monthlyGoals:[{...goal,...override}]}),{code:"INVALID_RESPONSE"});
+ assert.throws(()=>assertSnapshot({...value,monthlyGoals:[goal,goal]}),{code:"INVALID_RESPONSE"});
+ assert.throws(()=>assertSnapshot({...value,operationsFeature:"true"}),{code:"INVALID_RESPONSE"});
+ const admin={...value,self:{role:"admin",playerId:"ADMIN"},players:[{...player,active:false}]};assert.doesNotThrow(()=>assertSnapshot(admin));
+});

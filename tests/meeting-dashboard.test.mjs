@@ -5,6 +5,7 @@ import vm from "node:vm";
 import ts from "typescript";
 import * as nodeData from "../lib/node-data.ts";
 import * as meetingData from "../lib/meeting-data.ts";
+import * as monthlyGoals from "../lib/monthly-goals.ts";
 import { performanceMetrics } from "../lib/performance-metrics.ts";
 
 const source = ts.transpileModule(fs.readFileSync(new URL("../components/meeting-dashboard.tsx", import.meta.url), "utf8"), {
@@ -43,7 +44,7 @@ function harness(options = {}) {
     require: name => name === "react" ? react : name === "react/jsx-runtime" ? { jsx, jsxs: jsx, Fragment: "fragment" }
       : name === "lucide-react" ? new Proxy({}, { get: (_, key) => `icon:${String(key)}` })
         : name === "@/lib/node-data" ? nodeData : name === "@/lib/performance-metrics" ? { performanceMetrics }
-          : name === "@/lib/meeting-data" ? meetingData : name.endsWith(".css") ? {}
+          : name === "@/lib/meeting-data" ? meetingData : name === "@/lib/monthly-goals" ? monthlyGoals : name.endsWith(".css") ? {}
             : (() => { throw new Error(`Unexpected meeting import: ${name}`); })(),
   });
   let props = {
@@ -190,4 +191,23 @@ test("daily and all-time periods do not display monthly targets or differences",
     assert.equal(h.byClass("meeting-difference").length, 0);
     assert.match(h.text(), period === "all" ? /全期間の累計/ : /2026年10月30日/);
   }
+});
+
+
+test("monthly goal mode never presents a current standard as a confirmed historical goal", () => {
+ const h=harness({props:{monthlyGoalsEnabled:true,currentMonth:"2026-10",goals:[],period:"2026-09"}});
+ assert.match(text(h.byClass("meeting-target-cell")[0]),/20 \/ 未設定件未設定/);
+ assert.doesNotMatch(h.text(),/過去月を表示しても当時の目標への切り替えは行いません/);
+ assert.match(h.text(),/対象月に確定した値/);
+ h.render({period:"2026-10"});assert.match(text(h.byClass("meeting-target-cell")[0]),/24 \/ 20件標準目標・未確定/);
+ assert.equal(text(h.byClass("meeting-goal-percent")[0]),"未設定・未確定 2名");
+});
+test("confirmed monthly zero is visible, historical targets are stable and inactive players cannot receive new activity", () => {
+ const goals=[{playerId:"ND-001",month:"2026-09",target:10,version:"g1",updatedAt:"2026-10-30T01:00:00Z"},{playerId:"ND-002",month:"2026-09",target:0,version:"g2",updatedAt:"2026-10-30T01:00:00Z"}];
+ const h=harness({players:[{id:"ND-001",name:"合成停止担当",target:999,color:"blue",team:"NODE",bio:"",active:false},{id:"ND-002",name:"合成担当2",target:999,color:"blue",team:"NODE",bio:""}],props:{monthlyGoalsEnabled:true,currentMonth:"2026-10",goals,period:"2026-09"}});
+ assert.match(text(h.byClass("meeting-target-cell")[0]),/20 \/ 10件200%/);
+ assert.match(text(h.byClass("meeting-target-cell")[1]),/5 \/ 0件目標0件・達成率なし/);
+ assert.match(h.text(),/利用停止/);assert.equal(h.button("合成停止担当の提案数を記録").props.disabled,true);
+ h.click("合成担当2の発表画面を開く");assert.match(text(h.byClass("meeting-person-goal")[0]),/5 \/ 0 件/);assert.match(text(h.byClass("meeting-person-goal")[0]),/目標0件・達成率なし/);
+ h.render({exportBlocked:true});assert.equal(h.button("CSV保存").props.disabled,true);
 });

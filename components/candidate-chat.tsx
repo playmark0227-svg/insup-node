@@ -6,7 +6,7 @@ import type { CandidateProfile } from "@/lib/candidate-intake";
 import { unicodeLength } from "@/lib/candidate-intake";
 import type { InterviewReview } from "@/lib/sheets-client";
 import { valueAt } from "@/lib/management-data";
-import { answerCandidateFacts, buildCandidateChatContext, type CandidateChatSource } from "@/lib/candidate-chat";
+import { answerCandidateFacts, buildCandidateChatContext, candidateChatProfileChoices, type CandidateChatSource } from "@/lib/candidate-chat";
 import { generateCandidateChat, getOnDeviceAiAvailability, type OnDeviceAiAvailability, type OnDeviceAiProgress } from "@/lib/on-device-ai";
 import "./candidate-chat.css";
 
@@ -32,8 +32,10 @@ function CandidateChatSession({group,profiles,reviews,open,onClose}:Props){
  const [messages,setMessages]=useState<ChatMessage[]>([]),[draft,setDraft]=useState(""),[running,setRunning]=useState(false),[progress,setProgress]=useState<OnDeviceAiProgress|null>(null);
  const [error,setError]=useState(""),[notice,setNotice]=useState(""),[retryQuestion,setRetryQuestion]=useState(""),[copied,setCopied]=useState("");
  const pending=useRef<AbortController|null>(null),generation=useRef(0),mounted=useRef(true),engineTouched=useRef(false),conversation=useRef<HTMLDivElement|null>(null),composer=useRef<HTMLTextAreaElement|null>(null);
- const context=useMemo(()=>buildCandidateChatContext({group:scope==="all"?group:{...group,records:group.records.filter(record=>record.recordId===scope)},profiles,reviews}),[group,profiles,reviews,scope]);
- const fingerprint=JSON.stringify(context),currentFingerprint=useRef(fingerprint);
+ const profileChoices=useMemo(()=>candidateChatProfileChoices(group,profiles),[group,profiles]);
+ const context=useMemo(()=>buildCandidateChatContext({group:scope==="all"||scope.startsWith("profile:")?group:{...group,records:group.records.filter(record=>record.recordId===scope)},profiles,reviews,...(scope.startsWith("profile:")?{selectedProfileId:scope.slice(8)}:{})}),[group,profiles,reviews,scope]);
+ const identityBlocked=!!context.identityIssue;
+ const fingerprint=JSON.stringify({scope,context}),currentFingerprint=useRef(fingerprint);
  currentFingerprint.current=fingerprint;
  const available=availability!=="checking"&&availability!=="unavailable";
  const sourceCounts={records:context.sources.filter(source=>source.kind==="record").length,profiles:context.sources.filter(source=>source.kind==="profile").length,reviews:context.sources.filter(source=>source.kind==="review").length};
@@ -52,7 +54,7 @@ function CandidateChatSession({group,profiles,reviews,open,onClose}:Props){
 
  async function ask(question:string,retry=false,selectedEngine=engine){
   const q=question.trim();
-  if(!q||unicodeLength(q)>1000||pending.current||!open||selectedEngine==="device"&&!available)return;
+  if(!q||unicodeLength(q)>1000||pending.current||!open||identityBlocked||selectedEngine==="device"&&!available)return;
   engineTouched.current=true;
   const request=++generation.current,controller=new AbortController(),signature=fingerprint;
   pending.current=controller;setError("");setNotice("");setRetryQuestion(q);setCopied("");setDraft("");
@@ -83,15 +85,15 @@ function CandidateChatSession({group,profiles,reviews,open,onClose}:Props){
  const overLimit=unicodeLength(draft)>1000;
  return <Dialog open={open} onOpenChange={value=>{if(!value)close();}}><DialogContent presentation="panel" className="candidate-chat-panel"><DialogHeader><DialogTitle><MessageCircle size={20}/>{group.name||"候補者"}に関する相談</DialogTitle><DialogDescription>不足情報の確認、提案先の進捗、次の対応を整理します。</DialogDescription></DialogHeader>
   <div className="candidate-chat-controls">
-   <label htmlFor={`${id}-scope`}>参照する記録<select id={`${id}-scope`} value={scope} onChange={event=>{cancel();setScope(event.target.value);}}><option value="all">すべての提案・履歴（{group.records.length}件）</option>{group.records.map(record=><option key={record.recordId} value={record.recordId}>{valueAt(record,2)||"未提案"} · {valueAt(record,1)||"面談日未登録"} · 管理行{record.row}</option>)}</select></label>
+   <label htmlFor={`${id}-scope`}>参照する記録<select id={`${id}-scope`} value={scope} aria-invalid={identityBlocked} aria-describedby={identityBlocked?`${id}-identity`:undefined} onChange={event=>{cancel();setScope(event.target.value);}}><option value="all" disabled={profileChoices.length>1}>{profileChoices.length>1?"記録・基本情報を選んでください":"すべての提案・履歴"}（{group.records.length}件）</option>{profileChoices.length>1&&<optgroup label="基本情報ごとに確認">{profileChoices.map(choice=><option key={choice.profileId} value={`profile:${choice.profileId}`}>{choice.label}</option>)}</optgroup>}<optgroup label="記録を1件選ぶ">{group.records.map(record=><option key={record.recordId} value={record.recordId}>{valueAt(record,2)||"未提案"} · {valueAt(record,1)||"面談日未登録"} · 管理行{record.row}</option>)}</optgroup></select></label>
    <div className="candidate-chat-engines" role="group" aria-label="回答方法"><button type="button" aria-pressed={engine==="device"} disabled={!available} onClick={()=>changeEngine("device")}>端末内AI</button><button type="button" aria-pressed={engine==="records"} onClick={()=>changeEngine("records")}>登録情報を確認</button></div>
    <p className="candidate-chat-method" role="status"><span className="candidate-chat-method-long">{availability==="checking"?"端末内AIの対応状況を確認中。登録情報の確認はすぐに使えます。":engine==="device"?"自由な相談・文章の整理に使えます。初回はモデルの準備に時間がかかる場合があります。不足情報は入力チェックで確認します。":`記録にある事実の抽出・不足情報のチェックに使えます（AI未使用）。${availability==="unavailable"?"自由なAI相談は対応するPC版Chromeで利用できます。":"自由な質問や文章の整理は「端末内AI」を選んでください。"}`}</span><span className="candidate-chat-method-short">{availability==="checking"?"端末内AIの対応状況を確認中です。":engine==="device"?"端末内AI：自由な相談・文章整理。初回は準備が必要です。":"登録情報：事実の抽出・入力チェック（AI未使用）。"}</span></p>
    <p className="candidate-chat-source-count">参照中：提案・履歴 {sourceCounts.records}件 · 基本情報 {sourceCounts.profiles}件 · 振り返り {sourceCounts.reviews}件</p>
-   {new Set(group.records.map(record=>record.profileId).filter(Boolean)).size>1&&<p className="candidate-chat-context-note">基本情報が複数あります。内容を混ぜず、会社・記録ごとに確認します。</p>}
+   {identityBlocked&&<p id={`${id}-identity`} className="candidate-chat-context-note" role="alert">{context.identityIssue!.message}</p>}
    {(context.omittedRecords>0||context.sources.some(source=>source.facts.some(fact=>fact.label==="省略")))&&<p className="candidate-chat-context-note">情報量が多いため、一部の情報を省略しています。詳しく確認する場合は記録を1件選んでください。</p>}
   </div>
   <div className="candidate-chat-conversation" ref={conversation} role="log" aria-label="候補者との相談履歴" aria-live="polite" aria-relevant="additions text">
-   {!messages.length&&<div className="candidate-chat-welcome"><MessageCircle size={27}/><h3>何を確認しますか？</h3><p>選ぶと、この候補者の登録情報から確認します。未登録の内容は補わず、回答には参照した記録を表示します。</p><div className="candidate-chat-prompts">{prompts.map(prompt=><button type="button" key={prompt.question} aria-label={`${prompt.label}：${prompt.question}`} disabled={running} onClick={()=>void ask(prompt.question)}><span><strong>{prompt.label}</strong><small>{prompt.description}</small></span><Send size={13}/></button>)}</div></div>}
+   {!messages.length&&<div className="candidate-chat-welcome"><MessageCircle size={27}/><h3>{identityBlocked?"参照する情報を選んでください":"何を確認しますか？"}</h3><p>{identityBlocked?"上の「参照する記録」から、相談したい記録または基本情報を選ぶと質問できます。":"選ぶと、この候補者の登録情報から確認します。未登録の内容は補わず、回答には参照した記録を表示します。"}</p><div className="candidate-chat-prompts">{prompts.map(prompt=><button type="button" key={prompt.question} aria-label={`${prompt.label}：${prompt.question}`} disabled={running||identityBlocked} onClick={()=>void ask(prompt.question)}><span><strong>{prompt.label}</strong><small>{prompt.description}</small></span><Send size={13}/></button>)}</div></div>}
    {messages.map(message=><article key={message.id} className={`candidate-chat-message is-${message.role}${message.fingerprint!==fingerprint?" is-stale":""}`}><header><strong>{message.role==="user"?"あなた":message.engine==="device"?"端末内AI":message.engine==="record-check"?"入力内容のチェック（AI未使用）":"登録情報から確認（AI未使用）"}</strong>{message.fingerprint!==fingerprint&&<span>更新前の参照情報</span>}</header><div className="candidate-chat-answer">{message.content}</div>{message.role==="assistant"&&<footer>{message.sources.length>0&&<details className="candidate-chat-sources"><summary>参照した記録（{message.sources.length}）</summary>{message.sources.map(source=><details key={source.id}><summary>{source.label}</summary><dl>{source.facts.map((fact,index)=><div key={`${fact.label}-${index}`}><dt>{fact.label}</dt><dd>{fact.value}</dd></div>)}</dl></details>)}</details>}<button type="button" className="text-button" disabled={message.fingerprint!==fingerprint} aria-label="この回答をコピー" onClick={()=>void copy(message)}>{copied===message.id?<Check size={14}/>:<Copy size={14}/>} {copied===message.id?"コピー済み":"コピー"}</button></footer>}</article>)}
    {running&&<div className="candidate-chat-running" role="status"><LoaderCircle size={17}/><span>{engine==="device"?runningLabel:"登録情報を確認しています…"}</span><button type="button" className="text-button" onClick={()=>{cancel();setNotice("回答を中止しました。質問は会話に残っています。");}}><Square size={12}/>中止</button></div>}
    {error&&<div className="candidate-chat-error" role="alert"><p>{error}</p><div><button type="button" className="text-button" disabled={running} onClick={()=>void ask(retryQuestion,true)}><RotateCcw size={14}/>再試行</button><button type="button" className="text-button" onClick={editQuestion}>質問を編集</button>{engine==="device"&&<button type="button" className="text-button" onClick={()=>{changeEngine("records");void ask(retryQuestion,true,"records");}}>登録情報で確認</button>}</div></div>}
@@ -100,7 +102,7 @@ function CandidateChatSession({group,profiles,reviews,open,onClose}:Props){
   </div>
   <form className="candidate-chat-composer" onSubmit={event=>{event.preventDefault();void ask(draft);}}>
    <label className="sr-only" htmlFor={`${id}-question`}>この候補者への質問</label><textarea ref={composer} id={`${id}-question`} rows={2} value={draft} onChange={event=>setDraft(event.target.value)} aria-invalid={overLimit} aria-describedby={`${id}-input-help`} placeholder="例：C面談の前に確認しておくことは？" onKeyDown={event=>{if(event.key==="Enter"&&(event.metaKey||event.ctrlKey)&&!event.nativeEvent.isComposing){event.preventDefault();void ask(draft);}}}/>
-   <div className="candidate-chat-composer-bottom"><small id={`${id}-input-help`} className={overLimit?"form-error":""}>{overLimit?"質問は1,000文字以内で入力してください。":`${unicodeLength(draft)} / 1,000文字 · ⌘ / Ctrl + Enterで送信`}</small><button type="submit" className="primary-button" disabled={running||!draft.trim()||overLimit||engine==="device"&&!available}><Send size={15}/>送信</button></div><p>情報を外部AIへ送信せず、会話をシートに保存しません。AIの回答は記録と照合してください。</p>
+   <div className="candidate-chat-composer-bottom"><small id={`${id}-input-help`} className={overLimit?"form-error":""}>{identityBlocked?"質問する前に、参照する記録・基本情報を選んでください。":overLimit?"質問は1,000文字以内で入力してください。":`${unicodeLength(draft)} / 1,000文字 · ⌘ / Ctrl + Enterで送信`}</small><button type="submit" className="primary-button" disabled={running||identityBlocked||!draft.trim()||overLimit||engine==="device"&&!available}><Send size={15}/>送信</button></div><p>情報を外部AIへ送信せず、会話をシートに保存しません。AIの回答は記録と照合してください。</p>
   </form>
  </DialogContent></Dialog>;
 }

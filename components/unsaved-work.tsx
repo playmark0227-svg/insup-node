@@ -3,6 +3,22 @@ import "./unsaved-work.css";
 
 type UnsavedFormOptions = { onClose: () => void; locked: boolean };
 
+/** Warn only while the caller's current values differ from their saved baseline. */
+export function useUnsavedChangesWarning(dirty: boolean) {
+  const latest = useRef(dirty);
+  latest.current = dirty;
+  useEffect(() => {
+    if (!dirty) return;
+    const warn = (event: BeforeUnloadEvent) => {
+      if (!latest.current) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [dirty]);
+}
+
 /** A close safeguard only. Form values stay with the caller and are never stored here. */
 export function useUnsavedFormGuard({ onClose, locked }: UnsavedFormOptions) {
   const [dirty, setDirty] = useState(false);

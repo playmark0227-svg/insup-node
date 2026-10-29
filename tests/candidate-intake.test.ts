@@ -1,8 +1,24 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { blankInterviewFields, composeCandidateIntroduction, normalizeInterviewFields, unicodeLength,
+import { blankInterviewFields, linkedCandidateProfile, composeCandidateIntroduction, normalizeInterviewFields, unicodeLength,
   introductionLimit, interviewStringFields, interviewFieldLimits, crmOptions, chatOptions } from "../lib/candidate-intake.ts";
+
+test("profile prefill requires the exact record owner and authoritative profile ID",()=>{
+ const make=(profileId:string,playerId='ND-001',recordIds=['record-a'])=>({profileId,playerId,recordIds,version:profileId,updatedAt:'2026-10-30T00:00:00Z',fields:blankInterviewFields(),introduction:''});
+ const stale=make('stale'),current=make('current'),foreign=make('current','ND-002'),outside=make('current','ND-001',['outside']);
+ const profiles=[stale,foreign,outside,current],record={recordId:'record-a',playerId:'ND-001',profileId:'current'};
+ const before=JSON.stringify(profiles);assert.equal(linkedCandidateProfile(profiles,record),current);assert.equal(JSON.stringify(profiles),before);
+ assert.equal(linkedCandidateProfile([stale,foreign,outside],record),undefined);
+ assert.equal(linkedCandidateProfile(profiles,undefined),undefined);
+});
+
+test("legacy rows can prefill only one linked profile and never choose the first ambiguous profile",()=>{
+ const make=(profileId:string)=>({profileId,playerId:'ND-001',recordIds:['record-a'],version:profileId,updatedAt:'2026-10-30T00:00:00Z',fields:blankInterviewFields(),introduction:''});
+ const a=make('a'),b=make('b'),record={recordId:'record-a',playerId:'ND-001'};
+ assert.equal(linkedCandidateProfile([a],record),a);assert.equal(linkedCandidateProfile([a,b],record),undefined);
+ assert.equal(linkedCandidateProfile([b,a],record),undefined);assert.equal(linkedCandidateProfile([],record),undefined);
+});
 
 test("browser intake limits and multiple-choice schemas match the Apps Script source contract",()=>{
  const source=readFileSync(new URL("../google-apps-script/Code.gs",import.meta.url),"utf8");

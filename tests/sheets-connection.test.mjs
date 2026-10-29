@@ -6,6 +6,7 @@ import ts from "typescript";
 import {assertSnapshot, assertMutationReceipt, isUncertainWrite, validateEndpoint, SheetApiError} from "../lib/sheets-client.ts";
 import {correctionFields,correctedPayload,mutationDateErrors} from "../lib/save-correction.ts";
 import {pendingSaveResources,unlockPendingSaves as unlockRealPendingSaves,lockPendingSaves as lockRealPendingSaves} from "../lib/pending-saves.ts";
+import {createDeadlineSignal, isTimeoutSignal, throwIfAborted, abortReason} from "../lib/abort-signal.ts";
 import {matchingFields} from "../lib/management-data.ts";
 import {interviewFieldLabels,interviewStringFields,blankInterviewFields} from "../lib/candidate-intake.ts";
 import {assertWritingKitState,validateWritingPreferences,defaultWritingPreferences,writingSectionIds,writingTopicCodes} from "../lib/writing-ai.ts";
@@ -33,7 +34,7 @@ async function flush() { for (let i=0; i<35; i++) await Promise.resolve(); }
 
 // Execute the actual hook against a small deterministic hook runtime. This
 // exposes races and state restoration without adding a browser/test dependency.
-function harness(handle, {storedToken, malformedSession, deadlineController, browser, manifestEndpoint=endpoint, storedEndpoint=endpoint, manifestFailure=false, production=false, pendingSaves=[], persistLocal, replaceLocal, readLocal} = {}) {
+function harness(handle, {storedToken, malformedSession, deadlineController, makeDeadline, browser, manifestEndpoint=endpoint, storedEndpoint=endpoint, manifestFailure=false, production=false, pendingSaves=[], persistLocal, replaceLocal, readLocal} = {}) {
   const slots = [], effects = [], calls = [];
   let cursor = 0, stateUpdates = 0;
   const localStorage = storage({[ENDPOINT_KEY]:storedEndpoint});
@@ -68,11 +69,12 @@ function harness(handle, {storedToken, malformedSession, deadlineController, bro
   const unlocks=[],locks={count:0};
   const exports={};
   const timeoutDurations=[];
-  const deadlineSignals=deadlineController ? {any:signals=>AbortSignal.any(signals),timeout:ms=>{timeoutDurations.push(ms); return deadlineController.signal;}} : AbortSignal;
+  const deadlineSignals=AbortSignal;
+  const deadlineApi={createDeadlineSignal:(ms,sources=[])=>{if(deadlineController||makeDeadline)timeoutDurations.push(ms);return (makeDeadline||createDeadlineSignal)(ms,deadlineController?[...sources,deadlineController.signal]:sources);},isTimeoutSignal,throwIfAborted,abortReason};
   const context=vm.createContext({exports,module:{exports},AbortController,AbortSignal:deadlineSignals,JSON,Error,localStorage,sessionStorage,TEST_PRODUCTION:production,crypto,
     ...(browser || {}),
     fetch:async()=>{if(manifestFailure)throw new Error("設定取得失敗");return {ok:true,json:async()=>({endpoint:manifestEndpoint})};},
-    require:name=>name==="react" ? react : name.includes("save-correction") ? {correctionFields,correctedPayload,mutationDateErrors} : name.includes("pending-saves") ? pendingApi : name.includes("node-data") ? {initialPlayers:[player],makeDemoActivities:()=>[]} : name.includes("management-data") ? {matchingFields} : name.includes("candidate-intake") ? {interviewFieldLabels,interviewStringFields} : name.includes("writing-ai") ? {assertWritingKitState,validateWritingPreferences} : {assertSnapshot,assertMutationReceipt,isUncertainWrite,validateEndpoint,SheetApiError,sheetRequest}});
+    require:name=>name==="react" ? react : name.includes("abort-signal") ? deadlineApi : name.includes("save-correction") ? {correctionFields,correctedPayload,mutationDateErrors} : name.includes("pending-saves") ? pendingApi : name.includes("node-data") ? {initialPlayers:[player],makeDemoActivities:()=>[]} : name.includes("management-data") ? {matchingFields} : name.includes("candidate-intake") ? {interviewFieldLabels,interviewStringFields} : name.includes("writing-ai") ? {assertWritingKitState,validateWritingPreferences} : {assertSnapshot,assertMutationReceipt,isUncertainWrite,validateEndpoint,SheetApiError,sheetRequest}});
   vm.runInContext(source,context);
   const render = () => {cursor=0; const result=exports.useSheetsConnection(); while(effects.length) effects.shift()(); return result;};
   render();
@@ -112,6 +114,39 @@ test("authentication and its first read share one 45-second deadline and a read 
   assert.equal(h.render().authenticated,true); assert.equal(h.render().busy,false); assert.equal(h.render().loadPhase,null);
   assert.equal(JSON.parse(h.sessionStorage.getItem(SESSION_KEY)).token,token);
   assert.equal(h.render().snapshot,null); assert.match(h.render().error,/再取得/);
+  h.unmount();
+});
+
+test("a deadline setup error releases authentication state and permits a later login",async()=>{
+  let broken=true;
+  const h=harness(call=>call.action==='login'?{token,snapshot}:snapshot,{makeDeadline:(ms,sources)=>{
+    if(broken)throw new Error('deadline setup failed');
+    return createDeadlineSignal(ms,sources);
+  }});
+  await flush();await assert.rejects(h.render().login('ND-001','not-stored-password'),/deadline setup failed/);
+  assert.equal(h.calls.length,0);assert.equal(h.render().busy,false);assert.equal(h.render().loadPhase,null);
+  assert.match(h.render().error,/deadline setup failed/);
+  broken=false;await h.render().login('ND-001','not-stored-password');
+  assert.equal(h.render().authenticated,true);assert.equal(h.render().busy,false);assert.equal(h.render().snapshot,snapshot);
+  h.unmount();
+});
+
+test("older browsers retain the shared login deadline and logout cancellation without modern signal APIs",async t=>{
+  t.mock.timers.enable({apis:['setTimeout']});
+  for(const [target,key] of [[AbortSignal,'any'],[AbortSignal,'timeout'],[AbortSignal.prototype,'throwIfAborted']]) {
+    const descriptor=Object.getOwnPropertyDescriptor(target,key);
+    Object.defineProperty(target,key,{...descriptor,value:undefined});t.after(()=>Object.defineProperty(target,key,descriptor));
+  }
+  const h=harness(call=>call.action==='logout'?{}:new Promise((_,reject)=>call.options.signal.addEventListener('abort',()=>reject(abortReason(call.options.signal)),{once:true})),{makeDeadline:createDeadlineSignal});
+  await flush();const timed=assert.rejects(h.render().login('ND-001','not-stored-password'),{name:'TimeoutError'});await flush();
+  assert.equal(h.render().busy,true);assert.equal(h.calls.length,1);assert.deepEqual(h.timeoutDurations,[45_000]);
+  t.mock.timers.tick(44_999);await flush();assert.equal(h.calls[0].options.signal.aborted,false);
+  t.mock.timers.tick(1);await timed;assert.equal(h.calls[0].options.signal.aborted,true);
+  assert.equal(h.render().busy,false);assert.equal(h.render().loadPhase,null);
+  const cancelled=h.render().login('ND-001','not-stored-password');await flush();
+  const cancellationSignal=h.calls.at(-1).options.signal;
+  await h.render().logout();await cancelled;assert.equal(cancellationSignal.aborted,true);
+  assert.equal(h.render().busy,false);assert.equal(h.render().authenticated,false);assert.equal(h.render().snapshot,null);
   h.unmount();
 });
 
@@ -669,6 +704,69 @@ test('acceptance waits for the local transaction and local storage failure leave
  assert.equal(broken.calls.length,1);assert.equal(broken.render().hasPendingSave,false);assert.equal(broken.pendingStore.size,0);broken.unmount();
 });
 
+test('a failed local admission releases the next already committed independent save',async()=>{
+ const rejected=deferred();let writes=0;
+ const h=harness(call=>call.action==='snapshot'?snapshot:(writes++,{snapshot}),{storedToken:token,persistLocal:input=>input.operationId==='failed-admission'?rejected.promise:undefined});await flush();
+ const head=h.render().submitMutation('updateRecord',{recordId:'one',changes:{13:'kept in original form'}},'failed-admission');
+ const checked=assert.rejects(head,/端末の容量不足/);await flush();
+ await h.render().submitMutation('updateRecord',{recordId:'two',changes:{13:'committed locally'}},'accepted-tail');await flush();
+ assert.equal(writes,0);assert.equal(h.pendingStore.size,1);assert.equal(h.render().backgroundSave.pendingCount,2);
+ rejected.reject(new Error('端末の容量不足'));await checked;await flush();
+ assert.equal(writes,1);assert.equal(h.calls.at(-1).options.operationId,'accepted-tail');
+ assert.equal(h.calls.at(-1).payload.recordId,'two');assert.equal(h.pendingStore.size,0);
+ assert.equal(h.render().hasPendingSave,false);h.unmount();
+});
+
+test('offline inputs remain locally committed and unsent, then resume once online in order',async()=>{
+ const browser=autoSyncBrowser(),first=deferred();let writes=0;
+ const h=harness(call=>call.action==='snapshot'?snapshot:(++writes===1?first.promise:{snapshot}),{storedToken:token,browser});await flush();h.render();
+ browser.navigator.onLine=false;
+ await h.render().submitMutation('updateRecord',{recordId:'one',changes:{13:'offline one'}},'offline-one');
+ await h.render().submitMutation('updateRecord',{recordId:'two',changes:{13:'offline two'}},'offline-two');await flush();
+ assert.equal(writes,0);assert.equal(h.pendingStore.size,2);assert.equal(h.render().backgroundSave.status,'saving');
+ assert.equal(h.render().backgroundSave.waitingForConnection,true);assert.equal(h.render().backgroundSave.uncertain,false);
+ assert.ok([...h.pendingStore.values()].every(input=>!input.attempted));assert.equal(h.render().busy,false);
+ browser.navigator.onLine=true;browser.listeners.get('online')();browser.listeners.get('online')();await flush();
+ assert.equal(writes,1);assert.equal(h.calls.at(-1).options.operationId,'offline-one');assert.equal(h.render().backgroundSave.waitingForConnection,false);
+ first.resolve({snapshot});await flush();assert.equal(writes,2);assert.equal(h.calls.at(-1).options.operationId,'offline-two');
+ assert.equal(h.pendingStore.size,0);assert.equal(h.render().hasPendingSave,false);h.unmount();
+});
+
+test('offline restoration resumes only an unattempted input and respects read-only connections',async()=>{
+ for(const writable of [true,false]) {
+  const browser=autoSyncBrowser();browser.navigator.onLine=false;let writes=0;
+  const saved={operationId:'offline-restored',action:'updateRecord',payload:{recordId:'one',changes:{13:'restored memo'}},label:'元の変更',details:['元の入力'],createdAt:1,attempted:false};
+  const current={...snapshot,writesEnabled:writable};
+  const h=harness(call=>call.action==='snapshot'?current:(writes++,{snapshot:current}),{storedToken:token,browser,pendingSaves:[saved]});await flush();h.render();await flush();
+  assert.equal(writes,0);assert.equal(h.pendingStore.get(saved.operationId).attempted,false);
+  browser.navigator.onLine=true;browser.listeners.get('online')();await flush();
+  assert.equal(writes,writable?1:0);assert.equal(h.pendingStore.size,writable?0:1);h.unmount();
+ }
+});
+
+test('reconnecting never automatically replays an uncertain prior send',async()=>{
+ const browser=autoSyncBrowser();browser.navigator.onLine=false;let writes=0;
+ const saved={operationId:'uncertain-restored',action:'updateRecord',payload:{recordId:'one',changes:{13:'original memo'}},label:'元の変更',details:['元の入力'],createdAt:1,attempted:true};
+ const h=harness(call=>call.action==='snapshot'?snapshot:(writes++,{snapshot}),{storedToken:token,browser,pendingSaves:[saved]});await flush();h.render();await flush();
+ assert.equal(h.render().backgroundSave.status,'failed');assert.equal(h.render().backgroundSave.uncertain,true);
+ browser.navigator.onLine=true;browser.listeners.get('online')();browser.listeners.get('focus')();await flush();assert.equal(writes,0);
+ h.render().retryBackgroundSave();await flush();assert.equal(writes,1);assert.equal(h.calls.at(-1).options.operationId,saved.operationId);
+ assert.equal(h.pendingStore.size,0);h.unmount();
+});
+
+test('a network drop during local send marking rolls back attempted before any POST and safely resumes',async()=>{
+ const browser=autoSyncBrowser(),mark=deferred(),rollback=deferred();let writes=0,rolledBack=false;
+ const h=harness(call=>call.action==='snapshot'?snapshot:(writes++,{snapshot}),{storedToken:token,browser,persistLocal:input=>{
+  if(input.attempted)return mark.promise;
+  if(h.pendingStore.has(input.operationId)){rolledBack=true;return rollback.promise;}
+ }});await flush();h.render();
+ await h.render().submitMutation('updateRecord',{recordId:'one',changes:{13:'not posted'}},'pre-send-drop');await flush();
+ browser.navigator.onLine=false;mark.resolve();await flush();assert.equal(rolledBack,true);assert.equal(writes,0);
+ browser.navigator.onLine=true;browser.listeners.get('online')();await flush();assert.equal(writes,0);
+ rollback.resolve();await flush();assert.equal(writes,1);assert.equal(h.calls.at(-1).options.operationId,'pre-send-drop');
+ assert.equal(h.pendingStore.size,0);assert.equal(h.render().hasPendingSave,false);h.unmount();
+});
+
 test('an interrupted previous send restores privately without replaying until the user confirms the same operation',async()=>{
  const saved={operationId:'restored-operation-one',action:'updateRecord',payload:{recordId:'restored-row',changes:{13:'original private memo'}},label:'元の変更',details:['元の入力'],createdAt:1,attempted:true};
  const response=deferred();const h=harness(call=>call.action==='snapshot'?snapshot:response.promise,{storedToken:token,pendingSaves:[saved]});await flush();h.render();await flush();
@@ -1026,4 +1124,33 @@ test('a poll whose activity the server deferred leaves the input for the next po
   assert.equal(snapshotCalls(h)[3].options.background,true);
   assert.equal(touchCalls(h).length,0);
   h.unmount();
+});
+
+test('late operational, regular and password saves cannot release a new session mutation mutex',async()=>{
+ for(const path of ['operational','regular','password']){
+  const oldWrite=deferred(),newWrite=deferred(),lateRead=deferred(),admin={...snapshot,self:{playerId:'ADMIN',role:'admin'}};
+  const h=harness(call=>{
+   if(call.action==='snapshot')return admin;
+   if(call.action==='login')return {token:token+'-fresh',snapshot:admin};
+   if(call.action==='readOperationHistory')return lateRead.promise;
+   if(call.action==='changePassword')return oldWrite.promise;
+   if(call.action==='createPlayer')return oldWrite.promise;
+   if(call.action==='manageAccount')return call.options.operationId==='old-operational'?oldWrite.promise:call.options.operationId==='new-operational'?newWrite.promise:{managed:true};
+   throw new Error('Unexpected test action '+call.action);
+  },{storedToken:token});
+  await flush();
+  const read=h.render().readOperational('readOperationHistory').catch(error=>error);
+  const pending=path==='operational'?h.render().mutateOperational('manageAccount',{},'old-operational'):path==='regular'?h.render().mutate('createPlayer',{},'old-regular'):h.render().changePassword('old-password','next-password');
+  const observed=pending.catch(error=>error);
+  lateRead.reject(new SheetApiError('UNAUTHENTICATED','The old session expired'));await read;await flush();
+  assert.equal(h.render().authenticated,false,path);
+  await h.render().login('ADMIN','new-session-password');assert.equal(h.render().authenticated,true,path);
+  const current=h.render().mutateOperational('manageAccount',{},'new-operational');
+  try{
+   oldWrite.resolve(path==='password'?{changed:true}:path==='regular'?{snapshot:admin}:{managed:true});await observed;await flush();
+   assert.equal(h.render().busy,true,'The newer request still owns its busy state: '+path);
+   await assert.rejects(h.render().mutateOperational('manageAccount',{},'third-operational'),{code:'MUTATION_PENDING'},path);
+   assert.equal(h.calls.filter(call=>call.options.operationId==='third-operational').length,0,path);
+  }finally{newWrite.resolve({managed:true});await current;h.unmount();}
+ }
 });
