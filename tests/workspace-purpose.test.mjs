@@ -47,3 +47,11 @@ test('mobile logout closes its menu then uses the same draft and pending-save gu
  const button=nodes(tree).find(node=>node.type==='button'&&text(node).includes('ログアウト'));assert.ok(button);button.props.onClick();assert.deepEqual(calls,['close','logout']);
  const disabled=exports.WorkspaceMobileMenu({open:true,onClose(){},view:'home',admin:false,onNavigate(){},onHelp(){},onSignOut(){},signOutDisabled:true});assert.equal(nodes(disabled).find(node=>node.type==='button'&&text(node).includes('ログアウト')).props.disabled,true);
 });
+
+
+test('home inbox routes an unscheduled proposal to its exact record and labels date checks clearly',()=>{
+ const item=record('未調整の提案','ND-001');item.values[7]='2026-10-29';item.values[9]='';item.values[6]='提案完了（面談日確定待ち）';
+ const calls=[];const tree=exports.HomeActionInbox({...base,snapshot:snapshot([item]),onOpenRecord:(...args)=>calls.push(args)});
+ assert.match(text(tree),/日程・結果などの確認/);assert.match(text(tree),/C面談の予定日は未登録/);
+ const button=nodes(tree).find(node=>node.type==='button'&&text(node).includes('提案を確認'));assert.ok(button);button.props.onClick();assert.deepEqual(calls,[['未調整の提案','schedule_missing']]);
+});

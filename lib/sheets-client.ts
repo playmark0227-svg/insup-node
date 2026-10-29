@@ -1,3 +1,4 @@
+import {abortReason, createDeadlineSignal, isTimeoutSignal, throwIfAborted} from "./abort-signal.ts";
 import { stages, type Activity, type Metric, type Player } from "./node-data.ts";
 import { interviewStringFields, crmOptions, chatOptions, pcOptions, genderOptions, type CandidateProfile } from "./candidate-intake.ts";
 import { validateWritingPreferences, type WritingPreferences } from './on-device-ai.ts';
@@ -17,6 +18,9 @@ export type InterviewAdvice = {summary:string;actions:string[];count:number;gene
 export type InterviewAdviceState = {advice:InterviewAdvice|null;stale:boolean;count:number;usage:InterviewAdviceUsage;configured:boolean;pending:boolean};
 export type DeletedCandidate = {changeId:string;playerId:string;candidateName:string;deletedAt:string;companies:string[];recordCount:number};
 export type SheetSnapshot = {
+  operationsFeature?: boolean;
+  monthlyGoalsFeature?: boolean;
+  monthlyGoals?: {playerId:string;month:string;target:number;version:string;updatedAt:string}[];
   // Set when the server could not record this request's activity (busy lock); the input is reported again.
   activityDeferred?: boolean;
   writingFeature?: boolean;
@@ -99,8 +103,8 @@ function recoverableContentUrl(response: Response): string | null {
 
 function waitForRetry(signal: AbortSignal, milliseconds: number): Promise<void> {
   return new Promise((resolve, reject) => {
-    if (signal.aborted) { reject(signal.reason); return; }
-    const abort = () => { clearTimeout(timer); reject(signal.reason); };
+    if (signal.aborted) { reject(abortReason(signal)); return; }
+    const abort = () => { clearTimeout(timer); reject(abortReason(signal)); };
     const timer = setTimeout(() => { signal.removeEventListener("abort", abort); resolve(); }, milliseconds);
     signal.addEventListener("abort", abort, { once: true });
   });
@@ -114,7 +118,7 @@ async function recoverContent(url: string, signal: AbortSignal): Promise<{ respo
   const delays = [700, 1_500];
   for (let attempt = 0; attempt < delays.length; attempt++) {
     await waitForRetry(signal, delays[attempt]);
-    signal.throwIfAborted();
+    throwIfAborted(signal);
     try {
       const response = await fetch(url, { method: "GET", credentials: "omit", cache: "no-store", referrerPolicy: "no-referrer", redirect: "error", signal });
       if (attempt === 0 && (response.status === 404 || temporaryHttpStatuses.has(response.status))) continue;
@@ -123,7 +127,7 @@ async function recoverContent(url: string, signal: AbortSignal): Promise<{ respo
       const body = response.ok ? await response.text() : undefined;
       return { response, body };
     } catch (error) {
-      signal.throwIfAborted();
+      throwIfAborted(signal);
       if (attempt > 0) throw error;
     }
   }
@@ -157,7 +161,7 @@ function connectionError(action: string, timedOut: boolean): SheetApiError {
 }
 
 function isCallerTimeout(signal?: AbortSignal): boolean {
-  return !!signal?.aborted && signal.reason?.name === "TimeoutError";
+  return isTimeoutSignal(signal);
 }
 
 export async function sheetRequest<T>(
@@ -169,78 +173,80 @@ export async function sheetRequest<T>(
   options: { token?: string; operationId?: string; signal?: AbortSignal; responseMode?: "receipt"; background?: boolean } = {},
 ): Promise<T> {
   const target = validateEndpoint(endpoint);
-  const timeout = AbortSignal.timeout(45_000);
-  const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
+  const deadline = createDeadlineSignal(45_000, options.signal ? [options.signal] : []);
+  const signal = deadline.signal;
   const readOnly = ["snapshot","touch","health","managementTables","managementTable","readInterviewAdvice","readWorkspaceInsights","readWritingKit","readWritingPreferences"].includes(action);
-  const body = JSON.stringify({ version: 1, action, payload, token: options.token, operationId: options.operationId, ...(options.responseMode ? { responseMode: options.responseMode } : {}), ...(options.background ? { background: true } : {}) });
-  for (let attempt = 0; attempt < (readOnly ? 2 : 1); attempt++) {
-    let recoveringResult = false;
-    try {
-      signal.throwIfAborted();
-      let recoveredBody: string | undefined;
-      let response = await fetch(target, {
-        method: "POST",
-        headers: { "Content-Type": "text/plain;charset=utf-8" },
-        credentials: "omit",
-        cache: "no-store",
-        referrerPolicy: "no-referrer",
-        redirect: "follow",
-        signal,
-        body,
-      });
-      const contentUrl = recoverableContentUrl(response);
-      if (contentUrl) {
-        recoveringResult = true;
-        const recovered = await recoverContent(contentUrl, signal);
-        response = recovered.response;
-        recoveredBody = recovered.body;
-      }
-      if (!response.ok) {
-        if (readOnly && attempt === 0 && !recoveringResult && temporaryHttpStatuses.has(response.status)) {
-          await waitForRetry(signal, 750);
+  try {
+    const body = JSON.stringify({ version: 1, action, payload, token: options.token, operationId: options.operationId, ...(options.responseMode ? { responseMode: options.responseMode } : {}), ...(options.background ? { background: true } : {}) });
+    for (let attempt = 0; attempt < (readOnly ? 2 : 1); attempt++) {
+      let recoveringResult = false;
+      try {
+        throwIfAborted(signal);
+        let recoveredBody: string | undefined;
+        let response = await fetch(target, {
+          method: "POST",
+          headers: { "Content-Type": "text/plain;charset=utf-8" },
+          credentials: "omit",
+          cache: "no-store",
+          referrerPolicy: "no-referrer",
+          redirect: "follow",
+          signal,
+          body,
+        });
+        const contentUrl = recoverableContentUrl(response);
+        if (contentUrl) {
+          recoveringResult = true;
+          const recovered = await recoverContent(contentUrl, signal);
+          response = recovered.response;
+          recoveredBody = recovered.body;
+        }
+        if (!response.ok) {
+          if (readOnly && attempt === 0 && !recoveringResult && temporaryHttpStatuses.has(response.status)) {
+            await waitForRetry(signal, 750);
+            continue;
+          }
+          throw new SheetApiError("HTTP", `Googleからの応答を確認できませんでした（${response.status}）。`);
+        }
+        // Body streaming can fail after fetch resolves; it shares the same deadline
+        // and recovery policy as the initial connection.
+        const responseBody = recoveredBody ?? await response.text();
+        throwIfAborted(signal);
+        let envelope: { ok?: boolean; data?: T; error?: { code?: string; message?: string } };
+        try { envelope = JSON.parse(responseBody); }
+        catch {
+          throw new SheetApiError("NOT_JSON", "連携用の応答が返りませんでした。Google側のウェブアプリ公開設定とURLを確認してください。");
+        }
+        if (envelope?.ok !== true) {
+          throw new SheetApiError(typeof envelope?.error?.code === "string" && envelope.error.code ? envelope.error.code : "API",
+            typeof envelope?.error?.message === "string" && envelope.error.message ? envelope.error.message : "スプレッドシートへの操作に失敗しました。");
+        }
+        if (!Object.hasOwn(envelope, "data")) throw new SheetApiError("INVALID_RESPONSE", "連携先から正しいデータを取得できませんでした。");
+        return envelope.data as T;
+      } catch (error) {
+        if (options.signal?.aborted) {
+          if (isCallerTimeout(options.signal)) throw connectionError(action, true);
+          throw error;
+        }
+        if (deadline.timedOut()) throw connectionError(action, true);
+        if (error instanceof SheetApiError) throw error;
+        // Only data reads may replay the POST after a transient connection failure.
+        // Login creates a session; writes can commit before their response is lost.
+        if (readOnly && attempt === 0 && !recoveringResult) {
+          try { await waitForRetry(signal, 750); }
+          catch (waitError) {
+            if (options.signal?.aborted) {
+              if (isCallerTimeout(options.signal)) throw connectionError(action, true);
+              throw waitError;
+            }
+            throw connectionError(action, deadline.timedOut());
+          }
           continue;
         }
-        throw new SheetApiError("HTTP", `Googleからの応答を確認できませんでした（${response.status}）。`);
+        throw connectionError(action, false);
       }
-      // Body streaming can fail after fetch resolves; it shares the same deadline
-      // and recovery policy as the initial connection.
-      const responseBody = recoveredBody ?? await response.text();
-      signal.throwIfAborted();
-      let envelope: { ok?: boolean; data?: T; error?: { code?: string; message?: string } };
-      try { envelope = JSON.parse(responseBody); }
-      catch {
-        throw new SheetApiError("NOT_JSON", "連携用の応答が返りませんでした。Google側のウェブアプリ公開設定とURLを確認してください。");
-      }
-      if (envelope?.ok !== true) {
-        throw new SheetApiError(typeof envelope?.error?.code === "string" && envelope.error.code ? envelope.error.code : "API",
-          typeof envelope?.error?.message === "string" && envelope.error.message ? envelope.error.message : "スプレッドシートへの操作に失敗しました。");
-      }
-      if (!Object.hasOwn(envelope, "data")) throw new SheetApiError("INVALID_RESPONSE", "連携先から正しいデータを取得できませんでした。");
-      return envelope.data as T;
-    } catch (error) {
-      if (options.signal?.aborted) {
-        if (isCallerTimeout(options.signal)) throw connectionError(action, true);
-        throw error;
-      }
-      if (timeout.aborted) throw connectionError(action, true);
-      if (error instanceof SheetApiError) throw error;
-      // Only data reads may replay the POST after a transient connection failure.
-      // Login creates a session; writes can commit before their response is lost.
-      if (readOnly && attempt === 0 && !recoveringResult) {
-        try { await waitForRetry(signal, 750); }
-        catch (waitError) {
-          if (options.signal?.aborted) {
-            if (isCallerTimeout(options.signal)) throw connectionError(action, true);
-            throw waitError;
-          }
-          throw connectionError(action, timeout.aborted);
-        }
-        continue;
-      }
-      throw connectionError(action, false);
     }
-  }
-  throw connectionError(action, timeout.aborted);
+    throw connectionError(action, deadline.timedOut());
+  } finally { deadline.dispose(); }
 }
 
 export function assertSnapshot(value: unknown): asserts value is SheetSnapshot {
@@ -254,13 +260,15 @@ export function assertSnapshot(value: unknown): asserts value is SheetSnapshot {
       typeof value.self.playerId !== "string" || !value.self.playerId || !Array.isArray(value.players) || !Array.isArray(value.activities) ||
       !object(value.counts) || typeof value.writesEnabled !== "boolean" ||
       (value.securityFeature !== undefined && typeof value.securityFeature !== "boolean") || (value.workspaceFeature !== undefined && typeof value.workspaceFeature !== "boolean") ||
+      ["operationsFeature","monthlyGoalsFeature"].some(key=>value[key]!==undefined&&typeof value[key]!=="boolean") ||
       !Array.isArray(value.warnings) || value.warnings.some(w => typeof w !== "string") || typeof value.syncedAt !== "string" ||
       value.players.some(p => !object(p) || !strings(p, ["id", "name"]) || !p.id || !Number.isSafeInteger(p.target) || Number(p.target) < 1 ||
-        !optionalStrings(p, ["team", "bio", "color"]) || (p.sheetNames !== undefined && (!Array.isArray(p.sheetNames) || p.sheetNames.some(n => typeof n !== "string")))) ||
+        !optionalStrings(p, ["team", "bio", "color"]) || (p.active!==undefined&&typeof p.active!=="boolean") || (p.sheetNames !== undefined && (!Array.isArray(p.sheetNames) || p.sheetNames.some(n => typeof n !== "string")))) ||
       value.activities.some(a => !object(a) || !strings(a, ["id", "playerId", "date", "candidateId", "candidateName", "source", "company", "position", "stage"]) ||
         !a.id || !a.playerId || !stages.includes(a.stage as Activity["stage"]) || !/^\d{4}-\d{2}-\d{2}$/.test(String(a.date)) ||
         !optionalStrings(a, ["recordId", "rowVersion", "status", "probability", "interviewScheduledDate", "clientInterviewScheduledTime", "offerScheduledDate", "memo"]))) invalid();
   const s = value as unknown as SheetSnapshot;
+  if(s.monthlyGoals!==undefined&&(!Array.isArray(s.monthlyGoals)||s.monthlyGoals.some(goal=>!object(goal)||!strings(goal,["playerId","month","version","updatedAt"])||!/^\d{4}-(0[1-9]|1[0-2])$/.test(String(goal.month))||!Number.isSafeInteger(goal.target)||Number(goal.target)<0||Number(goal.target)>9999||!goal.version||!s.players.some(p=>p.id===goal.playerId)||(s.self.role==="player"&&goal.playerId!==s.self.playerId))||new Set(s.monthlyGoals.map(g=>`${g.playerId}:${g.month}`)).size!==s.monthlyGoals.length))invalid("月別目標の形式または閲覧権限を確認できませんでした。");
   if (new Set(s.players.map(p => p.id)).size !== s.players.length ||
       Object.values(s.counts).some(people => !object(people) || Object.values(people).some(metrics => !object(metrics) ||
         Object.values(metrics).some(count => !Number.isSafeInteger(count) || Number(count) < 0)))) invalid();

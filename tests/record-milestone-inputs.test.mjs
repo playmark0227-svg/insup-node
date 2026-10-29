@@ -12,9 +12,9 @@ const nodes=tree=>!tree||typeof tree!=='object'?[]:Array.isArray(tree)?tree.flat
 const text=tree=>tree==null||typeof tree==='boolean'?'':typeof tree==='string'||typeof tree==='number'?String(tree):Array.isArray(tree)?tree.map(text).join(''):text(tree.props?.children);
 function harness(overrides={}){
  let cursor=0,closed=0;const slots=[],calls=[];
- const react={useState(initial){const i=cursor++;if(!slots[i])slots[i]={value:typeof initial==='function'?initial():initial};return [slots[i].value,value=>{slots[i].value=typeof value==='function'?value(slots[i].value):value;}];},useId(){cursor++;return'milestone';}};
+ const react={useState(initial){const i=cursor++;if(!slots[i])slots[i]={value:typeof initial==='function'?initial():initial};return [slots[i].value,value=>{slots[i].value=typeof value==='function'?value(slots[i].value):value;}];},useRef(initial){const i=cursor++;return slots[i]||={current:initial};},useId(){cursor++;return'milestone';}};
  const exports={},jsx=(type,props,key)=>({type,props:props||{},key});
- vm.runInNewContext(source,{exports,module:{exports},Error,require:name=>name==='react'?react:name==='react/jsx-runtime'?{jsx,jsxs:jsx}:name.includes('management-data')?management:name.includes('performance-metrics')?metrics:name.includes('sheets-client')?{businessToday}:name.includes('save-correction')?{mutationDateErrors}:new Proxy({},{get:(_,key)=>key})});
+ vm.runInNewContext(source,{exports,module:{exports},Error,require:name=>name==='react'?react:name==='react/jsx-runtime'?{jsx,jsxs:jsx}:name.includes('unsaved-work')?{useUnsavedChangesWarning(){}}:name.includes('management-data')?management:name.includes('performance-metrics')?metrics:name.includes('sheets-client')?{businessToday}:name.includes('save-correction')?{mutationDateErrors}:new Proxy({},{get:(_,key)=>key})});
  const values=Array(26).fill('');values[0]='2020-01-01';values[2]='架空候補者';
  const props={record:{recordId:'record-one',rowVersion:'original-version',row:2,playerId:'ND-001',candidateName:'架空候補者',source:'',values,formulaColumns:[]},players:[],admin:false,disabled:false,live:true,save:{busy:false,uncertain:false,error:'',save:async(...args)=>{calls.push(args);return true;}},onClose:()=>closed++,...overrides};
  const render=()=>{cursor=0;return exports.RecordEditor(props);};

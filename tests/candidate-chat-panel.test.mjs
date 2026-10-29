@@ -108,6 +108,50 @@ test("opening checks capability without inference and device answers retain thei
   assert.match(h.calls.copied[0], /端末AIが記録から整理した回答\n\n参照：架空会社A/); h.unmount();
 });
 
+test("same-name profiles cannot be sent together and choosing a profile scopes every source",async()=>{
+ const group=initialGroup();group.records[0].profileId='profile-a';group.records[1].profileId='profile-b';
+ const a=profileWithAmbiguities(),b={...profileWithAmbiguities(),profileId:'profile-b',recordIds:['record-b'],fields:{...blankInterviewFields(),age:'40',workHistory:'人物B専用の職歴'}};
+ const h=harness({props:{group,profiles:[a,b]}});await flush();
+ assert.match(h.text(),/別の人の情報を混ぜない/);assert.equal(h.button('追加入力したほうがいい情報は？').props.disabled,true);
+ h.change('希望条件と職歴を整理して');assert.equal(h.button('送信').props.disabled,true);h.submit();await flush();
+ assert.equal(h.calls.device.length,0);assert.equal(h.calls.facts.length,0);assert.equal(h.input().props.value,'希望条件と職歴を整理して');
+ h.scope('profile:profile-b');h.submit();await flush();
+ assert.equal(h.calls.device.length,1);assert.equal(h.calls.device[0][0].question,'希望条件と職歴を整理して');
+ const context=h.calls.device[0][0].context;
+ assert.deepEqual(Array.from(context.sources,source=>source.id),['record-b','profile:profile-b']);
+ assert.match(JSON.stringify(context),/人物B専用/);assert.doesNotMatch(JSON.stringify(context),/Salesforce|3000円|架空会社A/);
+ h.unmount();
+});
+
+test("selecting one record resolves multiple explicit identities without requiring profile documents",async()=>{
+ const group=initialGroup();group.records[0].profileId='person-a';group.records[1].profileId='person-b';
+ const h=harness({availability:'unavailable',props:{group}});await flush();
+ h.scope('record-b');h.change('提案先ごとの進捗は？');h.submit();await flush();
+ assert.equal(h.calls.device.length,0);assert.equal(h.calls.facts.length,1);
+ assert.deepEqual(Array.from(h.calls.facts[0][0].sources,source=>source.id),['record-b']);
+ assert.match(text(h.assistant()[0]),/架空会社B/);assert.doesNotMatch(text(h.assistant()[0]),/架空会社A/);h.unmount();
+});
+
+test("selecting another identity cancels inference and excludes prior identity history from the next question",async()=>{
+ const group=initialGroup();group.records[0].profileId='profile-a';group.records[1].profileId='profile-b';
+ const pending=deferred();let first=true;
+ const h=harness({props:{group},device:()=>first?(first=false,pending.promise):Promise.resolve({answer:'選択した記録のみ',sourceIds:['record-b']})});await flush();
+ h.scope('profile:profile-a');h.change('現在の状況を教えて');h.submit();await flush();assert.equal(h.calls.device.length,1);
+ h.scope('profile:profile-b');assert.equal(h.calls.device[0][1].signal.aborted,true);
+ pending.resolve({answer:'前の人に関する回答',sourceIds:['record-a']});await flush();assert.equal(h.assistant().length,0);
+ h.change('希望条件は？');h.submit();await flush();assert.equal(h.calls.device.length,2);
+ assert.equal(h.calls.device[1][0].history.length,0);assert.deepEqual(Array.from(h.calls.device[1][0].context.sources,source=>source.id),['record-b']);
+ assert.doesNotMatch(h.text(),/前の人に関する回答/);h.unmount();
+});
+
+test("newly ambiguous refreshed data blocks further questions and preserves the typed draft",async()=>{
+ const h=harness();await flush();h.change('入力中の質問');
+ const group=initialGroup();group.records[0].profileId='profile-a';group.records[1].profileId='profile-b';
+ h.render({group});h.submit();await flush();
+ assert.equal(h.calls.device.length,0);assert.equal(h.calls.facts.length,0);assert.equal(h.input().props.value,'入力中の質問');
+ assert.match(h.text(),/参照する記録または基本情報を1つ選んで/);h.unmount();
+});
+
 test("a native record-check response is labelled accurately and retains record citations when copied", async () => {
   const answer = "はい。希望単価の単位と、稼働できる曜日・時間帯を確認してください。";
   const h = harness({ device: () => Promise.resolve({ answer, sourceIds: ["record-b"], method: "record-check" }) }); await flush();

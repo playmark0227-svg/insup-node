@@ -140,3 +140,40 @@ test("evidence and meeting copy render server aggregate counts, period and timez
   assert.ok(copied.includes("同じ候補者が同じ月に工程を進んだ割合ではありません"));
   assert.equal(copied.includes("個人情報"), false);
 });
+
+
+test("proposed candidates without an interview schedule get a factual scheduling task, excluding later or closed stages", () => {
+  const data = snapshot([
+    record("waiting-schedule", { 8: "2026-10-13", 7: "提案完了（面談日確定待ち）" }),
+    record("booked-no-schedule", { 8: "2026-10-14", 9: "2026-10-14" }),
+    record("future-proposal", { 8: "2026-10-15" }),
+    record("no-proposal", {}),
+    record("stopped", { 8: "2026-10-13", 10: "停止" }),
+    record("interview-stop-marker", { 8: "2026-10-13", 17: "停止" }),
+    record("scheduled", { 8: "2026-10-13", 10: "2026-10-15" }),
+    record("interviewed", { 8: "2026-10-13", 17: "2026-10-14" }),
+    record("offered", { 8: "2026-10-13", 21: "2026-10-14" }),
+    record("matched", { 8: "2026-10-13", 22: "2026-10-14" }),
+    record("starting", { 8: "2026-10-13", 23: "2026-10-15" }),
+    record("ended", { 8: "2026-10-13", 7: "辞退（本人希望）" }),
+    record("departed", { 8: "2026-10-13", 26: "2026-10-14" }),
+    ...["提案なし", "面談実施（合否待ち）", "合格（シフト入力待ち）", "マッチ済み", "稼働予定日確定（稼働開始待ち）", "稼働開始"].map((status, index) => record(`later-status-${index}`, { 8: "2026-10-13", 7: status })),
+    record("other-owner", { 8: "2026-10-13" }, "ND-002"),
+  ], [], "player");
+  const tasks = buildFollowUpTasks(data, "2026-10-14");
+  assert.deepEqual(tasks.map(task => [task.recordId, task.kind, task.urgency]), [["waiting-schedule", "schedule_missing", "followup"], ["booked-no-schedule", "schedule_missing", "followup"]]);
+  assert.match(tasks[0].evidence, /提案完了 2026-10-13.*予定日は未登録/);
+  assert.match(tasks[0].suggestedAction, /面談日時を確認/);
+  assert.doesNotMatch(tasks[0].evidence, /連絡済み|落選|不成立/);
+});
+
+test("monthly insights use only the explicitly saved goals of that month",()=>{
+ const value=snapshot();value.monthlyGoalsFeature=true;value.monthlyGoals=[];
+ assert.equal(buildWorkspaceInsightAggregate(value,"2026-10","2026-10-30").proposalTarget,null);
+ value.monthlyGoals=[{playerId:"ND-001",month:"2026-10",target:0,version:"a",updatedAt:"2026-10-30T00:00:00Z"}];
+ assert.equal(buildWorkspaceInsightAggregate(value,"2026-10","2026-10-30").proposalTarget,null);
+ value.monthlyGoals.push({playerId:"ND-002",month:"2026-10",target:8,version:"b",updatedAt:"2026-10-30T00:00:00Z"});
+ assert.equal(buildWorkspaceInsightAggregate(value,"2026-10","2026-10-30").proposalTarget,8);
+ assert.equal(buildWorkspaceInsightAggregate(value,"2026-09","2026-10-30").proposalTarget,null);
+ value.self={role:"player",playerId:"ND-001"};assert.equal(buildWorkspaceInsightAggregate(value,"2026-10","2026-10-30").proposalTarget,0);
+});

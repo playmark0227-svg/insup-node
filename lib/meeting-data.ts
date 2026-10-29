@@ -14,6 +14,7 @@ type ExportRow = {
   id: string;
   name: string;
   target: number;
+  goalStatus?: "confirmed" | "standard" | "unset";
   counts: Record<string, number>;
   previous: Record<string, number>;
 };
@@ -28,7 +29,7 @@ function csvCell(value: string | number): string {
 export function meetingCsv(rows: ExportRow[], metrics: ReadonlyArray<{ stage: Stage; label: string }>, period: string): string {
   const monthly = previousMeetingMonth(period) !== null;
   const header = ["対象期間", "プレイヤーID", "氏名", ...metrics.map(metric => metric.label), ...(monthly ? [...metrics.map(metric => `${metric.label} 前月差`), "月間提案目標", "提案達成率（%）"] : [])];
-  const body = rows.map(row => [period, row.id, row.name, ...metrics.map(metric => row.counts[metric.stage]), ...(monthly ? [...metrics.map(metric => row.counts[metric.stage] - row.previous[metric.stage]), row.target > 0 ? row.target : "未設定", proposalAchievement(row.counts["提案"], row.target) ?? "未設定"] : [])]);
+  const body = rows.map(row => [period, row.id, row.name, ...metrics.map(metric => row.counts[metric.stage]), ...(monthly ? [...metrics.map(metric => row.counts[metric.stage] - row.previous[metric.stage]), row.goalStatus === "standard" ? "標準目標・未確定" : row.goalStatus === "unset" ? "未設定" : row.goalStatus === "confirmed" ? row.target : row.target > 0 ? row.target : "未設定", row.goalStatus && row.goalStatus !== "confirmed" ? "未確定" : row.goalStatus === "confirmed" && row.target === 0 ? "対象外（目標0件）" : proposalAchievement(row.counts["提案"], row.target) ?? "未設定"] : [])]);
   return [header, ...body].map(row => row.map(csvCell).join(",")).join("\r\n");
 }
 

@@ -1,3 +1,4 @@
+import {createDeadlineSignal, type RequestDeadline} from "../lib/abort-signal";
 import { persistPendingSave, readPendingSaves, removePendingSave, replacePendingSave, pendingSaveResources, unlockPendingSaves, lockPendingSaves, purgeExpiredPendingSaves, type PendingSave } from "../lib/pending-saves";
 import { correctionFields, correctedPayload, mutationDateErrors, type SaveCorrectionDraft } from "../lib/save-correction";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -19,7 +20,7 @@ const isPasswordChangeRequired = (e: unknown) => e instanceof SheetApiError && e
 export type ConnectionLoadPhase = "authenticating" | "loading" | "restoring" | null;
 export type BackgroundSaveState = {
   operationId: string; action: string; label: string; status: "saving" | "saved" | "failed";
-  details: string[]; error: string; uncertain: boolean; changeId?: string; intakeInput?: boolean; refreshing?: boolean; localSaved?: boolean; pendingCount?: number; editable?: boolean;
+  details: string[]; error: string; uncertain: boolean; changeId?: string; intakeInput?: boolean; refreshing?: boolean; localSaved?: boolean; pendingCount?: number; editable?: boolean; waitingForConnection?: boolean;
 };
 type BackgroundJob = { state: BackgroundSaveState; payload: unknown; endpoint: string; token: string; generation: number; account: string; savedInput: PendingSave; resources: string[] };
 const backgroundActions = new Set(["saveCandidateProfile", "saveClient", "deleteCandidate", "updateRecord", "createCandidate", "cancelAchievement", "restoreChange", "saveActivity", "updateProfile", "updateStatus", "saveManagementRow", "saveInterviewReview"]);
@@ -78,6 +79,7 @@ export function useSheetsConnection() {
   const loginRunning = useRef(false);
   const refreshRunning = useRef(false);
   const refreshLatest = useRef<(background?: boolean) => Promise<boolean | undefined>>(async () => undefined);
+  const resumeBackgroundLatest = useRef<() => void>(() => undefined);
   const activeRequest = useRef<AbortController | null>(null);
   const mounted = useRef(true);
   // The server ends a session after 60 minutes without activity. Every request counts except an
@@ -218,9 +220,10 @@ export function useSheetsConnection() {
     const {controller, g} = beginLoad("authenticating");
     // Authentication and its first read share one deadline, so splitting the
     // requests cannot double the total time before the recovery screen appears.
-    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(45_000)]);
-    let accepted = false;
+    let accepted = false, deadline: RequestDeadline | undefined;
     try {
+      deadline = createDeadlineSignal(45_000, [controller.signal]);
+      const signal = deadline.signal;
       const deviceToken = readDeviceToken(endpoint, id);
       const data = await sheetRequest<{token: string; deviceToken?: string; snapshot?: SheetSnapshot; mustChangePassword?: boolean}>(endpoint, "login", {id, password, sessionOnly: true, idleAware: true, ...(deviceToken ? {deviceToken} : {})}, {signal});
       if (!isCurrent(g)) return;
@@ -247,6 +250,7 @@ export function useSheetsConnection() {
       // The recovery screen retries data retrieval without sending credentials.
       if (!accepted || isExpired(e)) throw e;
     } finally {
+      deadline?.dispose();
       if (isCurrent(g)) { loginRunning.current = false; finishLoad(g, controller); }
     }
   };
@@ -331,6 +335,7 @@ export function useSheetsConnection() {
       if (!stopped) schedule();
     };
     const resume = () => {
+      if (navigator.onLine !== false) resumeBackgroundLatest.current();
       if (!refreshRunning.current && !mutationRunning.current && document.visibilityState === "visible" && navigator.onLine !== false && Date.now() - lastAttempt >= 10_000) void tick();
     };
     // Focus and visibility stay passive: clicking into the window already produces a pointerdown.
@@ -358,7 +363,7 @@ export function useSheetsConnection() {
       applySnapshot(data.snapshot); if (data.credentials) setCredentials(data.credentials);
       return data;
     } catch (e) { if (isCurrent(g)) { if(isExpired(e)) clearSession(); setError(e instanceof Error ? e.message : "保存できませんでした。"); } throw e; }
-    finally { mutationRunning.current = false; if (isCurrent(g)) setBusy(false); }
+    finally { if (isCurrent(g)) { mutationRunning.current = false; setBusy(false); } }
   };
 
   const publishQueue = () => {
@@ -366,19 +371,39 @@ export function useSheetsConnection() {
     backgroundJob.current = head || null;
     setBackgroundSave(head ? {...head.state, pendingCount:backgroundQueue.current.length} : null);
   };
+  const online = () => typeof navigator === "undefined" || navigator.onLine !== false;
+  const resumeBackground = () => {
+    const next = backgroundQueue.current[0];
+    // Never replay a possibly transmitted operation without the user's explicit retry.
+    if (online() && latestSnapshot.current?.writesEnabled && next?.state.localSaved && !next.savedInput.attempted && next.state.status !== "failed") void runBackground(next);
+  };
+  resumeBackgroundLatest.current = resumeBackground;
   // Google writes are serialized; accepting another independent input waits only
   // for its encrypted local transaction, never for this network worker.
   const runBackground = async (job: BackgroundJob) => {
     if (mutationRunning.current || backgroundQueue.current[0] !== job || !isCurrent(job.generation)) return;
+    if (!online()) {
+      if (!job.savedInput.attempted) job.state = {...job.state, status:"saving", error:"", uncertain:false, waitingForConnection:true};
+      else job.state = {...job.state, status:"failed", error:"オフラインです。接続後に同じ内容で保存結果を確認してください。", waitingForConnection:false};
+      publishQueue(); return;
+    }
     let updateAfterCommit = false, posted = false;
     mutationRunning.current = true;
     ++requestVersion.current; activeRequest.current?.abort(); activeRequest.current = null;
     setSyncing(false); setLoadPhase(null); setBusy(false);
-    job.state = {...job.state, status:"saving", error:"", uncertain:false}; publishQueue();
+    job.state = {...job.state, status:"saving", error:"", uncertain:false, waitingForConnection:false}; publishQueue();
     try {
       job.savedInput.attempted = true;
       await persistPendingSave(job.endpoint, job.account, job.savedInput);
       if (!isCurrent(job.generation)) return;
+      if (!online()) {
+        // The network disappeared before fetch. Persist that no POST was made so a later
+        // connection may safely resume it, including after a tab restart.
+        job.savedInput.attempted = false;
+        await persistPendingSave(job.endpoint, job.account, job.savedInput);
+        if (!isCurrent(job.generation)) return;
+        job.state = {...job.state, waitingForConnection:true}; publishQueue(); return;
+      }
       posted = true;
       const data = await reporting(sheetRequest<MutationResult | MutationReceipt>(job.endpoint, job.state.action, job.payload, {token:job.token, operationId:job.state.operationId, responseMode:"receipt"}));
       if (!isCurrent(job.generation) || backgroundQueue.current[0] !== job) return;
@@ -400,7 +425,7 @@ export function useSheetsConnection() {
       if (isCurrent(job.generation)) {
         mutationRunning.current = false;
         const next = backgroundQueue.current[0];
-        if (next && next !== job && next.state.localSaved && next.state.status !== "failed") void runBackground(next);
+        if (next && (next !== job || next.state.waitingForConnection)) resumeBackground();
         else if (!next && updateAfterCommit) void refreshLatest.current(true);
       }
     }
@@ -454,7 +479,7 @@ export function useSheetsConnection() {
       const job:BackgroundJob={state:{operationId,action,label:input.label,status:"saving",details:input.details,error:"",uncertain:false,intakeInput:!!backgroundIntakeBody(action,owned),localSaved:false},payload:owned,savedInput:input,endpoint,token:savedToken,generation:g,account,resources};
       backgroundQueue.current.push(job);
       try { await persistPendingSave(endpoint,account,input); }
-      catch (error) { backgroundQueue.current=backgroundQueue.current.filter(item=>item!==job); publishQueue(); throw error; }
+      catch (error) { backgroundQueue.current=backgroundQueue.current.filter(item=>item!==job); publishQueue(); resumeBackground(); throw error; }
       if (!isCurrent(g) || token.current !== savedToken) throw new SheetApiError("STALE_SESSION", "ログイン状態が変更されました。未同期の入力はこの端末に残っています。");
       job.state.localSaved=true; publishQueue();
       if (backgroundQueue.current[0]===job) void runBackground(job);
@@ -607,7 +632,7 @@ export function useSheetsConnection() {
       if (isCurrent(g) && (isExpired(e) || isUncertainPasswordChange(e))) clearSession();
       if (isUncertainPasswordChange(e)) throw new Error("変更結果を確認できませんでした。新しいパスワードでログインし、入れなければ元のパスワードで確認してください。");
       throw e;
-    } finally { mutationRunning.current = false; if (isCurrent(g)) setBusy(false); }
+    } finally { if (isCurrent(g)) { mutationRunning.current = false; setBusy(false); } }
   };
 
   const readManagement = async <T,>(action: "managementTables" | "managementTable", payload: unknown = {}): Promise<T> => {
@@ -618,6 +643,24 @@ export function useSheetsConnection() {
     catch(e){if(isCurrent(g)&&isExpired(e))expire(e);throw e;}
     if (!isCurrent(g)) throw new Error("ログイン状態が変更されました。");
     return data;
+  };
+
+  const readOperational = async <T,>(action:"readAccountManagement"|"readOperationHistory"|"readDataExport",payload:unknown={}):Promise<T> => {
+    if(!token.current||snapshot?.self.role!=="admin")throw new Error("管理者でログインしてください。");
+    const g=generation.current;
+    try{const data=await reporting(sheetRequest<T>(endpoint,action,payload,{token:token.current}));if(!isCurrent(g))throw new Error("ログイン状態が変更されました。");return data;}
+    catch(e){if(isCurrent(g)&&isExpired(e))expire(e);throw e;}
+  };
+  const mutateOperational = async <T,>(action:"manageAccount"|"saveMonthlyTarget",payload:unknown,operationId:string):Promise<T> => {
+    if(!token.current||!snapshot)throw new Error("ログインしてください。");
+    if(action==="manageAccount"&&snapshot.self.role!=="admin")throw new Error("管理者でログインしてください。");
+    if(!snapshot.writesEnabled)throw new Error("現在の接続は閲覧のみです。");
+    if(mutationRunning.current||hasPendingBackground()||loginRunning.current)throw new SheetApiError("MUTATION_PENDING","保存を完了してから操作してください。");
+    const g=generation.current;
+    mutationRunning.current=true;++requestVersion.current;activeRequest.current?.abort();activeRequest.current=null;setBusy(true);
+    try{const data=await sheetRequest<T>(endpoint,action,payload,{token:token.current,operationId});if(!isCurrent(g))throw new Error("ログイン状態が変更されました。操作結果を再確認してください。");return data;}
+    catch(e){if(isCurrent(g)&&isExpired(e))expire(e);throw e;}
+    finally{if(isCurrent(g)){mutationRunning.current=false;setBusy(false);}}
   };
 
   const logout = async () => {
@@ -636,7 +679,7 @@ export function useSheetsConnection() {
   };
 
   return { ready, endpoint, mode, players, setPlayers, activities, setActivities, snapshot, authenticated, mustChangePassword, loadPhase, busy, error,
-    syncing, syncError, backgroundSave, hasPendingSave, submitMutation, retryBackgroundSave, dismissBackgroundSave, readBackgroundSaveCorrection, correctBackgroundSave, copyBackgroundIntakeInput, credentials, dismissCredentials:() => setCredentials(null), connect, login, logout, refresh, mutate, readManagement, analyzeReviews, readAdvice, analyzeInsights, readInsights, readWritingKit, generateWritingKit, readWritingPreferences, saveWritingPreferences, readSecurity, changePassword, showDemo };
+    syncing, syncError, backgroundSave, hasPendingSave, submitMutation, retryBackgroundSave, dismissBackgroundSave, readBackgroundSaveCorrection, correctBackgroundSave, copyBackgroundIntakeInput, credentials, dismissCredentials:() => setCredentials(null), connect, login, logout, refresh, mutate, readManagement, readOperational, mutateOperational, analyzeReviews, readAdvice, analyzeInsights, readInsights, readWritingKit, generateWritingKit, readWritingPreferences, saveWritingPreferences, readSecurity, changePassword, showDemo };
 }
 
 function saveLabel(action: string) {

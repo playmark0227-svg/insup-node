@@ -41,6 +41,26 @@ class MockMetadataFinder {
   find() { return this.spreadsheet.metadata.filter(item => (!this.sheet || item.sheet === this.sheet) && (!this.range || item.row >= this.range.row && item.row < this.range.row + this.range.rows) && this.filters.every(filter => filter(item))); }
 }
 
+class MockTextFinder {
+  constructor(range, text) { this.range = range; this.text = text; this.options = {}; }
+  matchCase(value) { this.options.matchCase = value; return this; }
+  matchEntireCell(value) { this.options.matchEntireCell = value; return this; }
+  useRegularExpression(value) { this.options.useRegularExpression = value; return this; }
+  matchFormulaText(value) { this.options.matchFormulaText = value; return this; }
+  findAll() {
+    const {range} = this; range.sheet.spreadsheet.beforeRead(range, 'findAll');
+    const search = {text: this.text, ...this.options, row:range.row, column:range.column, rows:range.rows, columns:range.columns};
+    (range.sheet.spreadsheet.textSearches ??= []).push(search);
+    const found = [];
+    for(let r=range.row;r<range.row+range.rows;r++)for(let c=range.column;c<range.column+range.columns;c++){
+      let value=String(range.sheet.values[r-1]?.[c-1]??''), text=String(this.text);
+      if(!this.options.matchCase){value=value.toLowerCase();text=text.toLowerCase();}
+      if(this.options.useRegularExpression ? new RegExp(text).test(value) : this.options.matchEntireCell ? value===text : value.includes(text))found.push(range.sheet.getRange(r,c));
+    }
+    return found;
+  }
+}
+
 class MockRange {
   constructor(sheet, row, column, rows = 1, columns = 1) {
     Object.assign(this, { sheet, row, column, rows, columns });
@@ -58,6 +78,7 @@ class MockRange {
   getFormula() { return this.getFormulas()[0][0]; }
   getDeveloperMetadata() { return this.createDeveloperMetadataFinder().find(); }
   createDeveloperMetadataFinder() { return new MockMetadataFinder(this.sheet.spreadsheet, this.sheet, this); }
+  createTextFinder(text) { return new MockTextFinder(this, text); }
   addDeveloperMetadata(key, value, visibility) {
     this.sheet.spreadsheet.metadata.push(new MockMetadata(this.sheet.spreadsheet, this.sheet, this.row, key, String(value), visibility));
     return this;
@@ -1144,7 +1165,8 @@ test("profile updates preserve role and aliases so renamed profiles keep existin
   const { harness, player } = signedInFixture();
   const before = clone(player.snapshot.activities);
   const profile = { id: "ND-001", name: "表示名変更", target: 25, bio: "本人が書いた紹介文", team: "権限外チーム", sheetNames: ["担当二"], role: "admin", active: false };
-  const saved = assertSuccess(mutate(harness, player.token, "updateProfile", { player: profile }));
+  assert.equal(assertFailure(mutate(harness, player.token, "updateProfile", { player: profile })).code, "FORBIDDEN");
+  const saved = assertSuccess(mutate(harness, player.token, "updateProfile", { player: { ...profile, team: "NODE" } }));
   const own = saved.snapshot.players.find(person => person.id === "ND-001");
   assert.equal(own.name, profile.name);
   assert.equal(own.target, 25);
@@ -4214,4 +4236,355 @@ test("authentication compute measurement is owner-editor-only and not a web API 
   const harness = createHarness({ properties: { NODE_PEPPER: "synthetic-benchmark-pepper", NODE_CONFIG: JSON.stringify({ ownerEmail: "owner@example.test" }) }, kdfIterations: null }), counter = countHmac(harness);
   assert.equal(assertFailure(request(harness, "benchmarkNodeAuthentication", {})).code, "BAD_REQUEST"); counter.restore();
   assert.equal(counter.calls, 0); assert.equal(counter.kdfCalls, 0); assert.equal(harness.logs.length, 0); assert.equal(harness.spreadsheet.reads.length, 0); assert.equal(harness.writes.length, 0);
+});
+
+function managedAccount(fixture, id = 'ND-001') {
+  return assertSuccess(request(fixture.harness, 'readAccountManagement', {}, {token:fixture.admin.token})).accounts.find(account => account.id === id);
+}
+function accountCommand(fixture, action, {id='ND-001', version, operationId=randomUUID(), token=fixture.admin.token} = {}) {
+  const expectedVersion=version ?? managedAccount(fixture,id).version;
+  return request(fixture.harness,'manageAccount',{playerId:id,action,expectedVersion},{token,operationId});
+}
+
+test('administrator team edits persist while player tampering is rejected and omitted team stays unchanged', () => {
+  const f=signedInFixture(), h=f.harness, profile=f.admin.snapshot.players.find(p=>p.id==='ND-001');
+  const saved=assertSuccess(mutate(h,f.admin.token,'updateProfile',{player:{...profile,team:'営業一課'}}));
+  assert.equal(saved.snapshot.players.find(p=>p.id==='ND-001').team,'営業一課');
+  const before=clone(h.spreadsheet.getSheetById(8001).values);
+  assert.equal(assertFailure(mutate(h,f.player.token,'updateProfile',{player:{...profile,team:'乗っ取り'}})).code,'FORBIDDEN');
+  assert.deepEqual(h.spreadsheet.getSheetById(8001).values,before);
+  const {team,...own}=profile;
+  assert.equal(assertSuccess(mutate(h,f.player.token,'updateProfile',{player:own})).snapshot.players.find(p=>p.id==='ND-001').team,'営業一課');
+});
+
+test('idempotency lookup searches exact IDs and reads only one matching row in a large ledger', () => {
+  const h=baseHarness(), sheet=h.spreadsheet.getSheetById(8002), wanted='operation-bounded-lookup';
+  sheet.values.push(...Array.from({length:8000},(_,i)=>['other-'+i,'ND-001','updateRecord','digest','{"private":"'+('x'.repeat(512))+'"}','2026-10-07T06:00:00.000Z']));
+  sheet.values[4000]=[wanted,'ND-001','updateRecord','hash','{"restored":true}','2026-10-07T06:00:00.000Z'];
+  sheet.values[7000][0]='prefix-'+wanted;
+  h.spreadsheet.reads.length=0;
+  assert.deepEqual(JSON.parse(JSON.stringify(h.context.operation_({operationSheet:sheet},wanted))),{actorId:'ND-001',action:'updateRecord',payloadHash:'hash',result:{restored:true}});
+  const reads=h.spreadsheet.reads.filter(r=>r.method==='getValues');
+  assert.deepEqual(reads.map(r=>[r.row,r.rows,r.columns]),[[1,1,6],[4001,1,6]]);
+  assert.deepEqual(h.spreadsheet.textSearches,[{text:wanted,matchCase:true,matchEntireCell:true,useRegularExpression:false,matchFormulaText:false,row:2,column:1,rows:8000,columns:1}]);
+  assert.equal(h.context.operation_({operationSheet:sheet},wanted.toUpperCase()),null);
+});
+
+test('idempotency lookup fails closed for duplicated IDs, corrupt results, search outages and changed headers', () => {
+  for(const kind of ['duplicate','result','outage','header','moved']){
+    const h=baseHarness(),sheet=h.spreadsheet.getSheetById(8002),id='bounded-corruption-test';
+    sheet.values.push([id,'ND-001','updateRecord','hash','{}','2026-10-07T06:00:00.000Z']);
+    if(kind==='duplicate')sheet.values.push([...sheet.values[1]]);
+    if(kind==='result')sheet.values[1][4]='["not an operation object"]';
+    if(kind==='outage')h.spreadsheet.readObserver=r=>{if(r.method==='findAll')throw new Error('search unavailable');};
+    if(kind==='header')sheet.values[0][0]='wrong header';
+    if(kind==='moved')h.spreadsheet.readObserver=r=>{if(r.method==='getValues'&&r.row===2)sheet.values[1][0]='another operation';};
+    assert.throws(()=>h.context.operation_({operationSheet:sheet},id),error=>['OPERATION_CONFLICT','SCHEMA_MISMATCH','SHEET_READ_FAILED'].includes(error.nodeCode),kind);
+    assert.equal(h.writes.length,0);
+  }
+});
+
+test('account management read contains safe versions, no credentials, and reads only roster rows', () => {
+  const f=signedInFixture(),h=f.harness;h.properties.NODE_GEMINI_API_KEY='secret-provider-key';
+  h.spreadsheet.reads.length=0;const before=clone(h.properties), result=assertSuccess(request(h,'readAccountManagement',{}, {token:f.admin.token}));
+  assert.equal(result.canManageAccounts,true);assert.equal(result.accounts.length,3);
+  assert.match(result.accounts[1].version,/^[A-Za-z0-9_-]{43}\.[A-Za-z0-9_-]{43}$/);
+  assert.equal(result.accounts[1].hasCredentials,true);assert.equal(result.accounts[2].hasCredentials,false);
+  for(const secret of ['secret-provider-key','本人候補','test-pepper','salt','hash','correct-test-password'])assert.ok(!JSON.stringify(result).includes(secret),secret);
+  assert.ok(h.spreadsheet.reads.every(r=>r.sheetId===8001));assert.deepEqual(h.properties,before);assert.equal(h.apiCalls.length,0);
+});
+
+test('account, history and data export APIs reject forged/player/issued-password sessions before private reads', () => {
+  for(const action of ['readAccountManagement','manageAccount','readOperationHistory','readDataExport'])for(const kind of ['forged','player','issued']){
+    const f=signedInFixture(),h=f.harness;
+    if(kind==='issued')h.properties.NODE_AUTH_ADMIN=JSON.stringify({...JSON.parse(h.properties.NODE_AUTH_ADMIN),mustChange:true});
+    h.spreadsheet.reads.length=0;
+    const token=kind==='forged'?'forged-session':kind==='player'?f.player.token:f.admin.token;
+    const error=assertFailure(request(h,action,{playerId:'ND-001',action:'stop',expectedVersion:'bad'}, {token,operationId:randomUUID()}));
+    assert.ok(['UNAUTHENTICATED','FORBIDDEN','PASSWORD_CHANGE_REQUIRED'].includes(error.code),`${action}:${kind}:${error.code}`);
+    assert.ok(h.spreadsheet.reads.every(r=>r.sheetId===8001));assert.equal(h.apiCalls.length,0);
+  }
+});
+
+test('stopping/resuming a player preserves business history and aliases, invalidates every old token and keeps password', () => {
+  const f=signedInFixture(),h=f.harness,second=assertSuccess(request(h,'login',{id:'ND-001',password:'correct-test-password',sessionOnly:true}));
+  const auth=JSON.parse(h.properties['NODE_AUTH_ND-001']),business=clone(h.spreadsheet.getSheetById(MATCHING_SHEET_ID).values),kpi=clone(h.spreadsheet.getSheetById(KPI_SHEET_ID).values);
+  const stopped=assertSuccess(accountCommand(f,'stop'));
+  assert.equal(stopped.active,false);assert.equal(stopped.replayed,false);
+  for(const token of [f.player.token,second.token])assert.equal(assertFailure(request(h,'snapshot',{}, {token})).code,'UNAUTHENTICATED');
+  assert.equal(h.context.trustedDevice_('ND-001',h.context.authRecord_('ND-001'),f.player.deviceToken),false);
+  const after=JSON.parse(h.properties['NODE_AUTH_ND-001']);const {version:oldVersion,...oldCredential}=auth,{version:newVersion,...newCredential}=after;
+  assert.notEqual(oldVersion,newVersion);assert.deepEqual(newCredential,oldCredential);
+  const snapshot=assertSuccess(request(h,'snapshot',{}, {token:f.admin.token}));
+  assert.equal(snapshot.players.find(p=>p.id==='ND-001').active,false);
+  assert.deepEqual(snapshot.records.filter(r=>r.playerId==='ND-001'),f.admin.snapshot.records.filter(r=>r.playerId==='ND-001'));
+  assert.deepEqual(snapshot.counts.all['ND-001'],f.admin.snapshot.counts.all['ND-001']);
+  const other=authenticate(h,'ND-002'),publicRanking=assertSuccess(request(h,'snapshot',{}, {token:other.token}));
+  assert.equal(publicRanking.players.some(p=>p.id==='ND-001'),false);assert.equal(publicRanking.counts.all['ND-001'],undefined,'Stopped members are not exposed in player rankings');
+  assert.equal(snapshot.warnings.filter(w=>/担当者名が未設定/.test(w)).length,0);
+  assert.equal(assertFailure(mutate(h,f.admin.token,'saveActivity',{activity:newCandidate()})).code,'VALIDATION');
+  assert.equal(assertFailure(mutate(h,f.admin.token,'createPlayer',{name:'別人',team:'営業',target:20,sheetNames:['担 当 一']})).code,'ALIAS_CONFLICT');
+  const resumed=assertSuccess(accountCommand(f,'resume'));assert.equal(resumed.active,true);
+  assert.equal(assertFailure(request(h,'snapshot',{}, {token:second.token})).code,'UNAUTHENTICATED');
+  assertSuccess(request(h,'login',{id:'ND-001',password:'correct-test-password',sessionOnly:true}));
+  assert.deepEqual(h.spreadsheet.getSheetById(MATCHING_SHEET_ID).values,business);assert.deepEqual(h.spreadsheet.getSheetById(KPI_SHEET_ID).values,kpi);
+});
+
+test('revoking player sessions is atomic with its audit record and allows login with the same password', () => {
+  const f=signedInFixture(),h=f.harness,version=managedAccount(f).version,id=randomUUID(),auth=JSON.parse(h.properties['NODE_AUTH_ND-001']);
+  const result=assertSuccess(accountCommand(f,'revokeSessions',{version,operationId:id}));
+  assert.equal(result.active,true);assert.equal(result.action,'revokeSessions');
+  assert.equal(h.apiCalls.length,1);assert.equal(h.apiCalls[0].body.requests.length,2);
+  assert.equal(h.spreadsheet.getSheetById(8002).values[1][2],'manageAccount');
+  assert.equal(assertFailure(request(h,'snapshot',{}, {token:f.player.token})).code,'UNAUTHENTICATED');
+  assert.equal(h.context.trustedDevice_('ND-001',h.context.authRecord_('ND-001'),f.player.deviceToken),false);
+  const after=JSON.parse(h.properties['NODE_AUTH_ND-001']);assert.equal(after.hash,auth.hash);assert.equal(after.salt,auth.salt);
+  assertSuccess(request(h,'login',{id:'ND-001',password:'correct-test-password',sessionOnly:true}));
+  const writes=h.apiCalls.length,replay=assertSuccess(accountCommand(f,'revokeSessions',{version,operationId:id}));
+  assert.equal(replay.replayed,true);assert.equal(replay.version,result.version);assert.equal(h.apiCalls.length,writes);
+});
+
+test('account commands enforce expected version and bind operation IDs to actor, action and payload', () => {
+  const f=signedInFixture(),h=f.harness,version=managedAccount(f).version,id=randomUUID();
+  assertSuccess(accountCommand(f,'stop',{version,operationId:id}));const auth=h.properties['NODE_AUTH_ND-001'],writes=h.apiCalls.length;
+  assert.equal(assertFailure(accountCommand(f,'resume',{version})).code,'CONFLICT');
+  assert.equal(assertFailure(accountCommand(f,'resume',{version,operationId:id})).code,'OPERATION_CONFLICT');
+  assert.equal(assertFailure(accountCommand(f,'stop',{version,operationId:'short'})).code,'VALIDATION');
+  assert.equal(h.properties['NODE_AUTH_ND-001'],auth);assert.equal(h.apiCalls.length,writes);
+  // A replay observes the current state and must not stop an account resumed by a later operation.
+  assertSuccess(accountCommand(f,'resume'));const replay=assertSuccess(accountCommand(f,'stop',{version,operationId:id}));assert.equal(replay.replayed,true);assert.equal(replay.active,true);
+});
+
+test('management commands forbid self/admin, missing credentials on resume/revoke, readonly and formula targets', () => {
+  for(const kind of ['self','admin','resume-noauth','revoke-noauth','readonly','formula']){
+    const f=signedInFixture(),h=f.harness;let id='ND-001',action='stop';
+    if(kind==='self'||kind==='admin')id='ADMIN';
+    if(kind.endsWith('noauth')){id='ND-002';action=kind.startsWith('resume')?'resume':'revokeSessions';}
+    const version=managedAccount(f,id).version;
+    if(kind==='readonly')h.properties.NODE_CONFIG=JSON.stringify({...JSON.parse(h.properties.NODE_CONFIG),writesEnabled:false});
+    if(kind==='formula')h.spreadsheet.getSheetById(8001).formulas[2]=['=PRIVATE()'];
+    const auth=h.properties['NODE_AUTH_ND-001'];assertFailure(accountCommand(f,action,{id,version}));
+    assert.equal(h.properties['NODE_AUTH_ND-001'],auth,kind);assert.equal(h.apiCalls.length,0,kind);
+  }
+});
+
+test('same-ID account retry recovers a confirmed revocation followed by failed Sheets save without rotating twice', () => {
+  const f=signedInFixture(),h=f.harness,version=managedAccount(f).version,id=randomUUID(),original=h.properties['NODE_AUTH_ND-001'];
+  h.spreadsheet.failure=operation=>operation.sheet.id===8001;
+  assert.equal(assertFailure(accountCommand(f,'stop',{version,operationId:id})).code,'SHEET_WRITE_FAILED');
+  const revoked=h.properties['NODE_AUTH_ND-001'];assert.notEqual(revoked,original);
+  assert.equal(h.spreadsheet.getSheetById(8001).values[2][8],true);assert.equal(h.spreadsheet.getSheetById(8002).getLastRow(),1);
+  assert.equal(assertFailure(request(h,'snapshot',{}, {token:f.player.token})).code,'UNAUTHENTICATED');
+  h.spreadsheet.failure=null;const result=assertSuccess(accountCommand(f,'stop',{version,operationId:id}));
+  assert.equal(result.active,false);assert.equal(h.properties['NODE_AUTH_ND-001'],revoked);assert.equal(h.spreadsheet.getSheetById(8002).getLastRow(),2);
+  assert.equal(assertSuccess(accountCommand(f,'stop',{version,operationId:id})).replayed,true);
+});
+
+test('same-ID account retry recovers an ambiguous committed batch or property write', () => {
+  for(const kind of ['batch','property']){
+    const f=signedInFixture(),h=f.harness,version=managedAccount(f).version,id=randomUUID(),fetch=h.context.UrlFetchApp.fetch,api=h.context.PropertiesService.getScriptProperties(),set=api.setProperty;
+    if(kind==='batch')h.context.UrlFetchApp.fetch=(...args)=>{const response=fetch(...args);throw new Error('Response lost after commit');};
+    else api.setProperty=function(key,value){const result=set.call(this,key,value);if(key==='NODE_AUTH_ND-001')throw new Error('Ambiguous property write');return result;};
+    const first=accountCommand(f,'stop',{version,operationId:id});if(kind==='batch')assertFailure(first);else assertSuccess(first);
+    const auth=h.properties['NODE_AUTH_ND-001'];h.context.UrlFetchApp.fetch=fetch;api.setProperty=set;
+    const retry=assertSuccess(accountCommand(f,'stop',{version,operationId:id}));assert.equal(retry.replayed,true);assert.equal(retry.active,false);
+    assert.equal(h.properties['NODE_AUTH_ND-001'],auth);assert.equal(h.spreadsheet.getSheetById(8002).getLastRow(),2);
+  }
+});
+
+test('failed credential revocation prevents sheet activation and completed account actions recheck administrator', () => {
+  const f=signedInFixture(),h=f.harness,version=managedAccount(f).version,api=h.context.PropertiesService.getScriptProperties(),set=api.setProperty,original=h.properties['NODE_AUTH_ND-001'];
+  api.setProperty=function(key,value){return key==='NODE_AUTH_ND-001'?this:set.call(this,key,value);};
+  assert.equal(assertFailure(accountCommand(f,'stop',{version})).code,'INTERNAL');assert.equal(h.properties['NODE_AUTH_ND-001'],original);assert.equal(h.apiCalls.length,0);
+  api.setProperty=set;const fetch=h.context.UrlFetchApp.fetch;
+  h.context.UrlFetchApp.fetch=(...args)=>{const response=fetch(...args);delete h.properties[h.context.sessionKey_(f.admin.token)];return response;};
+  assert.equal(assertFailure(accountCommand(f,'stop',{version})).code,'UNAUTHENTICATED');assert.equal(h.spreadsheet.getSheetById(8001).values[2][8],false,'Committed actions stay committed despite a revoked response');
+});
+
+test('account actions stop before revocation if roster, administrator or auth changes during fresh validation', () => {
+  for(const kind of ['roster','admin','auth']){
+    const f=signedInFixture(),h=f.harness,version=managedAccount(f).version,original=h.properties['NODE_AUTH_ND-001'];let changed=false;
+    h.spreadsheet.readObserver=read=>{
+      if(changed||read.sheetId!==8001||read.method!=='getFormulas')return;changed=true;
+      if(kind==='roster')h.spreadsheet.getSheetById(8001).values[2][1]='別名に変更';
+      if(kind==='admin')h.spreadsheet.getSheetById(8001).values[1][7]='player';
+      if(kind==='auth')h.properties['NODE_AUTH_ND-001']=JSON.stringify({...JSON.parse(original),version:'new-external-version'});
+    };
+    const result=assertFailure(accountCommand(f,'stop',{version}));assert.ok(['CONFLICT','BUSY','FORBIDDEN'].includes(result.code),kind+result.code);
+    if(kind!=='auth')assert.equal(h.properties['NODE_AUTH_ND-001'],original);assert.equal(h.apiCalls.length,0);
+  }
+});
+
+test('operation history uses bounded metadata-only pages and fixed summaries without raw undo/body/hash content', () => {
+  const f=signedInFixture(),h=f.harness,sheet=h.spreadsheet.getSheetById(8002);
+  sheet.values.push(...Array.from({length:75},(_,i)=>['history-'+i,'ND-001',i===74?'constructor':'updateRecord','secret-hash','{"undo":"candidate-private-'+('x'.repeat(1000))+'"}','2026-10-07T06:00:00.000Z']));
+  h.spreadsheet.reads.length=0;const first=assertSuccess(request(h,'readOperationHistory',{limit:50},{token:f.admin.token}));
+  assert.equal(first.entries.length,50);assert.equal(first.nextCursor,26);assert.equal(first.entries[0].row,76);assert.equal(first.entries[0].action,'unknown');assert.equal(first.entries[0].summary,'業務データを更新');
+  assert.ok(!/secret-hash|candidate-private|constructor|undo/.test(JSON.stringify(first)));
+  assert.deepEqual(h.spreadsheet.reads.filter(r=>r.sheetId===8002).map(r=>[r.row,r.column,r.rows,r.columns]),[[1,1,1,6],[27,2,50,2],[27,6,50,1]]);
+  const second=assertSuccess(request(h,'readOperationHistory',{limit:50,cursor:first.nextCursor},{token:f.admin.token}));
+  assert.equal(second.entries.length,25);assert.equal(second.nextCursor,null);assert.equal(new Set([...first.entries,...second.entries].map(e=>e.row)).size,75);
+  assert.equal(h.apiCalls.length,0);
+});
+
+test('history validates pages and never echoes private manually entered action, actor or timestamp text', () => {
+  const f=signedInFixture(),h=f.harness;h.spreadsheet.getSheetById(8002).values.push(['id','候補者の私的な情報','raw private action','hash','private response','2026-10-07T06:00:00.000Z private']);
+  const row=assertSuccess(request(h,'readOperationHistory',{}, {token:f.admin.token})).entries[0];
+  assert.deepEqual(row,{row:2,committedAt:'',actorId:'unknown',action:'unknown',summary:'業務データを更新'});
+  for(const payload of [{limit:51},{limit:0},{limit:'10'},{cursor:1},{cursor:'2'}])assert.equal(assertFailure(request(h,'readOperationHistory',payload,{token:f.admin.token})).code,'VALIDATION');
+});
+
+test('application data export is read-only, keeps formula information as JSON and excludes authentication and operation bodies', () => {
+  const f=signedInFixture(),h=f.harness;h.properties.NODE_GEMINI_API_KEY='export-secret-key';h.properties.NODE_GEMINI_FREE_TIER_CONFIRMED='true';
+  h.spreadsheet.getSheetById(8002).values.push(['private-op','ADMIN','updateRecord','private-payload-hash','{"undo":"private-undo-content"}','2026-10-07T06:00:00.000Z']);
+  const table=h.spreadsheet.insertSheet('案件管理表');table.values=[['会社','集計'],['テスト会社',123]];table.formulas=[[],['','=SUM(1,2)']];
+  const before=clone(h.properties),business=clone(h.spreadsheet.getSheets().map(s=>[s.id,s.values,s.formulas]));
+  const result=assertSuccess(request(h,'readDataExport',{}, {token:f.admin.token}));
+  assert.equal(result.schemaVersion,1);assert.equal(result.scope,'application-data');assert.equal(result.snapshot.self.role,'admin');
+  assert.equal(result.snapshot.outboxKey,undefined);assert.equal(result.snapshot.destination,undefined);assert.equal(result.snapshot.operationsFeature,true);
+  assert.equal(result.snapshot.records.length,f.admin.snapshot.records.length);assert.ok(result.managementTables.every(t=>!t.title.startsWith('_NODE_')));
+  assert.equal(result.managementTables.find(t=>t.title==='案件管理表').rows[1].cells[1].formula,'=SUM(1,2)');
+  assert.deepEqual(result.limits,{maxCells:50000,maxCharacters:2000000});
+  for(const privateText of ['export-secret-key','private-payload-hash','private-undo-content','NODE_AUTH_','NODE_SESSION_','test-pepper'])assert.ok(!JSON.stringify(result).includes(privateText));
+  assert.deepEqual(h.properties,before);assert.deepEqual(h.spreadsheet.getSheets().map(s=>[s.id,s.values,s.formulas]),business);assert.equal(h.apiCalls.length,0);assert.equal(h.writes.length,0);
+});
+
+test('admin operational APIs refuse original and unregistered workbooks and exports remain read-only when writes are off', () => {
+  const originalId='1AnyvEoUtgUSTnuuJjIjA80XGHw_DaL9fSUoNCrYZ36s';
+  for(const kind of ['original','unregistered'])for(const action of ['readAccountManagement','readOperationHistory','readDataExport','manageAccount']){
+    const spreadsheetId=kind==='original'?originalId:'unregistered-workbook';
+    const f=signedInFixture({spreadsheetId,properties:configProperties({spreadsheetId})}),h=f.harness;
+    const error=assertFailure(request(h,action,{}, {token:f.admin.token,operationId:randomUUID()}));
+    assert.equal(error.code,kind==='original'?'PROTECTED_SOURCE':'UNAPPROVED_DESTINATION');assert.equal(h.apiCalls.length,0);
+  }
+  const f=signedInFixture(),h=f.harness;h.properties.NODE_CONFIG=JSON.stringify({...JSON.parse(h.properties.NODE_CONFIG),writesEnabled:false});
+  assert.equal(assertSuccess(request(h,'readAccountManagement',{}, {token:f.admin.token})).canManageAccounts,false);
+  assertSuccess(request(h,'readDataExport',{}, {token:f.admin.token}));assert.equal(h.apiCalls.length,0);
+});
+
+test('operational reads reauthorize after their last data read and never return data after revocation or destination switch', () => {
+  for(const action of ['readAccountManagement','readOperationHistory','readDataExport'])for(const kind of ['role','session','destination']){
+    const f=signedInFixture(),h=f.harness;const sheet=h.spreadsheet.getSheetById(8001);let rosterReads=0;
+    h.spreadsheet.readObserver=read=>{if(read.sheetId!==8001||read.method!=='getValues')return;if(++rosterReads!==2)return;
+      if(kind==='role')sheet.values[1][7]='player';
+      if(kind==='session')delete h.properties[h.context.sessionKey_(f.admin.token)];
+      if(kind==='destination')h.properties.NODE_CONFIG=JSON.stringify({...JSON.parse(h.properties.NODE_CONFIG),spreadsheetId:'changed-destination'});
+    };
+    assert.ok(['FORBIDDEN','BUSY','UNAUTHENTICATED'].includes(assertFailure(request(h,action,{}, {token:f.admin.token})).code),action+kind);
+    assert.equal(h.apiCalls.length,0);
+  }
+});
+
+test('application export enforces row, column, cell, character and per-account rate limits', () => {
+  for(const kind of ['rows','columns','cells','characters']){
+    const f=signedInFixture(),h=f.harness,table=h.spreadsheet.insertSheet('案件管理表');
+    if(kind==='rows')table.values[2000]=['too many rows'];
+    if(kind==='columns')table.values=[Array(101).fill('too many columns')];
+    if(kind==='cells')table.values=Array.from({length:1000},()=>Array(51).fill('x'));
+    if(kind==='characters')table.values=[['x'.repeat(2000000)]];
+    assert.equal(assertFailure(request(h,'readDataExport',{}, {token:f.admin.token})).code,'EXPORT_LIMIT',kind);assert.equal(h.apiCalls.length,0);
+  }
+  const f=signedInFixture(),h=f.harness;assertSuccess(request(h,'readDataExport',{}, {token:f.admin.token}));assertSuccess(request(h,'readDataExport',{}, {token:f.admin.token}));h.spreadsheet.reads.length=0;
+  assert.equal(assertFailure(request(h,'readDataExport',{}, {token:f.admin.token})).code,'RATE_LIMITED');assert.equal(h.spreadsheet.reads.length,0);
+  assertSuccess(request(h,'snapshot',{}, {token:f.admin.token}));
+});
+
+function monthlyCommand(fixture, {playerId='ND-001',month='2026-10',target=20,expectedVersion='',operationId=randomUUID(),token=fixture.player.token} = {}) {
+  return request(fixture.harness,'saveMonthlyTarget',{playerId,month,target,expectedVersion},{token,operationId});
+}
+
+test('monthly goals are optional read-only snapshot data until explicitly saved and distinguish zero from unset', () => {
+  const f=signedInFixture(),h=f.harness,business=clone(h.spreadsheet.getSheetById(MATCHING_SHEET_ID).values),kpi=clone(h.spreadsheet.getSheetById(KPI_SHEET_ID).values);
+  const initial=assertSuccess(request(h,'snapshot',{}, {token:f.player.token}));assert.equal(initial.monthlyGoalsFeature,true);assert.deepEqual(initial.monthlyGoals,[]);assert.equal(h.spreadsheet.getSheetByName('_NODE_monthly_targets'),null);
+  const operationId=randomUUID(),saved=assertSuccess(monthlyCommand(f,{target:0,operationId}));
+  assert.equal(saved.saved,true);assert.equal(saved.replayed,false);assert.equal(saved.operationId,operationId);assert.equal(saved.goal.target,0);assert.match(saved.goal.version,/^[A-Za-z0-9_-]{43}$/);
+  const own=assertSuccess(request(h,'snapshot',{}, {token:f.player.token}));assert.deepEqual(own.monthlyGoals,[saved.goal]);assert.equal(own.players.find(p=>p.id==='ND-001').target,20,'The default profile target is not rewritten');
+  assert.equal(h.apiCalls.length,1);assert.ok(h.apiCalls[0].body.requests.some(r=>r.addSheet));assert.equal(h.spreadsheet.getSheetById(8002).values.at(-1)[2],'saveMonthlyTarget');
+  assert.deepEqual(h.spreadsheet.getSheetById(MATCHING_SHEET_ID).values,business);assert.deepEqual(h.spreadsheet.getSheetById(KPI_SHEET_ID).values,kpi);
+});
+
+test('monthly targets retain separate past months and do not inherit later default-profile changes', () => {
+  const f=signedInFixture(),h=f.harness;
+  const previous=assertSuccess(monthlyCommand(f,{month:'2026-09',target:15})).goal;
+  const current=assertSuccess(monthlyCommand(f,{month:'2026-10',target:40})).goal;
+  const profile=f.player.snapshot.players.find(p=>p.id==='ND-001');assertSuccess(mutate(h,f.player.token,'updateProfile',{player:{...profile,target:99}}));
+  const own=assertSuccess(request(h,'snapshot',{}, {token:f.player.token}));assert.deepEqual(own.monthlyGoals,[previous,current]);assert.equal(own.players.find(p=>p.id==='ND-001').target,99);
+  assert.ok(!own.monthlyGoals.some(goal=>goal.month==='2026-08'),'Missing months stay unset');
+});
+
+test('monthly target updates use expected versions and exactly-once operation IDs without reverting later edits on replay', () => {
+  const f=signedInFixture(),h=f.harness,id=randomUUID(),initial=assertSuccess(monthlyCommand(f,{target:10,operationId:id})),writes=h.apiCalls.length;
+  assert.equal(assertSuccess(monthlyCommand(f,{target:10,operationId:id})).replayed,true);assert.equal(h.apiCalls.length,writes);
+  assert.equal(assertFailure(monthlyCommand(f,{target:11,operationId:id})).code,'OPERATION_CONFLICT');
+  assert.equal(assertFailure(monthlyCommand(f,{target:11})).code,'CONFLICT');
+  const updated=assertSuccess(monthlyCommand(f,{target:25,expectedVersion:initial.goal.version}));assert.notEqual(updated.goal.version,initial.goal.version);
+  assert.equal(assertFailure(monthlyCommand(f,{target:30,expectedVersion:initial.goal.version})).code,'CONFLICT');
+  const replay=assertSuccess(monthlyCommand(f,{target:10,operationId:id}));assert.equal(replay.replayed,true);assert.deepEqual(replay.goal,initial.goal);
+  assert.deepEqual(assertSuccess(request(h,'snapshot',{}, {token:f.player.token})).monthlyGoals,[updated.goal],'Reading the old acknowledgement never writes over the latest month');
+  assert.equal(h.spreadsheet.getSheetByName('_NODE_monthly_targets').getLastRow(),2);
+});
+
+test('monthly goals enforce owner authorization and return only own goals to players', () => {
+  const f=signedInFixture(),h=f.harness,other=authenticate(h,'ND-002');
+  assertSuccess(monthlyCommand(f,{target:12}));assertSuccess(monthlyCommand(f,{playerId:'ND-002',target:34,token:f.admin.token}));
+  const own=assertSuccess(request(h,'snapshot',{}, {token:f.player.token})),foreign=assertSuccess(request(h,'snapshot',{}, {token:other.token})),all=assertSuccess(request(h,'snapshot',{}, {token:f.admin.token}));
+  assert.deepEqual(own.monthlyGoals.map(goal=>goal.playerId),['ND-001']);assert.deepEqual(foreign.monthlyGoals.map(goal=>goal.playerId),['ND-002']);assert.equal(all.monthlyGoals.length,2);
+  assert.equal(assertFailure(monthlyCommand(f,{playerId:'ND-002'})).code,'FORBIDDEN');assert.equal(assertFailure(monthlyCommand(f,{playerId:'ADMIN',token:f.admin.token})).code,'FORBIDDEN');
+  assertSuccess(accountCommand(f,'stop',{id:'ND-002'}));const previous=all.monthlyGoals.find(goal=>goal.playerId==='ND-002');
+  assertSuccess(monthlyCommand(f,{playerId:'ND-002',target:35,expectedVersion:previous.version,token:f.admin.token}));
+  assert.equal(assertSuccess(request(h,'snapshot',{}, {token:f.admin.token})).monthlyGoals.find(goal=>goal.playerId==='ND-002').target,35,'Administrators may correct stopped members’ historical goals');
+});
+
+test('monthly saves validate values and require a genuine authenticated session, operation ID and approved writable destination', () => {
+  for(const payload of [{month:'2026-13'},{month:'2026-1'},{target:-1},{target:10000},{target:1.2},{target:'20'},{expectedVersion:'stale'},{operationId:'short'}]){
+    const f=signedInFixture();assert.equal(assertFailure(monthlyCommand(f,payload)).code,'VALIDATION');assert.equal(f.harness.apiCalls.length,0);
+  }
+  for(const kind of ['forged','issued','readonly','original','unregistered']){
+    const spreadsheetId=kind==='original'?'1AnyvEoUtgUSTnuuJjIjA80XGHw_DaL9fSUoNCrYZ36s':kind==='unregistered'?'unregistered-monthly':SPREADSHEET_ID;
+    const f=signedInFixture({spreadsheetId,properties:configProperties({spreadsheetId})}),h=f.harness;
+    if(kind==='issued')h.properties['NODE_AUTH_ND-001']=JSON.stringify({...JSON.parse(h.properties['NODE_AUTH_ND-001']),mustChange:true});
+    if(kind==='readonly')h.properties.NODE_CONFIG=JSON.stringify({...JSON.parse(h.properties.NODE_CONFIG),writesEnabled:false});
+    assertFailure(monthlyCommand(f,{token:kind==='forged'?'forged-token':f.player.token}));assert.equal(h.apiCalls.length,0);assert.equal(h.spreadsheet.getSheetByName('_NODE_monthly_targets'),null);
+  }
+});
+
+test('monthly goal creation and audit entry are atomic on Sheets failure and retry the same operation exactly once', () => {
+  const f=signedInFixture(),h=f.harness,id=randomUUID();h.spreadsheet.failure=operation=>operation.sheet.name==='_NODE_operations';
+  assert.equal(assertFailure(monthlyCommand(f,{target:70,operationId:id})).code,'SHEET_WRITE_FAILED');assert.equal(h.spreadsheet.getSheetByName('_NODE_monthly_targets'),null);assert.equal(h.spreadsheet.getSheetById(8002).getLastRow(),1);
+  h.spreadsheet.failure=null;const saved=assertSuccess(monthlyCommand(f,{target:70,operationId:id}));assert.equal(saved.goal.target,70);assert.equal(h.spreadsheet.getSheetById(8002).getLastRow(),2);
+  assert.equal(assertSuccess(monthlyCommand(f,{target:70,operationId:id})).replayed,true);
+});
+
+test('monthly save cannot overwrite a sheet edit, accept formulas/duplicates, or survive role changes before commit', () => {
+  for(const kind of ['edit','formula','duplicate','role']){
+    const f=signedInFixture(),h=f.harness,old=assertSuccess(monthlyCommand(f,{})).goal,sheet=h.spreadsheet.getSheetByName('_NODE_monthly_targets');h.apiCalls.length=0;
+    if(kind==='formula')sheet.formulas[1]=['','=PRIVATE()'];
+    if(kind==='duplicate')sheet.values.push([...sheet.values[1]]);
+    if(kind==='edit'||kind==='role'){
+      let reads=0;h.spreadsheet.readObserver=read=>{if(read.sheetId!==sheet.id||read.method!=='getFormulas'||++reads!==1)return;if(kind==='edit')sheet.values[1][2]=55;else h.spreadsheet.getSheetById(8001).values[2][8]=false;};
+    }
+    const error=assertFailure(monthlyCommand(f,{target:99,expectedVersion:old.version}));assert.ok(['CONFLICT','FORMULA_PROTECTED','SCHEMA_MISMATCH','UNAUTHENTICATED','BUSY'].includes(error.code),kind+error.code);assert.equal(h.apiCalls.length,0);
+    assert.notEqual(sheet.values[1][2],99);
+  }
+});
+
+test('monthly goal response reauthorizes after an ambiguous commit and retry returns the committed goal', () => {
+  const f=signedInFixture(),h=f.harness,id=randomUUID(),fetch=h.context.UrlFetchApp.fetch;
+  h.context.UrlFetchApp.fetch=(...args)=>{const response=fetch(...args);delete h.properties[h.context.sessionKey_(f.player.token)];return response;};
+  assert.equal(assertFailure(monthlyCommand(f,{operationId:id})).code,'UNAUTHENTICATED');assert.equal(h.spreadsheet.getSheetByName('_NODE_monthly_targets').getLastRow(),2);
+  h.context.UrlFetchApp.fetch=fetch;const next=assertSuccess(request(h,'login',{id:'ND-001',password:'correct-test-password',sessionOnly:true}));
+  assert.equal(assertSuccess(monthlyCommand(f,{operationId:id,token:next.token})).replayed,true);assert.equal(h.spreadsheet.getSheetById(8002).getLastRow(),2);
+});
+
+
+test('administrator may complete historical goals for stopped players without resuming login or changing credentials',()=>{
+ const f=signedInFixture(),h=f.harness;assertSuccess(accountCommand(f,'stop'));
+ const auth=h.properties['NODE_AUTH_ND-001'],business=clone(h.spreadsheet.getSheetById(MATCHING_SHEET_ID).values);
+ const goal=assertSuccess(monthlyCommand(f,{month:'2026-09',target:12,token:f.admin.token})).goal;
+ assert.equal(goal.playerId,'ND-001');assert.equal(goal.month,'2026-09');assert.equal(goal.target,12);
+ assert.equal(h.spreadsheet.getSheetById(8001).values[2][8],false);assert.equal(h.properties['NODE_AUTH_ND-001'],auth);
+ assert.equal(assertFailure(request(h,'snapshot',{}, {token:f.player.token})).code,'UNAUTHENTICATED');
+ assert.equal(assertFailure(mutate(h,f.admin.token,'saveActivity',{activity:newCandidate()})).code,'VALIDATION');
+ assert.deepEqual(h.spreadsheet.getSheetById(MATCHING_SHEET_ID).values,business);
+ const admin=assertSuccess(request(h,'snapshot',{}, {token:f.admin.token}));assert.deepEqual(admin.monthlyGoals,[goal]);assert.equal(admin.players.find(p=>p.id==='ND-001').active,false);
 });

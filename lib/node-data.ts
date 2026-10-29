@@ -1,7 +1,7 @@
 export const stages = ["候補者面談", "提案", "C面談予約", "クライアント面談", "内定", "内定承諾", "稼働開始予定", "稼働開始"] as const;
 export type Stage = typeof stages[number];
 export type Metric = Stage | "紹介人数";
-export type Player = { id: string; name: string; team: string; color: string; target: number; bio: string };
+export type Player = { id: string; name: string; team: string; color: string; target: number; bio: string; active?: boolean };
 export type Activity = { id: string; recordId?: string; rowVersion?: string; playerId: string; candidateId: string; candidateName: string; source: string; company: string; position: string; stage: Stage; date: string; status?: string; probability?: string; interviewScheduledDate?: string; clientInterviewScheduledTime?: string; offerScheduledDate?: string; memo?: string; interviewProfile?: {fields:import('./candidate-intake').InterviewFields;introduction:string;profileVersion?:string};profileSourceRecordId?:string };
 export const positions = ["アポインター", "FS", "ディレクション", "コールシステム", "コンサル", "その他"];
 export const statuses = ["提案候補", "提案なし", "提案完了（面談日確定待ち）", "面談確定(面談実施待ち）", "面談実施（合否待ち）", "合格（シフト入力待ち）", "稼働予定日確定（稼働開始待ち）", "稼働開始", "落選（面談後）", "落選（面談前）", "辞退（音信不通）", "辞退（他決）", "辞退（本人希望）", "案件枠埋まり", "合格後離脱", "稼働後離脱", "C面談リスケ", "C面談ブッチ"];
