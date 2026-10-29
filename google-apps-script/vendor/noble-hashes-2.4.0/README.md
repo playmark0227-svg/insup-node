@@ -55,3 +55,10 @@ Script performance. Do not lower the iteration count as a performance shortcut.
 Upstream independent auditing covered version 1.0.0 in 2022. It does not certify
 the entire 2.4.0 release or these deployment adapters. Preserve the pinned source
 and review future upstream security updates explicitly.
+
+For repeated, branch-specific compute checks, the owner may run
+`benchmarkNodeAuthentication`. It uses in-memory synthetic fixtures and measures
+six fixed cases five times each, logging only case names and numeric samples,
+minimum, median, nearest-rank p95, and maximum. With five samples, p95 equals
+the maximum; it is not a production latency distribution. It reads no account
+record, issues no session, and does not alter the work factor.
