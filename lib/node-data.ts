@@ -7,13 +7,13 @@ export const positions = ["アポインター", "FS", "ディレクション", "
 export const statuses = ["提案候補", "提案なし", "提案完了（面談日確定待ち）", "面談確定(面談実施待ち）", "面談実施（合否待ち）", "合格（シフト入力待ち）", "稼働予定日確定（稼働開始待ち）", "稼働開始", "落選（面談後）", "落選（面談前）", "辞退（音信不通）", "辞退（他決）", "辞退（本人希望）", "案件枠埋まり", "合格後離脱", "稼働後離脱", "C面談リスケ", "C面談ブッチ"];
 export const statusForStage: Record<Stage,string> = {"候補者面談":"提案候補","提案":"提案完了（面談日確定待ち）","C面談予約":"面談確定(面談実施待ち）","クライアント面談":"面談実施（合否待ち）","内定":"合格（シフト入力待ち）","内定承諾":"合格（シフト入力待ち）","稼働開始予定":"稼働予定日確定（稼働開始待ち）","稼働開始":"稼働開始"};
 export const initialPlayers: Player[] = [
- { id:"ND-001", name:"越前祐美", team:"NODE", color:"mint", target:20, bio:"" },
- { id:"ND-002", name:"鈴木楓", team:"NODE", color:"blue", target:20, bio:"" },
- { id:"ND-003", name:"櫻庭奈々", team:"NODE", color:"amber", target:20, bio:"" },
- { id:"ND-004", name:"髙田侑弥", team:"NODE", color:"violet", target:20, bio:"" },
- { id:"ND-005", name:"佐藤光", team:"NODE", color:"rose", target:20, bio:"" },
- { id:"ND-006", name:"倉島颯汰", team:"NODE", color:"cyan", target:20, bio:"" },
- { id:"ND-007", name:"佐々木駿", team:"NODE", color:"blue", target:20, bio:"" },
+ { id:"ND-001", name:"デモ 一郎", team:"NODE", color:"mint", target:20, bio:"" },
+ { id:"ND-002", name:"デモ 二郎", team:"NODE", color:"blue", target:20, bio:"" },
+ { id:"ND-003", name:"デモ 三郎", team:"NODE", color:"amber", target:20, bio:"" },
+ { id:"ND-004", name:"デモ 四郎", team:"NODE", color:"violet", target:20, bio:"" },
+ { id:"ND-005", name:"デモ 五郎", team:"NODE", color:"rose", target:20, bio:"" },
+ { id:"ND-006", name:"デモ 六郎", team:"NODE", color:"cyan", target:20, bio:"" },
+ { id:"ND-007", name:"デモ 七郎", team:"NODE", color:"blue", target:20, bio:"" },
 ];
 export function makeDemoActivities(): Activity[] {
  const all:Activity[]=[]; const quantities=[24,21,17,16,13,11,9];

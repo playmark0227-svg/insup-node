@@ -17,8 +17,25 @@ var NODE = Object.freeze({
   candidateProfileKey: 'NODE_CANDIDATE_PROFILE_ID',
   configKey: 'NODE_CONFIG',
   pepperKey: 'NODE_PEPPER',
+  // Owner switch, set to 'true' only after the frontend with the forced change screen is published.
+  forceChangeKey: 'NODE_FORCE_PASSWORD_CHANGE',
   sessionHours: 6,
+  // Idle sessions end server-side. lastSeenAt is rewritten at most once per sessionTouchMinutes,
+  // so the effective idle window is 55-60 minutes. The 6-hour expiresAt is never extended.
+  sessionIdleMinutes: 60,
+  sessionTouchMinutes: 5,
   sessionsPerAccount: 8,
+  deviceDays: 90,
+  loginFailures: 5,
+  loginAttemptsPerMinute: 60,
+  // Login takes the write lock only for short counter and session sections, and gives up sooner than business writes.
+  loginLockMs: 5000,
+  // Stretched password hash rounds (PBKDF2-HMAC-SHA256, one Utilities HMAC call per round).
+  // 2000 is deliberately conservative because the per-call HMAC cost on Apps Script has not
+  // been measured. The owner should time benchmarkNodePasswordHash in the editor and may raise
+  // it: every record stores its own round count, so raising this is safe and older records
+  // upgrade on their next login. Keep this exact line form; the tests override the number.
+  kdfIterations: 2000,
   stages: ['候補者面談','提案','C面談予約','クライアント面談','内定','内定承諾','稼働開始予定','稼働開始'],
   stageColumns: [1,8,9,17,21,22,23,24],
   positions: ['アポインター','FS','ディレクション','コールシステム','コンサル','その他'],
@@ -32,9 +49,8 @@ var NODE = Object.freeze({
   },
   playerHeaders: ['id','name','team','color','target','bio','sheetNames','role','active'],
   operationHeaders: ['operationId','actorId','action','payloadHash','result','committedAt'],
-  seedNames: ['越前祐美','鈴木楓','櫻庭奈々','髙田侑弥','佐藤光','倉島颯汰','佐々木駿'],
-  seedSheetNames: [['越前','越前祐美'],['鈴木','鈴木楓'],['櫻庭','櫻庭奈々'],['高田','髙田侑弥'],['佐藤','佐藤光'],['倉島','倉島颯汰'],['佐々木駿']],
-  seedColors: ['mint','blue','amber','violet','rose','cyan','blue']
+  // Initial player names come from the owner-only NODE_SEED_PLAYERS property, never public source.
+  seedPlayersKey: 'NODE_SEED_PLAYERS'
 });
 
 function doGet() { return output_({ ok: true, data: health_() }); }
@@ -112,19 +128,58 @@ function health_() {
   try { config = config_(); } catch (_) { return { configured: false, writesEnabled: false, protocol: NODE.protocol }; }
   return { configured: true, writesEnabled: writesEnabled_(config), protocol: NODE.protocol };
 }
-function withLock_(fn) {
+/* touchSession_ reuses a held lock instead of taking it again: re-entrancy is undocumented, and
+ * releasing an inner lock could release the mutation's own lock mid-write. */
+var nodeLockDepth_ = 0;
+function withLock_(fn, waitMs) {
   var lock = LockService.getScriptLock();
-  if (!lock.tryLock(20000)) fail_('BUSY', '別の処理が実行中です。少し待って再試行してください。');
-  try { return fn(); } finally { lock.releaseLock(); }
+  if (!lock.tryLock(waitMs || 20000)) fail_('BUSY', '別の処理が実行中です。少し待って再試行してください。');
+  nodeLockDepth_++;
+  try { return fn(); } finally { nodeLockDepth_--; lock.releaseLock(); }
+}
+/* Per-account read budgets: [per minute, per hour]. CacheService only, so there is
+ * no lock and no property write. get/put is not atomic: parallel requests can lose
+ * increments, so counts are approximate. A cache outage or eviction never blocks a
+ * read, and rejected requests do not count. NODE_AI_QUOTA still governs Gemini.
+ * Writes are not budgeted here; their reads are serialized by the script lock. A replayed operation
+ * that answers with a snapshot writes nothing, so it is charged to the snapshot budget. */
+var NODE_READ_BUCKETS = Object.freeze({ snapshot: 'snapshot', readInterviewAdvice: 'report', readWorkspaceInsights: 'report', analyzeInterviewReviews: 'report', analyzeWorkspaceInsights: 'report', auditSecurity: 'report', managementTables: 'table', managementTable: 'table', readWritingKit: 'kit', readWritingPreferences: 'kit', generateWritingKit: 'kit' });
+var NODE_READ_LIMITS = Object.freeze({ snapshot: [40, 900], report: [20, 300], table: [40, 600], kit: [60, 1200] });
+function readBudget_(id, action) {
+  // id is always an ID the server already normalized (a session record or issueSession_), never request input.
+  var bucket = NODE_READ_BUCKETS[action], limits = NODE_READ_LIMITS[bucket], now = Date.now(), minute = Math.floor(now / 60000), hour = Math.floor(now / 3600000), key = 'NODE_READ_' + bucket + '_' + id, cache, raw, state;
+  try { cache = CacheService.getScriptCache(); raw = cache.get(key); } catch (_) { return; }
+  try { state = JSON.parse(raw || 'null'); } catch (_) { state = null; }
+  if (!Array.isArray(state) || state.length !== 4 || state.some(function (n) { return typeof n !== 'number' || !isFinite(n) || n < 0; })) state = [minute, 0, hour, 0];
+  if (state[0] !== minute) { state[0] = minute; state[1] = 0; }
+  if (state[2] !== hour) { state[2] = hour; state[3] = 0; }
+  var kept = '表示中のデータと未同期の入力はそのまま残ります。';
+  // When both windows are spent the hourly wait is the longer one, so report it first.
+  if (state[3] >= limits[1]) fail_('RATE_LIMITED', '1時間あたりの読み込み上限に達しました。約' + Math.ceil((3600000 - now % 3600000) / 60000) + '分後に再試行してください。' + kept);
+  if (state[1] >= limits[0]) fail_('RATE_LIMITED', '短時間の読み込みが多すぎます。約' + Math.ceil((60000 - now % 60000) / 1000) + '秒後に再試行してください。' + kept);
+  state[1]++; state[3]++;
+  try { cache.put(key, JSON.stringify(state), 3600); } catch (_) { /* Approximate budgets never block a read. */ }
 }
 function nodeHandle_(request) {
   if (!request || typeof request !== 'object' || Array.isArray(request) || request.version !== 1 || typeof request.action !== 'string') fail_('BAD_REQUEST', 'APIバージョンと操作を確認してください。');
   if (request.responseMode !== undefined && request.responseMode !== 'receipt') fail_('BAD_REQUEST', '応答形式を確認してください。');
+  if (request.background !== undefined && typeof request.background !== 'boolean') fail_('BAD_REQUEST', '同期の種別を確認してください。');
   var action = request.action;
+  // Only an automatic snapshot poll or session check that says so is passive. Sessions from frontends built
+  // before the idle timeout are never idle-checked (see sessionIdle_), so they keep today's 6-hour behavior.
+  var passive = (action === 'snapshot' || action === 'touch') && request.background === true;
   if (action === 'health') return health_();
   if (action === 'login') return login_(request.payload || {});
   if (action === 'changePassword') return changePassword_(request);
+  // Budget expensive reads per account after authentication and before any sheet, AI or audit read.
+  // hasOwnProperty keeps inherited names such as 'constructor' answering BAD_REQUEST below.
+  var budgeted = null;
+  if (Object.prototype.hasOwnProperty.call(NODE_READ_BUCKETS, action)) { budgeted = authenticate_(request.token, false, passive); readBudget_(budgeted.id, action); }
   if (action === 'auditSecurity') return auditSecurity_(request);
+  // Real input while an editor is open: records activity without reading the business table. A background
+  // touch only checks the session (idle and absolute limits) while a pending save pauses the polls.
+  // deferred: the due refresh was not written (busy lock), so the client keeps the input to report again.
+  if (action === 'touch') { var touched = authenticate_(request.token, false, passive); return passive ? { touched: false } : touched.touchDeferred ? { touched: false, deferred: true } : { touched: true }; }
   if (['snapshot','logout','saveActivity','updateStatus','updateProfile','createPlayer','updateRecord','deleteCandidate','cancelAchievement','restoreChange','managementTables','managementTable','saveManagementRow','createCandidate','saveInterviewReview','saveCandidateProfile','saveClient','analyzeInterviewReviews','readInterviewAdvice','readWorkspaceInsights','analyzeWorkspaceInsights','readWritingKit','generateWritingKit','readWritingPreferences','saveWritingPreferences'].indexOf(action) < 0) fail_('BAD_REQUEST', '対応していない操作です。');
   if (action === 'readWritingKit') return readWritingKit_(request);
   if (action === 'generateWritingKit') return generateWritingKit_(request);
@@ -141,12 +196,15 @@ function nodeHandle_(request) {
     requireAdmin_(snapshotActor_(accounts,request.token)); return data;
   }
   if (action === 'snapshot') {
-    authenticate_(request.token);
-    var snapshotStore = readStore_({ readOnly: true });
-    return authenticatedSnapshot_(snapshotStore, request.token);
+    // The read budget above has already authenticated this token before any sheet read.
+    var snapshotStore = readStore_({ readOnly: true }), snapshot = authenticatedSnapshot_(snapshotStore, request.token);
+    // Older frontends ignore this field; the current one reports the input again on the next poll.
+    if (budgeted && budgeted.touchDeferred) snapshot.activityDeferred = true;
+    return snapshot;
   }
   var committed = withLock_(function () {
-    var user = authenticate_(request.token);
+    // A session that still holds an issued password may only log out here (see authenticate_).
+    var user = authenticate_(request.token, action === 'logout', action === 'logout');
     if (action === 'logout') { props_().deleteProperty(sessionKey_(request.token)); return { loggedOut: true }; }
     var activity = request.payload && request.payload.activity;
     var existingRow = ['saveInterviewReview','saveCandidateProfile','saveClient','updateStatus','updateRecord','deleteCandidate','cancelAchievement'].indexOf(action) >= 0 || action === 'saveActivity' && activity && activity.recordId;
@@ -164,6 +222,9 @@ function nodeHandle_(request) {
     var previous = operation_(store, operationId);
     if (previous) {
       if (previous.actorId !== user.id || previous.action !== action || previous.payloadHash !== payloadHash) fail_('OPERATION_CONFLICT', '同じ保存IDを別の内容に使うことはできません。');
+      // A replay writes nothing, so a replay answered with a full snapshot is a read and spends the
+      // snapshot budget. A receipt replay (the outbox retry) stays free, as genuine writes do.
+      if (request.responseMode !== 'receipt' || action === 'createPlayer') readBudget_(user.id, 'snapshot');
       return { user:user, result:previous.result, operationId:operationId, config:store.config };
     }
     var plan;
@@ -181,7 +242,7 @@ function nodeHandle_(request) {
     if (action === 'restoreChange') plan = planRestoreChange_(store,user,payload);
     if (action === 'saveManagementRow') plan = planManagementRow_(store,user,payload);
     commit_(store, user, action, operationId, payloadHash, plan, request.token);
-    return { user:user, result:plan.result || {}, operationId:operationId, config:store.config };
+    return { user:user, result:plan.result || {}, operationId:operationId, config:store.config, secret:plan.secret };
   });
   if (action === 'logout') return committed;
   if (request.responseMode === 'receipt' && action !== 'createPlayer') {
@@ -196,15 +257,63 @@ function nodeHandle_(request) {
   // The atomic write is complete. Do not make other writers wait for a fresh
   // dashboard read, and do not fetch thousands of formula-only template rows.
   var freshStore = readStore_({ readOnly:true });
-  return mutationResponse_(freshStore, committed.user, action, committed.result, committed.operationId, request.token);
+  return mutationResponse_(freshStore, committed.user, action, committed.result, committed.operationId, request.token, committed.secret);
 }
 
 /* Authentication is entirely server-side. Tokens and passwords are never stored in sheet cells. */
 function hash_(text) { return Utilities.base64EncodeWebSafe(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, String(text), Utilities.Charset.UTF_8)).replace(/=+$/, ''); }
 function hmac_(text, key) { return Utilities.base64EncodeWebSafe(Utilities.computeHmacSha256Signature(String(text), String(key), Utilities.Charset.UTF_8)).replace(/=+$/, ''); }
 function random256_() { return hash_(Utilities.getUuid() + '|' + Utilities.getUuid() + '|' + Utilities.getUuid() + '|' + Date.now()); }
-function passwordHash_(password, salt) { return hmac_(String(password) + '|' + salt, props_().getProperty(NODE.pepperKey) || fail_('NOT_CONFIGURED', '認証設定が必要です。')); }
-function makeAuth_(password) { var salt = random256_(); return { salt: salt, hash: passwordHash_(password, salt) }; }
+function pepper_() { return props_().getProperty(NODE.pepperKey) || fail_('NOT_CONFIGURED', '認証設定が必要です。'); }
+/* Legacy record hash (no kdf field). Kept byte-for-byte so existing records still verify. */
+function passwordHash_(password, salt) { return hmac_(String(password) + '|' + salt, pepper_()); }
+/* pbkdf2p1: PBKDF2-HMAC-SHA256, one 32-byte block, keyed by HMAC(pepper, password), so a copy of
+ * the records alone cannot be attacked without the pepper. Salts written here are ASCII. */
+function stretchedHash_(password, salt, iterations) {
+  var key=Utilities.computeHmacSha256Signature('kdf-v2|'+String(password),pepper_(),Utilities.Charset.UTF_8),block=[];
+  for(var i=0;i<salt.length;i++)block.push(salt.charCodeAt(i));
+  var u=Utilities.computeHmacSha256Signature(block.concat([0,0,0,1]),key),t=[];
+  for(var k=0;k<32;k++)t.push(u[k]);
+  for(var n=1;n<iterations;n++){u=Utilities.computeHmacSha256Signature(u,key);for(var j=0;j<32;j++)t[j]^=u[j];}
+  return Utilities.base64EncodeWebSafe(t).replace(/=+$/,'');
+}
+/* Records keep their own round count, so a corrupted value is bounded, yet a later lower constant never rejects a stronger record. */
+function kdfMaxIterations_() { return Math.max(100000, NODE.kdfIterations * 10); }
+function makeAuth_(password) { var salt = random256_(); return { salt: salt, hash: stretchedHash_(password, salt, NODE.kdfIterations), kdf: 'pbkdf2p1', iter: NODE.kdfIterations }; }
+/* Server-generated random256_ secrets carry 256 bits, so stretching adds nothing and would hold
+ * the script lock for every member during bulk issuance. They upgrade on first login.
+ * An issued secret has been seen by the owner or an admin, so issuers mark it mustChange: it opens
+ * only password change and logout until its holder replaces it. The fresh version makes every
+ * session and device token from before the issue unable to match it, even one a scan missed.
+ * Apps Script deploys before the frontend, and a frontend built before the forced change has no way
+ * to reach its change screen, so the mark is written only once the owner sets the forceChangeKey
+ * property after publishing the frontend. Until then an issued password works as it did before.
+ * A record that already carries the mark stays enforced whatever the switch says. */
+function forcedPasswordChange_() { return props_().getProperty(NODE.forceChangeKey) === 'true'; }
+function makeGeneratedAuth_(secret, issued) { var salt = random256_(), auth = { salt: salt, hash: passwordHash_(secret, salt) }; if (issued === true) { auth.version = random256_(); if (forcedPasswordChange_()) auth.mustChange = true; } return auth; }
+function passwordMatches_(password, auth) { return constantEqual_(auth.kdf === undefined ? passwordHash_(password, auth.salt) : stretchedHash_(password, auth.salt, auth.iter), auth.hash); }
+/* Login verify. Unknown IDs, legacy records and current stretched records all cost one legacy HMAC
+ * plus one stretch at NODE.kdfIterations, so response time does not tell them apart. The legacy
+ * branch's stretch (fresh salt) is the record that replaces it after a successful login.
+ * A stretched record below the constant pays its upgrade stretch whether or not the password is
+ * right: it runs before the locked limits, so a correct guess that is then RATE_LIMITED must not
+ * take longer than a wrong one. */
+function verifyPassword_(password, auth) {
+  var legacy = passwordHash_(password, auth ? auth.salt : 'unavailable');
+  if (auth && auth.kdf !== undefined) { var valid = constantEqual_(stretchedHash_(password, auth.salt, auth.iter), auth.hash), upgrade = auth.iter < NODE.kdfIterations ? makeAuth_(password) : null; return { valid: valid, upgrade: valid ? upgrade : null }; }
+  var upgrade = makeAuth_(password);
+  return auth && constantEqual_(legacy, auth.hash) ? { valid: true, upgrade: upgrade } : { valid: false, upgrade: null };
+}
+/** Owner-only, editor-run before changing kdfIterations. Logs only timings; no secret leaves the function.
+ * suggested never goes below the 2000-round floor, so the measured fit and the current constant's cost are
+ * reported as well, with a warning when the constant is already over the target. */
+function benchmarkNodePasswordHash() {
+  requireOwner_(); var sample=500,target=500,started=Date.now();stretchedHash_(random256_(),random256_(),sample);
+  var ms=Math.max(1,Date.now()-started),fit=Math.floor(target*sample/ms/500)*500,suggested=Math.max(2000,Math.min(20000,fit)),currentMs=Math.round(ms*NODE.kdfIterations/sample),over=currentMs>target;
+  Logger.log('kdf '+sample+' rounds: '+ms+' ms; current kdfIterations '+NODE.kdfIterations+' costs about '+currentMs+' ms per login check; suggested kdfIterations for about '+target+' ms: '+suggested+' (rounds that fit the target: '+fit+')');
+  if(over)Logger.log('warning: the current kdfIterations is over the '+target+' ms target (about '+currentMs+' ms, and a password change runs two checks). The suggestion is held at the 2000-round floor; lowering the constant is safe for existing records, which keep their own round count.');
+  return {sampleRounds:sample,ms:ms,suggested:suggested,current:NODE.kdfIterations,roundsForTarget:fit,currentMs:currentMs,overTarget:over};
+}
 function constantEqual_(a, b) {
   a = String(a || ''); b = String(b || ''); var diff = a.length ^ b.length;
   for (var i = 0; i < Math.max(a.length, b.length); i++) diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
@@ -214,17 +323,51 @@ function sessionKey_(token) { return 'NODE_SESSION_' + hash_(token); }
 function authRecord_(id) {
   var raw=props_().getProperty('NODE_AUTH_'+id),auth;
   try{auth=raw?JSON.parse(raw):null;}catch(_){return null;}
-  if(!auth||typeof auth.salt!=='string'||typeof auth.hash!=='string'||auth.salt.length>200||auth.hash.length!==43||(auth.version!==undefined&&typeof auth.version!=='string'))return null;
+  if(!auth||typeof auth.salt!=='string'||typeof auth.hash!=='string'||auth.salt.length>200||auth.hash.length!==43||(auth.version!==undefined&&typeof auth.version!=='string')||(auth.mustChange!==undefined&&typeof auth.mustChange!=='boolean'))return null;
+  // Stretched records: known scheme, ASCII salt and a bounded round count (a corrupted value cannot stall a login).
+  if(auth.kdf!==undefined&&(auth.kdf!=='pbkdf2p1'||!/^[A-Za-z0-9_-]{43}$/.test(auth.salt)||typeof auth.iter!=='number'||auth.iter%1!==0||auth.iter<1||auth.iter>kdfMaxIterations_()))return null;
+  if(auth.kdf===undefined&&auth.iter!==undefined)return null;
   return auth;
 }
-function authenticate_(token) {
+/* Only sessions opened by a frontend that reports activity (login with idleAware:true) are idle-checked.
+ * Older bundles send nothing while a dialog is open or an input has focus, so idle-checking their
+ * sessions would log out someone who is typing. Those sessions, and sessions issued before this
+ * change, keep the 6-hour expiresAt only. */
+function sessionLastSeen_(session) { return typeof session.lastSeenAt === 'number' && isFinite(session.lastSeenAt) ? session.lastSeenAt : null; }
+function sessionIdle_(session, now) { var seen = sessionLastSeen_(session); return session.idleAware === true && seen !== null && now - seen >= NODE.sessionIdleMinutes * 60000; }
+/* passive === true checks every limit but records no activity (background polls, re-checks, logout). */
+function authenticate_(token, allowPasswordChange, passive) {
   if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(token)) fail_('UNAUTHENTICATED', 'ログインしてください。');
-  var key=sessionKey_(token),raw=props_().getProperty(key),session;
+  var key=sessionKey_(token),raw=props_().getProperty(key),session,now=Date.now();
   try{session=raw?JSON.parse(raw):null;}catch(_){session=null;}
-  if (!session || typeof session.id!=='string' || typeof session.expiresAt!=='number' || !isFinite(session.expiresAt) || session.expiresAt <= Date.now()) { props_().deleteProperty(key); fail_('UNAUTHENTICATED', 'ログインの有効期限が切れました。'); }
+  if (!session || typeof session.id!=='string' || typeof session.expiresAt!=='number' || !isFinite(session.expiresAt) || session.expiresAt <= now) { props_().deleteProperty(key); fail_('UNAUTHENTICATED', 'ログインの有効期限が切れました。'); }
+  if (sessionIdle_(session, now)) { props_().deleteProperty(key); fail_('UNAUTHENTICATED', NODE.sessionIdleMinutes + '分以上操作がなかったため、ログアウトしました。もう一度ログインしてください。'); }
   var auth=authRecord_(session.id);
   if(!auth||(session.authVersion||null)!==(auth.version||null)){props_().deleteProperty(key);fail_('UNAUTHENTICATED','パスワードが更新されました。もう一度ログインしてください。');}
-  return { id: session.id };
+  // An issued password opens only password change and logout. Every other caller passes no flag and is
+  // refused, including endpoints added later. The session is kept so its holder can still change it.
+  if(auth.mustChange===true&&allowPasswordChange!==true)fail_('PASSWORD_CHANGE_REQUIRED','初期パスワードの変更が必要です。画面を再読み込みし、パスワードを変更してください。');
+  var seen=sessionLastSeen_(session),result={ id: session.id };
+  if(session.idleAware!==true)return result;
+  // touchDeferred tells the caller a due refresh was not written, so its client reports the input again.
+  if(passive!==true&&(seen===null||now-seen>=NODE.sessionTouchMinutes*60000)&&!touchSession_(key,raw,session,now))result.touchDeferred=true;
+  return result;
+}
+/* Every revocation (logout, password change or reissue, cleanup, eviction, destination switch) runs
+ * under the script lock, so a compare-and-set under that lock can never resurrect a deleted or
+ * expiresAt:0 session. Reads never wait: a busy lock or failed write only defers the refresh.
+ * Returns false only when the refresh was deferred. A session changed meanwhile is not deferred:
+ * another request refreshed it, or it was revoked and the next request fails anyway. */
+function touchSession_(key, raw, session, now) {
+  var lock = nodeLockDepth_ > 0 ? null : LockService.getScriptLock();
+  try {
+    if (lock && !lock.tryLock(0)) { lock = null; return false; }
+    if (props_().getProperty(key) !== raw) return true;
+    session.lastSeenAt = now;
+    props_().setProperty(key, JSON.stringify(session));
+    return true;
+  } catch (_) { return false;
+  } finally { if (lock) lock.releaseLock(); }
 }
 function activeActor_(store, session) {
   var player = store.players.find(function (p) { return p.id === session.id && p.active; });
@@ -232,49 +375,133 @@ function activeActor_(store, session) {
   return { id: player.id, role: player.role };
 }
 function login_(payload) {
-  // Only rate counters, account checks and token issuance share the write lock.
+  // The stretched password check, device checks and the roster read run unlocked. Only
+  // short sections for the rate counters and session registration take the write lock,
+  // with a short wait, so a login flood fails fast instead of queueing behind saves.
   // Fetching the business table afterwards must not queue every player's login.
-  var issued = withLock_(function () { return issueSession_(payload); });
-  if (payload.sessionOnly === true) return { token: issued.token };
+  var issued = issueSession_(payload);
+  // An issued password grants no business data until its holder replaces it.
+  if (issued.mustChange) return { token: issued.token, deviceToken: issued.deviceToken, mustChangePassword: true };
+  if (payload.sessionOnly === true) return { token: issued.token, deviceToken: issued.deviceToken };
   try {
+    // Legacy logins return a full snapshot, so they share the snapshot budget. It is charged only
+    // after the password check, so a wrong guess cannot spend another account's budget.
+    readBudget_(issued.id, 'snapshot');
     var store = readStore_({ readOnly: true }, issued.accountStore);
-    return { token: issued.token, snapshot: authenticatedSnapshot_(store, issued.token) };
+    return { token: issued.token, deviceToken: issued.deviceToken, snapshot: authenticatedSnapshot_(store, issued.token) };
   } catch (error) { props_().deleteProperty(sessionKey_(issued.token)); throw error; }
+}
+/* A device that has logged in before carries a signed token. Its failures use a
+ * separate bucket, so anonymous guessing against a public ID cannot lock the
+ * owner out of a known device. The token is not a credential by itself. */
+function deviceSignature_(id, authVersion, expiresAt, nonce) { return hmac_('device-v1|' + id + '|' + (authVersion || '') + '|' + expiresAt + '|' + nonce, props_().getProperty(NODE.pepperKey) || fail_('NOT_CONFIGURED', '認証設定が必要です。')); }
+function makeDeviceToken_(id, auth) { var expiresAt = Date.now() + NODE.deviceDays * 86400000, nonce = random256_(); return ['d1', expiresAt, nonce, deviceSignature_(id, auth.version, expiresAt, nonce)].join('.'); }
+function trustedDevice_(id, auth, token) {
+  if (!auth || typeof token !== 'string' || token.length > 200) return false;
+  var parts = token.split('.');
+  if (parts.length !== 4 || parts[0] !== 'd1' || !/^\d{13}$/.test(parts[1]) || !/^[A-Za-z0-9_-]{43}$/.test(parts[2]) || !/^[A-Za-z0-9_-]{43}$/.test(parts[3])) return false;
+  var expiresAt = Number(parts[1]);
+  if (expiresAt <= Date.now() || expiresAt > Date.now() + NODE.deviceDays * 86400000) return false;
+  return constantEqual_(parts[3], deviceSignature_(id, auth.version, expiresAt, parts[2]));
+}
+function readRate_(key, now, windowMs, field) {
+  var rate; try { rate = JSON.parse(props_().getProperty(key) || 'null'); } catch (_) { rate = null; }
+  if (!rate || typeof rate.start !== 'number' || typeof rate[field] !== 'number' || now - rate.start >= windowMs) { rate = { start: now }; rate[field] = 0; }
+  return rate;
+}
+/* An invented ID gets an account bucket's fixed window: it starts at the first counted attempt and ends
+ * 15 minutes later however often the ID is retried, and an attempt that is already limited is not counted.
+ * So an invented ID changes its answer at the same moments an account would. Cache entries expire on their
+ * own (TTL = what is left of the window), so invented IDs never consume script properties. */
+function unknownIdLimited_(id, now, globalLimited) {
+  var windowMs = 15 * 60 * 1000;
+  try {
+    var cache = CacheService.getScriptCache(), key = 'NODE_LOGIN_ID_' + hash_(id), state;
+    try { state = JSON.parse(cache.get(key) || 'null'); } catch (_) { state = null; }
+    // A bare count was written before the fixed window; it starts one now.
+    if (typeof state === 'number' && isFinite(state) && state >= 0) state = { start: now, failures: Math.floor(state) };
+    if (!state || typeof state !== 'object' || typeof state.start !== 'number' || typeof state.failures !== 'number' || !isFinite(state.start) || !isFinite(state.failures) || state.start > now || now - state.start >= windowMs) state = { start: now, failures: 0 };
+    if (globalLimited || state.failures >= NODE.loginFailures) return true;
+    state.failures++;
+    cache.put(key, JSON.stringify(state), Math.max(1, Math.ceil((state.start + windowMs - now) / 1000)));
+    return false;
+  } catch (_) { return globalLimited; }
+}
+function sameAuth_(a, b) { return !a && !b || !!a && !!b && a.salt === b.salt && a.hash === b.hash && (a.version || null) === (b.version || null) && (a.mustChange === true) === (b.mustChange === true); }
+function dummyStretchAllowed_(now) {
+  // Invented IDs pay the same KDF run as accounts, but from one script-wide budget per minute,
+  // so a flood of new IDs cannot buy unbounded CPU. Past it they answer without the run.
+  try { var cache = CacheService.getScriptCache(), key = 'NODE_LOGIN_KDF_' + Math.floor(now / 60000), count = (Number(cache.get(key)) || 0) + 1; cache.put(key, String(count), 120); return count <= NODE.loginAttemptsPerMinute; }
+  catch (_) { return false; }
 }
 function issueSession_(payload) {
   var config = config_();
   var id = typeof payload.id === 'string' && payload.id.length <= 30 ? payload.id.trim().toUpperCase() : '';
   var password = typeof payload.password === 'string' && payload.password.length <= 200 ? payload.password : '';
-  var raw = id ? props_().getProperty('NODE_AUTH_' + id) : null;
-  // Public callers cannot allocate one ScriptProperty per invented ID.
-  var now = Date.now(), rateKey = raw ? 'NODE_RATE_' + hash_(id) : 'NODE_RATE_UNKNOWN', rawRate = props_().getProperty(rateKey);
-  var rate = rawRate ? JSON.parse(rawRate) : { start: now, failures: 0 };
-  if (now - rate.start >= 15 * 60 * 1000) rate = { start: now, failures: 0 };
-  var globalRaw = props_().getProperty('NODE_LOGIN_RATE'), globalRate = globalRaw ? JSON.parse(globalRaw) : { start: now, attempts: 0 };
-  if (now - globalRate.start >= 60 * 1000) globalRate = { start: now, attempts: 0 };
-  if (rate.failures >= 5 || globalRate.attempts >= 60) fail_('RATE_LIMITED', 'ログイン試行が多すぎます。時間をおいて再試行してください。');
-  globalRate.attempts++; props_().setProperty('NODE_LOGIN_RATE', JSON.stringify(globalRate));
-  var auth = authRecord_(id) || { salt: 'unavailable', hash: '' };
-  var valid = constantEqual_(passwordHash_(password, auth.salt), auth.hash);
-  if (!valid) { rate.failures++; props_().setProperty(rateKey, JSON.stringify(rate)); fail_('INVALID_CREDENTIALS', 'IDまたはパスワードを確認してください。'); }
+  var auth = id ? authRecord_(id) : null, now = Date.now(), trusted = trustedDevice_(id, auth, payload.deviceToken);
+  var rateKey = trusted ? 'NODE_RATE_DEV_' + hash_(payload.deviceToken) : auth ? 'NODE_RATE_' + hash_(id) : 'NODE_RATE_UNKNOWN';
+  var limited = 'ログイン試行が多すぎます。時間をおいて再試行してください。', invalid = 'IDまたはパスワードを確認してください。', changed = 'ログイン情報が更新されました。もう一度ログインしてください。';
+  var failureWindow = 15 * 60 * 1000, globalWindow = 60 * 1000, perMinute = NODE.loginAttemptsPerMinute;
+  // Unlocked pre-checks read the counters the locked section re-reads. Counters only change
+  // under the lock, so a rejection here is one the lock would also make, and a full bucket
+  // costs neither a KDF run nor a lock wait.
+  var rate = readRate_(rateKey, now, failureWindow, 'failures'), globalRate = readRate_('NODE_LOGIN_RATE', now, globalWindow, 'attempts');
+  if (!auth) {
+    // Answer an unknown ID exactly like an account: invalid for five tries, then limited until the window ends.
+    if (unknownIdLimited_(id, now, globalRate.attempts >= perMinute)) fail_('RATE_LIMITED', limited);
+  } else if (rate.failures >= NODE.loginFailures || !trusted && globalRate.attempts >= perMinute) fail_('RATE_LIMITED', limited);
+  // The expensive check runs outside the lock and costs the same for unknown, legacy and stretched records.
+  var costed = !!auth || dummyStretchAllowed_(now), check = costed ? verifyPassword_(password, auth) : { valid: false, upgrade: null };
+  // A full shared bucket for invented IDs has nothing left to count.
+  if (!auth && rate.failures >= NODE.loginFailures) fail_('INVALID_CREDENTIALS', invalid);
+  withLock_(function () {
+    // A reissue or password change may have landed during the unlocked check. Records reissued
+    // before issued passwords carried a version have none, so the session version alone cannot reject the old password.
+    if (!sameAuth_(id ? authRecord_(id) : null, auth)) fail_('BUSY', changed);
+    var now = Date.now(), rate = readRate_(rateKey, now, failureWindow, 'failures'), globalRate = readRate_('NODE_LOGIN_RATE', now, globalWindow, 'attempts');
+    if (!auth) {
+      // The shared bucket bounds properties and the global budget for invented IDs.
+      if (globalRate.attempts >= perMinute) fail_('RATE_LIMITED', limited);
+      if (rate.failures < NODE.loginFailures) { globalRate.attempts++; props_().setProperty('NODE_LOGIN_RATE', JSON.stringify(globalRate)); rate.failures++; props_().setProperty(rateKey, JSON.stringify(rate)); }
+      fail_('INVALID_CREDENTIALS', invalid);
+    }
+    if (rate.failures >= NODE.loginFailures || !trusted && globalRate.attempts >= perMinute) fail_('RATE_LIMITED', limited);
+    if (!trusted) { globalRate.attempts++; props_().setProperty('NODE_LOGIN_RATE', JSON.stringify(globalRate)); }
+    // Only a wrong password is counted here, so a correct one cannot lock its owner out even when the next section times out.
+    if (!check.valid) { rate.failures++; props_().setProperty(rateKey, JSON.stringify(rate)); fail_('INVALID_CREDENTIALS', invalid); }
+  }, NODE.loginLockMs);
+  // Only a correct password reads the roster, so wrong guesses never spend the owner's Sheets quota.
+  // A correct password for a disabled account is still answered and counted like a wrong one.
   var store = readAccountStore_(config), actor = store.players.find(function (p) { return p.id === id && p.active; });
-  if (!actor) { rate.failures++; props_().setProperty(rateKey, JSON.stringify(rate)); fail_('INVALID_CREDENTIALS', 'IDまたはパスワードを確認してください。'); }
-  props_().deleteProperty(rateKey);
-  cleanupSessions_();
-  var token = random256_();
-  registerSession_(id,token,auth.version||null);
-  return { token: token, accountStore: store };
+  var token = withLock_(function () {
+    var current = authRecord_(id);
+    if (!sameAuth_(current, auth)) fail_('BUSY', changed);
+    // A destination switch clears every session under this lock; never register one validated against the old roster.
+    if (stableJson_(config_()) !== stableJson_(config)) fail_('BUSY', '管理設定が更新されました。もう一度ログインしてください。');
+    if (!actor) { var rate = readRate_(rateKey, Date.now(), failureWindow, 'failures'); rate.failures++; props_().setProperty(rateKey, JSON.stringify(rate)); fail_('INVALID_CREDENTIALS', invalid); }
+    props_().deleteProperty(rateKey);
+    // Lazy upgrade keeps the credential version, so sessions and device tokens stay valid, and keeps
+    // an issued password's change requirement. Best effort: the old record still verifies, so a failed
+    // write only retries next login.
+    if (check.upgrade) { if (current.version !== undefined) check.upgrade.version = current.version; if (current.mustChange === true) check.upgrade.mustChange = true; try { props_().setProperty('NODE_AUTH_' + id, JSON.stringify(check.upgrade)); } catch (_) {} }
+    cleanupSessions_();
+    var token = random256_();
+    registerSession_(id, token, auth.version || null, payload.idleAware === true);
+    return token;
+  }, NODE.loginLockMs);
+  return { id: id, token: token, deviceToken: makeDeviceToken_(id, auth), accountStore: store, mustChange: auth.mustChange === true };
 }
 function sessionIndexKey_(id) {return 'NODE_SESSIONS_INDEX_'+hash_(id);}
-function parseSession_(raw) {try{var session=JSON.parse(raw);return session&&typeof session.id==='string'&&typeof session.expiresAt==='number'&&isFinite(session.expiresAt)&&session.expiresAt>Date.now()?session:null;}catch(_){return null;}}
-function registerSession_(id,token,authVersion) {
+function parseSession_(raw) {try{var session=JSON.parse(raw),now=Date.now();return session&&typeof session.id==='string'&&typeof session.expiresAt==='number'&&isFinite(session.expiresAt)&&session.expiresAt>now&&!sessionIdle_(session,now)?session:null;}catch(_){return null;}}
+function registerSession_(id,token,authVersion,idleAware) {
   var properties=props_(),index=[];
   try{index=JSON.parse(properties.getProperty(sessionIndexKey_(id))||'[]');}catch(_){}
   if(!Array.isArray(index))index=[];
   index=index.filter(function(key){if(typeof key!=='string'||!/^NODE_SESSION_[A-Za-z0-9_-]{43}$/.test(key))return false;var session=parseSession_(properties.getProperty(key));return session&&session.id===id;});
   while(index.length>=NODE.sessionsPerAccount)properties.deleteProperty(index.shift());
-  var key=sessionKey_(token);
-  properties.setProperty(key,JSON.stringify({id:id,issuedAt:Date.now(),expiresAt:Date.now()+NODE.sessionHours*3600000,authVersion:authVersion}));
+  var key=sessionKey_(token),now=Date.now();
+  var record={id:id,issuedAt:now,lastSeenAt:now,expiresAt:now+NODE.sessionHours*3600000,authVersion:authVersion};if(idleAware===true)record.idleAware=true;
+  properties.setProperty(key,JSON.stringify(record));
   index.push(key);
   try{properties.setProperty(sessionIndexKey_(id),JSON.stringify(index));}catch(error){properties.deleteProperty(key);throw error;}
 }
@@ -287,14 +514,25 @@ function cleanupSessions_() {
     var session=parseSession_(all[key]);
     if(!session){props_().deleteProperty(key);return;}
     if(!groups[session.id])groups[session.id]=[];
-    groups[session.id].push({key:key,time:session.issuedAt||session.expiresAt-NODE.sessionHours*3600000});
+    // Over the per-account cap, the least recently used session goes first.
+    groups[session.id].push({key:key,time:sessionLastSeen_(session)!==null?session.lastSeenAt:session.issuedAt||session.expiresAt-NODE.sessionHours*3600000});
   });
   Object.keys(groups).forEach(function(id){var sessions=groups[id].sort(function(a,b){return a.time-b.time;});while(sessions.length>NODE.sessionsPerAccount)props_().deleteProperty(sessions.shift().key);props_().setProperty(sessionIndexKey_(id),JSON.stringify(sessions.map(function(s){return s.key;})));});
+  Object.keys(all).forEach(function (key) {
+    if (!/^NODE_RATE_(?:DEV_)?[A-Za-z0-9_-]{43}$/.test(key) && key !== 'NODE_RATE_UNKNOWN') return;
+    var rate; try { rate = JSON.parse(all[key]); } catch (_) { rate = null; }
+    if (!rate || typeof rate.start !== 'number' || now - rate.start >= 15 * 60 * 1000) props_().deleteProperty(key);
+  });
   props_().setProperty('NODE_CLEANUP_AT', String(now));
 }
 function changePassword_(request) {
+  // Both KDF runs happen before the write lock, and only for a live session with a well-formed,
+  // not rate-limited request, so the lock holds no stretch and anonymous calls buy none.
+  // Password change is the one business action an issued password may perform.
+  var early=request.payload||{},current=early.currentPassword,next=early.newPassword,session=authenticate_(request.token,true,true),seen=null,matches=false,prepared=null;
+  if(typeof current==='string'&&current.length<=200&&typeof next==='string'&&next.length>=12&&next.length<=200&&!/[\u0000-\u001f\u007f]/.test(next)&&next!==current&&readRate_('NODE_RATE_'+hash_(session.id),Date.now(),15*60000,'failures').failures<5){seen=authRecord_(session.id);matches=!!seen&&passwordMatches_(current,seen);prepared=makeAuth_(next);}
   return withLock_(function(){
-    var session=authenticate_(request.token),accounts=readAccountStore_(),user=activeActor_(accounts,session),payload=request.payload||{};
+    var session=authenticate_(request.token,true,true),accounts=readAccountStore_(),user=activeActor_(accounts,session),payload=request.payload||{};
     var current=payload.currentPassword,next=payload.newPassword;
     if(typeof current!=='string'||current.length>200||typeof next!=='string'||next.length<12||next.length>200||/[\u0000-\u001f\u007f]/.test(next)||next===current)fail_('VALIDATION','新しいパスワードは現在と異なる12〜200文字で入力してください。');
     var properties=props_(),rateKey='NODE_RATE_'+hash_(user.id),rate;
@@ -302,12 +540,15 @@ function changePassword_(request) {
     if(!rate||typeof rate.start!=='number'||typeof rate.failures!=='number'||Date.now()-rate.start>=15*60000)rate={start:Date.now(),failures:0};
     if(rate.failures>=5)fail_('RATE_LIMITED','パスワードの確認回数が多すぎます。時間をおいて再試行してください。');
     var auth=authRecord_(user.id);
-    if(!auth||!constantEqual_(passwordHash_(current,auth.salt),auth.hash)){rate.failures++;properties.setProperty(rateKey,JSON.stringify(rate));fail_('INVALID_CREDENTIALS','現在のパスワードを確認してください。');}
-    snapshotActor_(accounts,request.token);
+    // The unlocked check stands only while the record is unchanged; otherwise verify again here.
+    var currentMatches=!!auth&&(user.id===session.id&&sameAuth_(auth,seen)?matches:passwordMatches_(current,auth));
+    if(!currentMatches){rate.failures++;properties.setProperty(rateKey,JSON.stringify(rate));fail_('INVALID_CREDENTIALS','現在のパスワードを確認してください。');}
+    snapshotActor_(accounts,request.token,true);
     var all=properties.getProperties(),revoke={};
     Object.keys(all).forEach(function(key){if(!/^NODE_SESSION_[A-Za-z0-9_-]{43}$/.test(key))return;var old=parseSession_(all[key]);if(old&&old.id===user.id)revoke[key]=JSON.stringify({id:user.id,expiresAt:0});});
     if(Object.keys(revoke).length){properties.setProperties(revoke,false);if(Object.keys(revoke).some(function(key){return properties.getProperty(key)!==revoke[key];}))fail_('INTERNAL','ログイン状態を更新できませんでした。もう一度ログインしてからパスワードを変更してください。');}
-    var updated=makeAuth_(next);updated.version=random256_();var serialized=JSON.stringify(updated),authKey='NODE_AUTH_'+user.id;
+    // makeAuth_ writes no mustChange, so the new record clears the requirement and its version revokes the issued session.
+    var updated=prepared||makeAuth_(next);updated.version=random256_();var serialized=JSON.stringify(updated),authKey='NODE_AUTH_'+user.id;
     // A credential version also revokes any legacy session missed by cleanup.
     // Check the persisted value if Google reports an ambiguous property write.
     try{properties.setProperty(authKey,serialized);}catch(error){if(properties.getProperty(authKey)!==serialized)throw error;}
@@ -320,11 +561,12 @@ function auditSecurity_(request) {
   var session=authenticate_(request.token),accounts=readAccountStore_(),user=activeActor_(accounts,session);requireAdmin_(user);
   var store=readStore_({readOnly:true},accounts),properties=props_(),all=properties.getProperties(),sessions=0;
   Object.keys(all).forEach(function(key){if(!/^NODE_SESSION_[A-Za-z0-9_-]{43}$/.test(key))return;var s=parseSession_(all[key]),account=s&&store.players.find(function(p){return p.id===s.id&&p.active;});if(account){var auth=authRecord_(s.id);if(auth&&(s.authVersion||null)===(auth.version||null))sessions++;}});
-  var result={checkedAt:new Date().toISOString(),activePlayers:store.players.filter(function(p){return p.active&&p.role==='player';}).length,activeAdmins:store.players.filter(function(p){return p.active&&p.role==='admin';}).length,disabledAccounts:store.players.filter(function(p){return !p.active;}).length,activeSessions:sessions,sessionsPerAccountLimit:NODE.sessionsPerAccount,sessionHours:NODE.sessionHours,missingCredentials:store.players.filter(function(p){return p.active&&!authRecord_(p.id);}).length,unmappedRecords:store.records.filter(function(r){return !r.playerId;}).length,writesEnabled:store.schemaCompatible&&writesEnabled_(store.config)&&store.book.getSpreadsheetTimeZone()==='Asia/Tokyo',originalProtected:true,aiConfigured:!!properties.getProperty('NODE_GEMINI_API_KEY'),aiFreeTierConfirmed:properties.getProperty('NODE_GEMINI_FREE_TIER_CONFIRMED')==='true'};
+  var result={checkedAt:new Date().toISOString(),activePlayers:store.players.filter(function(p){return p.active&&p.role==='player';}).length,activeAdmins:store.players.filter(function(p){return p.active&&p.role==='admin';}).length,disabledAccounts:store.players.filter(function(p){return !p.active;}).length,activeSessions:sessions,sessionsPerAccountLimit:NODE.sessionsPerAccount,sessionHours:NODE.sessionHours,sessionIdleMinutes:NODE.sessionIdleMinutes,missingCredentials:store.players.filter(function(p){return p.active&&!authRecord_(p.id);}).length,unmappedRecords:store.records.filter(function(r){return !r.playerId;}).length,writesEnabled:store.schemaCompatible&&writesEnabled_(store.config)&&store.book.getSpreadsheetTimeZone()==='Asia/Tokyo',originalProtected:true,aiConfigured:!!properties.getProperty('NODE_GEMINI_API_KEY'),aiFreeTierConfirmed:properties.getProperty('NODE_GEMINI_FREE_TIER_CONFIRMED')==='true'};
   requireAdmin_(snapshotActor_(store,request.token));return result;
 }
-function snapshotActor_(store, token) {
-  var players = readPlayers_(store.playerSheet), actor = activeActor_({ players: players }, authenticate_(token));
+function snapshotActor_(store, token, allowPasswordChange) {
+  // Re-checks after a read are passive, so they never turn a background poll into activity.
+  var players = readPlayers_(store.playerSheet), actor = activeActor_({ players: players }, authenticate_(token, allowPasswordChange, true));
   function access(players) { return players.map(function (p) { return [p.id, p.role, p.active, p.sheetNames]; }); }
   // A direct sheet edit can occur while the unlocked read is in flight. Never
   // return records mapped through an obsolete owner/role configuration.
@@ -332,7 +574,7 @@ function snapshotActor_(store, token) {
   return actor;
 }
 function authenticatedSnapshot_(store, token) {
-  var snapshot = buildSnapshot_(store, activeActor_(store, authenticate_(token)));
+  var snapshot = buildSnapshot_(store, activeActor_(store, authenticate_(token, false, true)));
   // Aggregate computation and even book-title/timezone reads precede the final
   // authorization check, so a revocation during those reads cannot leak data.
   snapshotActor_(store, token);
@@ -528,6 +770,10 @@ function buildSnapshot_(store, user) {
   snapshot.writingFeature=true; snapshot.writingPreferences=writingPreferences_();
   snapshot.reviewFeature=true;
   snapshot.securityFeature=true; snapshot.workspaceFeature=true;
+  var pepper=props_().getProperty(NODE.pepperKey);
+  // Device drafts are encrypted with a key derived from this secret, so a browser
+  // profile alone cannot decrypt them after the session ends.
+  if(pepper)snapshot.outboxKey=hmac_('outbox-v2|'+store.config.spreadsheetId+'|'+user.role+'|'+user.id,pepper);
   snapshot.records=store.schemaCompatible ? store.records.filter(function(r){return user.role==='admin'||r.playerId===user.id;}).map(publicRecord_) : [];
   if(user.role==='admin'){
     var prefix='https://docs.google.com/spreadsheets/d/'+encodeURIComponent(store.config.spreadsheetId)+'/edit#gid=';
@@ -650,16 +896,16 @@ function planProfile_(store, user, player) {
   var cells = [id,name,previous.team,previous.color,target,bio,JSON.stringify(aliases),previous.role,true];
   return { requests: [rowUpdateRequest_(store.playerSheet.getSheetId(), previous.row, cells)], profileRow: previous.row, result: {} };
 }
-function credentialPassword_(actorId, operationId) { return hmac_('new-player|' + actorId + '|' + operationId, props_().getProperty(NODE.pepperKey)); }
 function planPlayer_(store, user, payload, operationId) {
   if (user.role !== 'admin') fail_('FORBIDDEN', 'プレイヤーの追加は管理者のみ可能です。');
   var name = shortText_(payload.name, 40, true), team = shortText_(payload.team, 40, true), target = target_(payload.target), aliases = aliases_(payload.sheetNames, name);
   validateAliases_(store, aliases, '');
   var max = store.players.reduce(function (n, p) { var match = p.id.match(/^ND-(\d+)$/); return match ? Math.max(n, Number(match[1])) : n; }, 0), id = 'ND-' + ('000' + (max + 1)).slice(-Math.max(3, String(max + 1).length));
-  var password = credentialPassword_(user.id, operationId);
+  // Random and returned once. A replay of the same operation cannot reveal it again.
+  var password = random256_();
   // Preparing an auth hash cannot grant access: login also requires an active, atomically committed player row.
-  props_().setProperty('NODE_AUTH_' + id, JSON.stringify(makeAuth_(password)));
-  return { requests: [{ appendCells: { sheetId: store.playerSheet.getSheetId(), rows: [{ values: [id,name,team,'blue',target,'',JSON.stringify(aliases),'player',true].map(cell_) }], fields: 'userEnteredValue' } }], result: { playerId: id } };
+  props_().setProperty('NODE_AUTH_' + id, JSON.stringify(makeGeneratedAuth_(password, true)));
+  return { requests: [{ appendCells: { sheetId: store.playerSheet.getSheetId(), rows: [{ values: [id,name,team,'blue',target,'',JSON.stringify(aliases),'player',true].map(cell_) }], fields: 'userEnteredValue' } }], result: { playerId: id }, secret: password };
 }
 function operation_(store, id) {
   var rows = table_(store.operationSheet, NODE.operationHeaders).slice(1);
@@ -668,11 +914,11 @@ function operation_(store, id) {
   if (!matches.length) return null;
   var row = matches[0]; return { actorId: String(row[1]), action: String(row[2]), payloadHash: String(row[3]), result: JSON.parse(String(row[4] || '{}')) };
 }
-function mutationResponse_(store, user, action, result, operationId, token) {
+function mutationResponse_(store, user, action, result, operationId, token, secret) {
   var response = { snapshot: token ? authenticatedSnapshot_(store,token) : buildSnapshot_(store, user) };
   if (result.undo) response.changeId=operationId;
   if (action === 'createPlayer' && token) requireAdmin_(snapshotActor_(store, token));
-  if (action === 'createPlayer') response.credentials = { id: result.playerId, password: credentialPassword_(user.id, operationId) };
+  if (action === 'createPlayer') { if (secret) response.credentials = { id: result.playerId, password: secret }; else response.credentialsUnavailable = true; }
   return response;
 }
 function cell_(value) {
@@ -733,13 +979,19 @@ function sheetsBatch_(spreadsheetId, requests) {
 }
 
 /* Owner-only editor/menu setup. Never reachable through the web-app action dispatch. */
-function onOpen() { SpreadsheetApp.getUi().createMenu('NODE連携').addItem('新しい管理シートの初期設定','setupNode').addItem('別の検証用コピーを設定','setupNodeVerificationCopy').addItem('検証用コピーの書き込みを有効化','enableNodeWritesForCopy').addItem('検証用コピーで実検証','verifyNodeCopyIntegration').addItem('検証後に新しい管理シートを有効化','enableNodeDestinationAfterVerifiedCopy').addItem('行IDを同期','syncNodeRowIds').addItem('書き込みを停止','disableNodeWrites').addItem('パスワードを再発行','rotateNodePassword').addItem('全員のパスワードを再発行','rotateAllNodePasswords').addToUi(); }
+function onOpen() { SpreadsheetApp.getUi().createMenu('NODE連携').addItem('新しい管理シートの初期設定','setupNode').addItem('別の検証用コピーを設定','setupNodeVerificationCopy').addItem('検証用コピーの書き込みを有効化','enableNodeWritesForCopy').addItem('検証用コピーで実検証','verifyNodeCopyIntegration').addItem('検証後に新しい管理シートを有効化','enableNodeDestinationAfterVerifiedCopy').addItem('行IDを同期','syncNodeRowIds').addItem('書き込みを停止','disableNodeWrites').addItem('パスワードを再発行','rotateNodePassword').addItem('全員のパスワードを再発行','rotateAllNodePasswords').addItem('ログイン制限を解除','unlockNodeLogins').addToUi(); }
 function requireOwner_() {
   var active = Session.getActiveUser().getEmail(), effective = Session.getEffectiveUser().getEmail();
   if (!active || !effective || active !== effective) fail_('FORBIDDEN', 'スクリプト所有者がエディターまたはシートから実行してください。');
   var raw = props_().getProperty(NODE.configKey);
   if (raw && JSON.parse(raw).ownerEmail !== active) fail_('FORBIDDEN', '設定した所有者のみ実行できます。');
   return active;
+}
+function seedPlayers_() {
+  var raw=props_().getProperty(NODE.seedPlayersKey),seeds;if(!raw)return [];
+  try{seeds=JSON.parse(raw);}catch(_){fail_('VALIDATION','NODE_SEED_PLAYERS のJSONを確認してください。');}
+  if(!Array.isArray(seeds)||seeds.length>50||seeds.some(function(s){return !s||typeof s.name!=='string'||!s.name.trim()||s.name.length>40||!Array.isArray(s.sheetNames)||!s.sheetNames.length||s.sheetNames.some(function(a){return typeof a!=='string'||!a.trim()||a.length>40;});}))fail_('VALIDATION','NODE_SEED_PLAYERS の形式を確認してください。');
+  return seeds.map(function(s){return {name:s.name.trim(),sheetNames:s.sheetNames.map(function(a){return a.trim();}),color:['mint','blue','amber','violet','rose','cyan'].indexOf(s.color)>=0?s.color:'blue'};});
 }
 function setupNode() {
   var owner = requireOwner_(), ui = SpreadsheetApp.getUi(), book = SpreadsheetApp.getActiveSpreadsheet();
@@ -757,9 +1009,9 @@ function setupNode() {
     var playerSheet = book.insertSheet(NODE.playersTab), operationSheet = book.insertSheet(NODE.operationsTab);
     var credentials = [], rows = [NODE.playerHeaders];
     rows.push(['ADMIN','insup 管理者','NODE','blue',20,'',JSON.stringify([]),'admin',true]);
-    NODE.seedNames.forEach(function (name, i) { rows.push(['ND-' + ('00' + (i + 1)).slice(-3),name,'NODE',NODE.seedColors[i],20,'',JSON.stringify(NODE.seedSheetNames[i]),'player',true]); });
+    seedPlayers_().forEach(function (seed, i) { rows.push(['ND-' + ('00' + (i + 1)).slice(-3),seed.name,'NODE',seed.color,20,'',JSON.stringify(seed.sheetNames),'player',true]); });
     props_().setProperty(NODE.pepperKey, random256_());
-    rows.slice(1).forEach(function (row) { var password = random256_(); props_().setProperty('NODE_AUTH_' + row[0],JSON.stringify(makeAuth_(password))); credentials.push({ id:row[0],name:row[1],password:password }); });
+    rows.slice(1).forEach(function (row) { var password = random256_(); props_().setProperty('NODE_AUTH_' + row[0],JSON.stringify(makeGeneratedAuth_(password, true))); credentials.push({ id:row[0],name:row[1],password:password }); });
     playerSheet.getRange(1,1,rows.length,NODE.playerHeaders.length).setValues(rows);
     operationSheet.getRange(1,1,1,NODE.operationHeaders.length).setValues([NODE.operationHeaders]);
     // Only app-owned sheets and metadata are added; original business values, formulas and timezone stay unchanged.
@@ -871,15 +1123,29 @@ function takeProbeRow_(store,actorId,authenticatedId) {
 function verifyNodeCopyIntegration() {
   var owner=requireOwner_(),config=config_(),ui=SpreadsheetApp.getUi();
   if(config.purpose!=='verification'||config.spreadsheetId!==props_().getProperty(NODE.verificationKey)||config.spreadsheetId===props_().getProperty(NODE.destinationKey)||!writesEnabled_(config))fail_('COPY_VERIFICATION_REQUIRED','書き込みを有効にした独立した検証用コピーで検証してください。');
+  // The synthetic ADMIN session acts as ADMIN, so it must not run while ADMIN still holds an issued password.
+  var adminAuth=authRecord_('ADMIN'),adminRequired='先にアプリへADMINでログインし、発行されたパスワードを変更してから実検証してください。';
+  if(!adminAuth||adminAuth.mustChange===true)fail_('PASSWORD_CHANGE_REQUIRED',adminRequired);
   if(ui.alert('複製シートで実検証','検証コピーの末尾に新規2行を追加し、その2行だけ入力制限を外してログイン・保存・数式拒否・読み戻しを確認します。既存セルは変更せず、終了時にテスト内容を消去します。空の2行とアプリの検証履歴はコピーに残します。',ui.ButtonSet.YES_NO)!==ui.Button.YES)return;
+  // Re-read after the modal: ADMIN may have changed the password while it was open.
+  adminAuth=authRecord_('ADMIN');
+  if(!adminAuth||adminAuth.mustChange===true)fail_('PASSWORD_CHANGE_REQUIRED',adminRequired);
   props_().deleteProperty('NODE_COPY_PROOF');
-  var adminToken=random256_(),testToken='',testId='',suffix=Utilities.getUuid().replace(/-/g,'').slice(0,12),failure=null,cleanupConfirmed=false;
-  props_().setProperty(sessionKey_(adminToken),JSON.stringify({id:'ADMIN',expiresAt:Date.now()+30*60000}));
+  var adminToken=random256_(),firstToken='',testToken='',testId='',suffix=Utilities.getUuid().replace(/-/g,'').slice(0,12),failure=null,cleanupConfirmed=false;
+  props_().setProperty(sessionKey_(adminToken),JSON.stringify({id:'ADMIN',issuedAt:Date.now(),lastSeenAt:Date.now(),expiresAt:Date.now()+30*60000,authVersion:adminAuth.version||null}));
   try{
     var created=nodeHandle_({version:1,action:'createPlayer',token:adminToken,operationId:'copy-probe-player-'+suffix,payload:{name:'連携検証'+suffix,team:'検証用',target:1,sheetNames:['連携検証'+suffix]}});
     testId=created.credentials.id;
     reserveCopyProbeRows_(testId);
-    var loggedIn=nodeHandle_({version:1,action:'login',payload:{id:testId,password:created.credentials.password}});
+    // With the owner's switch on, the issued password must open only the change screen; with it off it logs in as before.
+    // Either way the probe then changes it like a member would.
+    var forced=forcedPasswordChange_(),first=nodeHandle_({version:1,action:'login',payload:{id:testId,password:created.credentials.password}});
+    firstToken=first.token;
+    if(forced&&(first.mustChangePassword!==true||first.snapshot!==undefined))fail_('COPY_VERIFICATION_FAILED','初期パスワードの変更要求を確認できませんでした。');
+    if(!forced&&(first.mustChangePassword!==undefined||!first.snapshot))fail_('COPY_VERIFICATION_FAILED','発行したパスワードでのログインを確認できませんでした。');
+    var probePassword=random256_();
+    nodeHandle_({version:1,action:'changePassword',token:firstToken,payload:{currentPassword:created.credentials.password,newPassword:probePassword}});
+    var loggedIn=nodeHandle_({version:1,action:'login',payload:{id:testId,password:probePassword}});
     testToken=loggedIn.token;
     if(loggedIn.snapshot.self.playerId!==testId||loggedIn.snapshot.self.role!=='player')fail_('COPY_VERIFICATION_FAILED','検証ログインに失敗しました。');
     var activity={playerId:testId,candidateName:'接続検証'+suffix,source:'検証専用',position:'その他',company:'',stage:'候補者面談',date:today_(),memo:'複製での接続確認'};
@@ -899,7 +1165,7 @@ function verifyNodeCopyIntegration() {
   }catch(error){failure=error;}
   finally{
     try{if(testId){cleanupCopyProbe_(testId);cleanupConfirmed=true;}}catch(cleanupError){failure=cleanupError;}
-    if(testToken)props_().deleteProperty(sessionKey_(testToken));props_().deleteProperty(sessionKey_(adminToken));if(testId)props_().deleteProperty('NODE_AUTH_'+testId);
+    if(testToken)props_().deleteProperty(sessionKey_(testToken));if(firstToken)props_().deleteProperty(sessionKey_(firstToken));props_().deleteProperty(sessionKey_(adminToken));if(testId){props_().deleteProperty('NODE_AUTH_'+testId);props_().deleteProperty(sessionIndexKey_(testId));}
   }
   if(failure)throw failure;
   if(!cleanupConfirmed||props_().getProperty(NODE.probeKey))fail_('COPY_VERIFICATION_FAILED','検証用の入力セルと管理IDの後始末を確認できませんでした。');
@@ -964,12 +1230,16 @@ function enableNodeDestinationAfterVerifiedCopy() {
     return {configured:true,writesEnabled:true,purpose:'production'};
   });
 }
+function unlockNodeLogins() {
+  requireOwner_();
+  return withLock_(function () { var all=props_().getProperties(),cleared=0;Object.keys(all).forEach(function(key){if(key.indexOf('NODE_RATE_')===0||key==='NODE_LOGIN_RATE'){props_().deleteProperty(key);cleared++;}});return {cleared:cleared}; });
+}
 function disableNodeWrites() { requireOwner_(); return withLock_(function () { var config=config_();config.writesEnabled=false;props_().setProperty(NODE.configKey,JSON.stringify(config)); }); }
 function rotateNodePassword() {
   requireOwner_(); var ui=SpreadsheetApp.getUi(),answer=ui.prompt('パスワード再発行','対象ID（ADMINまたはND-001など）',ui.ButtonSet.OK_CANCEL);
   if(answer.getSelectedButton()!==ui.Button.OK)return;
   var id=answer.getResponseText().trim().toUpperCase();
-  return withLock_(function () { var store=readStore_(),player=store.players.find(function(p){return p.id===id&&p.active;});if(!player)fail_('VALIDATION','対象IDがありません。');var password=random256_();props_().setProperty('NODE_AUTH_'+id,JSON.stringify(makeAuth_(password)));var all=props_().getProperties();Object.keys(all).forEach(function(key){if(key.indexOf('NODE_SESSION_')===0&&JSON.parse(all[key]).id===id)props_().deleteProperty(key);});showCredentials_([{id:id,name:player.name,password:password}],'再発行したログイン情報'); });
+  return withLock_(function () { var store=readStore_(),player=store.players.find(function(p){return p.id===id&&p.active;});if(!player)fail_('VALIDATION','対象IDがありません。');var password=random256_();props_().setProperty('NODE_AUTH_'+id,JSON.stringify(makeGeneratedAuth_(password,true)));var all=props_().getProperties();Object.keys(all).forEach(function(key){if(key.indexOf('NODE_SESSION_')===0&&JSON.parse(all[key]).id===id)props_().deleteProperty(key);});showCredentials_([{id:id,name:player.name,password:password}],'再発行したログイン情報'); });
 }
 function allPasswordRotationTarget_() {
   var owner=requireOwner_(),config=config_(),destinationId=props_().getProperty(NODE.destinationKey);
@@ -998,7 +1268,7 @@ function rotateAllNodePasswords() {
     var current=allPasswordRotationTarget_();
     if(stableJson_(current)!==stableJson_(preview))fail_('CONFLICT','確認中に所有者・保存先・対象名簿が変わりました。何も変更せず停止しました。もう一度確認してください。');
     var before=props_().getProperties(),updates={},previous={},expired={},credentials=[],ids=current.players.map(function(p){return p.id;});
-    current.players.forEach(function(p){var password=random256_(),key='NODE_AUTH_'+p.id,rateKey='NODE_RATE_'+hash_(p.id);updates[key]=JSON.stringify(makeAuth_(password));previous[key]=before[key];updates[rateKey]=JSON.stringify({start:Date.now(),failures:0});previous[rateKey]=before[rateKey];credentials.push({id:p.id,name:p.name,password:password});});
+    current.players.forEach(function(p){var password=random256_(),key='NODE_AUTH_'+p.id,rateKey='NODE_RATE_'+hash_(p.id);updates[key]=JSON.stringify(makeGeneratedAuth_(password,true));previous[key]=before[key];updates[rateKey]=JSON.stringify({start:Date.now(),failures:0});previous[rateKey]=before[rateKey];credentials.push({id:p.id,name:p.name,password:password});});
     Object.keys(before).forEach(function(key){if(key.indexOf('NODE_SESSION_')!==0)return;var session;try{session=JSON.parse(before[key]);}catch(_){return;}if(session&&ids.indexOf(session.id)>=0)expired[key]=JSON.stringify({id:session.id,expiresAt:0});});
     // Revoke existing sessions first, while the lock excludes every login and authenticated API request.
     if(!setRotationProperties_(expired))fail_('PASSWORD_ROTATION_FAILED','ログインセッションの失効を確認できなかったため、パスワードは変更していません。所有者がもう一度実行してください。');
@@ -1017,11 +1287,11 @@ function rotateAllNodePasswords() {
 }
 function escapeHtml_(text) { return String(text).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
 function showCredentials_(credentials,title) {
-  var html='<div style="font-family:system-ui;padding:16px"><p>パスワードは画面を閉じる前に控えてください。シート・ログには保存しません。</p><table style="border-collapse:collapse;width:100%">'+credentials.map(function(c){return '<tr><td style="padding:10px">'+escapeHtml_(c.id)+' '+escapeHtml_(c.name)+'</td><td><code style="user-select:all">'+escapeHtml_(c.password)+'</code></td></tr>';}).join('')+'</table></div>';
+  var html='<div style="font-family:system-ui;padding:16px"><p>パスワードは画面を閉じる前に控えてください。シート・ログには保存しません。初回ログイン時に本人がパスワードを変更します。</p><table style="border-collapse:collapse;width:100%">'+credentials.map(function(c){return '<tr><td style="padding:10px">'+escapeHtml_(c.id)+' '+escapeHtml_(c.name)+'</td><td><code style="user-select:all">'+escapeHtml_(c.password)+'</code></td></tr>';}).join('')+'</table></div>';
   SpreadsheetApp.getUi().showModalDialog(HtmlService.createHtmlOutput(html).setWidth(850).setHeight(500),title);
 }
 
-if (typeof NODE_TESTS !== 'undefined') Object.assign(NODE_TESTS,{constants:NODE,handle:nodeHandle_,hash:hash_,passwordHash:passwordHash_,makeAuth:makeAuth_,day:day_,dayDate:dayDate_,candidateId:candidateId_,detectHeader:detectHeader_,countActivities:countActivities_,rowVersion:rowVersion_,readStore:readStore_,snapshot:buildSnapshot_,activities:activities_,writesEnabled:writesEnabled_,makeCopyProof:makeCopyProof_,validCopyProof:validCopyProof_,verifyDestinationReadiness:verifyDestinationReadiness_,destinationAuthorization:destinationAuthorization_,resolveBusinessTabs:resolveBusinessTabs_,assertManagedBook:assertManagedBook_,mappedHeadersMatch:mappedHeadersMatch_});
+if (typeof NODE_TESTS !== 'undefined') Object.assign(NODE_TESTS,{constants:NODE,handle:nodeHandle_,hash:hash_,passwordHash:passwordHash_,makeAuth:makeAuth_,makeGeneratedAuth:makeGeneratedAuth_,stretchedHash:stretchedHash_,verifyPassword:verifyPassword_,day:day_,dayDate:dayDate_,candidateId:candidateId_,detectHeader:detectHeader_,countActivities:countActivities_,rowVersion:rowVersion_,readStore:readStore_,snapshot:buildSnapshot_,activities:activities_,writesEnabled:writesEnabled_,makeCopyProof:makeCopyProof_,validCopyProof:validCopyProof_,verifyDestinationReadiness:verifyDestinationReadiness_,destinationAuthorization:destinationAuthorization_,resolveBusinessTabs:resolveBusinessTabs_,assertManagedBook:assertManagedBook_,mappedHeadersMatch:mappedHeadersMatch_});
 
 /* Candidate records and bounded administration tables. */
 function requireAdmin_(user) { if(user.role!=='admin')fail_('FORBIDDEN','管理者だけがこの管理表を利用できます。'); }
@@ -1095,7 +1365,7 @@ function makeRowChange_(book,sheet,row,expected,changes,recordId,ownerId,label) 
   var cells=gridRead_(book,sheet,row,1)[0],before=gridFingerprint_(cells);
   if(expected&&before!==expected)fail_('CONFLICT','この行は更新されています。再取得してから編集してください。');
   var edited=JSON.parse(JSON.stringify(cells)),entries=[],requests=[];
-  Object.keys(changes).forEach(function(key){var col=Number(key);if(!Number.isInteger(col)||col<1||col>cells.length)fail_('VALIDATION','入力列を確認してください。');var value=primitiveInput_(cells[col-1],changes[key]);
+  Object.keys(changes).forEach(function(key){var col=columnKey_(key,cells.length);var value=primitiveInput_(cells[col-1],changes[key]);
     if(stableJson_(value)===stableJson_(cells[col-1].userEnteredValue||{}))return;
     entries.push({column:col,before:cells[col-1].userEnteredValue||{},after:value});edited[col-1].userEnteredValue=value;requests.push(rawCellRequest_(sheet.getSheetId(),row,col,value));});
   return {check:{sheetId:sheet.getSheetId(),row:row,before:before,recordId:recordId||null},undo:{sheetId:sheet.getSheetId(),row:row,recordId:recordId||null,ownerId:ownerId||'',label:label||sheet.getName(),after:gridFingerprint_(edited),entries:entries},requests:requests};
@@ -1104,9 +1374,19 @@ function combinedChangePlan_(changes,label) {
   var entries=changes.filter(function(c){return c.requests.length;});if(!entries.length)fail_('NO_CHANGE','変更する項目を入力してください。');
   return {requests:entries.reduce(function(a,c){return a.concat(c.requests);},[]),checks:entries.map(function(c){return c.check;}),result:{label:label,undo:entries.map(function(c){return c.undo;})}};
 }
+function columnKey_(key,maxColumn) {
+  // "04", "4.0", "1e0" or " 4" would bypass string-keyed checks yet reach Number(key).
+  if(!/^[1-9][0-9]{0,2}$/.test(key)||Number(key)>maxColumn)fail_('VALIDATION','列番号を確認してください。');
+  return Number(key);
+}
+function columnChanges_(changes,maxColumn) {
+  if(!changes||typeof changes!=='object'||Array.isArray(changes))fail_('VALIDATION','変更する項目を確認してください。');
+  var normalized={};Object.keys(changes).forEach(function(key){normalized[columnKey_(key,maxColumn)]=changes[key];});
+  return normalized;
+}
 function planRecord_(store,user,payload) {
   var record=findRecord_(store,payload.recordId);actorOwns_(user,record);checkVersion_(record,payload.rowVersion);
-  var changes=payload.changes;if(!changes||typeof changes!=='object'||Array.isArray(changes)||Object.keys(changes).length>26)fail_('VALIDATION','変更する項目を確認してください。');
+  var changes=columnChanges_(payload.changes,26);if(!Object.keys(changes).length)fail_('VALIDATION','変更する項目を確認してください。');
   if(Object.hasOwnProperty.call(changes,'3')&&!normalizeName_(changes[3]))fail_('VALIDATION','候補者名は必須です。');
   if(Object.hasOwnProperty.call(changes,'3')&&(typeof changes[3]!=='string'||changes[3]!==normalizeName_(changes[3])||changes[3].length>60))fail_('VALIDATION','候補者名は60文字以内・スペースなしで入力してください。');
   if(Object.hasOwnProperty.call(changes,'4')){
@@ -1805,7 +2085,10 @@ function planClient_(store,user,payload) {
   if(payload.active!==undefined&&typeof payload.active!=='boolean')fail_('VALIDATION','クライアントの利用状態を確認してください。');
   var active=payload.active===undefined?(previous?previous.active:true):payload.active,id=previous?previous.id:Utilities.getUuid();
   if(active&&state.entries.some(function(c){return c.active&&c.id!==id&&clientNameKey_(c.name)===clientNameKey_(name);}))fail_('VALIDATION','同じクライアントが登録されています。既存のクライアントを選択してください。');
-  var plan={requests:[],result:{clientId:id}};intakeWritePlan_(store,plan,CLIENT_TAB,CLIENT_HEADERS,state,previous?previous.row:state.rows.length+2,[id,name,active,Utilities.getUuid(),new Date().toISOString()]);return plan;
+  var plan={requests:[],result:{clientId:id}};
+  // Shared entries are team-editable; the operation history records who renamed or deactivated what.
+  if(previous)plan.result.before={name:previous.name,active:previous.active};
+  intakeWritePlan_(store,plan,CLIENT_TAB,CLIENT_HEADERS,state,previous?previous.row:state.rows.length+2,[id,name,active,Utilities.getUuid(),new Date().toISOString()]);return plan;
 }
 function profileBindingSignature_(maps,profileId) {return stableJson_(Object.keys(maps[NODE.candidateProfileKey]||{}).filter(function(row){return maps[NODE.candidateProfileKey][row].value===profileId;}).map(function(row){return [Number(row),maps[NODE.recordKey][row]?maps[NODE.recordKey][row].value:''];}).sort(function(a,b){return a[0]-b[0];}));}
 function addProfileGroupCheck_(store,plan,profileId) {

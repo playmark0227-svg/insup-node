@@ -1,4 +1,4 @@
-import { persistPendingSave, readPendingSaves, removePendingSave, replacePendingSave, pendingSaveResources, type PendingSave } from "../lib/pending-saves";
+import { persistPendingSave, readPendingSaves, removePendingSave, replacePendingSave, pendingSaveResources, unlockPendingSaves, lockPendingSaves, purgeExpiredPendingSaves, type PendingSave } from "../lib/pending-saves";
 import { correctionFields, correctedPayload, mutationDateErrors, type SaveCorrectionDraft } from "../lib/save-correction";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { initialPlayers, makeDemoActivities, type Activity } from "../lib/node-data";
@@ -9,7 +9,13 @@ import { assertWritingKitState, validateWritingPreferences, type WritingKitState
 
 const ENDPOINT_KEY = "insup.node.endpoint.v1";
 const SESSION_KEY = "insup.node.session.v1";
+// Signed by the server after a successful login. It only exempts this device from
+// lockouts caused by other people's failed guesses; it is not a credential.
+const DEVICE_KEY = "insup.node.devices.v1";
+const DEVICE_TOKEN = /^d1\.\d{13}\.[A-Za-z0-9_-]{43}\.[A-Za-z0-9_-]{43}$/;
 const isExpired = (e: unknown) => e instanceof SheetApiError && ["AUTH_REQUIRED", "UNAUTHENTICATED", "UNAUTHORIZED", "SESSION_EXPIRED"].includes(e.code);
+// An issued password is valid, but the server opens only password change and logout until it is replaced.
+const isPasswordChangeRequired = (e: unknown) => e instanceof SheetApiError && e.code === "PASSWORD_CHANGE_REQUIRED";
 export type ConnectionLoadPhase = "authenticating" | "loading" | "restoring" | null;
 export type BackgroundSaveState = {
   operationId: string; action: string; label: string; status: "saving" | "saved" | "failed";
@@ -17,10 +23,27 @@ export type BackgroundSaveState = {
 };
 type BackgroundJob = { state: BackgroundSaveState; payload: unknown; endpoint: string; token: string; generation: number; account: string; savedInput: PendingSave; resources: string[] };
 const backgroundActions = new Set(["saveCandidateProfile", "saveClient", "deleteCandidate", "updateRecord", "createCandidate", "cancelAchievement", "restoreChange", "saveActivity", "updateProfile", "updateStatus", "saveManagementRow", "saveInterviewReview"]);
+// An open dialog or a focused field: background work must not change what someone is editing.
+const editing = () => typeof document !== "undefined" && !!(document.querySelector('[role="dialog"], [role="alertdialog"]') || document.activeElement?.matches('input, textarea, select, [contenteditable="true"]'));
 const readStorage = (storage: Storage, key: string) => { try { return storage.getItem(key); } catch { return null; } };
 const writeStorage = (storage: Storage, key: string, value: string | null) => {
   try { if (value === null) storage.removeItem(key); else storage.setItem(key, value); } catch { /* A memory-only session remains usable. */ }
 };
+const deviceSlot = (endpoint: string, id: string) => `${endpoint}|${id.trim().toUpperCase()}`;
+function deviceTokens(): Record<string, string> {
+  try { const map = JSON.parse(readStorage(localStorage, DEVICE_KEY) || "{}"); return map && typeof map === "object" && !Array.isArray(map) ? map : {}; } catch { return {}; }
+}
+function readDeviceToken(endpoint: string, id: string): string | undefined {
+  const token = deviceTokens()[deviceSlot(endpoint, id)];
+  return typeof token === "string" && DEVICE_TOKEN.test(token) ? token : undefined;
+}
+function writeDeviceToken(endpoint: string, id: string, token: unknown): void {
+  if (typeof token !== "string" || !DEVICE_TOKEN.test(token)) return;
+  const map = deviceTokens(), slot = deviceSlot(endpoint, id);
+  delete map[slot]; map[slot] = token;
+  const kept = Object.entries(map).filter(([, value]) => typeof value === "string" && DEVICE_TOKEN.test(value)).slice(-20);
+  try { writeStorage(localStorage, DEVICE_KEY, JSON.stringify(Object.fromEntries(kept))); } catch { /* Login works without device trust. */ }
+}
 
 export function useSheetsConnection() {
   const [ready, setReady] = useState(false);
@@ -37,6 +60,8 @@ export function useSheetsConnection() {
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState("");
   const [credentials, setCredentials] = useState<{id: string; password: string} | null>(null);
+  // Never persisted: the server re-derives it from the account on every request.
+  const [mustChangePassword, setMustChangePassword] = useState(false);
   const [backgroundSave, setBackgroundSave] = useState<BackgroundSaveState | null>(null);
   const backgroundJob = useRef<BackgroundJob | null>(null);
   const backgroundQueue = useRef<BackgroundJob[]>([]);
@@ -55,6 +80,17 @@ export function useSheetsConnection() {
   const refreshLatest = useRef<(background?: boolean) => Promise<boolean | undefined>>(async () => undefined);
   const activeRequest = useRef<AbortController | null>(null);
   const mounted = useRef(true);
+  // The server ends a session after 60 minutes without activity. Every request counts except an
+  // automatic poll marked background, so a poll reports activity only when someone has pointed,
+  // typed or scrolled since the last request that reached the server.
+  const inputSeq = useRef(0);
+  const reportedInput = useRef(0);
+  const lastTouch = useRef(-Infinity);
+  const keepAliveLatest = useRef<() => void>(() => undefined);
+  const report = (seen: number) => { reportedInput.current = Math.max(reportedInput.current, seen); };
+  // Other requests also refresh the session on the server, but cannot tell whether that refresh was
+  // deferred. Only polls and keep-alives, which can, mark input as reported; the next one re-sends it.
+  const reporting = <T,>(request: Promise<T>) => request;
 
   const beginLoad = useCallback((phase: ConnectionLoadPhase) => {
     activeRequest.current?.abort();
@@ -88,13 +124,18 @@ export function useSheetsConnection() {
     generation.current++; token.current = "";
     ++requestVersion.current;
     writeStorage(sessionStorage, SESSION_KEY, null);
+    lockPendingSaves();
     setAuthenticated(false); setLoadPhase(null); setSyncing(false); setSyncError("");
-    setSnapshot(null); latestSnapshot.current=null; setPlayers([]); setActivities([]); setCredentials(null); setBusy(false); setLocalSaving(false);
+    setSnapshot(null); latestSnapshot.current=null; setPlayers([]); setActivities([]); setCredentials(null); setMustChangePassword(false); setBusy(false); setLocalSaving(false);
     backgroundJob.current = null; backgroundQueue.current = []; outboxLoad.current = null; mutationRunning.current = false; setBackgroundSave(null);
   }, []);
+  // The login screen replaces the view that failed, so the reason must be shown there.
+  const expire = useCallback((e: unknown) => { clearSession(); setError(e instanceof Error && e.message ? e.message : "ログインの有効期限が切れました。もう一度ログインしてください。"); }, [clearSession]);
 
   useEffect(() => {
     mounted.current = true;
+    // Expired drafts are removed on every start, even before anyone signs in.
+    void purgeExpiredPendingSaves().catch(() => undefined);
     const {controller, g} = beginLoad(null);
     (async () => {
       let target = "";
@@ -135,9 +176,13 @@ export function useSheetsConnection() {
         }
       } catch (e) {
         if (isCurrent(g)) {
-          // A network failure does not invalidate a successfully issued session.
-          if (isExpired(e)) clearSession();
-          setError(e instanceof Error ? e.message : "接続を確認できませんでした。");
+          // An issued password keeps its session, but only for the forced change screen.
+          if (isPasswordChangeRequired(e)) setMustChangePassword(true);
+          else {
+            // A network failure does not invalidate a successfully issued session.
+            if (isExpired(e)) clearSession();
+            setError(e instanceof Error ? e.message : "接続を確認できませんでした。");
+          }
         }
       } finally { if (isCurrent(g)) { setReady(true); finishLoad(g, controller); } }
     })();
@@ -176,12 +221,17 @@ export function useSheetsConnection() {
     const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(45_000)]);
     let accepted = false;
     try {
-      const data = await sheetRequest<{token: string; snapshot?: SheetSnapshot}>(endpoint, "login", {id, password, sessionOnly: true}, {signal});
+      const deviceToken = readDeviceToken(endpoint, id);
+      const data = await sheetRequest<{token: string; deviceToken?: string; snapshot?: SheetSnapshot; mustChangePassword?: boolean}>(endpoint, "login", {id, password, sessionOnly: true, idleAware: true, ...(deviceToken ? {deviceToken} : {})}, {signal});
       if (!isCurrent(g)) return;
       if (!data || typeof data.token !== "string" || data.token.length < 32) throw new Error("ログイン結果を確認できませんでした。");
+      writeDeviceToken(endpoint, id, data.deviceToken);
       token.current = data.token;
       writeStorage(sessionStorage, SESSION_KEY, JSON.stringify({endpoint, token: data.token}));
-      setAuthenticated(true); setLoadPhase("loading"); accepted = true;
+      setAuthenticated(true); accepted = true;
+      // An issued password only opens the change screen; no business data is requested.
+      if (data.mustChangePassword === true) { setMustChangePassword(true); return; }
+      setLoadPhase("loading");
       // Older deployments include a snapshot; updated ones authenticate first.
       const dataSnapshot = data.snapshot === undefined
         ? await sheetRequest<SheetSnapshot>(endpoint, "snapshot", {}, {token: data.token, signal})
@@ -189,6 +239,8 @@ export function useSheetsConnection() {
       if (isCurrent(g)) applySnapshot(dataSnapshot);
     } catch (e) {
       if (!isCurrent(g)) return;
+      // A server that reports the requirement only on the first read still opens the change screen.
+      if (accepted && isPasswordChangeRequired(e)) { setMustChangePassword(true); return; }
       if (accepted && isExpired(e)) clearSession();
       setError(e instanceof Error ? e.message : accepted ? "実績を取得できませんでした。再取得してください。" : "ログインできませんでした。");
       // Keep the token and clear the submitted password after successful auth.
@@ -203,21 +255,26 @@ export function useSheetsConnection() {
     if (!token.current || mutationRunning.current || hasPendingBackground() || loginRunning.current || refreshRunning.current || activeRequest.current) return;
     // Avoid changing an editor's baseline or row revision while someone types,
     // including an editor opened while this request was already in flight.
-    const editing = () => typeof document !== "undefined" && !!(document.querySelector('[role="dialog"], [role="alertdialog"]') || document.activeElement?.matches('input, textarea, select, [contenteditable="true"]'));
     if (background && editing()) return;
+    const seen = inputSeq.current, passive = background && seen === reportedInput.current;
     refreshRunning.current = true;
     const controller = new AbortController(), g = generation.current, version = ++requestVersion.current;
     activeRequest.current = controller;
     setSyncing(true);
     if (!background) { setBusy(true); setLoadPhase("loading"); setError(""); }
     try {
-      const data = await sheetRequest<SheetSnapshot>(endpoint, "snapshot", {}, {token: token.current, signal: controller.signal});
+      const data = await sheetRequest<SheetSnapshot>(endpoint, "snapshot", {}, {token: token.current, signal: controller.signal, ...(passive ? {background: true} : {})});
+      // A server that could not record the activity (busy lock) says so; the next poll reports the input again.
+      if (!passive && data?.activityDeferred !== true) report(seen);
       if (isCurrent(g) && version === requestVersion.current && (!background || !editing())) { applySnapshot(data); setSyncError(""); }
       return true;
     } catch (e) {
       if (isCurrent(g) && version === requestVersion.current) {
-        if (isExpired(e)) clearSession();
-        else if (background) setSyncError("自動同期を再試行しています。表示中のデータは前回取得した内容です。");
+        if (isPasswordChangeRequired(e)) setMustChangePassword(true);
+        // The login screen explains why, including the server's idle-timeout message.
+        else if (isExpired(e)) { clearSession(); setError(e instanceof Error && e.message ? e.message : "ログインの有効期限が切れました。もう一度ログインしてください。"); }
+        // A read budget names its own wait, which the generic retry notice would hide.
+        else if (background) setSyncError(e instanceof SheetApiError && e.code === "RATE_LIMITED" ? e.message : "自動同期を再試行しています。表示中のデータは前回取得した内容です。");
         else { setError(e instanceof Error ? e.message : "再取得できませんでした。"); throw e; }
       }
       return isCurrent(g) && version === requestVersion.current ? false : undefined;
@@ -228,6 +285,31 @@ export function useSheetsConnection() {
     }
   };
   refreshLatest.current = refresh;
+
+  // Reports real input whenever the automatic poll did not: an open editor, a pending or failed save,
+  // another request in flight, or a failed read. It reads no business data and never closes an editor.
+  // Only saves that go through the encrypted outbox survive an expired session; a dialog that saves
+  // directly (player issue, settings) loses its input when the session is cleared, so the notice says so.
+  // With a pending or failed save the polls stop, so when nobody is typing and no editor is open it sends
+  // a passive check instead: the server's idle logout then clears the screen and locks the outbox.
+  const keepAlive = () => {
+    const current = token.current, seen = inputSeq.current, g = generation.current, input = seen !== reportedInput.current;
+    const check = !input && hasPendingBackground() && !mutationRunning.current && !editing();
+    if (!current || !input && !check || Date.now() - lastTouch.current < 60_000) return;
+    lastTouch.current = Date.now();
+    // An Apps Script deployment without touch answers BAD_REQUEST, which is ignored like any other failure.
+    void sheetRequest<{touched?: boolean; deferred?: boolean} | undefined>(endpoint, "touch", {}, {token: current, ...(input ? {} : {background: true})}).then(data => {
+      // A busy server lock can defer the refresh; that input is then reported again on a later tick.
+      if (input && data?.deferred !== true) report(seen);
+    }, e => {
+      if (!isCurrent(g) || token.current !== current || !isExpired(e)) return;
+      if (check && !editing() && inputSeq.current === seen) {
+        clearSession();
+        setError(`${e instanceof Error && e.message ? e.message : "ログインの有効期限が切れました。"}未同期の入力はこの端末に残っています。再ログインすると確認できます。`);
+      } else setSyncError("ログインの有効期限が切れています。保存するとログイン画面に戻り、画面によっては入力中の内容が残りません。必要な内容を控えてから、もう一度ログインしてください。");
+    });
+  };
+  keepAliveLatest.current = keepAlive;
 
   const hasSnapshot = !!snapshot;
   useEffect(() => {
@@ -243,17 +325,23 @@ export function useSheetsConnection() {
         const success = await refreshLatest.current(true);
         if (success === true) failures = 0;
         if (success === false) failures = Math.min(4, failures + 1);
+        // Whatever stopped the poll, input since the last report still keeps the session alive.
+        if (success !== true && !stopped) keepAliveLatest.current();
       }
       if (!stopped) schedule();
     };
     const resume = () => {
       if (!refreshRunning.current && !mutationRunning.current && document.visibilityState === "visible" && navigator.onLine !== false && Date.now() - lastAttempt >= 10_000) void tick();
     };
+    // Focus and visibility stay passive: clicking into the window already produces a pointerdown.
+    const markInput = () => { inputSeq.current++; };
+    const inputEvents = ["pointerdown", "keydown", "wheel", "input"];
+    inputEvents.forEach(name => window.addEventListener(name, markInput, {capture: true, passive: true}));
     schedule();
     document.addEventListener("visibilitychange", resume);
     window.addEventListener("focus", resume);
     window.addEventListener("online", resume);
-    return () => { stopped = true; clearTimeout(timer); document.removeEventListener("visibilitychange", resume); window.removeEventListener("focus", resume); window.removeEventListener("online", resume); };
+    return () => { stopped = true; clearTimeout(timer); document.removeEventListener("visibilitychange", resume); window.removeEventListener("focus", resume); window.removeEventListener("online", resume); inputEvents.forEach(name => window.removeEventListener(name, markInput, {capture: true})); };
   }, [authenticated, mode, endpoint, hasSnapshot]);
 
   const mutate = async (action: string, payload: unknown, operationId: string) => {
@@ -265,7 +353,7 @@ export function useSheetsConnection() {
     ++requestVersion.current; activeRequest.current?.abort(); activeRequest.current = null;
     setLoadPhase(null); setBusy(true); setError("");
     try {
-      const data = await sheetRequest<MutationResult>(endpoint, action, payload, {token:token.current, operationId});
+      const data = await reporting(sheetRequest<MutationResult>(endpoint, action, payload, {token:token.current, operationId}));
       if (!isCurrent(g)) throw new SheetApiError("STALE_SESSION", "ログイン状態が変更されました。");
       applySnapshot(data.snapshot); if (data.credentials) setCredentials(data.credentials);
       return data;
@@ -292,7 +380,7 @@ export function useSheetsConnection() {
       await persistPendingSave(job.endpoint, job.account, job.savedInput);
       if (!isCurrent(job.generation)) return;
       posted = true;
-      const data = await sheetRequest<MutationResult | MutationReceipt>(job.endpoint, job.state.action, job.payload, {token:job.token, operationId:job.state.operationId, responseMode:"receipt"});
+      const data = await reporting(sheetRequest<MutationResult | MutationReceipt>(job.endpoint, job.state.action, job.payload, {token:job.token, operationId:job.state.operationId, responseMode:"receipt"}));
       if (!isCurrent(job.generation) || backgroundQueue.current[0] !== job) return;
       if (data && "snapshot" in data) { assertSnapshot(data.snapshot); applySnapshot(data.snapshot); }
       else { assertMutationReceipt(data, job.state.operationId); updateAfterCommit = true; }
@@ -324,6 +412,7 @@ export function useSheetsConnection() {
     if (!current || !savedToken) return Promise.resolve();
     const account = `${current.self.role}:${current.self.playerId}`;
     const promise = (async () => {
+      unlockPendingSaves(endpoint, account, current.outboxKey);
       const saved = await readPendingSaves(endpoint, account);
       if (!isCurrent(g) || savedToken !== token.current) return;
       backgroundQueue.current = saved.map(input => ({state:{operationId:input.operationId,action:input.action,label:input.label,
@@ -452,10 +541,10 @@ export function useSheetsConnection() {
     if (!token.current) throw new Error("ログインしてください。");
     const g=generation.current;
     try {
-      const data=await sheetRequest<T>(endpoint,action,{period},{token:token.current});
+      const data=await reporting(sheetRequest<T>(endpoint,action,{period},{token:token.current}));
       if(!isCurrent(g))throw new Error("ログイン状態が変更されました。");
       return data;
-    }catch(e){if(isCurrent(g)&&isExpired(e))clearSession();throw e;}
+    }catch(e){if(isCurrent(g)&&isExpired(e))expire(e);throw e;}
   };
   const analyzeReviews = (period:string) => requestAdvice<InterviewAdvice>("analyzeInterviewReviews",period);
   const readAdvice = (period:string) => requestAdvice<InterviewAdviceState>("readInterviewAdvice",period);
@@ -468,10 +557,10 @@ export function useSheetsConnection() {
     if(!writingToken||!snapshot)throw new Error("ログインしてください。");
     const g=writingGeneration;
     try{
-      const data=await sheetRequest<T>(endpoint,action,payload,{token:token.current});
+      const data=await reporting(sheetRequest<T>(endpoint,action,payload,{token:token.current}));
       if(!isCurrent(g))throw new Error("ログイン状態が変更されました。");
       return data;
-    }catch(e){if(isCurrent(g)&&isExpired(e))clearSession();throw e;}
+    }catch(e){if(isCurrent(g)&&isExpired(e))expire(e);throw e;}
   };
   // This request deliberately has no parameter for a candidate or private text.
   const writingKit = async(action:'readWritingKit'|'generateWritingKit',style:WritingStyle):Promise<WritingKitState>=>{
@@ -497,14 +586,14 @@ export function useSheetsConnection() {
     if (!token.current || snapshot?.self.role !== "admin") throw new Error("管理者でログインしてください。");
     const g = generation.current;
     try {
-      const data = await sheetRequest<T>(endpoint, "auditSecurity", {}, {token:token.current});
+      const data = await reporting(sheetRequest<T>(endpoint, "auditSecurity", {}, {token:token.current}));
       if (!isCurrent(g)) throw new Error("ログイン状態が変更されました。");
       return data;
-    } catch (e) { if (isCurrent(g) && isExpired(e)) clearSession(); throw e; }
+    } catch (e) { if (isCurrent(g) && isExpired(e)) expire(e); throw e; }
   };
 
   const changePassword = async (currentPassword: string, newPassword: string) => {
-    if (!token.current || !snapshot) throw new Error("ログインしてください。");
+    if (!token.current || (!snapshot && !mustChangePassword)) throw new Error("ログインしてください。");
     if (mutationRunning.current || hasPendingBackground() || loginRunning.current) throw new Error("保存が完了してから変更してください。");
     const g = generation.current;
     mutationRunning.current = true; ++requestVersion.current;
@@ -524,13 +613,18 @@ export function useSheetsConnection() {
   const readManagement = async <T,>(action: "managementTables" | "managementTable", payload: unknown = {}): Promise<T> => {
     if (!token.current || snapshot?.self.role!=="admin") throw new Error("管理者でログインしてください。");
     const g=generation.current;
-    const data=await sheetRequest<T>(endpoint,action,payload,{token:token.current});
+    let data:T;
+    try{data=await reporting(sheetRequest<T>(endpoint,action,payload,{token:token.current}));}
+    catch(e){if(isCurrent(g)&&isExpired(e))expire(e);throw e;}
     if (!isCurrent(g)) throw new Error("ログイン状態が変更されました。");
     return data;
   };
 
   const logout = async () => {
-    await ensureOutbox();
+    // Older deployments return no outbox secret and cannot accept new local
+    // saves. They must still let the user clear this session without deleting
+    // drafts; a supplied key that cannot unlock existing input still fails.
+    if (latestSnapshot.current?.outboxKey !== undefined) await ensureOutbox();
     if (hasPendingBackground()) throw new SheetApiError("MUTATION_PENDING", "右上の保存結果を確認してからログアウトしてください。");
     const oldToken = token.current; clearSession(); setBusy(false); setCredentials(null);
     if (oldToken) { try { await sheetRequest(endpoint, "logout", {}, {token:oldToken}); } catch { /* Local session already removed; server session has an expiry. */ } }
@@ -541,7 +635,7 @@ export function useSheetsConnection() {
     clearSession(); setMode("demo"); setPlayers(initialPlayers); setActivities(makeDemoActivities()); setError("");
   };
 
-  return { ready, endpoint, mode, players, setPlayers, activities, setActivities, snapshot, authenticated, loadPhase, busy, error,
+  return { ready, endpoint, mode, players, setPlayers, activities, setActivities, snapshot, authenticated, mustChangePassword, loadPhase, busy, error,
     syncing, syncError, backgroundSave, hasPendingSave, submitMutation, retryBackgroundSave, dismissBackgroundSave, readBackgroundSaveCorrection, correctBackgroundSave, copyBackgroundIntakeInput, credentials, dismissCredentials:() => setCredentials(null), connect, login, logout, refresh, mutate, readManagement, analyzeReviews, readAdvice, analyzeInsights, readInsights, readWritingKit, generateWritingKit, readWritingPreferences, saveWritingPreferences, readSecurity, changePassword, showDemo };
 }
 

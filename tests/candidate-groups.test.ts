@@ -32,9 +32,9 @@ test("identical names remain separate for different owners, including unmapped d
   const unmappedASpaced = record("unmapped-a-spaced", "山田太郎", "");
   const unmappedB = record("unmapped-b", "山田太郎", "");
   const emptyOwner = record("empty-owner", "山田太郎", "");
-  unmappedA.values[3] = "越前祐美";
-  unmappedASpaced.values[3] = "越前 祐美";
-  unmappedB.values[3] = "鈴木楓";
+  unmappedA.values[3] = "架空一郎";
+  unmappedASpaced.values[3] = "架空 一郎";
+  unmappedB.values[3] = "架空二郎";
   const groups = groupCandidates([first, second, unmappedA, unmappedASpaced, unmappedB, emptyOwner], "interview-desc");
   assert.equal(groups.length, 5);
   assert.equal(new Set(groups.map(group => group.key)).size, 5);
