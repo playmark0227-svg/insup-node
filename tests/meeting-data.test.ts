@@ -20,7 +20,7 @@ test("meeting export preserves six metric counts and signed monthly differences 
     { stage: "C面談予約", label: "C面談予約" }, { stage: "クライアント面談", label: "C面談実施" },
     { stage: "内定承諾", label: "マッチ数" }, { stage: "稼働開始", label: "稼働開始" },
   ] as const;
-  const row = { id: "ND-001", name: "越前祐美", target: 20, counts: { "候補者面談": 9, "提案": 24, "C面談予約": 10, "クライアント面談": 8, "内定承諾": 3, "稼働開始": 2 }, previous: { "候補者面談": 10, "提案": 20, "C面談予約": 8, "クライアント面談": 8, "内定承諾": 2, "稼働開始": 1 } };
+  const row = { id: "ND-001", name: "架空一郎", target: 20, counts: { "候補者面談": 9, "提案": 24, "C面談予約": 10, "クライアント面談": 8, "内定承諾": 3, "稼働開始": 2 }, previous: { "候補者面談": 10, "提案": 20, "C面談予約": 8, "クライアント面談": 8, "内定承諾": 2, "稼働開始": 1 } };
   const csv = meetingCsv([row], metrics, "2026-10");
   assert.equal(csv.split("\r\n").length, 2);
   assert.ok(csv.endsWith('"9","24","10","8","3","2","-1","4","2","0","1","1","20","120"'));

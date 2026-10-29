@@ -17,6 +17,8 @@ export type InterviewAdvice = {summary:string;actions:string[];count:number;gene
 export type InterviewAdviceState = {advice:InterviewAdvice|null;stale:boolean;count:number;usage:InterviewAdviceUsage;configured:boolean;pending:boolean};
 export type DeletedCandidate = {changeId:string;playerId:string;candidateName:string;deletedAt:string;companies:string[];recordCount:number};
 export type SheetSnapshot = {
+  // Set when the server could not record this request's activity (busy lock); the input is reported again.
+  activityDeferred?: boolean;
   writingFeature?: boolean;
   writingPreferences?: WritingPreferences;
   intakeFeature?: boolean;
@@ -37,10 +39,14 @@ export type SheetSnapshot = {
   warnings: string[];
   writesEnabled: boolean;
   destination?: SheetDestination;
+  /** Per-account secret that unlocks this device's encrypted outbox. Memory only. */
+  outboxKey?: string;
 };
 export type MutationResult = {
   snapshot: SheetSnapshot;
   credentials?: { id: string; password: string };
+  /** A replayed player creation cannot show the one-time password again. */
+  credentialsUnavailable?: boolean;
   changeId?: string;
 };
 export type MutationReceipt = { committed: true; operationId: string; changeId?: string };
@@ -158,13 +164,15 @@ export async function sheetRequest<T>(
   endpoint: string,
   action: string,
   payload: unknown = {},
-  options: { token?: string; operationId?: string; signal?: AbortSignal; responseMode?: "receipt" } = {},
+  // background: an automatic poll with no user input since the last report. The server's idle
+  // timeout does not count it as activity; every request without it does.
+  options: { token?: string; operationId?: string; signal?: AbortSignal; responseMode?: "receipt"; background?: boolean } = {},
 ): Promise<T> {
   const target = validateEndpoint(endpoint);
   const timeout = AbortSignal.timeout(45_000);
   const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
-  const readOnly = ["snapshot","health","managementTables","managementTable","readInterviewAdvice","readWorkspaceInsights","readWritingKit","readWritingPreferences"].includes(action);
-  const body = JSON.stringify({ version: 1, action, payload, token: options.token, operationId: options.operationId, ...(options.responseMode ? { responseMode: options.responseMode } : {}) });
+  const readOnly = ["snapshot","touch","health","managementTables","managementTable","readInterviewAdvice","readWorkspaceInsights","readWritingKit","readWritingPreferences"].includes(action);
+  const body = JSON.stringify({ version: 1, action, payload, token: options.token, operationId: options.operationId, ...(options.responseMode ? { responseMode: options.responseMode } : {}), ...(options.background ? { background: true } : {}) });
   for (let attempt = 0; attempt < (readOnly ? 2 : 1); attempt++) {
     let recoveringResult = false;
     try {

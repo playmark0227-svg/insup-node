@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash, createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac, pbkdf2Sync, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { gzipSync, gunzipSync } from "node:zlib";
@@ -277,7 +277,7 @@ class MockSpreadsheet {
   }
 }
 
-export function createHarness({ spreadsheetId = "test-spreadsheet", sheets = [], properties = {}, now = "2026-10-07T06:00:00.000Z", code } = {}) {
+export function createHarness({ spreadsheetId = "test-spreadsheet", sheets = [], properties = {}, now = "2026-10-07T06:00:00.000Z", code, kdfIterations = 64 } = {}) {
   const writes = [];
   const spreadsheet = new MockSpreadsheet(spreadsheetId, sheets, writes);
   const propertyStore = { ...properties };
@@ -388,7 +388,16 @@ export function createHarness({ spreadsheetId = "test-spreadsheet", sheets = [],
       sleep: () => {},
     },
   });
-  vm.runInContext(code ?? readFileSync(CODE_PATH, "utf8"), context, { filename: CODE_PATH, timeout: 5000 });
+  let source = code;
+  if (source === undefined) {
+    source = readFileSync(CODE_PATH, "utf8");
+    // Fewer KDF rounds keep the suite fast; kdfIterations: null runs the production value.
+    if (kdfIterations !== null) {
+      assert.match(source, /\n  kdfIterations: \d+,\n/, "The KDF round constant keeps the line form the harness overrides");
+      source = source.replace(/\n  kdfIterations: \d+,\n/, `\n  kdfIterations: ${kdfIterations},\n`);
+    }
+  }
+  vm.runInContext(source, context, { filename: CODE_PATH, timeout: 5000 });
   return {
     context, spreadsheet, writes, apiCalls, metadataReads, sheetReads, properties: propertyStore, logs, locks, clock,
     json(body) {
@@ -416,6 +425,8 @@ function configProperties(overrides = {}) {
   return {
     NODE_DESTINATION_ID: "test-destination",
     NODE_VERIFICATION_ID: SPREADSHEET_ID,
+    // The owner turns the forced change on after publishing the frontend; most fixtures run with it on.
+    NODE_FORCE_PASSWORD_CHANGE: "true",
     NODE_CONFIG: JSON.stringify({ spreadsheetId: SPREADSHEET_ID, matchingSheetId: MATCHING_SHEET_ID, kpiSheetId: KPI_SHEET_ID, purpose: "verification", writesEnabled: true, ownerEmail: "owner@example.test", ...overrides }),
   };
 }
@@ -475,7 +486,8 @@ function authenticate(harness, id = "ND-001", password = "correct-test-password"
   harness.properties.NODE_PEPPER ??= "test-pepper-keep-fixtures-out-of-production";
   const auth = harness.context.NODE_TESTS.makeAuth(password);
   harness.properties[`NODE_AUTH_${id}`] = JSON.stringify(auth);
-  return assertSuccess(request(harness, "login", { id, password }));
+  // Logins here act as the current frontend, which reports activity and is idle-checked.
+  return assertSuccess(request(harness, "login", { id, password, idleAware: true }));
 }
 
 function signedInFixture(options = {}) {
@@ -486,6 +498,15 @@ function signedInFixture(options = {}) {
   harness.writes.length = 0;
   harness.apiCalls.length = 0;
   return { harness, records, player, admin };
+}
+
+// An issued password opens only the forced change; this performs it the way a member would.
+function issuedLogin(harness, credentials, next = `changed-${credentials.id}-password`) {
+  const first = assertSuccess(request(harness, "login", { id: credentials.id, password: credentials.password, sessionOnly: true }));
+  assert.equal(first.mustChangePassword, true);
+  assert.equal(first.snapshot, undefined);
+  assert.deepEqual(assertSuccess(request(harness, "changePassword", { currentPassword: credentials.password, newPassword: next }, { token: first.token })), { changed: true });
+  return assertSuccess(request(harness, "login", { id: credentials.id, password: next }));
 }
 
 test("row metadata uses one bulk read for 214 entries without remote per-entry getters", () => {
@@ -585,15 +606,16 @@ test("login rejects wrong credentials without exposing user existence or credent
   assert.ok(!JSON.stringify(wrong).includes("salt"));
 });
 
-test("session-only login reads only fresh account rows and bad passwords never open a spreadsheet", () => {
+test("session-only login reads only fresh account rows and bad passwords read nothing but the roster", () => {
   const harness = baseHarness();
   harness.properties.NODE_PEPPER = "test-pepper";
   harness.properties["NODE_AUTH_ND-001"] = JSON.stringify(harness.context.makeAuth_("test-password"));
-  const opening = harness.context.SpreadsheetApp.openById;
-  harness.context.SpreadsheetApp.openById = () => { throw new Error("Bad passwords must not access Sheets"); };
+  // A bad password reads the roster exactly as a correct one does, so its timing cannot single out a correct guess.
+  harness.spreadsheet.readObserver = read => assert.equal(read.sheetId, 8001, "Bad passwords read no business data");
   assert.equal(assertFailure(request(harness, "login", { id: "ND-001", password: "wrong" })).code, "INVALID_CREDENTIALS");
   assert.equal(assertFailure(request(harness, "login", { id: "UNKNOWN", password: "wrong" })).code, "INVALID_CREDENTIALS");
-  harness.context.SpreadsheetApp.openById = opening;
+  assert.deepEqual(harness.writes, []); assert.deepEqual(harness.metadataReads, []);
+  harness.spreadsheet.reads.length = 0;
   const propertyApi = harness.context.PropertiesService.getScriptProperties(), setProperty = propertyApi.setProperty;
   propertyApi.setProperty = function(key, value) {
     if (key === "NODE_LOGIN_RATE" || key.startsWith("NODE_SESSION_")) assert.equal(harness.locks.held, true, "Rate increments and session issuance keep their write lock");
@@ -601,11 +623,12 @@ test("session-only login reads only fresh account rows and bad passwords never o
   };
   harness.spreadsheet.readObserver = read => {
     assert.equal(read.sheetId, 8001, "Authentication must not load matching/KPI/operations data");
-    assert.equal(harness.locks.held, true, "Fresh account validation and session issuance remain atomic");
+    assert.equal(harness.locks.held, false, "The roster read never holds the write lock; every later request re-checks the account");
   };
   const result = assertSuccess(request(harness, "login", { id: "nd-001", password: "test-password", sessionOnly: true, role: "admin" }));
-  assert.deepEqual(Object.keys(result), ["token"]);
+  assert.deepEqual(Object.keys(result), ["token", "deviceToken"]);
   assert.match(result.token, /^[A-Za-z0-9_-]{43}$/);
+  assert.match(result.deviceToken, /^d1\.\d{13}\.[A-Za-z0-9_-]{43}\.[A-Za-z0-9_-]{43}$/);
   assert.equal(JSON.parse(harness.properties[harness.context.sessionKey_(result.token)]).id, "ND-001");
   assert.equal(harness.spreadsheet.reads.length, 1);
   assert.deepEqual(harness.metadataReads, []);
@@ -1071,7 +1094,7 @@ test("a missing explicit record ID fails instead of creating a replacement propo
   assert.equal(harness.apiCalls.length, 0);
 });
 
-test("admin issues server-assigned player IDs and replayable credentials without storing plaintext passwords in sheets", () => {
+test("admin issues server-assigned player IDs and one-time credentials without storing plaintext passwords in sheets", () => {
   const { harness, admin } = signedInFixture();
   const payload = { name: "新担当", team: "新チーム", target: 15, sheetNames: ["新担当シート名"], id: "ADMIN", role: "admin" };
   const operationId = randomUUID();
@@ -1079,13 +1102,16 @@ test("admin issues server-assigned player IDs and replayable credentials without
   assert.equal(first.credentials.id, "ND-003", "The client cannot choose account IDs");
   assert.ok(first.credentials.password.length >= 32);
   assert.ok(!JSON.stringify(harness.spreadsheet.sheets.map(sheet => sheet.values)).includes(first.credentials.password), "Sheet cells and operation history must not contain plaintext credentials");
-  const newLogin = assertSuccess(request(harness, "login", { id: first.credentials.id, password: first.credentials.password }));
+  const issued = assertSuccess(request(harness, "login", { id: first.credentials.id, password: first.credentials.password }));
+  assert.deepEqual(Object.keys(issued), ["token", "deviceToken", "mustChangePassword"], "An issued password opens only the change screen");
+  const newLogin = issuedLogin(harness, first.credentials);
   assert.equal(newLogin.snapshot.self.role, "player", "New accounts cannot receive a client-specified admin role");
   assert.equal(newLogin.snapshot.self.playerId, first.credentials.id);
   assert.deepEqual(newLogin.snapshot.activities, []);
   const apiCalls = harness.apiCalls.length;
   const replay = assertSuccess(mutate(harness, admin.token, "createPlayer", payload, operationId));
-  assert.deepEqual(replay.credentials, first.credentials);
+  assert.equal(replay.credentials, undefined, "A replay must not reveal the one-time password again");
+  assert.equal(replay.credentialsUnavailable, true);
   assert.equal(harness.apiCalls.length, apiCalls);
   const next = assertSuccess(mutate(harness, admin.token, "createPlayer", { name: "次担当", team: "NODE", target: 10, sheetNames: ["次担当"] }));
   assert.equal(next.credentials.id, "ND-004");
@@ -1097,8 +1123,7 @@ test("failed player creation cannot grant login and a retry commits one active a
   const payload = { name: "障害時担当", team: "NODE", target: 20, sheetNames: ["障害時担当"] };
   harness.spreadsheet.failure = operation => operation.sheet.name === "_NODE_operations";
   assertFailure(mutate(harness, admin.token, "createPlayer", payload, operationId));
-  const expectedPassword = harness.evaluate(`credentialPassword_("ADMIN", ${JSON.stringify(operationId)})`);
-  assertFailure(request(harness, "login", { id: "ND-003", password: expectedPassword }));
+  assert.equal(harness.evaluate("typeof credentialPassword_"), "undefined", "Initial passwords are random, not derivable from the operation ID");
   assert.equal(harness.spreadsheet.getSheetByName("_NODE_players").values.filter(row => row[0] === "ND-003").length, 0);
   harness.spreadsheet.failure = null;
   const saved = assertSuccess(mutate(harness, admin.token, "createPlayer", payload, operationId));
@@ -1203,7 +1228,7 @@ test("bulk password menu registration and cancellation change no credentials, se
     const { harness, ids, shown } = bulkPasswordFixture(), before = clone(harness.properties), items = [];
     const menu = {addItem(name,action){items.push([name,action]);return this;},addToUi(){return this;}};
     harness.context.SpreadsheetApp.getUi = () => ({createMenu:()=>menu,ButtonSet:{YES_NO:"YES_NO"},Button:{YES:"YES"},alert:(_title,message)=>{
-      assert.equal(harness.locks.held,false); assert.equal(harness.locks.calls,2);
+      assert.equal(harness.locks.held,false); assert.equal(harness.locks.calls,4);
       ids.forEach(id => assert.ok(message.includes(id)));
       assert.ok(message.includes("旧パスワード") && message.includes("ログインセッション"));
       assert.deepEqual(harness.properties,before); return answer;
@@ -1239,7 +1264,7 @@ test("bulk password rotation updates all eight active accounts and revokes their
   assert.equal(assertFailure(request(harness,"snapshot",{},{token:admin.token})).code,"UNAUTHENTICATED");
   for (const credential of shown[0]) {
     assert.equal(assertFailure(request(harness,"login",{id:credential.id,password:`old-${credential.id}`})).code,"INVALID_CREDENTIALS");
-    assert.equal(assertSuccess(request(harness,"login",credential)).snapshot.self.playerId,credential.id);
+    assert.equal(issuedLogin(harness,credential).snapshot.self.playerId,credential.id);
     assert.ok(!JSON.stringify(harness.properties).includes(credential.password));
     assert.ok(!JSON.stringify(harness.logs).includes(credential.password));
   }
@@ -1332,7 +1357,7 @@ test("bulk rotation clears only target account failure counters so fresh passwor
   ids.forEach(id => assert.equal(JSON.parse(harness.properties[`NODE_RATE_${harness.context.hash_(id)}`]).failures,0));
   assert.equal(harness.properties.NODE_LOGIN_RATE,global);
   assert.equal(harness.properties.NODE_RATE_UNKNOWN,unknown); assert.equal(harness.properties[otherRate],other);
-  shown[0].forEach(credential => assert.equal(assertSuccess(request(harness,"login",credential)).snapshot.self.playerId,credential.id));
+  shown[0].forEach(credential => { const login = assertSuccess(request(harness,"login",credential)); assert.equal(login.mustChangePassword,true); assert.equal(login.snapshot,undefined); });
 });
 
 test("bulk rotation never reports success when partial credential writes cannot be restored", () => {
@@ -1565,9 +1590,9 @@ test("non-string activity memos are rejected without clearing existing notes or 
   assert.deepEqual(harness.apiCalls, []);
 });
 
-test("many different unknown login IDs share one bounded rate bucket", () => {
+test("many different unknown login IDs share one bounded rate bucket and answer like real accounts", () => {
   const { harness } = signedInFixture();
-  const initialPropertyCount = Object.keys(harness.properties).length;
+  const initialPropertyCount = Object.keys(harness.properties).length, initialAttempts = JSON.parse(harness.properties.NODE_LOGIN_RATE).attempts;
   const codes = [];
   for (let index = 0; index < 100; index++) {
     codes.push(assertFailure(request(harness, "login", { id: `UNKNOWN-${index}`, password: "incorrect-password" })).code);
@@ -1575,8 +1600,10 @@ test("many different unknown login IDs share one bounded rate bucket", () => {
   const buckets = Object.keys(harness.properties).filter(key => key.startsWith("NODE_RATE_"));
   assert.deepEqual(buckets, ["NODE_RATE_UNKNOWN"], "Untrusted IDs cannot each consume a script property");
   assert.ok(Object.keys(harness.properties).length <= initialPropertyCount + 2);
-  assert.ok(codes.slice(0, 5).every(code => code === "INVALID_CREDENTIALS"));
-  assert.ok(codes.slice(5).every(code => code === "RATE_LIMITED"), "Changing an unknown ID cannot bypass its shared login rate limit");
+  assert.ok(codes.every(code => code === "INVALID_CREDENTIALS"), "A full shared bucket must not reveal that an ID does not exist");
+  assert.equal(JSON.parse(harness.properties.NODE_LOGIN_RATE).attempts, initialAttempts + 5, "Invented IDs cannot exhaust the global login budget");
+  for (let index = 0; index < 5; index++) assert.equal(assertFailure(request(harness, "login", { id: "UNKNOWN-REPEAT", password: "x" })).code, "INVALID_CREDENTIALS");
+  assert.equal(assertFailure(request(harness, "login", { id: "UNKNOWN-REPEAT", password: "x" })).code, "RATE_LIMITED", "Unknown IDs lock after five tries exactly like accounts");
   assert.deepEqual(harness.apiCalls, []);
 });
 
@@ -1611,7 +1638,7 @@ test("only authenticated admins receive the current destination URLs, using actu
 });
 
 test("new destination setup preserves every business value and formula while resolving copied gids", () => {
-  const copiedRows = [MATCHING_HEADERS, ["2026/10/01", "移行した会社", "移行した候補者", "越前祐美"]];
+  const copiedRows = [MATCHING_HEADERS, ["2026/10/01", "移行した会社", "移行した候補者", "架空一郎"]];
   const harness = createHarness({ spreadsheetId: "new-private-destination-id", sheets: [
     { id: 34567, name: "2期目マッチングDB", values: copiedRows, formulas: [[], ["", "", "", "", "=ROW()"]] },
     { id: 89012, name: "2期目月間KPI・KGI", values: [["KPI", "表示値"]], formulas: [["", "=COUNTA('2期目マッチングDB'!C:C)"]] },
@@ -1682,8 +1709,15 @@ test("the complete verification-copy probe logs in, writes and reads back, refus
   const { harness } = signedInFixture();
   const business = harness.spreadsheet.getSheetById(MATCHING_SHEET_ID);
   const originalValues = clone(business.values), originalFormulas = clone(business.formulas), originalMetadata = harness.spreadsheet.metadata.map(item => item.id);
+  const handle = harness.context.nodeHandle_, actions = [];
+  harness.context.nodeHandle_ = req => { actions.push(req.action); return handle(req); };
   const result = harness.context.verifyNodeCopyIntegration();
+  harness.context.nodeHandle_ = handle;
   assert.equal(result.verified, true);
+  // The probe account gets an issued password, so the probe performs the forced change once.
+  assert.equal(actions.filter(action => action === "changePassword").length, 1);
+  assert.equal(actions.filter(action => action === "login").length, 2);
+  assert.ok(Object.keys(harness.properties).filter(key => key.startsWith("NODE_SESSION_")).every(key => { const session = harness.context.parseSession_(harness.properties[key]); return !session || !String(session.id).startsWith("ND-") || session.id === "ND-001"; }));
   const proof = JSON.parse(harness.properties.NODE_COPY_PROOF);
   assert.equal(proof.destinationId, "test-destination");
   assert.equal(harness.context.NODE_TESTS.validCopyProof(proof, "owner@example.test"), true);
@@ -1817,7 +1851,7 @@ function reserveFixture() {
   const fixture = signedInFixture(), { harness, admin } = fixture;
   const created = assertSuccess(mutate(harness, admin.token, "createPlayer", { name: "連携検証abcdef123456", team: "検証用", target: 1, sheetNames: ["連携検証abcdef123456"] }));
   const reservation = harness.context.reserveCopyProbeRows_(created.credentials.id);
-  const player = assertSuccess(request(harness, "login", created.credentials));
+  const player = issuedLogin(harness, created.credentials);
   harness.writes.length = 0; harness.apiCalls.length = 0;
   return { ...fixture, probePlayer: player, reservation };
 }
@@ -1890,7 +1924,7 @@ test("a probe reservation cannot move to another file, tab, or application purpo
 });
 
 test("new player masters seed strict-dropdown names first and verification copies preserve that order for new D writes", () => {
-  const expected = [["越前", "越前祐美"], ["鈴木", "鈴木楓"], ["櫻庭", "櫻庭奈々"], ["高田", "髙田侑弥"], ["佐藤", "佐藤光"], ["倉島", "倉島颯汰"], ["佐々木駿"]];
+  const expected = [["架空一", "架空一郎"], ["架空二", "架空二郎"], ["架空三", "架空三郎"], ["架空四", "架空四郎"], ["架空五", "架空五郎"], ["架空六", "架空六郎"], ["架空七郎"]];
   const destinationId = "test-new-management-spreadsheet", copyId = "test-new-verification-spreadsheet";
   const harness = createHarness({ spreadsheetId: destinationId, sheets: [
     { id: 34567, name: "2期目マッチングDB", values: [MATCHING_HEADERS] },
@@ -1899,6 +1933,8 @@ test("new player masters seed strict-dropdown names first and verification copie
   let promptText = destinationId, credentials;
   harness.context.SpreadsheetApp.getUi = () => ({ ButtonSet: { OK_CANCEL: "OK_CANCEL" }, Button: { OK: "OK" }, prompt: () => ({ getSelectedButton: () => "OK", getResponseText: () => promptText }) });
   harness.context.showCredentials_ = value => { credentials = value; };
+  harness.properties.NODE_SEED_PLAYERS = JSON.stringify(expected.map(sheetNames => ({ name: sheetNames.at(-1), sheetNames })));
+  harness.properties.NODE_FORCE_PASSWORD_CHANGE = "true";
   harness.context.setupNode();
   const masters = harness.spreadsheet.getSheetByName("_NODE_players").values.slice(2);
   assert.deepEqual(masters.map(row => JSON.parse(row[6])), expected);
@@ -1920,8 +1956,10 @@ test("new player masters seed strict-dropdown names first and verification copie
   const matching = copy.getSheetById(1234);
   const validation = { strict: true, condition: { type: "ONE_OF_LIST", values: expected.map(names => ({ userEnteredValue: names[0] })) } };
   for (let row = 2; row <= 20; row++) matching.validations[`${row},4`] = clone(validation);
+  for (const credential of credentials) { const auth = JSON.parse(harness.properties[`NODE_AUTH_${credential.id}`]); assert.equal(auth.mustChange, true, credential.id); assert.equal(typeof auth.version, "string"); }
+  assert.deepEqual(clone(credentials.map(item => item.id)), ["ADMIN", "ND-001", "ND-002", "ND-003", "ND-004", "ND-005", "ND-006", "ND-007"]);
   for (let i = 0; i < 7; i++) {
-    const id = `ND-00${i + 1}`, login = assertSuccess(request(harness, "login", { id, password: credentials.find(item => item.id === id).password }));
+    const id = `ND-00${i + 1}`, login = issuedLogin(harness, { id, password: credentials.find(item => item.id === id).password });
     const candidateName = `架空候補者${i + 1}`;
     assertSuccess(mutate(harness, login.token, "saveActivity", { activity: newCandidate({ playerId: id, candidateName }) }));
     assert.equal(matching.values.find(row => row[2] === candidateName)[3], expected[i][0]);
@@ -2335,7 +2373,8 @@ test('password rotation invalidates any missed legacy token by credential versio
   api.getProperties=()=>{const all=get();delete all[stolenKey];return all;};
   api.setProperty=(key,value)=>{const result=set.call(api,key,value);if(key==='NODE_AUTH_ND-001')throw new Error('Ambiguous Google transport failure');return result;};
   assertSuccess(request(harness,'changePassword',{currentPassword:'correct-test-password',newPassword:'new-password-confirmed'},{token:player.token}));
-  assert.equal(assertFailure(request(harness,'snapshot',{},{token:stolen})).code,'UNAUTHENTICATED');
+  const stolenError=assertFailure(request(harness,'snapshot',{},{token:stolen}));
+  assert.equal(stolenError.code,'UNAUTHENTICATED');assert.match(stolenError.message,/パスワードが更新されました/,'Rejected by the credential version, not by the idle limit');
   api.setProperty=set;assertSuccess(request(harness,'login',{id:'ND-001',password:'new-password-confirmed',sessionOnly:true}));
 });
 
@@ -2623,7 +2662,7 @@ test('shared clients support team edits and deactivation without rewriting histo
  const first=assertSuccess(request(h,'saveClient',payload,{token:f.player.token,operationId}));assert.equal(first.snapshot.clients.length,1);let client=first.snapshot.clients[0];assert.equal(client.active,true);assert.equal(h.apiCalls.length,1);assert.equal(h.apiCalls[0].body.requests.find(r=>r.addSheet).addSheet.properties.title,'_NODE_clients');
  assertSuccess(request(h,'saveClient',payload,{token:f.player.token,operationId}));assert.equal(h.apiCalls.length,1);
  const other=authenticate(h,'ND-002');assert.deepEqual(other.snapshot.clients,first.snapshot.clients);
- const revised=assertSuccess(request(h,'saveClient',{id:client.id,version:client.version,name:'株式会社新正式名'},{token:other.token,operationId:randomUUID()}));assert.equal(revised.snapshot.clients[0].name,'株式会社新正式名');assert.deepEqual(matching.values,before);
+ const revised=assertSuccess(request(h,'saveClient',{id:client.id,version:client.version,name:'株式会社新正式名'},{token:other.token,operationId:randomUUID()}));assert.equal(revised.snapshot.clients[0].name,'株式会社新正式名');assert.deepEqual(JSON.parse(h.spreadsheet.getSheetByName('_NODE_operations').values.at(-1)[4]).before,{name:'株式会社正式名',active:true});assert.deepEqual(matching.values,before);
  h.apiCalls.length=0;assert.equal(assertFailure(request(h,'saveClient',{id:client.id,version:client.version,name:'古い編集'},{token:f.player.token,operationId:randomUUID()})).code,'CONFLICT');assert.equal(h.apiCalls.length,0);
  client=revised.snapshot.clients[0];const stopped=assertSuccess(request(h,'saveClient',{id:client.id,version:client.version,name:client.name,active:false},{token:other.token,operationId:randomUUID()}));assert.equal(stopped.snapshot.clients[0].active,false);assert.deepEqual(matching.values,before);
 });
@@ -2863,4 +2902,1140 @@ test('compact commit receipts skip dashboard loading, retain authorization and r
  const refreshed=assertSuccess(request(f.harness,'snapshot',{}, {token:f.player.token}));
  assert.equal(refreshed.records.find(r=>r.recordId===row.recordId).values[6],'辞退（本人希望）');
  assert.equal(assertFailure(request(f.harness,'updateStatus',payload,{token:f.player.token,operationId:randomUUID(),responseMode:'unsupported'})).code,'BAD_REQUEST');
+});
+
+test("updateRecord rejects non-canonical column keys before any write", () => {
+  const f = signedInFixture(), r = f.player.snapshot.records.find(record => record.row === 2), sheet = f.harness.spreadsheet.getSheetById(MATCHING_SHEET_ID), before = clone(sheet.values);
+  for (const key of ["04", "4.0", " 4", "4 ", "+4", "1e0", "0x4", "-1", "0", "27", "100", "024", "abc"]) {
+    f.harness.apiCalls.length = 0;
+    const error = assertFailure(request(f.harness, "updateRecord", { recordId: r.recordId, rowVersion: r.rowVersion, changes: { [key]: "担当二" } }, { token: f.player.token, operationId: randomUUID() }));
+    assert.equal(error.code, "VALIDATION", key);
+    assert.equal(f.harness.apiCalls.length, 0, key);
+  }
+  assert.deepEqual(sheet.values, before);
+  assert.equal(assertFailure(request(f.harness, "updateRecord", { recordId: r.recordId, rowVersion: r.rowVersion, changes: { 4: "担当二" } }, { token: f.player.token, operationId: randomUUID() })).code, "FORBIDDEN");
+  assert.equal(assertFailure(request(f.harness, "updateRecord", { recordId: r.recordId, rowVersion: r.rowVersion, changes: { 24: "2099-12-31" } }, { token: f.player.token, operationId: randomUUID() })).code, "INVALID_DATE");
+  const moved = assertSuccess(request(f.harness, "updateRecord", { recordId: r.recordId, rowVersion: r.rowVersion, changes: { 4: "担当二" } }, { token: f.admin.token, operationId: randomUUID() }));
+  assert.equal(moved.snapshot.records.find(record => record.recordId === r.recordId).playerId, "ND-002", "Admins can still reassign with canonical keys");
+});
+
+test("management row edits also require canonical column keys", () => {
+  const f = signedInFixture();
+  assert.throws(() => f.harness.context.columnKey_("07", 26), error => error.nodeCode === "VALIDATION");
+  assert.throws(() => f.harness.context.columnKey_("101", 100), error => error.nodeCode === "VALIDATION");
+  assert.equal(f.harness.context.columnKey_("100", 100), 100);
+});
+
+test("anonymous lockout of an ID cannot block its owner on a trusted device", () => {
+  const { harness } = signedInFixture();
+  const first = assertSuccess(request(harness, "login", { id: "ADMIN", password: "correct-test-password", sessionOnly: true }));
+  for (let i = 0; i < 5; i++) assert.equal(assertFailure(request(harness, "login", { id: "ADMIN", password: "attacker-guess" })).code, "INVALID_CREDENTIALS");
+  assert.equal(assertFailure(request(harness, "login", { id: "ADMIN", password: "correct-test-password" })).code, "RATE_LIMITED", "New devices stay throttled during an attack");
+  const trusted = assertSuccess(request(harness, "login", { id: "ADMIN", password: "correct-test-password", sessionOnly: true, deviceToken: first.deviceToken }));
+  assert.match(trusted.token, /^[A-Za-z0-9_-]{43}$/);
+  assert.notEqual(trusted.deviceToken, first.deviceToken, "Each login refreshes the device token");
+  for (let i = 0; i < 5; i++) assertFailure(request(harness, "login", { id: "ADMIN", password: "wrong", deviceToken: trusted.deviceToken }));
+  assert.equal(assertFailure(request(harness, "login", { id: "ADMIN", password: "correct-test-password", deviceToken: trusted.deviceToken })).code, "RATE_LIMITED", "A trusted device keeps its own five-failure limit");
+});
+
+test("device tokens are bound to the account, signature, expiry and credential version", () => {
+  const { harness } = signedInFixture();
+  const issued = assertSuccess(request(harness, "login", { id: "ND-001", password: "correct-test-password", sessionOnly: true })).deviceToken;
+  const auth = JSON.parse(harness.properties["NODE_AUTH_ND-001"]);
+  assert.equal(harness.context.trustedDevice_("ND-001", auth, issued), true);
+  assert.equal(harness.context.trustedDevice_("ADMIN", JSON.parse(harness.properties.NODE_AUTH_ADMIN), issued), false, "Another account");
+  const parts = issued.split(".");
+  assert.equal(harness.context.trustedDevice_("ND-001", auth, [parts[0], parts[1], parts[2], parts[3].replace(/^./, c => c === "A" ? "B" : "A")].join(".")), false, "Forged signature");
+  assert.equal(harness.context.trustedDevice_("ND-001", auth, [parts[0], String(Number(parts[1]) + 1), parts[2], parts[3]].join(".")), false, "Extended expiry");
+  assert.equal(harness.context.trustedDevice_("ND-001", { ...auth, version: "rotated-credential-version" }, issued), false, "Password change revokes device trust");
+  harness.clock.milliseconds += 91 * 86400000;
+  assert.equal(harness.context.trustedDevice_("ND-001", auth, issued), false, "Expired");
+});
+
+test("owner can clear every login limit and cleanup prunes expired buckets", () => {
+  const { harness } = signedInFixture();
+  for (let i = 0; i < 6; i++) assertFailure(request(harness, "login", { id: "ADMIN", password: "wrong" }));
+  assert.ok(harness.properties[`NODE_RATE_${harness.context.hash_("ADMIN")}`]);
+  harness.clock.milliseconds += 16 * 60 * 1000;
+  harness.properties.NODE_CLEANUP_AT = "0";
+  harness.context.cleanupSessions_();
+  assert.equal(harness.properties[`NODE_RATE_${harness.context.hash_("ADMIN")}`], undefined, "Expired failure buckets are removed");
+  for (let i = 0; i < 6; i++) assertFailure(request(harness, "login", { id: "ADMIN", password: "wrong" }));
+  harness.context.Session = { getActiveUser: () => ({ getEmail: () => "owner@example.invalid" }), getEffectiveUser: () => ({ getEmail: () => "owner@example.invalid" }) };
+  harness.properties.NODE_CONFIG = JSON.stringify({ ...JSON.parse(harness.properties.NODE_CONFIG), ownerEmail: "owner@example.invalid" });
+  assert.ok(harness.context.unlockNodeLogins().cleared >= 1);
+  assertSuccess(request(harness, "login", { id: "ADMIN", password: "correct-test-password" }));
+});
+
+test("snapshots carry a per-account outbox key that never matches another account", () => {
+  const { harness, player, admin } = signedInFixture();
+  const other = authenticate(harness, "ND-002");
+  assert.match(player.snapshot.outboxKey, /^[A-Za-z0-9_-]{43}$/);
+  assert.equal(assertSuccess(request(harness, "snapshot", {}, { token: player.token })).outboxKey, player.snapshot.outboxKey, "Stable across sessions so expired-session drafts can be recovered");
+  assert.notEqual(player.snapshot.outboxKey, other.snapshot.outboxKey);
+  assert.notEqual(player.snapshot.outboxKey, admin.snapshot.outboxKey);
+});
+
+/* Login restructuring: stretched hashes outside the lock, short locked sections, lazy upgrade. */
+function legacyRecord(harness, password, salt = harness.context.random256_(), extra = {}) {
+  return { salt, hash: createHmac("sha256", harness.properties.NODE_PEPPER).update(`${password}|${salt}`).digest("base64url"), ...extra };
+}
+function countHmac(harness) {
+  const utilities = harness.context.Utilities, original = utilities.computeHmacSha256Signature;
+  const counter = { calls: 0, locked: 0, restore() { utilities.computeHmacSha256Signature = original; } };
+  utilities.computeHmacSha256Signature = (...args) => { counter.calls++; if (harness.locks.held) counter.locked++; return original(...args); };
+  return counter;
+}
+const sessionCount = harness => Object.keys(harness.properties).filter(key => /^NODE_SESSION_[A-Za-z0-9_-]{43}$/.test(key)).length;
+const accountRateKey = (harness, id) => `NODE_RATE_${harness.context.hash_(id)}`;
+const loginAs = (harness, id, password, extra = {}) => request(harness, "login", { id, password, sessionOnly: true, ...extra });
+
+test("stretched password hashes are PBKDF2-HMAC-SHA256 keyed by the pepper at the production round count", () => {
+  const harness = createHarness({ properties: { NODE_PEPPER: "vector-pepper" }, kdfIterations: null });
+  const rounds = harness.context.NODE.kdfIterations, salt = "S".repeat(43), password = "パスワード|with 記号";
+  assert.equal(rounds, 2000, "Conservative until the owner times it on Apps Script");
+  const key = createHmac("sha256", "vector-pepper").update(`kdf-v2|${password}`).digest();
+  assert.equal(harness.context.stretchedHash_(password, salt, rounds), pbkdf2Sync(key, salt, rounds, 32, "sha256").toString("base64url"));
+  const record = JSON.parse(JSON.stringify(harness.context.makeAuth_(password)));
+  assert.deepEqual(Object.keys(record), ["salt", "hash", "kdf", "iter"]);
+  assert.equal(record.kdf, "pbkdf2p1"); assert.equal(record.iter, rounds);
+  assert.match(record.salt, /^[A-Za-z0-9_-]{43}$/); assert.match(record.hash, /^[A-Za-z0-9_-]{43}$/);
+  harness.properties.NODE_AUTH_VECTOR = JSON.stringify(record);
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.context.authRecord_("VECTOR"))), record, "Records this code writes always pass authRecord_");
+  assert.equal(harness.context.passwordMatches_(password, record), true);
+  assert.equal(harness.context.passwordMatches_(`${password} `, record), false);
+  assert.equal(createHarness().context.NODE.kdfIterations, 64, "The suite runs fewer rounds unless asked otherwise");
+});
+
+test("legacy records verify unchanged, upgrade once on login and keep sessions and device tokens valid", () => {
+  for (const version of ["kept-version", undefined]) {
+    const { harness } = signedInFixture();
+    const legacy = legacyRecord(harness, "legacy-password-123", undefined, version === undefined ? {} : { version }), raw = JSON.stringify(legacy);
+    harness.properties["NODE_AUTH_ND-001"] = raw;
+    const oldToken = "O".repeat(43), now = harness.clock.milliseconds;
+    harness.properties[harness.context.sessionKey_(oldToken)] = JSON.stringify({ id: "ND-001", issuedAt: now, expiresAt: now + 3600000, authVersion: version ?? null });
+    const oldDevice = harness.context.makeDeviceToken_("ND-001", legacy);
+    assert.equal(assertFailure(loginAs(harness, "ND-001", "wrong-password")).code, "INVALID_CREDENTIALS");
+    assert.equal(harness.properties["NODE_AUTH_ND-001"], raw, "A wrong password never rewrites the record");
+    const login = assertSuccess(loginAs(harness, "ND-001", "legacy-password-123"));
+    const upgraded = JSON.parse(harness.properties["NODE_AUTH_ND-001"]);
+    assert.equal(upgraded.kdf, "pbkdf2p1"); assert.equal(upgraded.iter, harness.context.NODE.kdfIterations);
+    assert.notEqual(upgraded.salt, legacy.salt); assert.match(upgraded.salt, /^[A-Za-z0-9_-]{43}$/);
+    assert.equal(Object.hasOwn(upgraded, "version"), version !== undefined); assert.equal(upgraded.version, version);
+    assert.equal(JSON.parse(harness.properties[harness.context.sessionKey_(login.token)]).authVersion, version ?? null);
+    assertSuccess(request(harness, "snapshot", {}, { token: oldToken }));
+    assertSuccess(request(harness, "snapshot", {}, { token: login.token }));
+    assert.equal(harness.context.trustedDevice_("ND-001", upgraded, oldDevice), true, "Device tokens signed before the upgrade stay trusted");
+    const stored = harness.properties["NODE_AUTH_ND-001"];
+    assertSuccess(loginAs(harness, "ND-001", "legacy-password-123", { deviceToken: oldDevice }));
+    assert.equal(harness.properties["NODE_AUTH_ND-001"], stored, "An upgraded record is not rewritten");
+    assert.equal(assertFailure(loginAs(harness, "ND-001", "wrong-password")).code, "INVALID_CREDENTIALS");
+  }
+});
+
+test("unknown, legacy and stretched logins cost the same KDF work and never hash under the lock", () => {
+  const { harness } = signedInFixture();
+  harness.properties["NODE_AUTH_ND-002"] = JSON.stringify(legacyRecord(harness, "legacy-password-123"));
+  const rounds = harness.context.NODE.kdfIterations;
+  const cost = (id, password, ok) => {
+    const counter = countHmac(harness);
+    try { const result = loginAs(harness, id, password); if (ok) assertSuccess(result); else assertFailure(result); } finally { counter.restore(); }
+    assert.equal(counter.locked, 0, `${id}: no HMAC runs under the write lock`);
+    return counter.calls;
+  };
+  assert.equal(cost("UNKNOWN-ID", "wrong-password", false), rounds + 2);
+  assert.equal(cost("ND-001", "wrong-password", false), rounds + 2);
+  assert.equal(cost("ND-002", "wrong-password", false), rounds + 2);
+  assert.equal(cost("ND-001", "correct-test-password", true), rounds + 3, "Success adds only the device signature");
+  assert.equal(cost("ND-002", "legacy-password-123", true), rounds + 3, "The legacy branch's stretch is the upgrade record");
+  assert.equal(JSON.parse(harness.properties["NODE_AUTH_ND-002"]).kdf, "pbkdf2p1");
+  assert.equal(cost("ND-002", "wrong-password", false), rounds + 2);
+  for (const auth of [null, JSON.parse(harness.properties["NODE_AUTH_ND-001"]), legacyRecord(harness, "x-password-123")]) {
+    const counter = countHmac(harness);
+    harness.context.verifyPassword_("probe-password", auth);
+    counter.restore();
+    assert.equal(counter.calls, rounds + 2);
+  }
+});
+
+test("invented IDs share a per-minute KDF budget so a flood cannot buy unbounded CPU", () => {
+  const { harness } = signedInFixture();
+  const rounds = harness.context.NODE.kdfIterations, budget = harness.context.NODE.loginAttemptsPerMinute, globalBefore = JSON.parse(harness.properties.NODE_LOGIN_RATE).attempts;
+  const counter = countHmac(harness), codes = [];
+  for (let i = 0; i < budget + 20; i++) codes.push(assertFailure(loginAs(harness, `INVENTED-${i}`, "guess-password")).code);
+  counter.restore();
+  assert.ok(codes.every(code => code === "INVALID_CREDENTIALS"), codes.join(","));
+  assert.equal(counter.calls, budget * (rounds + 2), "Only the budgeted attempts run the KDF");
+  assert.equal(JSON.parse(harness.properties.NODE_LOGIN_RATE).attempts, globalBefore + 5, "Invented IDs still cannot exhaust the login budget of real accounts");
+  const account = countHmac(harness);
+  assert.equal(assertFailure(loginAs(harness, "ND-001", "wrong-password")).code, "INVALID_CREDENTIALS");
+  account.restore();
+  assert.equal(account.calls, rounds + 2, "Real accounts are not affected by the invented-ID budget");
+  harness.clock.milliseconds += 60 * 1000;
+  const refilled = countHmac(harness);
+  assertFailure(loginAs(harness, "INVENTED-NEXT", "guess-password"));
+  refilled.restore();
+  assert.equal(refilled.calls, rounds + 2, "The budget refills each minute");
+});
+
+test("malformed stretched records fail closed at the same cost, and the round bound follows the constant", () => {
+  const { harness } = signedInFixture();
+  const rounds = harness.context.NODE.kdfIterations, good = JSON.parse(harness.properties["NODE_AUTH_ND-001"]);
+  const variants = [{ ...good, kdf: "argon2" }, { ...good, iter: 0 }, { ...good, iter: 100001 }, { ...good, iter: 1e9 }, { ...good, iter: 1.5 }, { ...good, iter: "64" }, { ...good, salt: "short" }, { ...good, salt: "é".repeat(43) }, { salt: good.salt, hash: good.hash, iter: rounds }];
+  for (const variant of variants) {
+    harness.properties["NODE_AUTH_ND-001"] = JSON.stringify(variant);
+    assert.equal(harness.context.authRecord_("ND-001"), null, JSON.stringify(variant));
+    const counter = countHmac(harness);
+    assert.equal(assertFailure(loginAs(harness, "ND-001", "correct-test-password")).code, "INVALID_CREDENTIALS");
+    counter.restore();
+    assert.equal(counter.calls, rounds + 2, "A malformed record costs what an unknown ID costs");
+    harness.clock.milliseconds += 15 * 60 * 1000;
+  }
+  harness.properties["NODE_AUTH_ND-001"] = JSON.stringify(legacyRecord(harness, "legacy-password-123", "塩|salt"));
+  assertSuccess(loginAs(harness, "ND-001", "legacy-password-123"));
+  assert.equal(JSON.parse(harness.properties["NODE_AUTH_ND-001"]).kdf, "pbkdf2p1");
+  assert.equal(harness.context.kdfMaxIterations_(), 100000);
+  const raised = createHarness({ properties: { NODE_PEPPER: "test-pepper" }, kdfIterations: 20000 });
+  assert.equal(raised.context.kdfMaxIterations_(), 200000, "The bound keeps headroom above a raised constant");
+  raised.properties.NODE_AUTH_X = JSON.stringify({ ...good, iter: 150000 });
+  assert.equal(raised.context.authRecord_("X").iter, 150000);
+  raised.properties.NODE_AUTH_X = JSON.stringify({ ...good, iter: 200001 });
+  assert.equal(raised.context.authRecord_("X"), null);
+});
+
+test("raising the round count upgrades older stretched records on login without changing their version", () => {
+  const { harness } = signedInFixture();
+  const salt = harness.context.random256_(), weak = { salt, hash: harness.context.stretchedHash_("correct-test-password", salt, 32), kdf: "pbkdf2p1", iter: 32, version: "kept-version" };
+  harness.properties["NODE_AUTH_ND-001"] = JSON.stringify(weak);
+  const login = assertSuccess(loginAs(harness, "ND-001", "correct-test-password"));
+  const stored = JSON.parse(harness.properties["NODE_AUTH_ND-001"]);
+  assert.equal(stored.iter, harness.context.NODE.kdfIterations); assert.equal(stored.version, "kept-version"); assert.notEqual(stored.hash, weak.hash);
+  assert.equal(JSON.parse(harness.properties[harness.context.sessionKey_(login.token)]).authVersion, "kept-version");
+  const strong = { ...stored, salt, hash: harness.context.stretchedHash_("correct-test-password", salt, 96), iter: 96 };
+  harness.properties["NODE_AUTH_ND-001"] = JSON.stringify(strong);
+  assertSuccess(loginAs(harness, "ND-001", "correct-test-password"));
+  assert.deepEqual(JSON.parse(harness.properties["NODE_AUTH_ND-001"]), strong, "A record stronger than the constant is kept");
+});
+
+test("a failed lazy-upgrade write still logs in and the next login upgrades", () => {
+  const { harness } = signedInFixture();
+  const legacy = JSON.stringify(legacyRecord(harness, "legacy-password-123"));
+  harness.properties["NODE_AUTH_ND-001"] = legacy;
+  const api = harness.context.PropertiesService.getScriptProperties(), set = api.setProperty;
+  api.setProperty = function(key, value) { if (key === "NODE_AUTH_ND-001") throw new Error("Property write failed"); return set.call(this, key, value); };
+  const login = assertSuccess(loginAs(harness, "ND-001", "legacy-password-123"));
+  assert.equal(harness.properties["NODE_AUTH_ND-001"], legacy);
+  assertSuccess(request(harness, "snapshot", {}, { token: login.token }));
+  api.setProperty = set;
+  assertSuccess(loginAs(harness, "ND-001", "legacy-password-123"));
+  assert.equal(JSON.parse(harness.properties["NODE_AUTH_ND-001"]).kdf, "pbkdf2p1");
+  assertSuccess(request(harness, "snapshot", {}, { token: login.token }));
+});
+
+test("password change stretches outside the lock, accepts a legacy current password and anonymous calls cost no KDF", () => {
+  const { harness, player } = signedInFixture();
+  harness.properties["NODE_AUTH_ND-001"] = JSON.stringify(legacyRecord(harness, "correct-test-password"));
+  const rounds = harness.context.NODE.kdfIterations;
+  let counter = countHmac(harness);
+  assert.equal(assertFailure(request(harness, "changePassword", { currentPassword: "correct-test-password", newPassword: "brand-new-password" }, { token: "A".repeat(43) })).code, "UNAUTHENTICATED");
+  counter.restore();
+  assert.equal(counter.calls, 0);
+  counter = countHmac(harness);
+  assertSuccess(request(harness, "changePassword", { currentPassword: "correct-test-password", newPassword: "brand-new-password" }, { token: player.token }));
+  counter.restore();
+  assert.equal(counter.locked, 0, "No KDF run holds the write lock");
+  assert.equal(counter.calls, rounds + 2, "One legacy check and one stretch of the new password");
+  const stored = JSON.parse(harness.properties["NODE_AUTH_ND-001"]);
+  assert.equal(stored.kdf, "pbkdf2p1"); assert.equal(stored.iter, rounds); assert.match(stored.version, /^[A-Za-z0-9_-]{43}$/);
+  assertSuccess(loginAs(harness, "ND-001", "brand-new-password"));
+});
+
+test("a credential replaced before the password-change lock is verified again inside it", () => {
+  for (const current of ["correct-test-password", "replacement-password-1"]) {
+    const { harness, player } = signedInFixture();
+    const original = harness.context.LockService.getScriptLock;
+    let swapped = false;
+    harness.context.LockService = { getScriptLock: () => { const lock = original(); return { ...lock, tryLock: ms => { if (!swapped) { swapped = true; harness.properties["NODE_AUTH_ND-001"] = JSON.stringify(harness.context.makeGeneratedAuth_("replacement-password-1")); } return lock.tryLock(ms); } }; } };
+    const result = request(harness, "changePassword", { currentPassword: current, newPassword: "brand-new-password" }, { token: player.token });
+    if (current === "correct-test-password") {
+      assert.equal(assertFailure(result).code, "INVALID_CREDENTIALS", "The old password no longer matches the replaced record");
+      assert.equal(JSON.parse(harness.properties[accountRateKey(harness, "ND-001")]).failures, 1);
+    } else {
+      assertSuccess(result);
+      assertSuccess(loginAs(harness, "ND-001", "brand-new-password"));
+    }
+  }
+});
+
+test("server-generated passwords stay single-HMAC records and upgrade on first login", () => {
+  const { harness, ids, shown } = bulkPasswordFixture();
+  const counter = countHmac(harness);
+  assert.equal(harness.context.rotateAllNodePasswords().rotated, 8);
+  counter.restore();
+  assert.ok(counter.calls < harness.context.NODE.kdfIterations, `Bulk issuance runs no KDF under the lock (${counter.calls} HMAC calls)`);
+  for (const id of ids) assert.deepEqual(Object.keys(JSON.parse(harness.properties[`NODE_AUTH_${id}`])), ["salt", "hash", "version", "mustChange"]);
+  const issued = shown[0].find(row => row.id === "ND-002"), issuedVersion = JSON.parse(harness.properties["NODE_AUTH_ND-002"]).version;
+  assertSuccess(loginAs(harness, "ND-002", issued.password));
+  assert.equal(JSON.parse(harness.properties["NODE_AUTH_ND-002"]).kdf, "pbkdf2p1");
+  // The upgrade keeps the issued version and the change requirement.
+  assert.equal(JSON.parse(harness.properties["NODE_AUTH_ND-002"]).version, issuedVersion);
+  assert.equal(JSON.parse(harness.properties["NODE_AUTH_ND-002"]).mustChange, true);
+  assert.equal(assertSuccess(loginAs(harness, "ND-002", issued.password)).mustChangePassword, true);
+});
+
+test("login hashes, verifies devices and reads the roster unlocked; only counters, upgrades and sessions are locked", () => {
+  const { harness } = signedInFixture();
+  harness.properties["NODE_AUTH_ND-002"] = JSON.stringify(legacyRecord(harness, "legacy-password-123"));
+  const device = assertSuccess(loginAs(harness, "ADMIN", "correct-test-password")).deviceToken;
+  const rounds = harness.context.NODE.kdfIterations, counter = countHmac(harness);
+  const api = harness.context.PropertiesService.getScriptProperties(), set = api.setProperty, del = api.deleteProperty;
+  api.setProperty = function(key, value) { if (/^NODE_(RATE_|LOGIN_RATE|SESSION|AUTH_)/.test(key)) assert.equal(harness.locks.held, true, key); return set.call(this, key, value); };
+  api.deleteProperty = function(key) { if (/^NODE_RATE_/.test(key)) assert.equal(harness.locks.held, true, key); return del.call(this, key); };
+  let rosterReads = 0;
+  harness.spreadsheet.readObserver = read => { if (read.sheetId === 8001) { rosterReads++; assert.equal(harness.locks.held, false, "The roster read never holds the write lock"); } };
+  assertFailure(loginAs(harness, "ND-001", "wrong-password"));
+  assertFailure(loginAs(harness, "UNKNOWN-ID", "wrong-password"));
+  assert.equal(rosterReads, 0, "Wrong passwords and unknown IDs never spend the owner's Sheets quota");
+  assertSuccess(loginAs(harness, "ND-001", "correct-test-password"));
+  assertSuccess(loginAs(harness, "ND-002", "legacy-password-123"));
+  assertSuccess(loginAs(harness, "ADMIN", "correct-test-password", { deviceToken: device }));
+  api.setProperty = set; api.deleteProperty = del; counter.restore();
+  assert.equal(rosterReads, 3);
+  assert.equal(counter.locked, 0);
+  assert.equal(counter.calls, 5 * (rounds + 2) + 4, "Two failures, three successes with device signatures, one trusted-device check");
+  assert.equal(harness.locks.held, false);
+});
+
+test("full failure buckets and an exhausted global budget answer without the lock or a KDF run", () => {
+  const { harness } = signedInFixture();
+  const device = assertSuccess(loginAs(harness, "ADMIN", "correct-test-password")).deviceToken, now = harness.clock.milliseconds;
+  harness.properties.NODE_RATE_UNKNOWN = JSON.stringify({ start: now, failures: 5 });
+  harness.properties[accountRateKey(harness, "ND-001")] = JSON.stringify({ start: now, failures: 5 });
+  const before = clone(harness.properties), lockCalls = harness.locks.calls;
+  harness.locks.available = false;
+  for (let i = 0; i < 50; i++) assert.equal(assertFailure(loginAs(harness, `INVENTED-${i}`, "guess-password")).code, "INVALID_CREDENTIALS");
+  let counter = countHmac(harness);
+  assert.equal(assertFailure(loginAs(harness, "ND-001", "correct-test-password")).code, "RATE_LIMITED");
+  counter.restore(); assert.equal(counter.calls, 0);
+  harness.properties.NODE_LOGIN_RATE = JSON.stringify({ start: now, attempts: 60 });
+  harness.properties["NODE_AUTH_ND-002"] = JSON.stringify(harness.context.makeAuth_("correct-test-password"));
+  counter = countHmac(harness);
+  assert.equal(assertFailure(loginAs(harness, "ND-002", "wrong-password")).code, "RATE_LIMITED");
+  assert.equal(assertFailure(loginAs(harness, "INVENTED-LATE", "guess-password")).code, "RATE_LIMITED");
+  counter.restore(); assert.equal(counter.calls, 0);
+  assert.equal(harness.locks.calls, lockCalls, "Rejected logins never touch the lock");
+  const after = clone(harness.properties); delete after.NODE_LOGIN_RATE; delete after["NODE_AUTH_ND-002"];
+  const expected = clone(before); delete expected.NODE_LOGIN_RATE;
+  assert.deepEqual(after, expected);
+  harness.locks.available = true;
+  assertSuccess(loginAs(harness, "ADMIN", "correct-test-password", { deviceToken: device }));
+  assert.equal(JSON.parse(harness.properties.NODE_LOGIN_RATE).attempts, 60, "Trusted devices stay outside the global budget");
+});
+
+test("login waits at most loginLockMs and a busy lock writes no counters or sessions", () => {
+  const { harness, player } = signedInFixture();
+  const waits = [], original = harness.context.LockService.getScriptLock;
+  harness.context.LockService = { getScriptLock: () => { const lock = original(); return { ...lock, tryLock: ms => { waits.push(ms); return lock.tryLock(ms); } }; } };
+  const before = clone(harness.properties);
+  harness.locks.available = false;
+  assert.equal(assertFailure(loginAs(harness, "ND-001", "correct-test-password")).code, "BUSY");
+  assert.equal(assertFailure(loginAs(harness, "ADMIN", "wrong-password")).code, "BUSY");
+  assert.deepEqual(harness.properties, before);
+  assert.equal(assertFailure(mutate(harness, player.token, "saveActivity", { activity: newCandidate() })).code, "BUSY");
+  assert.deepEqual(waits, [5000, 5000, 20000]);
+  assert.equal(harness.context.NODE_TESTS.constants.loginLockMs, 5000);
+  harness.locks.available = true; waits.length = 0;
+  assertSuccess(loginAs(harness, "ND-001", "correct-test-password"));
+  assert.deepEqual(waits, [5000, 5000], "A successful login takes two short sections");
+});
+
+test("a correct password is never counted as a failure when its lock is busy or the roster read fails", () => {
+  const { harness } = signedInFixture();
+  const rateKey = accountRateKey(harness, "ND-001");
+  for (let i = 0; i < 6; i++) {
+    harness.spreadsheet.readObserver = read => { if (read.sheetId === 8001) harness.locks.available = false; };
+    assert.equal(assertFailure(loginAs(harness, "ND-001", "correct-test-password")).code, "BUSY");
+    harness.spreadsheet.readObserver = null; harness.locks.available = true;
+  }
+  assert.equal(harness.properties[rateKey], undefined, "Six busy logins with the right password leave no failures");
+  const opening = harness.context.SpreadsheetApp.openById;
+  harness.context.SpreadsheetApp.openById = () => { throw new Error("Temporary Sheets outage"); };
+  for (let i = 0; i < 6; i++) assertFailure(loginAs(harness, "ND-001", "correct-test-password"));
+  harness.context.SpreadsheetApp.openById = opening;
+  assert.equal(harness.properties[rateKey], undefined, "An outage after a proven password leaves no failures");
+  assertSuccess(loginAs(harness, "ND-001", "correct-test-password"));
+  for (let i = 0; i < 5; i++) assert.equal(assertFailure(loginAs(harness, "ND-001", "wrong-password")).code, "INVALID_CREDENTIALS");
+  assert.equal(assertFailure(loginAs(harness, "ND-001", "correct-test-password")).code, "RATE_LIMITED", "Wrong guesses are still counted");
+});
+
+test("a correct guess that loses the race to a full bucket is limited before any roster read, like a wrong one", () => {
+  const { harness } = signedInFixture();
+  const rateKey = accountRateKey(harness, "ND-001"), now = harness.clock.milliseconds;
+  harness.properties[rateKey] = JSON.stringify({ start: now, failures: 4 });
+  const utilities = harness.context.Utilities, original = utilities.computeHmacSha256Signature;
+  utilities.computeHmacSha256Signature = (...args) => { harness.properties[rateKey] = JSON.stringify({ start: now, failures: 5 }); return original(...args); };
+  let rosterReads = 0;
+  harness.spreadsheet.readObserver = read => { if (read.sheetId === 8001) rosterReads++; };
+  assert.equal(assertFailure(loginAs(harness, "ND-001", "correct-test-password")).code, "RATE_LIMITED");
+  utilities.computeHmacSha256Signature = original;
+  assert.equal(rosterReads, 0, "A limited correct guess takes as long as a wrong one");
+  assert.equal(sessionCount(harness), 2);
+});
+
+test("a credential replaced during the unlocked check or roster read never yields a session", () => {
+  for (const point of ["kdf", "roster"]) for (const versioned of [false, true]) {
+    const { harness } = signedInFixture();
+    const sessions = sessionCount(harness), globalBefore = harness.properties.NODE_LOGIN_RATE;
+    const replace = () => { const next = versioned ? harness.context.makeAuth_("replacement-password-1") : harness.context.makeGeneratedAuth_("replacement-password-1"); if (versioned) next.version = harness.context.random256_(); harness.properties["NODE_AUTH_ND-001"] = JSON.stringify(next); };
+    const utilities = harness.context.Utilities, original = utilities.computeHmacSha256Signature;
+    if (point === "kdf") { let done = false; utilities.computeHmacSha256Signature = (...args) => { if (!done && !harness.locks.held) { done = true; replace(); } return original(...args); }; }
+    else harness.spreadsheet.readObserver = read => { if (read.sheetId === 8001 && !harness.locks.held) { harness.spreadsheet.readObserver = null; replace(); } };
+    const error = assertFailure(loginAs(harness, "ND-001", "correct-test-password"));
+    utilities.computeHmacSha256Signature = original; harness.spreadsheet.readObserver = null;
+    assert.equal(error.code, "BUSY"); assert.equal(error.message, "ログイン情報が更新されました。もう一度ログインしてください。");
+    assert.equal(sessionCount(harness), sessions);
+    assert.equal(harness.properties[accountRateKey(harness, "ND-001")], undefined, "The replaced credential is not counted against the account");
+    if (point === "kdf") assert.equal(harness.properties.NODE_LOGIN_RATE, globalBefore);
+    assert.equal(harness.locks.held, false);
+    assert.equal(assertFailure(loginAs(harness, "ND-001", "correct-test-password")).code, "INVALID_CREDENTIALS");
+    assertSuccess(loginAs(harness, "ND-001", "replacement-password-1"));
+  }
+});
+
+test("a destination switch during the unlocked roster read never yields a session", () => {
+  const { harness } = signedInFixture();
+  const sessions = sessionCount(harness);
+  harness.spreadsheet.readObserver = read => {
+    if (read.sheetId !== 8001 || harness.locks.held) return;
+    const config = JSON.parse(harness.properties.NODE_CONFIG); config.switchedAt = "x"; harness.properties.NODE_CONFIG = JSON.stringify(config);
+    harness.spreadsheet.readObserver = null;
+  };
+  const error = assertFailure(loginAs(harness, "ND-001", "correct-test-password"));
+  assert.equal(error.code, "BUSY"); assert.equal(error.message, "管理設定が更新されました。もう一度ログインしてください。");
+  assert.equal(sessionCount(harness), sessions);
+  assert.equal(harness.properties[accountRateKey(harness, "ND-001")], undefined);
+  assertSuccess(loginAs(harness, "ND-001", "correct-test-password"));
+});
+
+test("an account disabled after the unlocked roster read cannot use the issued session", () => {
+  const { harness } = signedInFixture();
+  const api = harness.context.PropertiesService.getScriptProperties(), set = api.setProperty;
+  let flipped = false;
+  api.setProperty = function(key, value) {
+    if (!flipped && /^NODE_SESSION_[A-Za-z0-9_-]{43}$/.test(key)) { flipped = true; harness.spreadsheet.getSheetByName("_NODE_players").values.find(row => row[0] === "ND-001")[8] = false; }
+    return set.call(this, key, value);
+  };
+  const login = assertSuccess(loginAs(harness, "ND-001", "correct-test-password"));
+  api.setProperty = set;
+  assert.equal(assertFailure(request(harness, "snapshot", {}, { token: login.token })).code, "UNAUTHENTICATED");
+  assert.equal(assertFailure(loginAs(harness, "ND-001", "correct-test-password")).code, "INVALID_CREDENTIALS");
+});
+
+test("sessions, auth records and counters written before the change keep working", () => {
+  const { harness, player } = signedInFixture();
+  const legacyToken = "L".repeat(43), now = harness.clock.milliseconds;
+  harness.properties[harness.context.sessionKey_(legacyToken)] = JSON.stringify({ id: "ND-001", expiresAt: now + 3600000 });
+  assertSuccess(request(harness, "snapshot", {}, { token: player.token }));
+  assertSuccess(request(harness, "snapshot", {}, { token: legacyToken }));
+  harness.properties["NODE_AUTH_ND-002"] = JSON.stringify(legacyRecord(harness, "legacy-password-123"));
+  harness.properties[accountRateKey(harness, "ND-002")] = JSON.stringify({ start: now, failures: 4 });
+  const login = assertSuccess(loginAs(harness, "ND-002", "legacy-password-123"));
+  assert.equal(JSON.parse(harness.properties[harness.context.sessionKey_(login.token)]).authVersion, null);
+  assert.equal(harness.properties[accountRateKey(harness, "ND-002")], undefined);
+  assert.equal(Object.hasOwn(JSON.parse(harness.properties["NODE_AUTH_ND-002"]), "version"), false);
+  assertSuccess(request(harness, "snapshot", {}, { token: login.token }));
+});
+
+/* Forced change of issued passwords (mustChange). */
+const PASSWORD_CHANGE_REQUIRED = error => error.code === "PASSWORD_CHANGE_REQUIRED" && error.message.includes("初期パスワードの変更が必要です");
+function issuedPlayer(harness, admin) {
+  const created = assertSuccess(mutate(harness, admin.token, "createPlayer", { name: "新担当", team: "NODE", target: 10, sheetNames: ["新担当"] }));
+  harness.writes.length = 0; harness.apiCalls.length = 0;
+  return created.credentials;
+}
+
+test("issued passwords open only password change and logout until their holder replaces them", () => {
+  const { harness, admin } = signedInFixture(), credentials = issuedPlayer(harness, admin), authKey = `NODE_AUTH_${credentials.id}`;
+  const issuedAuth = JSON.parse(harness.properties[authKey]);
+  assert.equal(issuedAuth.mustChange, true);
+  assert.equal(typeof issuedAuth.version, "string");
+  harness.spreadsheet.reads.length = 0;
+  const metadataReads = harness.metadataReads.length;
+  // The old frontend logs in without sessionOnly; an issued password still returns no business data.
+  const login = assertSuccess(request(harness, "login", credentials));
+  assert.deepEqual(Object.keys(login), ["token", "deviceToken", "mustChangePassword"]);
+  assert.equal(login.mustChangePassword, true);
+  assert.equal(harness.metadataReads.length, metadataReads);
+  assert.ok(harness.spreadsheet.reads.every(read => read.sheetId !== MATCHING_SHEET_ID), "A forced login never reads the business table");
+  const token = login.token, sessionKey = harness.context.sessionKey_(token);
+  const attempts = [
+    () => request(harness, "snapshot", {}, { token }),
+    () => mutate(harness, token, "saveActivity", { activity: newCandidate({ playerId: credentials.id, candidateName: "強制変更前候補" }) }),
+    () => request(harness, "saveActivity", { activity: newCandidate({ playerId: credentials.id }) }, { token, operationId: randomUUID(), responseMode: "receipt" }),
+    () => mutate(harness, token, "updateProfile", { player: { id: credentials.id, name: "変更前の名前" } }),
+    () => request(harness, "managementTables", {}, { token }),
+    () => request(harness, "auditSecurity", {}, { token }),
+    () => request(harness, "readWritingPreferences", {}, { token }),
+    () => request(harness, "readWorkspaceInsights", { period: "2026-10" }, { token }),
+  ];
+  for (const attempt of attempts) assert.ok(PASSWORD_CHANGE_REQUIRED(assertFailure(attempt())));
+  assert.ok(harness.properties[sessionKey], "The forced session is kept so its holder can still change the password");
+  assert.deepEqual(harness.writes, []); assert.deepEqual(harness.apiCalls, []);
+  assert.equal(harness.metadataReads.length, metadataReads);
+  assert.ok(harness.spreadsheet.reads.every(read => read.sheetId !== MATCHING_SHEET_ID));
+  assert.equal(harness.locks.held, false);
+  assertSuccess(request(harness, "health"));
+  assert.equal(assertFailure(request(harness, "changePassword", { currentPassword: credentials.password, newPassword: credentials.password }, { token })).code, "VALIDATION");
+  assert.equal(assertFailure(request(harness, "changePassword", { currentPassword: "not-the-issued-password", newPassword: "member-chosen-password" }, { token })).code, "INVALID_CREDENTIALS");
+  assert.deepEqual(assertSuccess(request(harness, "changePassword", { currentPassword: credentials.password, newPassword: "member-chosen-password" }, { token })), { changed: true });
+  const changed = JSON.parse(harness.properties[authKey]);
+  assert.equal(Object.hasOwn(changed, "mustChange"), false);
+  assert.equal(typeof changed.version, "string"); assert.notEqual(changed.version, issuedAuth.version);
+  assert.equal(assertFailure(request(harness, "snapshot", {}, { token })).code, "UNAUTHENTICATED");
+  assert.equal(assertFailure(request(harness, "login", credentials)).code, "INVALID_CREDENTIALS");
+  const fresh = assertSuccess(request(harness, "login", { id: credentials.id, password: "member-chosen-password" }));
+  assert.equal(fresh.snapshot.self.playerId, credentials.id);
+  assert.equal(Object.hasOwn(fresh, "mustChangePassword"), false);
+  assert.ok(!JSON.stringify(harness.properties).includes(credentials.password));
+});
+
+test("a session holding an issued password can log out", () => {
+  const { harness, admin } = signedInFixture(), credentials = issuedPlayer(harness, admin);
+  const login = assertSuccess(request(harness, "login", { ...credentials, sessionOnly: true })), sessionKey = harness.context.sessionKey_(login.token);
+  assert.equal(login.mustChangePassword, true);
+  assert.ok(harness.properties[sessionKey]);
+  assert.deepEqual(assertSuccess(request(harness, "logout", {}, { token: login.token })), { loggedOut: true });
+  assert.equal(harness.properties[sessionKey], undefined);
+  assert.equal(assertFailure(request(harness, "changePassword", { currentPassword: credentials.password, newPassword: "member-chosen-password" }, { token: login.token })).code, "UNAUTHENTICATED");
+  assert.deepEqual(harness.writes, []); assert.deepEqual(harness.apiCalls, []);
+});
+
+test("records without the flag or with it false keep working; a malformed flag fails closed", () => {
+  const harness = baseHarness();
+  harness.properties.NODE_PEPPER = "test-pepper-keep-fixtures-out-of-production";
+  const key = "NODE_AUTH_ND-001", auth = harness.context.makeAuth_("legacy-password");
+  harness.properties[key] = JSON.stringify(auth);
+  const legacy = assertSuccess(loginAs(harness, "ND-001", "legacy-password"));
+  assert.deepEqual(Object.keys(legacy), ["token", "deviceToken"]);
+  assertSuccess(request(harness, "snapshot", {}, { token: legacy.token }));
+  harness.properties[key] = JSON.stringify({ ...auth, mustChange: false });
+  assertSuccess(request(harness, "snapshot", {}, { token: legacy.token }));
+  const explicit = assertSuccess(loginAs(harness, "ND-001", "legacy-password"));
+  assert.deepEqual(Object.keys(explicit), ["token", "deviceToken"]);
+  assertSuccess(request(harness, "snapshot", {}, { token: explicit.token }));
+  harness.properties[key] = JSON.stringify({ ...auth, mustChange: "true" });
+  const sessions = sessionCount(harness);
+  assert.equal(assertFailure(loginAs(harness, "ND-001", "legacy-password")).code, "INVALID_CREDENTIALS");
+  assert.equal(sessionCount(harness), sessions);
+  assert.equal(assertFailure(request(harness, "snapshot", {}, { token: explicit.token })).code, "UNAUTHENTICATED");
+});
+
+test("an owner reissue forces a change and revokes sessions and device tokens a scan missed", () => {
+  const { harness, player } = signedInFixture();
+  const hidden = "H".repeat(43), hiddenKey = harness.context.sessionKey_(hidden);
+  harness.properties[hiddenKey] = JSON.stringify({ id: "ND-001", expiresAt: harness.clock.milliseconds + 3600000 });
+  assertSuccess(request(harness, "snapshot", {}, { token: hidden }));
+  const api = harness.context.PropertiesService.getScriptProperties(), getProperties = api.getProperties, shown = [];
+  api.getProperties = () => { const all = getProperties(); delete all[hiddenKey]; return all; };
+  harness.context.SpreadsheetApp.getUi = () => ({ ButtonSet: { OK_CANCEL: "OK_CANCEL" }, Button: { OK: "OK" }, prompt: () => ({ getSelectedButton: () => "OK", getResponseText: () => "nd-001" }) });
+  harness.context.showCredentials_ = credentials => shown.push(clone(credentials));
+  harness.context.rotateNodePassword();
+  api.getProperties = getProperties;
+  assert.equal(shown.length, 1); assert.equal(shown[0][0].id, "ND-001");
+  const auth = JSON.parse(harness.properties["NODE_AUTH_ND-001"]);
+  assert.equal(auth.mustChange, true); assert.equal(typeof auth.version, "string");
+  assert.equal(assertFailure(request(harness, "snapshot", {}, { token: player.token })).code, "UNAUTHENTICATED");
+  assert.equal(assertFailure(request(harness, "snapshot", {}, { token: hidden })).code, "UNAUTHENTICATED", "A legacy session the scan missed cannot match the issued version");
+  assert.equal(harness.context.trustedDevice_("ND-001", harness.context.authRecord_("ND-001"), player.deviceToken), false);
+  assert.equal(assertFailure(loginAs(harness, "ND-001", "correct-test-password")).code, "INVALID_CREDENTIALS");
+  assert.equal(issuedLogin(harness, shown[0][0]).snapshot.self.playerId, "ND-001");
+});
+
+test("the copy probe refuses before any change while ADMIN still holds an issued password", () => {
+  for (const when of ["before", "during"]) {
+    const { harness } = signedInFixture(), flagged = JSON.stringify({ ...JSON.parse(harness.properties.NODE_AUTH_ADMIN), mustChange: true });
+    if (when === "before") harness.properties.NODE_AUTH_ADMIN = flagged;
+    harness.properties.NODE_COPY_PROOF = "sentinel-proof";
+    let alerts = 0;
+    harness.context.SpreadsheetApp.getUi = () => ({ ButtonSet: { YES_NO: "YES_NO" }, Button: { YES: "YES" }, alert: () => { alerts++; harness.properties.NODE_AUTH_ADMIN = flagged; return "YES"; } });
+    const sessions = sessionCount(harness), players = clone(harness.spreadsheet.getSheetByName("_NODE_players").values);
+    assert.throws(() => harness.context.verifyNodeCopyIntegration(), error => error.nodeCode === "PASSWORD_CHANGE_REQUIRED" && error.message.includes("ADMIN"));
+    assert.equal(alerts, when === "before" ? 0 : 1);
+    assert.equal(harness.properties.NODE_COPY_PROOF, "sentinel-proof");
+    assert.equal(sessionCount(harness), sessions);
+    assert.deepEqual(harness.spreadsheet.getSheetByName("_NODE_players").values, players);
+    assert.deepEqual(harness.apiCalls, []); assert.deepEqual(harness.writes, []);
+  }
+});
+
+test("the copy probe runs the forced change itself and works after ADMIN changed its password", () => {
+  const { harness, admin } = signedInFixture();
+  assertSuccess(request(harness, "changePassword", { currentPassword: "correct-test-password", newPassword: "admin-changed-password" }, { token: admin.token }));
+  const handle = harness.context.nodeHandle_, actions = [];
+  harness.context.nodeHandle_ = req => { actions.push(req.action); return handle(req); };
+  assert.equal(harness.context.verifyNodeCopyIntegration().verified, true);
+  harness.context.nodeHandle_ = handle;
+  assert.equal(actions.filter(action => action === "changePassword").length, 1);
+  assert.equal(actions.filter(action => action === "login").length, 2);
+  const probe = harness.spreadsheet.getSheetByName("_NODE_players").values.find(row => String(row[1]).startsWith("連携検証"));
+  assert.ok(probe); assert.equal(probe[8], false);
+  assert.equal(harness.properties[`NODE_AUTH_${probe[0]}`], undefined);
+  assert.equal(harness.properties[harness.context.sessionIndexKey_(probe[0])], undefined);
+  assert.ok(Object.keys(harness.properties).filter(key => key.startsWith("NODE_SESSION_")).every(key => { const session = harness.context.parseSession_(harness.properties[key]); return !session || session.id !== probe[0]; }));
+  assert.equal(Object.keys(harness.properties).filter(key => key.startsWith("NODE_SESSION_")).map(key => harness.context.parseSession_(harness.properties[key])).filter(session => session && session.id === "ADMIN").length, 0, "The synthetic ADMIN session is removed");
+  assert.ok(harness.context.NODE_TESTS.validCopyProof(JSON.parse(harness.properties.NODE_COPY_PROOF), "owner@example.test"));
+});
+
+// Per-account read budgets (CacheService) for snapshot, report, management-table and writing-kit reads.
+const readBudgetKey = (bucket, id) => `NODE_READ_${bucket}_${id}`;
+const readBudgetState = (harness, bucket, id) => JSON.parse(harness.context.CacheService.getScriptCache().get(readBudgetKey(bucket, id)) || "null");
+function seedReadBudget(harness, bucket, id, minuteCount, hourCount) {
+  const now = harness.clock.milliseconds;
+  harness.context.CacheService.getScriptCache().put(readBudgetKey(bucket, id), JSON.stringify([Math.floor(now / 60000), minuteCount, Math.floor(now / 3600000), hourCount]), 3600);
+}
+const sessionKeys = harness => Object.keys(harness.properties).filter(key => key.startsWith("NODE_SESSION_")).sort();
+
+test("snapshot reads are budgeted per account per minute without touching the sheet or the session", () => {
+  const { harness, player, admin } = signedInFixture();
+  // The fixture's legacy logins count against the snapshot budget; start in a fresh minute.
+  harness.clock.milliseconds += 60000;
+  for (let i = 0; i < 40; i++) assertSuccess(request(harness, "snapshot", {}, { token: player.token }));
+  const reads = harness.spreadsheet.reads.length, sessions = sessionKeys(harness).map(key => [key, harness.properties[key]]);
+  const limited = assertFailure(request(harness, "snapshot", {}, { token: player.token }));
+  assert.equal(limited.code, "RATE_LIMITED");
+  assert.match(limited.message, /秒後に再試行/);
+  assert.match(limited.message, /未同期の入力はそのまま残ります/);
+  assert.equal(harness.spreadsheet.reads.length, reads, "A rejected snapshot reads no sheet");
+  assert.deepEqual(sessionKeys(harness).map(key => [key, harness.properties[key]]), sessions, "A rejected snapshot keeps every session");
+  for (let i = 0; i < 5; i++) assert.equal(assertFailure(request(harness, "snapshot", {}, { token: player.token })).code, "RATE_LIMITED");
+  assert.equal(readBudgetState(harness, "snapshot", "ND-001")[1], 40, "Rejected requests do not extend the lockout");
+  assertSuccess(request(harness, "snapshot", {}, { token: admin.token }));
+  harness.clock.milliseconds += 60000;
+  assertSuccess(request(harness, "snapshot", {}, { token: player.token }));
+  assert.equal(readBudgetState(harness, "snapshot", "ND-001")[1], 1);
+});
+
+test("hourly snapshot budget is shared by all sessions of one account and resets on the next hour", () => {
+  const { harness, player } = signedInFixture();
+  const second = assertSuccess(request(harness, "login", { id: "ND-001", password: "correct-test-password", sessionOnly: true }));
+  seedReadBudget(harness, "snapshot", "ND-001", 0, 900);
+  for (const token of [player.token, second.token]) {
+    const error = assertFailure(request(harness, "snapshot", {}, { token }));
+    assert.equal(error.code, "RATE_LIMITED");
+    assert.match(error.message, /分後に再試行/);
+  }
+  assert.ok(assertSuccess(request(harness, "login", { id: "ND-001", password: "correct-test-password", sessionOnly: true })).token, "Session-only logins are not read-budgeted");
+  // Keep the session within the 60-minute idle limit across the jump to the next hour.
+  harness.clock.milliseconds += 30 * 60000;
+  assertSuccess(request(harness, "touch", {}, { token: player.token }));
+  harness.clock.milliseconds = (Math.floor(harness.clock.milliseconds / 3600000) + 1) * 3600000;
+  assertSuccess(request(harness, "snapshot", {}, { token: player.token }));
+});
+
+test("authentication precedes read budgets and unknown inherited action names stay BAD_REQUEST", () => {
+  const { harness, player } = signedInFixture();
+  seedReadBudget(harness, "snapshot", "ND-001", 40, 900);
+  assert.equal(assertFailure(request(harness, "snapshot", {}, { token: "x".repeat(43) })).code, "UNAUTHENTICATED");
+  assertSuccess(request(harness, "logout", {}, { token: player.token }));
+  assert.equal(assertFailure(request(harness, "snapshot", {}, { token: player.token })).code, "UNAUTHENTICATED");
+  for (const action of ["constructor", "toString", "__proto__", "hasOwnProperty"]) assert.equal(assertFailure(request(harness, action, {}, { token: player.token })).code, "BAD_REQUEST", action);
+});
+
+test("legacy login snapshots share the budget and a rejected one deletes its unreturned session", () => {
+  const { harness } = signedInFixture();
+  seedReadBudget(harness, "snapshot", "ND-001", 40, 900);
+  const before = sessionKeys(harness);
+  assert.equal(assertFailure(request(harness, "login", { id: "ND-001", password: "correct-test-password" })).code, "RATE_LIMITED");
+  assert.deepEqual(sessionKeys(harness), before);
+  assert.ok(assertSuccess(request(harness, "login", { id: "ND-001", password: "correct-test-password", sessionOnly: true })).token);
+});
+
+test("read budgets fail open when CacheService is unavailable, write-incapable, or holds malformed state", () => {
+  const { harness, player } = signedInFixture();
+  const realCache = harness.context.CacheService;
+  harness.context.CacheService = { getScriptCache() { throw new Error("cache unavailable"); } };
+  assertSuccess(request(harness, "snapshot", {}, { token: player.token }));
+  harness.context.CacheService = { getScriptCache: () => ({ get() { throw new Error("cache get failed"); }, put() { throw new Error("unexpected"); } }) };
+  assertSuccess(request(harness, "snapshot", {}, { token: player.token }));
+  harness.context.CacheService = { getScriptCache: () => ({ get: () => null }) };
+  assertSuccess(request(harness, "snapshot", {}, { token: player.token }));
+  harness.context.CacheService = realCache;
+  for (const stored of ["garbage", "{}", "[1,2,3]", '[1,"x",1,1]', "[1,-5,1,-5]"]) {
+    realCache.getScriptCache().put(readBudgetKey("snapshot", "ND-001"), stored, 3600);
+    assertSuccess(request(harness, "snapshot", {}, { token: player.token }));
+    assert.equal(readBudgetState(harness, "snapshot", "ND-001")[1], 1, stored);
+  }
+  // Current-window indices with corrupt counts must reset too, not slip past the limit.
+  const minute = Math.floor(harness.clock.milliseconds / 60000), hour = Math.floor(harness.clock.milliseconds / 3600000);
+  for (const stored of [[minute, -5, hour, -5], [minute, "x", hour, "x"], [minute, null, hour, 1]]) {
+    realCache.getScriptCache().put(readBudgetKey("snapshot", "ND-001"), JSON.stringify(stored), 3600);
+    assertSuccess(request(harness, "snapshot", {}, { token: player.token }));
+    assert.deepEqual(readBudgetState(harness, "snapshot", "ND-001"), [minute, 1, hour, 1], JSON.stringify(stored));
+  }
+});
+
+test("AI and report reads share one budget, reject before Gemini or quota changes, and leave snapshots available", () => {
+  const { harness, player, admin, payload } = reviewFixture();
+  assertSuccess(request(harness, "saveInterviewReview", payload, { token: player.token, operationId: randomUUID() }));
+  harness.properties.NODE_GEMINI_API_KEY = "fixture-key"; harness.properties.NODE_GEMINI_FREE_TIER_CONFIRMED = "true";
+  let calls = 0; harness.context.UrlFetchApp.fetch = () => { calls++; throw new Error("Gemini must not be called"); };
+  seedReadBudget(harness, "report", "ND-001", 20, 20);
+  const quota = harness.properties.NODE_AI_QUOTA, reads = harness.spreadsheet.reads.length;
+  for (const [action, body] of [["readInterviewAdvice", { period: "2026-10" }], ["analyzeInterviewReviews", { period: "2026-10" }], ["readWorkspaceInsights", { period: "all" }], ["analyzeWorkspaceInsights", { period: "all" }]]) {
+    const error = assertFailure(request(harness, action, body, { token: player.token }));
+    assert.equal(error.code, "RATE_LIMITED", action);
+    assert.match(error.message, /秒後に再試行/);
+  }
+  assert.equal(calls, 0);
+  assert.equal(harness.properties.NODE_AI_QUOTA, quota);
+  assert.equal(harness.properties.NODE_AI_PENDING, undefined);
+  assert.equal(harness.spreadsheet.reads.length, reads);
+  assertSuccess(request(harness, "snapshot", {}, { token: player.token }));
+  assertSuccess(request(harness, "readInterviewAdvice", { period: "2026-10" }, { token: admin.token }));
+  seedReadBudget(harness, "report", "ADMIN", 20, 20);
+  assert.equal(assertFailure(request(harness, "auditSecurity", {}, { token: admin.token })).code, "RATE_LIMITED");
+});
+
+test("management and writing reads have their own budgets", () => {
+  const { harness, admin } = signedInFixture();
+  assertSuccess(request(harness, "managementTable", { sheetId: KPI_SHEET_ID }, { token: admin.token }));
+  seedReadBudget(harness, "table", "ADMIN", 40, 40);
+  const reads = harness.spreadsheet.reads.length;
+  assert.equal(assertFailure(request(harness, "managementTables", {}, { token: admin.token })).code, "RATE_LIMITED");
+  assert.equal(assertFailure(request(harness, "managementTable", { sheetId: KPI_SHEET_ID }, { token: admin.token })).code, "RATE_LIMITED");
+  seedReadBudget(harness, "kit", "ADMIN", 60, 60);
+  for (const action of ["readWritingKit", "readWritingPreferences", "generateWritingKit"]) assert.equal(assertFailure(request(harness, action, {}, { token: admin.token })).code, "RATE_LIMITED", action);
+  assert.equal(harness.spreadsheet.reads.length, reads, "Rejected management and writing reads touch no sheet");
+  assertSuccess(request(harness, "snapshot", {}, { token: admin.token }));
+});
+
+test("mutations are not read-budgeted and still return a fresh snapshot", () => {
+  const { harness, player, records } = signedInFixture();
+  const snapshot = assertSuccess(request(harness, "snapshot", {}, { token: player.token }));
+  const current = snapshot.records.find(record => record.recordId === records[0].id) ?? snapshot.records[0];
+  seedReadBudget(harness, "snapshot", "ND-001", 40, 900);
+  const saved = assertSuccess(mutate(harness, player.token, "updateStatus", { recordId: records[0].id, rowVersion: current.rowVersion, status: "辞退（本人希望）" }));
+  assert.ok(saved.snapshot && Array.isArray(saved.snapshot.records), "A write still answers with a snapshot");
+  assert.equal(assertFailure(request(harness, "snapshot", {}, { token: player.token })).code, "RATE_LIMITED", "The write did not reset the read budget");
+});
+
+test("budgeted actions authenticate before any sheet read, and an exhausted hour reports the hourly wait", () => {
+  const { harness } = signedInFixture();
+  const reads = harness.spreadsheet.reads.length, metadata = harness.metadataReads.length, readStore = harness.context.readStore_;
+  harness.context.readStore_ = () => { throw new Error("An unauthenticated request must not reach readStore_"); };
+  for (const [action, body] of [["snapshot", {}], ["readInterviewAdvice", { period: "all" }], ["managementTable", { sheetId: KPI_SHEET_ID }], ["readWritingKit", {}]]) {
+    assert.equal(assertFailure(request(harness, action, body, { token: "x".repeat(43) })).code, "UNAUTHENTICATED", action);
+  }
+  harness.context.readStore_ = readStore;
+  assert.equal(harness.spreadsheet.reads.length, reads);
+  assert.equal(harness.metadataReads.length, metadata);
+  const { harness: other, player } = signedInFixture();
+  seedReadBudget(other, "snapshot", "ND-001", 40, 900);
+  const error = assertFailure(request(other, "snapshot", {}, { token: player.token }));
+  assert.equal(error.code, "RATE_LIMITED");
+  assert.match(error.message, /分後に再試行/);
+  assert.doesNotMatch(error.message, /秒後/);
+});
+
+test("legacy login budget uses the issued normalized ID", () => {
+  const { harness } = signedInFixture();
+  seedReadBudget(harness, "snapshot", "ND-001", 40, 40);
+  assert.equal(assertFailure(request(harness, "login", { id: "  nd-001 ", password: "correct-test-password" })).code, "RATE_LIMITED");
+  harness.clock.milliseconds += 60000;
+  const login = assertSuccess(request(harness, "login", { id: "  nd-001 ", password: "correct-test-password" }));
+  assert.ok(login.snapshot);
+  assert.equal(readBudgetState(harness, "snapshot", "ND-001")[1], 1);
+  assert.equal(readBudgetState(harness, "snapshot", "  nd-001 "), null);
+});
+
+test("wrong passwords and issued-password sessions never spend an account's read budget", () => {
+  const { harness } = signedInFixture();
+  harness.clock.milliseconds += 60000;
+  const charged = readBudgetState(harness, "snapshot", "ND-001");
+  assert.equal(assertFailure(request(harness, "login", { id: "ND-001", password: "wrong-password-guess" })).code, "INVALID_CREDENTIALS");
+  assert.deepEqual(readBudgetState(harness, "snapshot", "ND-001"), charged, "Only a verified password is charged");
+  harness.properties["NODE_AUTH_ND-002"] = JSON.stringify(harness.context.makeGeneratedAuth_("issued-password-for-nd-002", true));
+  seedReadBudget(harness, "snapshot", "ND-002", 40, 900);
+  const issued = assertSuccess(request(harness, "login", { id: "ND-002", password: "issued-password-for-nd-002" }));
+  assert.equal(issued.mustChangePassword, true, "The forced-change answer carries no snapshot and is not budgeted");
+  harness.context.CacheService.getScriptCache().remove(readBudgetKey("snapshot", "ND-002"));
+  assert.equal(assertFailure(request(harness, "snapshot", {}, { token: issued.token })).code, "PASSWORD_CHANGE_REQUIRED");
+  assert.equal(readBudgetState(harness, "snapshot", "ND-002"), null);
+});
+
+/* Idle timeout: sessions end after 60 minutes without user activity. Automatic polls that
+ * say background:true are passive; lastSeenAt is refreshed at most every 5 minutes. */
+const MINUTE = 60000;
+const sessionOf = (harness, token) => { const raw = harness.properties[harness.context.sessionKey_(token)]; return raw === undefined ? undefined : JSON.parse(raw); };
+const countSessionWrites = (harness, token) => {
+  const api = harness.context.PropertiesService.getScriptProperties(), set = api.setProperty, key = harness.context.sessionKey_(token), counter = { writes: 0 };
+  api.setProperty = (k, v) => { if (k === key) counter.writes++; return set.call(api, k, v); };
+  return counter;
+};
+
+test("an idle session ends server-side after 60 minutes, and activity keeps it alive until the 6-hour limit", () => {
+  const { harness, player } = signedInFixture();
+  const issued = sessionOf(harness, player.token);
+  assert.equal(issued.lastSeenAt, issued.issuedAt, "New sessions start their idle clock at login");
+  assert.equal(harness.context.NODE_TESTS.constants.sessionIdleMinutes, 60);
+  for (let i = 0; i < 5; i++) {
+    harness.clock.milliseconds += 59 * MINUTE;
+    assertSuccess(request(harness, "snapshot", {}, { token: player.token }));
+    assert.equal(sessionOf(harness, player.token).lastSeenAt, harness.clock.milliseconds);
+  }
+  assert.equal(sessionOf(harness, player.token).expiresAt, issued.expiresAt, "Activity never extends the absolute limit");
+  harness.clock.milliseconds += 60 * MINUTE;
+  const error = assertFailure(request(harness, "snapshot", {}, { token: player.token }));
+  assert.equal(error.code, "UNAUTHENTICATED");
+  assert.match(error.message, /60分以上操作がなかったため、ログアウトしました。もう一度ログインしてください。/);
+  assert.equal(sessionOf(harness, player.token), undefined, "The idle session is deleted");
+  assert.equal(assertFailure(request(harness, "snapshot", {}, { token: player.token })).code, "UNAUTHENTICATED");
+  // The idle limit never outlives the absolute one.
+  const fresh = authenticate(harness);
+  for (let i = 0; i < 6; i++) { harness.clock.milliseconds += 59 * MINUTE; assertSuccess(request(harness, "touch", {}, { token: fresh.token })); }
+  harness.clock.milliseconds += 7 * MINUTE;
+  assert.match(assertFailure(request(harness, "touch", {}, { token: fresh.token })).message, /有効期限が切れました/);
+  assert.ok(assertSuccess(request(harness, "login", { id: "ND-001", password: "correct-test-password", sessionOnly: true })).token, "Idle expiry never touches the login rate bucket");
+});
+
+test("background polls are passive while flagless requests from older frontends still count as activity", () => {
+  const { harness, player } = signedInFixture();
+  const issued = sessionOf(harness, player.token);
+  harness.clock.milliseconds += 30 * MINUTE;
+  assertSuccess(request(harness, "snapshot", {}, { token: player.token, background: true }));
+  assert.deepEqual(sessionOf(harness, player.token), issued, "A background poll records no activity");
+  harness.clock.milliseconds += 30 * MINUTE;
+  const error = assertFailure(request(harness, "snapshot", {}, { token: player.token, background: true }));
+  assert.equal(error.code, "UNAUTHENTICATED");
+  assert.match(error.message, /操作がなかった/);
+  // An old bundle polls every 30 seconds without the flag: its open tab keeps the session alive as before.
+  const old = authenticate(harness);
+  for (let i = 0; i < 4; i++) { harness.clock.milliseconds += 50 * MINUTE; assertSuccess(request(harness, "snapshot", {}, { token: old.token })); }
+  assert.equal(sessionOf(harness, old.token).lastSeenAt, harness.clock.milliseconds);
+  // background:false is activity; a background touch only checks the session; a malformed flag is refused before anything else.
+  harness.clock.milliseconds += 10 * MINUTE;
+  assertSuccess(request(harness, "snapshot", {}, { token: old.token, background: false }));
+  assert.equal(sessionOf(harness, old.token).lastSeenAt, harness.clock.milliseconds);
+  harness.clock.milliseconds += 10 * MINUTE;
+  assert.deepEqual(assertSuccess(request(harness, "touch", {}, { token: old.token, background: true })), { touched: false });
+  assert.equal(sessionOf(harness, old.token).lastSeenAt, harness.clock.milliseconds - 10 * MINUTE);
+  assertSuccess(request(harness, "touch", {}, { token: old.token }));
+  assert.equal(sessionOf(harness, old.token).lastSeenAt, harness.clock.milliseconds);
+  const before = JSON.stringify(sessionOf(harness, old.token));
+  harness.clock.milliseconds += 10 * MINUTE;
+  for (const background of ["true", 1, null]) assert.equal(assertFailure(request(harness, "snapshot", {}, { token: old.token, background })).code, "BAD_REQUEST");
+  assert.equal(JSON.stringify(sessionOf(harness, old.token)), before);
+});
+
+test("lastSeenAt is rewritten at most once per five minutes", () => {
+  const { harness, player } = signedInFixture();
+  const counter = countSessionWrites(harness, player.token);
+  harness.clock.milliseconds += 4 * MINUTE + 59000;
+  assertSuccess(request(harness, "snapshot", {}, { token: player.token }));
+  assertSuccess(request(harness, "touch", {}, { token: player.token }));
+  assert.equal(counter.writes, 0, "A request that is not due writes nothing");
+  harness.clock.milliseconds += 1000;
+  assertSuccess(request(harness, "snapshot", {}, { token: player.token }));
+  assert.equal(counter.writes, 1);
+  assertSuccess(request(harness, "snapshot", {}, { token: player.token }));
+  assertSuccess(request(harness, "touch", {}, { token: player.token }));
+  assert.equal(counter.writes, 1);
+});
+
+test("touch records activity without reading the business table or spending a read budget", () => {
+  const { harness, player } = signedInFixture();
+  harness.spreadsheet.reads.length = 0;
+  const budget = readBudgetState(harness, "snapshot", "ND-001");
+  harness.clock.milliseconds += 20 * MINUTE;
+  assert.deepEqual(assertSuccess(request(harness, "touch", {}, { token: player.token })), { touched: true });
+  assert.deepEqual(harness.spreadsheet.reads, []);
+  assert.equal(harness.sheetReads.length, 0);
+  assert.deepEqual(readBudgetState(harness, "snapshot", "ND-001"), budget);
+  assert.equal(sessionOf(harness, player.token).lastSeenAt, harness.clock.milliseconds);
+  assert.equal(assertFailure(request(harness, "touch", {}, {})).code, "UNAUTHENTICATED");
+  assert.equal(assertFailure(request(harness, "touch", {}, { token: "x".repeat(43) })).code, "UNAUTHENTICATED");
+  // An issued password still opens only password change and logout.
+  const created = assertSuccess(mutate(harness, authenticate(harness, "ADMIN").token, "createPlayer", { name: "新規担当", team: "NODE", target: 1, sheetNames: ["新規担当"] }));
+  const first = assertSuccess(request(harness, "login", { id: created.credentials.id, password: created.credentials.password, sessionOnly: true }));
+  assert.equal(assertFailure(request(harness, "touch", {}, { token: first.token })).code, "PASSWORD_CHANGE_REQUIRED");
+});
+
+test("a due activity refresh never waits for the write lock and catches up once it is free", () => {
+  const { harness, player } = signedInFixture();
+  harness.clock.milliseconds += 10 * MINUTE;
+  const unchanged = harness.properties[harness.context.sessionKey_(player.token)], before = harness.locks.calls;
+  harness.locks.available = false;
+  assertSuccess(request(harness, "snapshot", {}, { token: player.token }));
+  assertSuccess(request(harness, "touch", {}, { token: player.token }));
+  assert.equal(harness.locks.calls - before, 2, "Each due read tries the lock once, without waiting");
+  assert.equal(harness.properties[harness.context.sessionKey_(player.token)], unchanged, "A busy lock only defers the refresh");
+  harness.locks.available = true;
+  assertSuccess(request(harness, "snapshot", {}, { token: player.token }));
+  assert.equal(sessionOf(harness, player.token).lastSeenAt, harness.clock.milliseconds);
+  assert.equal(harness.locks.held, false);
+  // A failed write is ignored as well.
+  harness.clock.milliseconds += 10 * MINUTE;
+  const api = harness.context.PropertiesService.getScriptProperties(), set = api.setProperty, key = harness.context.sessionKey_(player.token);
+  api.setProperty = (k, v) => { if (k === key) throw new Error("Injected property failure"); return set.call(api, k, v); };
+  assertSuccess(request(harness, "snapshot", {}, { token: player.token }));
+  api.setProperty = set;
+  assert.equal(harness.locks.held, false);
+});
+
+test("a mutation refreshes activity inside its own lock and logout writes nothing first", () => {
+  const { harness, player } = signedInFixture();
+  harness.clock.milliseconds += 10 * MINUTE;
+  const before = harness.locks.calls;
+  assertSuccess(mutate(harness, player.token, "saveActivity", { activity: newCandidate() }));
+  assert.equal(harness.locks.calls - before, 1, "The refresh reuses the mutation's lock instead of taking it again");
+  assert.equal(sessionOf(harness, player.token).lastSeenAt, harness.clock.milliseconds);
+  assert.equal(harness.locks.held, false);
+  harness.clock.milliseconds += 10 * MINUTE;
+  const counter = countSessionWrites(harness, player.token);
+  assertSuccess(request(harness, "logout", {}, { token: player.token }));
+  assert.equal(counter.writes, 0);
+  assert.equal(sessionOf(harness, player.token), undefined);
+});
+
+test("an activity refresh racing logout or a password-change tombstone never resurrects the session", () => {
+  for (const revoke of ["delete", "tombstone"]) {
+    const { harness, player } = signedInFixture();
+    harness.clock.milliseconds += 10 * MINUTE;
+    const api = harness.context.PropertiesService.getScriptProperties(), get = api.getProperty, key = harness.context.sessionKey_(player.token);
+    let first = true;
+    // The revocation lands between authenticate_'s read and the locked compare-and-set.
+    api.getProperty = k => {
+      const value = get.call(api, k);
+      if (k === key && first) { first = false; if (revoke === "delete") api.deleteProperty(k); else api.setProperty(k, JSON.stringify({ id: "ND-001", expiresAt: 0 })); }
+      return value;
+    };
+    assert.equal(assertFailure(request(harness, "snapshot", {}, { token: player.token })).code, "UNAUTHENTICATED", revoke);
+    api.getProperty = get;
+    if (revoke === "delete") assert.equal(sessionOf(harness, player.token), undefined);
+    else assert.ok(sessionOf(harness, player.token) === undefined || sessionOf(harness, player.token).expiresAt === 0);
+    assert.equal(assertFailure(request(harness, "snapshot", {}, { token: player.token })).code, "UNAUTHENTICATED", revoke);
+    assert.equal(harness.locks.held, false);
+  }
+});
+
+test("sessions from older frontends and from before the idle timeout keep only the 6-hour limit", () => {
+  const { harness } = signedInFixture();
+  const now = harness.clock.milliseconds, legacy = "L".repeat(43), noIssue = "N".repeat(43);
+  harness.properties[harness.context.sessionKey_(legacy)] = JSON.stringify({ id: "ND-001", issuedAt: now - 3 * 60 * MINUTE, expiresAt: now + 3 * 60 * MINUTE, authVersion: null });
+  harness.properties[harness.context.sessionKey_(noIssue)] = JSON.stringify({ id: "ND-001", expiresAt: now + 60 * MINUTE });
+  const before = harness.properties[harness.context.sessionKey_(legacy)];
+  assertSuccess(request(harness, "snapshot", {}, { token: legacy }));
+  assertSuccess(request(harness, "snapshot", {}, { token: noIssue }));
+  assert.equal(harness.properties[harness.context.sessionKey_(legacy)], before, "No idle bookkeeping is written for sessions that are never idle-checked");
+  // An old bundle sends nothing while a dialog is open; its user must not be logged out mid-typing.
+  harness.properties["NODE_AUTH_ND-002"] = JSON.stringify(harness.context.NODE_TESTS.makeAuth("correct-test-password"));
+  const oldBundle = assertSuccess(request(harness, "login", { id: "ND-002", password: "correct-test-password" }));
+  assert.equal(sessionOf(harness, oldBundle.token).idleAware, undefined);
+  harness.clock.milliseconds += 2 * 60 * MINUTE;
+  authenticate(harness, "ADMIN");
+  assert.ok(sessionOf(harness, legacy), "Login cleanup keeps them");
+  assertSuccess(request(harness, "snapshot", {}, { token: legacy }));
+  assertSuccess(request(harness, "snapshot", {}, { token: oldBundle.token }));
+  harness.clock.milliseconds += 61 * MINUTE;
+  assert.match(assertFailure(request(harness, "snapshot", {}, { token: legacy })).message, /有効期限が切れました/, "The 6-hour limit still ends it");
+  harness.clock.milliseconds += 3 * 60 * MINUTE;
+  assert.match(assertFailure(request(harness, "snapshot", {}, { token: oldBundle.token })).message, /有効期限が切れました/);
+});
+
+test("login cleanup and audit ignore idle sessions, and eviction drops the least recently used", () => {
+  const { harness } = signedInFixture();
+  harness.clock.milliseconds += 61 * MINUTE;
+  const admin = authenticate(harness, "ADMIN");
+  assert.deepEqual(sessionKeys(harness), [harness.context.sessionKey_(admin.token)], "Cleanup deleted both idle sessions");
+  const audit = assertSuccess(request(harness, "auditSecurity", {}, { token: admin.token }));
+  assert.equal(audit.activeSessions, 1);
+  assert.equal(audit.sessionIdleMinutes, 60);
+  assert.equal(audit.sessionHours, 6);
+  // Nine live sessions for one account: the one used longest ago goes, although it was issued last.
+  const now = harness.clock.milliseconds, keys = [];
+  for (let i = 1; i <= 9; i++) {
+    const key = harness.context.sessionKey_(String.fromCharCode(64 + i).repeat(43));
+    keys.push(key);
+    harness.properties[key] = JSON.stringify({ id: "ND-001", issuedAt: now - (10 - i) * MINUTE, lastSeenAt: now - i * MINUTE, expiresAt: now + 60 * MINUTE, authVersion: null });
+  }
+  harness.clock.milliseconds += 2 * MINUTE;
+  authenticate(harness, "ADMIN");
+  assert.equal(harness.properties[keys[8]], undefined);
+  assert.ok(keys.slice(0, 8).every(key => harness.properties[key]));
+});
+
+/* Round-2 regressions. */
+test("until the owner turns on the forced change, issued passwords keep working on a frontend built before it", () => {
+  const { harness, admin } = signedInFixture();
+  delete harness.properties.NODE_FORCE_PASSWORD_CHANGE;
+  // The pre-change frontend logs in with sessionOnly and then reads its own snapshot.
+  const usable = (credentials) => {
+    const login = assertSuccess(loginAs(harness, credentials.id, credentials.password));
+    assert.deepEqual(Object.keys(login), ["token", "deviceToken"], credentials.id);
+    assert.equal(assertSuccess(request(harness, "snapshot", {}, { token: login.token })).self.playerId, credentials.id);
+    return login;
+  };
+  const created = assertSuccess(mutate(harness, admin.token, "createPlayer", { name: "切替前担当", team: "NODE", target: 5, sheetNames: ["切替前担当"] })).credentials;
+  const createdAuth = JSON.parse(harness.properties[`NODE_AUTH_${created.id}`]);
+  assert.equal(Object.hasOwn(createdAuth, "mustChange"), false);
+  assert.equal(typeof createdAuth.version, "string", "An issue still revokes every earlier session and device token");
+  usable(created);
+  const shown = [];
+  harness.context.SpreadsheetApp.getUi = () => ({ ButtonSet: { OK_CANCEL: "OK_CANCEL" }, Button: { OK: "OK" }, prompt: () => ({ getSelectedButton: () => "OK", getResponseText: () => "nd-002" }) });
+  harness.context.showCredentials_ = credentials => shown.push(clone(credentials));
+  harness.context.rotateNodePassword();
+  assert.equal(Object.hasOwn(JSON.parse(harness.properties["NODE_AUTH_ND-002"]), "mustChange"), false);
+  usable(shown[0][0]);
+  // A record flagged while the switch was on stays fail-closed.
+  harness.properties["NODE_AUTH_ND-002"] = JSON.stringify({ ...JSON.parse(harness.properties["NODE_AUTH_ND-002"]), mustChange: true });
+  const flagged = assertSuccess(loginAs(harness, "ND-002", shown[0][0].password));
+  assert.equal(flagged.mustChangePassword, true);
+  assert.equal(assertFailure(request(harness, "snapshot", {}, { token: flagged.token })).code, "PASSWORD_CHANGE_REQUIRED");
+  // Any value other than the exact string 'true' leaves it off; 'true' turns it on for the next issue.
+  harness.properties.NODE_FORCE_PASSWORD_CHANGE = "TRUE";
+  assert.equal(harness.context.makeGeneratedAuth_("issued-password", true).mustChange, undefined);
+  harness.properties.NODE_FORCE_PASSWORD_CHANGE = "true";
+  assert.equal(harness.context.makeGeneratedAuth_("issued-password", true).mustChange, true);
+  assert.deepEqual(Object.keys(harness.context.makeGeneratedAuth_("replacement-password")), ["salt", "hash"]);
+});
+
+test("bulk rotation and the copy probe also work with the forced change still off", () => {
+  const { harness, shown } = bulkPasswordFixture();
+  delete harness.properties.NODE_FORCE_PASSWORD_CHANGE;
+  assert.equal(harness.context.rotateAllNodePasswords().rotated, 8);
+  for (const credential of shown[0]) {
+    assert.equal(Object.hasOwn(JSON.parse(harness.properties[`NODE_AUTH_${credential.id}`]), "mustChange"), false, credential.id);
+    const login = assertSuccess(loginAs(harness, credential.id, credential.password));
+    assert.equal(login.mustChangePassword, undefined, "ADMIN included, nobody is locked out on the older frontend");
+  }
+  const { harness: copy, admin } = signedInFixture();
+  delete copy.properties.NODE_FORCE_PASSWORD_CHANGE;
+  assertSuccess(request(copy, "changePassword", { currentPassword: "correct-test-password", newPassword: "admin-changed-password" }, { token: admin.token }));
+  assert.equal(copy.context.verifyNodeCopyIntegration().verified, true);
+});
+
+test("an invented ID keeps a fixed 15-minute window like an account, so retries cannot tell them apart", () => {
+  const { harness } = signedInFixture();
+  const attempt = id => assertFailure(loginAs(harness, id, "guess-password")).code;
+  const both = () => [attempt("ND-002"), attempt("INVENTED-77")];
+  for (let i = 0; i < 5; i++) assert.deepEqual(both(), ["INVALID_CREDENTIALS", "INVALID_CREDENTIALS"]);
+  assert.deepEqual(both(), ["RATE_LIMITED", "RATE_LIMITED"]);
+  harness.clock.milliseconds += 10 * MINUTE;
+  assert.deepEqual(both(), ["RATE_LIMITED", "RATE_LIMITED"], "A limited retry neither counts nor extends the window");
+  harness.clock.milliseconds += 5 * MINUTE + 30000;
+  assert.deepEqual(both(), ["INVALID_CREDENTIALS", "INVALID_CREDENTIALS"], "Both windows end 15 minutes after their first failure");
+  // Probing every few minutes never keeps an invented ID limited longer than an account.
+  for (let i = 0; i < 4; i++) both();
+  assert.deepEqual(both(), ["RATE_LIMITED", "RATE_LIMITED"]);
+  for (let step = 0; step < 3; step++) { harness.clock.milliseconds += 4 * MINUTE; assert.deepEqual(both(), ["RATE_LIMITED", "RATE_LIMITED"]); }
+  harness.clock.milliseconds += 4 * MINUTE;
+  assert.deepEqual(both(), ["INVALID_CREDENTIALS", "INVALID_CREDENTIALS"]);
+  // A bare count written before the fixed window is still honoured.
+  harness.context.CacheService.getScriptCache().put(`NODE_LOGIN_ID_${harness.context.hash_("INVENTED-OLD")}`, "5", 900);
+  assert.equal(attempt("INVENTED-OLD"), "RATE_LIMITED");
+  assert.ok(!Object.keys(harness.properties).some(key => key.includes(harness.context.hash_("INVENTED-77"))), "Invented IDs still use no script properties");
+});
+
+test("wrong passwords never read the roster; a correct password for a disabled account is refused and counted", () => {
+  const { harness } = signedInFixture();
+  harness.spreadsheet.getSheetByName("_NODE_players").values.find(row => row[0] === "ND-002")[8] = false;
+  harness.properties["NODE_AUTH_ND-002"] = JSON.stringify(harness.context.makeAuth_("departed-password"));
+  const measure = password => {
+    const reads = harness.spreadsheet.reads.length;
+    const code = assertFailure(loginAs(harness, "ND-002", password)).code;
+    return { code, reads: harness.spreadsheet.reads.slice(reads).map(read => read.sheetId) };
+  };
+  const wrong = measure("wrong-password-guess"), correct = measure("departed-password");
+  assert.deepEqual(wrong, { code: "INVALID_CREDENTIALS", reads: [] }, "A wrong guess costs no Sheets read, so a flood cannot exhaust the owner's quota");
+  assert.deepEqual(correct, { code: "INVALID_CREDENTIALS", reads: [8001] }, "The same answer as a wrong password");
+  assert.equal(JSON.parse(harness.properties[accountRateKey(harness, "ND-002")]).failures, 2, "Both count against the account");
+  const reads = harness.spreadsheet.reads.length;
+  assertFailure(loginAs(harness, "INVENTED-9", "guess-password"));
+  assert.equal(harness.spreadsheet.reads.length, reads, "Invented IDs never read the roster");
+  assert.equal(sessionCount(harness), 2);
+});
+
+test("a correct guess for an older stretched record that loses the race costs what a wrong guess costs", () => {
+  const { harness } = signedInFixture();
+  const salt = harness.context.random256_(), weak = { salt, hash: harness.context.stretchedHash_("correct-test-password", salt, 32), kdf: "pbkdf2p1", iter: 32 };
+  assert.ok(weak.iter < harness.context.NODE.kdfIterations);
+  harness.properties["NODE_AUTH_ND-001"] = JSON.stringify(weak);
+  const verify = password => { const counter = countHmac(harness); const result = harness.context.verifyPassword_(password, harness.context.authRecord_("ND-001")); counter.restore(); return { valid: result.valid, upgraded: !!result.upgrade, calls: counter.calls }; };
+  const right = verify("correct-test-password"), wrong = verify("wrong-password");
+  assert.deepEqual([right.valid, right.upgraded, wrong.valid, wrong.upgraded], [true, true, false, false]);
+  assert.equal(right.calls, wrong.calls, "The upgrade stretch runs for every guess, not only a correct one");
+  // The race through the login path: the bucket fills during the unlocked check.
+  const rateKey = accountRateKey(harness, "ND-001"), now = harness.clock.milliseconds, raced = password => {
+    harness.properties[rateKey] = JSON.stringify({ start: now, failures: 4 });
+    const utilities = harness.context.Utilities, original = utilities.computeHmacSha256Signature; let calls = 0;
+    utilities.computeHmacSha256Signature = (...args) => { calls++; harness.properties[rateKey] = JSON.stringify({ start: now, failures: 5 }); return original(...args); };
+    const code = assertFailure(loginAs(harness, "ND-001", password)).code;
+    utilities.computeHmacSha256Signature = original;
+    return { code, calls };
+  };
+  assert.deepEqual(raced("correct-test-password"), raced("wrong-password"));
+  assert.equal(raced("correct-test-password").code, "RATE_LIMITED");
+  assert.deepEqual(JSON.parse(harness.properties["NODE_AUTH_ND-001"]), weak, "A limited guess never upgrades the record");
+});
+
+test("replaying a committed mutation for its snapshot spends the snapshot budget, while receipt replays stay free", () => {
+  const { harness, player } = signedInFixture();
+  harness.clock.milliseconds += 60000;
+  const operationId = randomUUID(), payload = { activity: newCandidate({ candidateName: "再送候補" }) }, before = readBudgetState(harness, "snapshot", "ND-001");
+  assertSuccess(mutate(harness, player.token, "saveActivity", payload, operationId));
+  assert.deepEqual(readBudgetState(harness, "snapshot", "ND-001"), before, "A genuine write is not budgeted");
+  assert.ok(assertSuccess(mutate(harness, player.token, "saveActivity", payload, operationId)).snapshot);
+  const charged = readBudgetState(harness, "snapshot", "ND-001");
+  assert.deepEqual([charged[1], charged[3]], [1, before[3] + 1], "A replay answered with a snapshot is a read");
+  seedReadBudget(harness, "snapshot", "ND-001", 40, 40);
+  const writes = harness.writes.length;
+  assert.equal(assertFailure(mutate(harness, player.token, "saveActivity", payload, operationId)).code, "RATE_LIMITED");
+  const receipt = assertSuccess(request(harness, "saveActivity", payload, { token: player.token, operationId, responseMode: "receipt" }));
+  assert.equal(receipt.committed, true); assert.equal(receipt.operationId, operationId);
+  assert.equal(readBudgetState(harness, "snapshot", "ND-001")[1], 40, "Receipt replays are not charged");
+  assert.equal(harness.writes.length, writes, "Replays write nothing");
+  assert.equal(harness.locks.held, false);
+  // A fresh write still goes through with the budget exhausted.
+  assert.ok(assertSuccess(mutate(harness, player.token, "saveActivity", { activity: newCandidate({ candidateName: "新規候補" }) })).snapshot);
+});
+
+test("a due activity refresh deferred by a busy lock is reported, so the client reports that input again", () => {
+  const { harness, player } = signedInFixture();
+  harness.clock.milliseconds += 10 * MINUTE;
+  harness.locks.available = false;
+  assert.deepEqual(assertSuccess(request(harness, "touch", {}, { token: player.token })), { touched: false, deferred: true });
+  assert.equal(assertSuccess(request(harness, "snapshot", {}, { token: player.token })).activityDeferred, true);
+  assert.deepEqual(assertSuccess(request(harness, "touch", {}, { token: player.token, background: true })), { touched: false }, "A passive check never writes");
+  assert.equal(assertSuccess(request(harness, "snapshot", {}, { token: player.token, background: true })).activityDeferred, undefined);
+  harness.locks.available = true;
+  assert.deepEqual(assertSuccess(request(harness, "touch", {}, { token: player.token })), { touched: true });
+  assert.equal(sessionOf(harness, player.token).lastSeenAt, harness.clock.milliseconds);
+  assert.equal(assertSuccess(request(harness, "snapshot", {}, { token: player.token })).activityDeferred, undefined, "Not due: nothing deferred");
+  // A failed write is deferred too.
+  harness.clock.milliseconds += 10 * MINUTE;
+  const api = harness.context.PropertiesService.getScriptProperties(), set = api.setProperty, key = harness.context.sessionKey_(player.token);
+  api.setProperty = (k, v) => { if (k === key) throw new Error("Injected property failure"); return set.call(api, k, v); };
+  assert.deepEqual(assertSuccess(request(harness, "touch", {}, { token: player.token })), { touched: false, deferred: true });
+  api.setProperty = set;
+  // A background touch still enforces the idle limit.
+  harness.clock.milliseconds += 60 * MINUTE;
+  assert.match(assertFailure(request(harness, "touch", {}, { token: player.token, background: true })).message, /操作がなかった/);
+});
+
+test("the hash benchmark warns when the current round count is already over its target", () => {
+  const harness = createHarness({ properties: { NODE_PEPPER: "bench-pepper", NODE_CONFIG: JSON.stringify({ ownerEmail: "owner@example.test" }) }, kdfIterations: null });
+  const utilities = harness.context.Utilities, original = utilities.computeHmacSha256Signature;
+  utilities.computeHmacSha256Signature = (...args) => { harness.clock.milliseconds += 1; return original(...args); };
+  const slow = harness.context.benchmarkNodePasswordHash();
+  utilities.computeHmacSha256Signature = original;
+  assert.equal(slow.suggested, 2000, "The suggestion keeps its floor");
+  assert.equal(slow.roundsForTarget, 0); assert.equal(slow.overTarget, true); assert.ok(slow.currentMs > 1900);
+  assert.ok(harness.logs.some(args => /warning: the current kdfIterations is over the 500 ms target/.test(String(args[0]))));
+  assert.ok(!JSON.stringify(harness.logs).includes("bench-pepper"));
+  harness.logs.length = 0;
+  utilities.computeHmacSha256Signature = (...args) => { harness.clock.milliseconds += 0.05; return original(...args); };
+  const fast = harness.context.benchmarkNodePasswordHash();
+  utilities.computeHmacSha256Signature = original;
+  assert.equal(fast.overTarget, false); assert.ok(fast.suggested > 2000);
+  assert.ok(!harness.logs.some(args => /warning/.test(String(args[0]))));
 });
