@@ -4152,3 +4152,66 @@ test("the owner hash benchmark measures sample and current rounds directly and l
   assert.throws(() => harness.context.benchmarkNodePasswordHash(), error => error.nodeCode === "FORBIDDEN");
   assert.deepEqual(harness.properties, before); assert.deepEqual(harness.logs, logs);
 });
+
+test("the owner authentication compute benchmark runs five real KDF trials per fixed case with checked statistics and no mutations", () => {
+  const harness = createHarness({ properties: { NODE_PEPPER: "synthetic-benchmark-pepper", NODE_CONFIG: JSON.stringify({ ownerEmail: "owner@example.test" }), NODE_AUTH_EXISTING: "preserved-credential", NODE_SESSION_EXISTING: "preserved-session", NODE_RATE_EXISTING: "preserved-rate" }, kdfIterations: null });
+  const before = clone(harness.properties), propertyApi = harness.context.PropertiesService.getScriptProperties(), reads = [], kdf = harness.context.NODE_PASSWORD_KDF, derive = kdf.derive, observed = [];
+  const get = propertyApi.getProperty;
+  propertyApi.getProperty = key => { reads.push(key); return get(key); };
+  for (const method of ["setProperty", "setProperties", "deleteProperty", "deleteAllProperties", "getProperties"]) propertyApi[method] = () => { throw new Error("Benchmark must not mutate or enumerate properties"); };
+  for (const method of ["openById", "getActiveSpreadsheet", "getActive"]) harness.context.SpreadsheetApp[method] = () => { throw new Error("Benchmark must not access a spreadsheet"); };
+  harness.context.CacheService.getScriptCache = () => { throw new Error("Benchmark must not access shared cache"); };
+  harness.context.UrlFetchApp.fetch = () => { throw new Error("Benchmark must not make network calls"); };
+  kdf.derive = (key, salt, rounds) => {
+    observed.push(rounds);
+    // Setup costs 99ms. Each measured case has intentionally unsorted real trial timings.
+    harness.clock.milliseconds += observed.length === 1 ? 99 : [9, 1, 7, 3, 5][(observed.length - 2) % 5];
+    return derive(key, salt, rounds);
+  };
+  const proof = JSON.parse(JSON.stringify(harness.context.benchmarkNodeAuthentication()));
+  kdf.derive = derive;
+  const names = ["kdf-current-rounds", "current-correct", "current-wrong", "legacy-correct", "legacy-wrong", "unknown"];
+  assert.equal(proof.rounds, 2000); assert.equal(proof.samplesPerCase, 5);
+  assert.deepEqual(proof.cases.map(item => item.name), names);
+  assert.equal(observed.length, 31, "One in-memory current fixture and 30 actual measured KDF calls");
+  assert.ok(observed.every(rounds => rounds === 2000), "Every trial preserves the configured work factor");
+  for (const item of proof.cases) {
+    assert.deepEqual(item.samplesMs, [9, 1, 7, 3, 5]);
+    assert.deepEqual({ min: item.minMs, median: item.medianMs, p95: item.p95Ms, max: item.maxMs }, { min: 1, median: 5, p95: 9, max: 9 });
+    assert.deepEqual(Object.keys(item), ["name", "samplesMs", "minMs", "medianMs", "p95Ms", "maxMs"]);
+  }
+  const inspect = value => {
+    if (Array.isArray(value)) value.forEach(inspect);
+    else if (value && typeof value === "object") Object.values(value).forEach(inspect);
+    else if (typeof value === "string") assert.ok(names.includes(value), "Only fixed case names can leave the probe");
+    else assert.ok(typeof value === "number" && Number.isFinite(value) && value >= 0);
+  };
+  inspect(proof);
+  assert.deepEqual(JSON.parse(harness.logs[0][0]), proof); assert.equal(harness.logs.length, 1);
+  assert.ok(reads.every(key => ["NODE_CONFIG", "NODE_PEPPER"].includes(key)), "No operational auth, session or rate record is read");
+  assert.deepEqual(harness.properties, before); assert.equal(harness.writes.length, 0); assert.equal(harness.spreadsheet.reads.length, 0); assert.equal(harness.apiCalls.length, 0); assert.equal(harness.locks.calls, 0);
+  assert.equal(harness.context.NODE.kdfIterations, 2000);
+});
+
+test("authentication compute measurements fail closed if positive or negative fixture verification is incorrect", () => {
+  for (const broken of ["positive", "negative"]) {
+    const harness = createHarness({ properties: { NODE_PEPPER: "synthetic-benchmark-pepper", NODE_CONFIG: JSON.stringify({ ownerEmail: "owner@example.test" }) }, kdfIterations: null });
+    const verify = harness.context.verifyPassword_, before = clone(harness.properties);
+    harness.context.verifyPassword_ = (password, auth) => broken === "positive" ? { valid: false, upgrade: null } : auth === null ? { valid: true, upgrade: null } : verify(password, auth);
+    assert.throws(() => harness.context.benchmarkNodeAuthentication(), error => error.nodeCode === "BENCHMARK_FAILED");
+    assert.deepEqual(harness.properties, before); assert.equal(harness.logs.length, 0); assert.equal(harness.writes.length, 0); assert.equal(harness.spreadsheet.reads.length, 0);
+  }
+});
+
+test("authentication compute measurement is owner-editor-only and not a web API action", () => {
+  for (const [active, effective] of [["stranger@example.test", "owner@example.test"], ["stranger@example.test", "stranger@example.test"], ["", "owner@example.test"]]) {
+    const harness = createHarness({ properties: { NODE_PEPPER: "synthetic-benchmark-pepper", NODE_CONFIG: JSON.stringify({ ownerEmail: "owner@example.test" }) }, kdfIterations: null });
+    const before = clone(harness.properties), counter = countHmac(harness);
+    harness.context.Session = { getActiveUser: () => ({ getEmail: () => active }), getEffectiveUser: () => ({ getEmail: () => effective }) };
+    assert.throws(() => harness.context.benchmarkNodeAuthentication(), error => error.nodeCode === "FORBIDDEN"); counter.restore();
+    assert.equal(counter.calls, 0); assert.equal(counter.kdfCalls, 0); assert.deepEqual(harness.properties, before); assert.equal(harness.logs.length, 0); assert.equal(harness.spreadsheet.reads.length, 0); assert.equal(harness.writes.length, 0);
+  }
+  const harness = createHarness({ properties: { NODE_PEPPER: "synthetic-benchmark-pepper", NODE_CONFIG: JSON.stringify({ ownerEmail: "owner@example.test" }) }, kdfIterations: null }), counter = countHmac(harness);
+  assert.equal(assertFailure(request(harness, "benchmarkNodeAuthentication", {})).code, "BAD_REQUEST"); counter.restore();
+  assert.equal(counter.calls, 0); assert.equal(counter.kdfCalls, 0); assert.equal(harness.logs.length, 0); assert.equal(harness.spreadsheet.reads.length, 0); assert.equal(harness.writes.length, 0);
+});

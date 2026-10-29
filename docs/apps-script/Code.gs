@@ -324,6 +324,34 @@ function benchmarkNodePasswordHash() {
   Logger.log(JSON.stringify({sampleRounds:sample,sampleMs:ms,currentRounds:NODE.kdfIterations,currentMs:currentMs,targetMs:target,suggestedRounds:suggested,roundsForTarget:fit,overTarget:over?1:0}));
   return {sampleRounds:sample,ms:ms,suggested:suggested,current:NODE.kdfIterations,roundsForTarget:fit,currentMs:currentMs,targetMs:target,overTarget:over};
 }
+/** Owner-only compute probe. Fixtures exist in memory only: no real auth record, login, session,
+ * business read, property/cache mutation or network call. These timings exclude the rest of login.
+ * Each fixed case runs five times. p95 uses nearest rank (with five samples, it equals the maximum).
+ * The output contains fixed case names and numeric timings/counts only; never fixture secrets. */
+function benchmarkNodeAuthentication() {
+  requireOwner_();
+  var password=random256_(),wrong=password+'!',current=makeAuth_(password),legacy=makeGeneratedAuth_(password,false),count=5;
+  var cases=[
+    {name:'kdf-current-rounds',run:function(){var hash=stretchedHash_(password,current.salt,NODE.kdfIterations);if(typeof hash!=='string'||hash.length!==43)fail_('BENCHMARK_FAILED','認証計算の検証を完了できませんでした。');}},
+    {name:'current-correct',auth:current,password:password,valid:true},
+    {name:'current-wrong',auth:current,password:wrong,valid:false},
+    {name:'legacy-correct',auth:legacy,password:password,valid:true},
+    {name:'legacy-wrong',auth:legacy,password:wrong,valid:false},
+    {name:'unknown',auth:null,password:wrong,valid:false}
+  ];
+  var result={rounds:NODE.kdfIterations,samplesPerCase:count,cases:cases.map(function(item){
+    var samples=[];
+    for(var i=0;i<count;i++){
+      var started=Date.now();
+      if(item.run)item.run();
+      else {var check=verifyPassword_(item.password,item.auth);if(!check||check.valid!==item.valid)fail_('BENCHMARK_FAILED','認証計算の検証を完了できませんでした。');}
+      samples.push(Math.max(0,Date.now()-started));
+    }
+    var sorted=samples.slice().sort(function(a,b){return a-b;});
+    return {name:item.name,samplesMs:samples,minMs:sorted[0],medianMs:sorted[Math.floor(count/2)],p95Ms:sorted[Math.ceil(count*0.95)-1],maxMs:sorted[count-1]};
+  })};
+  Logger.log(JSON.stringify(result));return result;
+}
 function constantEqual_(a, b) {
   a = String(a || ''); b = String(b || ''); var diff = a.length ^ b.length;
   for (var i = 0; i < Math.max(a.length, b.length); i++) diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
