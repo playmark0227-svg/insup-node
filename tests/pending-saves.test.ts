@@ -99,6 +99,20 @@ test("expired drafts are removed on read and by the sign-in-free purge", async (
   assert.ok(!rows.some(row=>row.id.endsWith(stale.operationId)));assert.ok(rows.some(row=>row.id.endsWith(fresh.operationId)));
 });
 
+test("another tab's startup purge preserves the salt of an active tab with an empty queue", async () => {
+  const account=unlocked(randomUUID()),synced=input(),next=input();
+  await persistPendingSave(endpoint,account,synced);
+  await removePendingSave(endpoint,account,synced.operationId);
+  // Module instances model separate tabs: the active one retains its derived
+  // key while a newly opened, signed-out tab purges the shared browser database.
+  const otherTab=await import(`../lib/pending-saves.ts?purger=${randomUUID()}`);
+  await otherTab.purgeExpiredPendingSaves();
+  await persistPendingSave(endpoint,account,next);
+  const reloadedTab=await import(`../lib/pending-saves.ts?reload=${randomUUID()}`);
+  unlocked(account,reloadedTab);
+  assert.deepEqual(await reloadedTab.readPendingSaves(endpoint,account),[next]);
+});
+
 test("version 1 drafts are migrated to the server-bound key and the stored legacy key is removed", async () => {
   const account=unlocked(randomUUID()),save=input();
   const scopeBytes=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(`${endpoint}|${account}`));

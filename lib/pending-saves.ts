@@ -165,7 +165,10 @@ export async function purgeExpiredPendingSaves(now = Date.now()): Promise<number
   const tx = db.transaction(["saves", "keys"], "readwrite"), done = completed(tx), keys = tx.objectStore("keys");
   expired.forEach(id => tx.objectStore("saves").delete(id));
   const keyNames = await result<IDBValidKey[]>(keys.getAllKeys());
-  keyNames.forEach(name => { const scope = String(name).replace(saltPrefix, ""); if (!remainingScopes.has(scope)) keys.delete(name); });
+  // A different tab may still hold a key derived from this salt, even when this
+  // scope has no queued rows. Keep public salts stable so that tab's next draft
+  // remains decryptable after reload; only obsolete legacy keys are removed.
+  keyNames.forEach(name => { const scope = String(name); if (!scope.startsWith(saltPrefix) && !remainingScopes.has(scope)) keys.delete(name); });
   await done;
   return expired.length;
 }

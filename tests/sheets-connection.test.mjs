@@ -5,7 +5,7 @@ import vm from "node:vm";
 import ts from "typescript";
 import {assertSnapshot, assertMutationReceipt, isUncertainWrite, validateEndpoint, SheetApiError} from "../lib/sheets-client.ts";
 import {correctionFields,correctedPayload,mutationDateErrors} from "../lib/save-correction.ts";
-import {pendingSaveResources} from "../lib/pending-saves.ts";
+import {pendingSaveResources,unlockPendingSaves as unlockRealPendingSaves,lockPendingSaves as lockRealPendingSaves} from "../lib/pending-saves.ts";
 import {matchingFields} from "../lib/management-data.ts";
 import {interviewFieldLabels,interviewStringFields,blankInterviewFields} from "../lib/candidate-intake.ts";
 import {assertWritingKitState,validateWritingPreferences,defaultWritingPreferences,writingSectionIds,writingTopicCodes} from "../lib/writing-ai.ts";
@@ -16,7 +16,7 @@ const token = "only-a-test-session-token-12345678901234567890";
 const SESSION_KEY = "insup.node.session.v1";
 const ENDPOINT_KEY = "insup.node.endpoint.v1";
 const player = {id:"ND-001",name:"テスト担当",team:"NODE",target:20,bio:"",color:"blue"};
-const snapshot = {self:{playerId:player.id,role:"player"},players:[player],activities:[],counts:{},syncedAt:"2026-10-08T00:00:00Z",warnings:[],writesEnabled:true};
+const snapshot = {self:{playerId:player.id,role:"player"},players:[player],activities:[],counts:{},syncedAt:"2026-10-08T00:00:00Z",warnings:[],writesEnabled:true,outboxKey:"K".repeat(43)};
 const source = ts.transpileModule(fs.readFileSync(new URL("../hooks/use-sheets-connection.ts", import.meta.url), "utf8")
   .replace("import.meta.env.BASE_URL", '"/insup-node/"').replace("import.meta.env.PROD", "TEST_PRODUCTION"), {compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;
 
@@ -33,7 +33,7 @@ async function flush() { for (let i=0; i<35; i++) await Promise.resolve(); }
 
 // Execute the actual hook against a small deterministic hook runtime. This
 // exposes races and state restoration without adding a browser/test dependency.
-function harness(handle, {storedToken, malformedSession, deadlineController, browser, manifestEndpoint=endpoint, storedEndpoint=endpoint, manifestFailure=false, production=false, pendingSaves=[], persistLocal, replaceLocal} = {}) {
+function harness(handle, {storedToken, malformedSession, deadlineController, browser, manifestEndpoint=endpoint, storedEndpoint=endpoint, manifestFailure=false, production=false, pendingSaves=[], persistLocal, replaceLocal, readLocal} = {}) {
   const slots = [], effects = [], calls = [];
   let cursor = 0, stateUpdates = 0;
   const localStorage = storage({[ENDPOINT_KEY]:storedEndpoint});
@@ -60,11 +60,11 @@ function harness(handle, {storedToken, malformedSession, deadlineController, bro
     return handle(call);
   };
   const pendingStore = new Map(pendingSaves.map(save=>[save.operationId,structuredClone(save)]));
-  const pendingApi={pendingSaveResources,readPendingSaves:async()=>[...pendingStore.values()].map(value=>structuredClone(value)),
+  const pendingApi={pendingSaveResources,readPendingSaves:async()=>{if(readLocal)await readLocal();return [...pendingStore.values()].map(value=>structuredClone(value));},
     persistPendingSave:async(_endpoint,_account,value)=>{if(persistLocal)await persistLocal(value);pendingStore.set(value.operationId,structuredClone(value));},
     replacePendingSave:async(_endpoint,_account,id,value)=>{if(replaceLocal)await replaceLocal(value);if(!pendingStore.has(id))throw new Error("old input missing");pendingStore.set(value.operationId,structuredClone(value));pendingStore.delete(id);},
     removePendingSave:async(_endpoint,_account,id)=>{pendingStore.delete(id);},
-    unlockPendingSaves:(_endpoint,_account,secret)=>{unlocks.push(secret);},lockPendingSaves:()=>{locks.count++;},purgeExpiredPendingSaves:async()=>0};
+    unlockPendingSaves:(_endpoint,_account,secret)=>{unlocks.push(secret);unlockRealPendingSaves(_endpoint,_account,secret);},lockPendingSaves:()=>{locks.count++;lockRealPendingSaves();},purgeExpiredPendingSaves:async()=>0};
   const unlocks=[],locks={count:0};
   const exports={};
   const timeoutDurations=[];
@@ -134,11 +134,39 @@ test("a failed initial snapshot keeps the session and refresh never resends cred
 });
 
 test("an older login response remains compatible without a second snapshot request",async()=>{
-  const h=harness(()=>({token,snapshot}));
+  const {outboxKey,...legacySnapshot}=snapshot;
+  const h=harness(call=>call.action==="logout"?{loggedOut:true}:{token,snapshot:legacySnapshot});
   await flush(); await h.render().login("ND-001","only-a-test-password");
-  assert.equal(h.render().snapshot,snapshot); assert.equal(h.render().authenticated,true);
+  assert.equal(h.render().snapshot,legacySnapshot); assert.equal(h.render().authenticated,true);
   assert.equal(h.calls.length,1);
+  await h.render().logout();
+  assert.equal(h.render().authenticated,false);assert.equal(h.sessionStorage.getItem(SESSION_KEY),null);
+  assert.equal(h.calls.at(-1).action,"logout");
   h.unmount();
+});
+
+test("an old backend without an outbox key blocks new saves but can log out without deleting retained drafts",async()=>{
+  const {outboxKey,...legacySnapshot}=snapshot;
+  const draft={operationId:"legacy_pending_operation",action:"updateStatus",payload:{recordId:"one",status:"提案"},label:"以前の保存",details:[],createdAt:Date.now(),attempted:true};
+  const h=harness(call=>call.action==="snapshot"?legacySnapshot:{loggedOut:true},{storedToken:token,pendingSaves:[draft]});
+  await flush();h.render();await flush();
+  assert.match(h.render().syncError,/Google側/);
+  await assert.rejects(h.render().submitMutation("updateStatus",{recordId:"two",status:"提案"},"new_pending_operation"),/Google側/);
+  assert.equal(h.calls.length,1,"No save is sent without the server's outbox key");
+  const before=h.locks.count;
+  await h.render().logout();await flush();
+  assert.equal(h.render().authenticated,false);assert.equal(h.render().snapshot,null);
+  assert.equal(h.sessionStorage.getItem(SESSION_KEY),null);assert.ok(h.locks.count>before);
+  assert.deepEqual(h.pendingStore.get(draft.operationId),draft,"Logout preserves the encrypted input");
+  assert.equal(h.calls.at(-1).action,"logout");h.unmount();
+});
+
+test("logout with a supplied outbox key still rejects unreadable retained input",async()=>{
+  const h=harness(()=>snapshot,{storedToken:token,readLocal:async()=>{throw new Error("未同期の入力を復号できません");}});
+  await flush();h.render();await flush();
+  await assert.rejects(h.render().logout(),/復号できません/);
+  assert.equal(h.render().authenticated,true);assert.ok(h.sessionStorage.getItem(SESSION_KEY));
+  assert.ok(!h.calls.some(call=>call.action==="logout"));h.unmount();
 });
 
 test("restoration shows progress immediately and a transient failure does not log out",async()=>{

@@ -621,7 +621,10 @@ export function useSheetsConnection() {
   };
 
   const logout = async () => {
-    await ensureOutbox();
+    // Older deployments return no outbox secret and cannot accept new local
+    // saves. They must still let the user clear this session without deleting
+    // drafts; a supplied key that cannot unlock existing input still fails.
+    if (latestSnapshot.current?.outboxKey !== undefined) await ensureOutbox();
     if (hasPendingBackground()) throw new SheetApiError("MUTATION_PENDING", "右上の保存結果を確認してからログアウトしてください。");
     const oldToken = token.current; clearSession(); setBusy(false); setCredentials(null);
     if (oldToken) { try { await sheetRequest(endpoint, "logout", {}, {token:oldToken}); } catch { /* Local session already removed; server session has an expiry. */ } }
