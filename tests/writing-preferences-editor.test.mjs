@@ -18,7 +18,7 @@ const flush = async () => { for (let i = 0; i < 20; i++) await Promise.resolve()
 function harness(options = {}) {
   let slots = [], effects = [], cursor = 0, key, tree;
   const calls = { extract: [], save: [], read: 0 };
-  let props = { identityKey: "admin-one", preferences: options.preferences || defaultWritingPreferences(),
+  let props = { identityKey: "admin-one", preferences: options.preferences || defaultWritingPreferences(), onDirtyChange: options.onDirtyChange,
     onRead: async () => { calls.read++; return options.read ? options.read() : props.preferences; },
     onSave: async value => { calls.save.push(value); return options.save ? options.save(value) : { ...value, version: "saved_version_123456" }; } };
   const equal = (a, b) => a && b && a.length === b.length && a.every((value, i) => Object.is(value, b[i]));
@@ -104,4 +104,34 @@ test("the already registered standard needs no import and read-only settings can
   const h = harness(); await flush(); assert.match(h.text(), /以前共有いただいた紹介文の構成を標準登録済み/);
   assert.equal(h.calls.extract.length, 0); h.change(reference); h.click("参考文から書式案を作る"); await flush();
   h.render({ disabled: true }); assert.equal(h.button(saveLabel).props.disabled, true); assert.equal(h.calls.save.length, 0); h.unmount();
+});
+
+test("dirty notifications report only booleans for reference text and clear on identity changes", async () => {
+  const changes = [], h = harness({ onDirtyChange: value => changes.push(value) }); await flush();
+  assert.deepEqual(changes, [false]);
+  h.change(reference); h.render(); assert.deepEqual(changes, [false, true]);
+  h.render(); h.render({ disabled: true }); assert.deepEqual(changes, [false, true], "ordinary renders do not repeatedly notify the parent");
+  h.render({ identityKey: "another-admin", disabled: false }); await flush();
+  assert.equal(changes.at(-1), false); assert.equal(h.referenceValue(), "");
+  assert.ok(changes.every(value => typeof value === "boolean"));
+  assert.equal(h.calls.save.length, 0); h.unmount(); assert.equal(changes.at(-1), false);
+});
+
+test("an unsaved parsed reference remains dirty even after its source text is erased", async () => {
+  const changes = [], h = harness({ onDirtyChange: value => changes.push(value) }); await flush();
+  h.change(reference); h.click("参考文から書式案を作る"); await flush(); h.render();
+  h.change(""); h.render();
+  assert.equal(h.referenceValue(), ""); assert.ok(h.button(saveLabel)); assert.equal(changes.at(-1), true);
+  assert.equal(h.button("参考文を消去").props.disabled, false); h.click("参考文を消去"); h.render();
+  assert.equal(h.button(saveLabel), undefined); assert.equal(changes.at(-1), false);
+  assert.equal(h.calls.save.length, 0); h.unmount(); assert.equal(changes.at(-1), false);
+});
+
+test("manual settings changes and successful saves update the latest dirty listener without a render loop", async () => {
+  const original = [], replacement = [], h = harness({ onDirtyChange: value => original.push(value) }); await flush();
+  const tone = nodes(h.render()).find(node => node.type === "select" && node.props.id.endsWith("-tone"));
+  tone.props.onChange({ target: { value: "plain" } }); h.render(); assert.deepEqual(original, [false, true]);
+  h.render({ onDirtyChange: value => replacement.push(value) }); h.render(); assert.deepEqual(replacement, []);
+  h.click("共通ルールを保存"); await flush(); h.render(); assert.deepEqual(replacement, [false]);
+  assert.equal(h.calls.save.length, 1); h.unmount(); assert.deepEqual(replacement, [false, false]);
 });

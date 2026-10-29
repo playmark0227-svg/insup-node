@@ -1,0 +1,11 @@
+.unsaved-work-prompt{box-sizing:border-box;display:flex;flex:none;flex-direction:column;gap:10px;min-width:0;min-height:0;max-height:180px;overflow:hidden;margin:0;padding:12px 20px;border-top:1px solid #e5d2a0;background:#fffaf0;color:#705724;font-size:12px;line-height:1.7}
+.unsaved-work-prompt__message{flex:1;min-height:0;min-width:0;overflow-y:auto;overscroll-behavior:contain;overflow-wrap:anywhere}
+.unsaved-work-prompt__message>strong{display:block;font-size:12px;font-weight:650;line-height:1.7}
+.unsaved-work-prompt__message>p{margin:4px 0 0;font-size:12px;line-height:1.7}
+.unsaved-work-prompt__actions{display:flex;flex:none;justify-content:flex-end;align-items:stretch;flex-wrap:wrap;gap:8px;min-width:0}
+.unsaved-work-prompt__actions>.secondary-button{min-width:0;min-height:38px;max-width:100%;padding:8px 11px;font-size:12px;line-height:1.6;white-space:normal;text-align:center}
+.unsaved-work-prompt__actions>.unsaved-work-prompt__discard{color:#9a4545;border-color:#e1bcbc;background:#fff}
+.unsaved-work-prompt__actions>.secondary-button:disabled{opacity:.5;cursor:wait}
+.unsaved-work-prompt__actions>.secondary-button:focus-visible{outline:2px solid #167ec8;outline-offset:2px}
+@container (max-width:460px){.unsaved-work-prompt{padding:10px 16px}.unsaved-work-prompt__actions>.secondary-button{flex:1 1 120px;font-size:11px;min-height:36px}}
+@media(max-width:600px){.unsaved-work-prompt{padding:10px 16px}.unsaved-work-prompt__actions>.secondary-button{font-size:11px}}

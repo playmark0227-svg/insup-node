@@ -98,7 +98,7 @@ for (const mode of ["desktop", "mobile"]) {
     assert.match(text(toggle), /提案・履歴\s*2件/);
     assert.ok(toggle.props["aria-controls"]);
     assert.equal(h.actions(h.surface(mode), "基本情報").length, 0, "different profiles cannot be edited through an arbitrary first record");
-    assert.equal(h.actions(h.surface(mode), "詳細・修正").length, 0);
+    assert.equal(h.actions(h.surface(mode), "進捗・実績を編集").length, 0);
     h.click(toggle);
     assert.equal(h.toggles(mode)[0].props["aria-expanded"], true);
     const history = h.history(mode, toggle.props["aria-controls"]);
@@ -107,10 +107,10 @@ for (const mode of ["desktop", "mobile"]) {
     assert.match(text(history), /架空会社B/);
     assert.match(text(history), /提案候補/);
     assert.match(text(history), /面談実施/);
-    assert.equal(h.actions(history, "詳細・修正").length, 2);
+    assert.equal(h.actions(history, "進捗・実績を編集").length, 2);
     h.click(h.toggles(mode)[0]);
     assert.equal(h.toggles(mode)[0].props["aria-expanded"], false);
-    assert.equal(h.actions(h.surface(mode), "詳細・修正").length, 0);
+    assert.equal(h.actions(h.surface(mode), "進捗・実績を編集").length, 0);
     assert.deepEqual(h.calls, { edit: [], basic: [], delete: [] });
   });
 
@@ -118,7 +118,7 @@ for (const mode of ["desktop", "mobile"]) {
     const h = harness();
     const toggle = h.toggles(mode)[0]; h.click(toggle);
     const history = h.history(mode, toggle.props["aria-controls"]);
-    for (const button of h.actions(history, "詳細・修正")) h.click(button);
+    for (const button of h.actions(history, "進捗・実績を編集")) h.click(button);
     for (const button of h.actions(history, "基本情報")) h.click(button);
     for (const button of h.actions(history, "削除")) h.click(button);
     assert.deepEqual(h.calls.edit, ["proposal-a", "proposal-b"]);
@@ -164,9 +164,9 @@ test("a refreshed or reordered directory keeps expansion on the candidate key an
   const toggles = h.toggles("desktop");
   assert.deepEqual(toggles.map(button => button.props["aria-expanded"]), [false, true]);
   const expanded = h.history("desktop", toggles[1].props["aria-controls"]);
-  for (const button of h.actions(expanded, "詳細・修正")) h.click(button);
+  for (const button of h.actions(expanded, "進捗・実績を編集")) h.click(button);
   assert.deepEqual(h.calls.edit, ["other-person"]);
-  assert.equal(h.actions(h.surface("desktop"), "詳細・修正").length, 1);
+  assert.equal(h.actions(h.surface("desktop"), "進捗・実績を編集").length, 1);
 });
 
 test("a single-record candidate exposes a safe parent basic-information action", () => {
@@ -216,6 +216,197 @@ test("past unfinished appointments stay visible with a warning, while completed 
       assert.doesNotMatch(summary, /2000-01-01|2000-01-02|予定日経過・要確認/);
       if (mode === "desktop") assert.match(summary, /予定なし/);
       else assert.doesNotMatch(summary, /次の予定：/);
+    }
+  }
+});
+
+test("the next confirmation opens the company with the pending appointment, even when it is not the first record", () => {
+  const finished = record("finished-company", "架空会社A", 3);
+  finished.values[6] = "辞退（本人希望）";
+  const pending = record("pending-company", "架空会社B", 2);
+  pending.values[6] = "面談確定(面談実施待ち）";
+  pending.values[9] = "2000-01-03";
+  const h = harness({ groups: candidateGroups.groupCandidates([finished, pending], "registration-desc") });
+  for (const mode of ["desktop", "mobile"]) {
+    const next = nodes(h.surface(mode)).find(node => node.type === "button" && hasClass(node, "candidate-follow-up"));
+    assert.match(text(next), /C面談の実施状況を確認/);
+    assert.match(next.props["aria-label"], /架空会社B/);
+    h.click(next);
+    assert.equal(h.calls.edit.at(-1), "pending-company");
+  }
+});
+
+test("a recorded status does not invent a missing actual date, and ongoing and closed records get different confirmations", () => {
+  const cases = [
+    ["面談実施（合否待ち）", "C面談の実施日を確認"],
+    ["合格（シフト入力待ち）", "合格日を確認"],
+    ["稼働開始", "稼働開始日を確認"],
+    ["辞退（本人希望）", "終了した提案の履歴を確認"],
+    ["案件枠埋まり", "終了した提案の履歴を確認"],
+  ];
+  for (const [status, expected] of cases) {
+    const item = record("status-only", "架空会社", 2); item.values[6] = status;
+    const h = harness({ groups: candidateGroups.groupCandidates([item], "registration-desc") });
+    for (const mode of ["desktop", "mobile"]) {
+      const next = nodes(h.surface(mode)).find(node => node.type === "button" && hasClass(node, "candidate-follow-up"));
+      assert.equal(text(next), expected);
+      if (/辞退|枠埋まり/.test(status)) assert.ok(hasClass(next, "is-complete"));
+      h.click(next); assert.equal(h.calls.edit.at(-1), "status-only");
+    }
+  }
+});
+
+test("all edit actions including direct confirmations are disabled while saving", () => {
+  const h = harness(); h.click(h.toggles("desktop")[0]); h.render({ busy: true });
+  const edits = nodes(h.surface("desktop")).filter(node => node.type === "button" &&
+    (hasClass(node, "candidate-follow-up") || text(node).includes("進捗・実績を編集")));
+  assert.equal(edits.length, 3);
+  assert.ok(edits.every(node => node.props.disabled));
+});
+
+const managerSource = ts.transpileModule(fs.readFileSync(new URL("../components/candidate-manager.tsx", import.meta.url), "utf8"), {
+  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX },
+}).outputText + "\nexports.RecordEditor = RecordEditor; exports.CreateCandidate = CreateCandidate; exports.BasicInfoDialog = BasicInfoDialog;";
+
+function managerHarness(component, overrides = {}) {
+  let cursor = 0, closed = 0, consumed = 0;
+  const slots = [], effects = [], calls = [];
+  const react = {
+    useState(initial) { const i = cursor++; const slot = slots[i] ||= { value: typeof initial === "function" ? initial() : initial }; return [slot.value, value => { slot.value = typeof value === "function" ? value(slot.value) : value; }]; },
+    useRef(initial) { const i = cursor++; return slots[i] ||= { current: initial }; },
+    useId() { const i = cursor++; return slots[i] ||= `candidate-manager-${i}`; },
+    useEffect(fn, deps) { const i = cursor++, previous = slots[i]; if (!previous || !deps || deps.some((value, index) => !Object.is(value, previous[index]))) { slots[i] = deps; effects.push(fn); } },
+  };
+  const exports = {}, jsx = (type, props, key) => ({ type, props: props || {}, key });
+  vm.runInNewContext(managerSource, {
+    exports, module: { exports }, Error,
+    require: name => name === "react" ? react : name === "react/jsx-runtime" ? { jsx, jsxs: jsx }
+      : name.includes("management-data") ? management
+        : name.includes("performance-metrics") ? performance
+          : name.includes("sheets-client") ? { businessToday }
+            : name.includes("save-correction") ? { mutationDateErrors: () => ({}) }
+              : name.includes("candidate-groups") ? candidateGroups
+                : name.includes("candidate-intake") && !name.includes("components") ? { blankInterviewFields: () => ({ workHistory: "" }) }
+                  : name.includes("node-data") ? { statuses: ["提案候補"], positions: ["アポインター", "FS"] }
+                    : new Proxy({}, { get: (_, key) => key }),
+  });
+  const item = record("current-record", "架空会社", 2);
+  const props = {
+    record: item, records: [item], players: [{ id: "ND-001", name: "検証担当", sheetNames: ["検証担当"] }],
+    admin: true, disabled: false, busy: false, live: false, canWrite: true,
+    clients: [], knownNames: [], onClose: () => closed++, onExisting: id => calls.push(["existing", id]),
+    onCreateRequestHandled: () => consumed++, onSave: async () => ({}),
+    save: { busy: false, uncertain: false, error: "", save: async (...args) => { calls.push(args); return true; } },
+    ...overrides,
+  };
+  const render = (next = {}) => { Object.assign(props, next); cursor = 0; const tree = exports[component](props); while (effects.length) effects.shift()(); return tree; };
+  const button = label => nodes(render()).find(node => node.type === "button" && text(node) === label);
+  const click = label => { const found = button(label); assert.ok(found, label); assert.ok(!found.props.disabled, `${label} is enabled`); found.props.onClick(); };
+  const input = label => nodes(render()).find(node => node.type === "input" && node.props["aria-label"] === label);
+  const change = (label, value) => { const found = input(label); assert.ok(found, label); found.props.onChange({ target: { value } }); };
+  return { render, props, button, click, input, change, calls, closed: () => closed, consumed: () => consumed };
+}
+
+test("progress editing retains every business field and asks before discarding unsaved input", () => {
+  const h = managerHarness("RecordEditor");
+  const fields = nodes(h.render()).filter(node => node.type === "label" && /-field-\d+$/.test(node.props.htmlFor || ""));
+  assert.equal(fields.length, management.matchingFields.length, "none of the 26 business inputs is removed by grouping");
+  assert.equal(new Set(fields.map(node => node.props.htmlFor)).size, management.matchingFields.length);
+  assert.match(text(h.render()), /実施済みの成果.*今後の予定・回答期日.*提案先・担当・進捗.*面談の調整・連絡メモ.*稼働後の状況/s);
+  h.change("C面談予定日", "2099-01-01");
+  assert.match(text(h.render()), /1項目の変更が未保存/);
+  h.click("閉じる"); assert.equal(h.closed(), 0); assert.equal(h.calls.length, 0);
+  assert.match(text(h.render()), /未保存の変更が1項目あります/);
+  h.click("編集を続ける"); assert.equal(h.input("C面談予定日").props.value, "2099-01-01");
+  h.click("閉じる"); h.click("変更を破棄して閉じる"); assert.equal(h.closed(), 1); assert.equal(h.calls.length, 0);
+});
+
+test("basic information retains the initial row and profile versions when saving a draft", async () => {
+  const h = managerHarness("BasicInfoDialog", { profile: { version: "initial-profile-version", fields: { workHistory: "登録済みの経歴" }, introduction: "登録済み紹介文" } });
+  const editor = nodes(h.render()).find(node => node.type === "InterviewIntakeEditor");
+  assert.ok(editor); editor.props.onIntroductionChange("確認した紹介文");
+  h.props.record = { ...h.props.record, rowVersion: "arrived-later" };
+  h.props.profile = { ...h.props.profile, version: "arrived-later" };
+  h.click("閉じる"); assert.equal(h.closed(), 0); assert.match(text(h.render()), /基本情報に未保存の変更/);
+  h.click("編集を続ける");
+  await nodes(h.render()).find(node => node.type === "form").props.onSubmit({ preventDefault() {} });
+  assert.equal(h.calls.length, 1); assert.equal(h.calls[0][0], "saveCandidateProfile");
+  assert.equal(h.calls[0][1].recordId, "current-record");
+  assert.equal(h.calls[0][1].rowVersion, "version-current-record");
+  assert.equal(h.calls[0][1].profileVersion, "initial-profile-version");
+  assert.equal(h.calls[0][1].introduction, "確認した紹介文");
+});
+
+test("a home registration request waits for eligibility and is consumed only once", () => {
+  const h = managerHarness("CandidateManager", { createRequested: true, busy: true });
+  const openPanel = () => nodes(h.render()).find(node => typeof node.type === "function" && node.type.name === "CreateCandidate");
+  assert.equal(openPanel(), undefined); assert.equal(h.consumed(), 0);
+  h.render({ busy: false }); assert.ok(openPanel()); assert.equal(h.consumed(), 1);
+  openPanel().props.onClose();
+  h.render({ busy: true }); h.render({ busy: false });
+  assert.equal(openPanel(), undefined); assert.equal(h.consumed(), 1, "unchanged request cannot reopen after closing");
+  h.render({ createRequested: false }); h.render({ createRequested: true });
+  assert.ok(openPanel()); assert.equal(h.consumed(), 2);
+});
+
+test("searching to zero offers a filter reset and preserves the existing directory", () => {
+  const h = managerHarness("CandidateManager");
+  h.change("候補者・会社・メモを検索", "一致しない架空検索語");
+  assert.match(text(h.render()), /条件に合う候補者が見つかりません/);
+  assert.doesNotMatch(text(h.render()), /最初の候補者を登録/);
+  h.click("すべての候補者を表示");
+  assert.equal(h.input("候補者・会社・メモを検索").props.value, "");
+  const directory = nodes(h.render()).find(node => node.type === "CandidateDirectory");
+  assert.equal(directory.props.groups.length, 1); assert.equal(directory.props.groups[0].records[0].recordId, "current-record");
+});
+
+test("candidate registration warns about an existing same-owner person and can open the exact existing proposal", () => {
+  const h = managerHarness("CreateCandidate");
+  const name = nodes(h.render()).find(node => node.type === "input" && node.props.required);
+  name.props.onChange({ target: { value: "架空 候補者" } });
+  assert.match(text(h.render()), /同じ担当者に同名の登録があります/);
+  h.click("架空会社の記録を確認");
+  assert.deepEqual(h.calls, [["existing", "current-record"]]);
+});
+
+test("all candidate panels intercept native dismissal and retain drafts during saving or an uncertain result", () => {
+  for (const component of ["RecordEditor", "BasicInfoDialog", "CreateCandidate"]) {
+    const h = managerHarness(component);
+    if (component === "RecordEditor") h.change("C面談予定日", "2099-01-01");
+    else if (component === "BasicInfoDialog") nodes(h.render()).find(node => node.type === "InterviewIntakeEditor").props.onIntroductionChange("保存前の紹介文");
+    else nodes(h.render()).find(node => node.type === "input" && node.props.required).props.onChange({ target: { value: "新しい架空候補者" } });
+    const dismiss = () => nodes(h.render()).find(node => node.type === "Dialog").props.onOpenChange(false);
+    dismiss(); assert.equal(h.closed(), 0, `${component}: X, outside click and Escape do not silently discard`);
+    const continueLabel = component === "CreateCandidate" ? "入力を続ける" : "編集を続ける";
+    assert.ok(h.button(continueLabel)); h.click(continueLabel);
+    for (const state of ["busy", "uncertain"]) {
+      h.props.save[state] = true; dismiss(); assert.equal(h.closed(), 0);
+      assert.equal(h.button(continueLabel), undefined, `${component}: ${state} cannot initiate a discard`);
+      h.props.save[state] = false;
+    }
+  }
+});
+
+test("a genuinely empty directory starts with registration rather than a filter-recovery message", () => {
+  const h = managerHarness("CandidateManager", { records: [] });
+  assert.match(text(h.render()), /候補者を登録して、提案の進捗を管理しましょう/);
+  h.click("最初の候補者を登録");
+  assert.ok(nodes(h.render()).some(node => typeof node.type === "function" && node.type.name === "CreateCandidate"));
+});
+
+test("an already open discard confirmation cannot close any panel after a save starts", () => {
+  for (const component of ["RecordEditor", "BasicInfoDialog", "CreateCandidate"]) {
+    const h = managerHarness(component);
+    if (component === "RecordEditor") h.change("C面談予定日", "2099-01-01");
+    else if (component === "BasicInfoDialog") nodes(h.render()).find(node => node.type === "InterviewIntakeEditor").props.onIntroductionChange("保存前の紹介文");
+    else nodes(h.render()).find(node => node.type === "input" && node.props.required).props.onChange({ target: { value: "新しい架空候補者" } });
+    h.click("閉じる");
+    const label = component === "CreateCandidate" ? "入力を破棄して閉じる" : "変更を破棄して閉じる";
+    for (const state of ["busy", "uncertain"]) {
+      h.props.save[state] = true;
+      const discard = h.button(label); assert.ok(discard.props.disabled, `${component}: ${state} locks the discard button`);
+      discard.props.onClick(); assert.equal(h.closed(), 0);
+      h.props.save[state] = false;
     }
   }
 });

@@ -13,6 +13,7 @@
 .candidate-chat-engines button:disabled{opacity:.45;cursor:default}
 .candidate-chat-method,.candidate-chat-context-note{margin:0;font-size:11px;line-height:1.65;color:#65819b}
 .candidate-chat-method-short{display:none}
+.candidate-chat-source-count{margin:0;color:#5b7a96;font-size:10px;line-height:1.6}
 .candidate-chat-context-note{color:#977038}
 .candidate-chat-conversation{flex:1;min-height:0;overflow:auto;padding:20px 22px;overscroll-behavior:contain;scrollbar-gutter:stable;display:flex;flex-direction:column;gap:17px;background:#fff}
 .candidate-chat-welcome{display:grid;gap:10px;color:#34709e;padding:6px 0}
@@ -21,7 +22,16 @@
 .candidate-chat-prompts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:6px}
 .candidate-chat-prompts button{display:flex;align-items:center;justify-content:space-between;gap:6px;border:1px solid #d4e5f4;border-radius:7px;padding:10px;background:#f6faff;font-size:11px;line-height:1.6;text-align:left;color:#326897}
 .candidate-chat-prompts button:hover{background:#e9f5ff}
+.candidate-chat-prompts button>span{display:grid;gap:4px;min-width:0}
+.candidate-chat-prompts strong{font-size:12px;font-weight:650}
+.candidate-chat-prompts small{font-size:10px;color:#617e97;line-height:1.6}
 .candidate-chat-prompts svg{flex-shrink:0}
+.candidate-chat-prompts button:focus-visible,.candidate-chat-engines button:focus-visible,.candidate-chat-followup button:focus-visible{outline:2px solid #0874d6;outline-offset:3px}
+.candidate-chat-followup{flex:none;border-top:1px solid #e1ebf4;padding-top:12px;display:grid;gap:9px}
+.candidate-chat-followup>p{font-size:11px;color:#617d96;line-height:1.8;margin:0}
+.candidate-chat-followup>div{display:flex;flex-wrap:wrap;gap:7px}
+.candidate-chat-followup button{font-size:11px;line-height:1.6;text-align:left;padding:7px 9px;min-height:34px;border:1px solid #d4e5f4;border-radius:6px;color:#326897;background:#f6faff}
+.candidate-chat-followup button:hover{background:#e9f5ff}
 .candidate-chat-message{padding:13px 15px;background:#f6f9fd;border:1px solid #e5edf5;border-radius:9px;flex:none;min-width:0}
 .candidate-chat-message.is-user{background:#eaf6ff;border-color:#d6eafa;align-self:flex-end;max-width:90%}
 .candidate-chat-message>header{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:7px;color:#6585a2;font-size:10px}

@@ -27,6 +27,8 @@ jobs:
           package-manager-cache: false
       - name: Install locked dependencies
         run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Verify pinned password KDF source and reproducible bundle
+        run: node scripts/generate-password-kdf.mjs --check
       - name: Run regression tests
         run: npm test
       - name: Build and scan public artifacts

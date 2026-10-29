@@ -69,7 +69,7 @@ function harness(options = {}) {
     if (currentKey !== session.key) { unmount(); slots = []; effects = []; currentKey = session.key; }
     cursor = 0; tree = session.type(session.props); while (effects.length) effects.shift()(); return tree;
   }
-  const button = label => nodes(render()).find(node => node.type === "button" && text(node).trim() === label);
+  const button = label => nodes(render()).find(node => node.type === "button" && (node.props["aria-label"] === label || node.props["aria-label"]?.endsWith(`：${label}`) || text(node).trim() === label));
   const click = label => { const found = button(label); assert.ok(found, `button exists: ${label}`); assert.ok(!found.props.disabled, `button enabled: ${label}`); found.props.onClick?.(); };
   const input = () => nodes(render()).find(node => node.type === "textarea");
   const change = value => input().props.onChange({ target: { value } });
@@ -130,6 +130,50 @@ test("the missing-information suggestion asks a useful input question directly i
   assert.equal(h.calls.facts.length, 1); assert.equal(h.calls.device.length, 0);
   assert.equal(h.calls.facts[0][1], "追加入力したほうがいい情報は？");
   assert.match(text(h.assistant()[0]), /入力内容のチェック（AI未使用）/); h.unmount();
+});
+
+test("purpose-based suggestions explain their output and keep missing information separate from a summary", async () => {
+  const h = harness({ availability: "unavailable", props: { profiles: [profileWithAmbiguities()] } }); await flush();
+  assert.match(h.text(), /不足・あいまいな情報/);
+  assert.match(h.text(), /確認する項目・理由・本人への質問/);
+  assert.match(h.text(), /登録内容を要約/);
+  assert.match(h.text(), /参照中：提案・履歴 2件 · 基本情報 1件 · 振り返り 0件/);
+  h.click("希望条件と職歴を整理して"); await flush();
+  assert.equal(h.calls.facts[0][1], "希望条件と職歴を整理して");
+  assert.match(h.text(), /続けて|実際の状況に合わせて次の対応/);
+  assert.ok(h.button("追加入力したほうがいい情報は？")); h.unmount();
+});
+
+test("record-check answers explain manual correction and offer a source-grounded follow-up", async () => {
+  const h = harness({ availability: "unavailable", props: { profiles: [profileWithAmbiguities()] } }); await flush();
+  h.click("追加入力したほうがいい情報は？"); await flush();
+  assert.match(h.text(), /「基本情報・紹介文」や「進捗・実績を編集」で記録/);
+  assert.match(h.text(), /相談の回答だけでは登録内容は変わりません/);
+  h.click("他には？"); await flush();
+  assert.equal(h.calls.facts.length, 2);
+  assert.equal(h.calls.facts[1][1], "他には？");
+  assert.equal(h.calls.facts[1][2][0].content, "追加入力したほうがいい情報は？");
+  assert.match(text(h.assistant()[1]), /確認する質問/); h.unmount();
+});
+
+test("a failed question can be edited without silently resubmitting it", async () => {
+  const h = harness({ device: () => Promise.reject(new Error("temporary model failure")) }); await flush();
+  h.change("C面談前に確認することは？"); h.submit(); await flush();
+  assert.equal(h.input().props.value, "");
+  h.click("質問を編集");
+  assert.equal(h.input().props.value, "C面談前に確認することは？");
+  assert.equal(h.calls.device.length, 1);
+  assert.doesNotMatch(h.text(), /回答を作成できませんでした/); h.unmount();
+});
+
+test("editing a failed question preserves a newer question already being drafted", async () => {
+  const pending = deferred(), h = harness({ device: () => pending.promise }); await flush();
+  h.change("回答に失敗する最初の質問"); h.submit();
+  h.change("手入力で編集中の次の質問");
+  pending.reject(new Error("temporary model failure")); await flush();
+  h.click("質問を編集");
+  assert.equal(h.input().props.value, "手入力で編集中の次の質問");
+  assert.equal(h.calls.device.length, 1); h.unmount();
 });
 
 test("the reported missing-information question returns specific checks rather than a profile recap in record mode", async () => {
