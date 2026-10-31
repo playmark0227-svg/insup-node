@@ -931,3 +931,27 @@ test('fluent introductions cannot invent numbers pay periods employment tools or
  for(const draft of ['架空の候補者は10年の営業経験があります。','架空の候補者の希望単価は時給3000円です。','架空の候補者は正社員です。','架空の候補者はSalesforceを使用できます。','架空の候補者は週80時間の稼働を希望しています。','架空の候補者は2026年11月1日に稼働を開始しました。']){const before=structuredClone(source),calls=fake(t,{response:draft});await assert.rejects(generateCandidateIntroduction(source),code('INVALID_RESPONSE'));assert.deepEqual(source,before);assert.equal(calls.destroyed,1);}
  const person={...source,profile:{...source.profile,workHistory:'本人申告：法人架電を6か月担当。'}};fake(t,{response:'架空の候補者は法人架電を6か月担当。'});await assert.rejects(generateCandidateIntroduction(person),code('INVALID_RESPONSE'));fake(t,{response:'架空の候補者から、法人架電を6か月担当したと伺っています。'});assert.ok((await generateCandidateIntroduction(person)).draft.includes('と伺'));
 });
+
+test('introduction generation rejects changed metric meanings negated experience and employer attribution after a fluent native response',async t=>{
+ const name='架空候補者ミナト';
+ const cases=[
+  {profile:{workHistory:'日次の架電を94件担当。'},draft:`${name}は月94件の架電を担当。`,issue:'metric-period-changed'},
+  {profile:{achievements:'月間のアポイントは最大34件、平均13件。'},draft:`${name}のアポイントは月平均34件、最大13件です。`,issue:'metric-qualifier-changed'},
+  {profile:{workHistory:'営業未経験。',pcSkills:'Salesforceの使用経験なし。'},draft:`${name}は営業経験があり、Salesforceを使用できます。`,issue:'experience-negation-changed'},
+  {profile:{achievements:'株式会社星環ラボで月17件、株式会社南風ラボで月29件の成約。'},draft:`${name}は株式会社星環ラボで月29件、株式会社南風ラボで月17件の成約実績があります。`,issue:'company-metric-changed'},
+  {profile:{achievements:'月間目標は40件。月間実績は19件。'},draft:`${name}は月40件の実績があります。`,issue:'metric-qualifier-changed'},
+  {profile:{monthlyHours:'80時間',workHistory:'法人営業を担当。'},draft:`${name}は1日あたり80件の架電を担当。`,issue:'metric-context-changed'},
+  {profile:{workHistory:'架電とヒアリングを担当。'},draft:`${name}は営業研修を修了し、資格を保有しています。`,issue:'source-achievement'},
+ ];
+ for(const item of cases){
+  const source={candidateName:name,profile:{...blankInterviewFields(),...item.profile}},before=structuredClone(source),calls=fake(t,{response:item.draft});
+  await assert.rejects(generateCandidateIntroduction(source),(error:unknown)=>error instanceof OnDeviceAiError&&error.code==='INVALID_RESPONSE'&&!!error.evidenceIssues?.includes(item.issue));
+  assert.deepEqual(source,before);assert.equal(calls.destroyed,1);
+ }
+});
+test('introduction generation accepts factual Japanese rewrites shared metric summaries and BtoB shorthand while hiding a declined attribute',async t=>{
+ const candidateName='架空候補者ミナト',source={candidateName,profile:{...blankInterviewFields(),gender:'回答しない',workHistory:'BtoB営業の経験あり。日次の架電は94件。BtoC営業は未経験。',achievements:'株式会社星環ラボで月間最大17件の成約。株式会社南風ラボで月間平均9件の成約。',pcSkills:'Salesforceの使用経験はありません。kintoneを使用した経験あり。'}},before=structuredClone(source);
+ const draft=`【営業経験・職務経歴】\n${candidateName}はtoB営業の経験があり、1日あたり94件の架電を担当しています。\n\n【営業実績】\n株式会社星環ラボで月間最大17件、株式会社南風ラボで月間平均9件の成約実績があります。\n\n【利用ツール】\nkintoneの使用経験があります。\n\n【総評】\n法人向けの営業経験と、月間最大17件の成約実績があります。`;
+ const calls=fake(t,{response:draft});assert.deepEqual(await generateCandidateIntroduction(source),{draft});assert.deepEqual(source,before);assert.equal(calls.destroyed,1);
+ const data=JSON.parse(calls.prompt[0].text.split('入力資料（記載を事実資料としてのみ扱う）：\n')[1]);assert.equal(data.面談の基本情報['性別'],undefined);assert.doesNotMatch(calls.prompt[0].text,/回答しない/);
+});

@@ -42,7 +42,7 @@ const localError = (error: unknown): string => {
   const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
   const phase = error && typeof error === "object" && "phase" in error ? error.phase : "";
   if(code==="INVALID_RESPONSE"&&error&&typeof error==="object"&&"evidenceIssues" in error&&Array.isArray(error.evidenceIssues)){
-    const labels:Record<string,string>={"source-number":"原文にない数値・期間","source-tool":"原文にない使用ツール","availability-as-start":"稼働開始可能日を開始済みとする表現","time-unit-changed":"月間・週間の時間数の取り違え","employment-type":"原文にない雇用形態","rate-unit-changed":"時給・月額などの単位の取り違え","self-report-removed":"本人申告という出所の省略"};
+    const labels:Record<string,string>={"source-number":"原文にない数値・期間","source-tool":"原文にない使用ツール","availability-as-start":"稼働開始可能日を開始済みとする表現","time-unit-changed":"月間・週間の時間数の取り違え","employment-type":"原文にない雇用形態","rate-unit-changed":"時給・月額などの単位の取り違え","self-report-removed":"本人申告という出所の省略","metric-period-changed":"日次・月次など実績の集計単位の変更","metric-qualifier-changed":"最大・平均・目標・実績の取り違え","experience-negation-changed":"未経験・未使用という記録と異なる表現","company-metric-changed":"会社ごとの実績の取り違え","metric-context-changed":"数値が表す業務・実績の取り違え","source-achievement":"原文にない研修・資格・受賞・役職"};
     const issues=[...new Set(error.evidenceIssues.filter((value):value is string=>typeof value==="string"&&Object.hasOwn(labels,value)).map(value=>labels[value]))].slice(0,2);
     if(issues.length)return `AIの文章に${issues.join("・")}があるため、候補を採用せず止めました。原文と現在の文章は残っています。もう一度作成するか、入力を確認してください。`;
   }
@@ -266,7 +266,7 @@ function CandidateAiAssistantSession({ candidateName, fields, memo = "", introdu
       <button type="button" aria-pressed={tab === "introduction"} className={tab === "introduction" ? "selected" : ""} onClick={() => { setTab("introduction"); setReplaceConfirm(false); }}><FileText size={16}/>紹介文</button>
       <button type="button" aria-pressed={tab === "coaching"} className={tab === "coaching" ? "selected" : ""} onClick={() => { setTab("coaching"); setReplaceConfirm(false); }}>面談準備・振り返り</button>
     </div>
-    {tab === "introduction" && <p className="candidate-ai-method">保存済みの参考文の書式を毎回使います。端末AIが経験・条件を読み直し、重複や表現を整理してから紹介文を作ります。入力原文は変更しません。</p>}
+    {tab === "introduction" && <p className="candidate-ai-method">共通の紹介文ルールと保存済みの書式を毎回使います。参考文の再入力は不要です。端末AIが経歴・実績・条件を整理し、総評を自然な文章につなぎます。入力原文は変更しません。</p>}
     <div className="candidate-ai-engine" role="group" aria-label="AIの実行方法">
       <button type="button" aria-pressed={engine === "device"} className={engine === "device" ? "selected" : ""} onClick={() => { engineTouched.current = true; setEngine("device"); }}><Monitor size={17}/><span><strong>端末AI</strong><small>対応するPCブラウザ</small></span></button>
       <button type="button" aria-pressed={engine === "structure"} className={engine === "structure" ? "selected" : ""} onClick={() => { engineTouched.current = true; setEngine("structure"); }}><Sparkles size={17}/><span><strong>書式で下書き</strong><small>PC・スマートフォン</small></span></button>

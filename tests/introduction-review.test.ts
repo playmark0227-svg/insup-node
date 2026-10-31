@@ -58,3 +58,78 @@ test('flexible day and monthly hour ranges do not create false scheduling contra
 test('kanji digit years compare to the actual source year rather than their last character',()=>{
  const fields={...blankInterviewFields(),availableFrom:'2026-11-01',workHistory:'6か月の担当経験'};assert.deepEqual(introductionEvidenceIssues('候補者の稼働開始可能日は二〇二六年11月1日です。','候補者',fields),[]);assert.ok(introductionEvidenceIssues('候補者の稼働開始可能日は二〇二七年11月1日です。','候補者',fields).includes('source-number'));
 });
+
+// Independent fictional fixtures: neither source references nor production
+// candidate records are used for these semantic regressions.
+const metricSource=(achievements:string,workHistory='法人向けの営業を担当。')=>({...blankInterviewFields(),workHistory,achievements});
+test('counts and rates preserve readable daily monthly and hourly denominators, including natural Japanese rewrites',()=>{
+ const examples=[
+  ['日次の架電は94件。','候補者は1日あたり94件の架電を担当しました。','候補者は月94件の架電を担当しました。'],
+  ['月次のアポイントは18件。','候補者のアポイントは1か月あたり18件です。','候補者のアポイントは日次18件です。'],
+  ['1時間あたり43件の架電。','候補者は43件/時間の架電を担当。','候補者は1日あたり43件の架電を担当。'],
+  ['月間のアポイント率は6%。','候補者のアポイント率は月次で6パーセント。','候補者のアポイント率は日次で6%。'],
+  ['日94件の架電。','候補者は一日当たり94件の架電を担当。','候補者には94件の架電実績があります。'],
+ ] as const;
+ for(const [source,good,bad] of examples){assert.deepEqual(introductionEvidenceIssues(good,'候補者',metricSource(source)),[],good);assert.ok(introductionEvidenceIssues(bad,'候補者',metricSource(source)).includes('metric-period-changed'),bad);}
+});
+test('explicit call and appointment shorthand allows count-word rewrites without changing the denominator or business metric',()=>{
+ for(const [source,draft] of [
+  ['76コール/1日。','候補者は1日あたり76件の架電を担当。'],
+  ['日次架電数：76件。','候補者は日次76通の架電を担当。'],
+  ['7アポ/日。','候補者のアポイントは日次7件です。'],
+  ['架電は日76通。','候補者の架電数は76コール/1日です。'],
+ ] as const)assert.deepEqual(introductionEvidenceIssues(draft,'候補者',metricSource(source)),[],draft);
+ const fields=metricSource('76コール/1日。7アポ/日。');assert.ok(introductionEvidenceIssues('候補者は月76件の架電を担当。','候補者',fields).includes('metric-period-changed'));assert.ok(introductionEvidenceIssues('候補者のアポイントは日次76件です。','候補者',fields).includes('metric-context-changed'));
+ const separated=reviewIntroductionSource({...blankInterviewFields(),workHistory:Array.from({length:65},()=> '法人向け架電。1日あたり平均73件を担当。').join('\n'),desiredHourlyRate:'時給1,850円'}).fields;assert.deepEqual(introductionEvidenceIssues('【基本情報】\n氏名：架空検証\n【営業経験・職務経歴】\n法人向け架電を1日あたり平均73件担当。','架空検証',separated),[]);
+});
+test('maximum average target and actual counts cannot exchange values or lose their limiting meaning',()=>{
+ const fields=metricSource('月間のアポイントは最大34件、平均13件。目標は月40件。実績は月19件。');
+ for(const draft of ['候補者のアポイントは月平均34件、月最大13件です。','候補者は月34件のアポイント実績があります。','候補者のアポイント実績は月40件です。','候補者の月間アポイント目標は19件です。'])assert.ok(introductionEvidenceIssues(draft,'候補者',fields).includes('metric-qualifier-changed'),draft);
+ for(const draft of ['候補者のアポイント実績は月間最大34件、平均13件です。','候補者は月40件を目標としており、実績は月19件です。','候補者のアポイントは月平均13件です。'])assert.deepEqual(introductionEvidenceIssues(draft,'候補者',fields),[],draft);
+ const approximate=metricSource('月間の架電は約640件。');assert.ok(introductionEvidenceIssues('候補者の架電実績は月640件です。','候補者',approximate).includes('metric-qualifier-changed'));assert.deepEqual(introductionEvidenceIssues('候補者の架電は月640件程度です。','候補者',approximate),[]);
+});
+test('explicit company metrics remain attributed while a grounded summary can omit the company name',()=>{
+ const fields=metricSource('株式会社星環ラボで月17件、株式会社南風ラボで月29件の成約。');
+ const wrong='候補者は株式会社星環ラボで月29件、株式会社南風ラボで月17件の成約実績があります。';
+ assert.ok(introductionEvidenceIssues(wrong,'候補者',fields).includes('company-metric-changed'));
+ for(const draft of ['候補者は株式会社星環ラボで月17件、株式会社南風ラボで月29件の成約実績があります。','候補者には月29件の成約実績があります。','【職歴】\n■ 株式会社星環ラボ\n月17件の成約。\n■ 株式会社南風ラボ\n月29件の成約。\n【総評】\n候補者は月17件の成約実績も持っています。'])assert.deepEqual(introductionEvidenceIssues(draft,'候補者',fields),[],draft);
+ const separate={...blankInterviewFields(),workHistory:'株式会社星環ラボで月17件の成約。',achievements:'株式会社南風ラボで月29件の成約。'};assert.ok(introductionEvidenceIssues(wrong,'候補者',separate).includes('company-metric-changed'));
+ const short=metricSource('X社で月17件、Y社で月29件の成約。');assert.ok(introductionEvidenceIssues('候補者はX社で月29件の成約。','候補者',short).includes('company-metric-changed'));
+ for(const workHistory of ['株式会社星環ラボで、月17件の成約。','株式会社星環ラボで法人営業を担当。月17件の成約。','株式会社星環ラボに入社。月17件の成約。'])assert.deepEqual(introductionEvidenceIssues('候補者は株式会社星環ラボで月17件の成約。','候補者',{...blankInterviewFields(),workHistory}),[],workHistory);
+});
+test('numeric facts cannot be reassigned to a different business metric or changed from a count into a rate',()=>{
+ const fields=metricSource('月間の架電は730件。月間のアポイントは21件。');
+ for(const draft of ['候補者の架電は月21件、アポイントは月730件です。','候補者のアポイント率は月21%です。'])assert.ok(introductionEvidenceIssues(draft,'候補者',fields).includes('metric-context-changed'),draft);
+ assert.deepEqual(introductionEvidenceIssues('候補者は月730件の架電を担当し、アポイントは月21件です。','候補者',fields),[]);
+ const nonCounts={...blankInterviewFields(),age:'27歳',monthlyHours:'80時間'};for(const draft of ['候補者は月27件のアポイントを獲得。','候補者は月80件の架電を担当。'])assert.ok(introductionEvidenceIssues(draft,'候補者',nonCounts).includes('metric-context-changed'),draft);
+});
+test('explicitly absent experience and tools cannot become affirmative experience, but negatives and open questions remain valid',()=>{
+ const fields={...blankInterviewFields(),workHistory:'営業未経験。',pcSkills:'Salesforceの使用経験なし。kintoneを使用した経験があります。'};
+ for(const draft of ['候補者は営業経験があります。','候補者はSalesforceを使用できます。','候補者はSalesforceの使用経験があります。'])assert.ok(introductionEvidenceIssues(draft,'候補者',fields).includes('experience-negation-changed'),draft);
+ for(const draft of ['候補者は営業未経験で、Salesforceの使用経験はありません。','候補者はkintoneの使用経験があります。','候補者のSalesforceの経験は要確認です。'])assert.deepEqual(introductionEvidenceIssues(draft,'候補者',fields),[],draft);
+ const moreTools={...fields,pcSkills:'Salesforceを使ったことがありません。'};assert.ok(introductionEvidenceIssues('候補者はSalesforceを活用できます。','候補者',moreTools).includes('experience-negation-changed'));
+});
+test('compact negative tool and CRM labels never become usage claims, while explicit contrary experience stays ambiguous',()=>{
+ for(const [source,draft] of [
+  ['Salesforce：なし','候補者はSalesforceを使用できます。'],
+  ['Slack：未経験','候補者はSlackの利用経験があります。'],
+  ['テレアポ経験はありません。','候補者にはテレアポ経験があります。'],
+  ['CRM経験：なし','候補者はSalesforceを使用できます。'],
+ ] as const){const fields={...blankInterviewFields(),workHistory:source};assert.ok(introductionEvidenceIssues(draft,'候補者',fields).includes('experience-negation-changed'),draft);assert.deepEqual(introductionEvidenceIssues(`候補者の記録は「${source}」です。`,'候補者',fields),[]);}
+ const contradictory={...blankInterviewFields(),workHistory:'CRM経験：なし',pcSkills:'Salesforceの使用経験があります。'};assert.ok(!introductionEvidenceIssues('候補者はSalesforceを使用できます。','候補者',contradictory).includes('experience-negation-changed'));
+});
+test('BtoB shorthand changes preserve experience meaning without denying a separately stated business type',()=>{
+ const fields={...blankInterviewFields(),workHistory:'BtoB営業の経験あり。BtoC営業は未経験。日次の架電は94件。'};
+ for(const draft of ['候補者はtoB営業の経験があり、1日あたり94件の架電を担当。','候補者はB2B営業の経験があり、日94件の架電を担当。','候補者は法人向けの営業経験があります。'])assert.deepEqual(introductionEvidenceIssues(draft,'候補者',fields),[],draft);
+ assert.ok(introductionEvidenceIssues('候補者はtoC営業の経験があります。','候補者',fields).includes('experience-negation-changed'));
+});
+test('unsupported concrete career events are rejected without requiring source-identical prose',()=>{
+ const fields={...blankInterviewFields(),workHistory:'法人向けの架電とヒアリングを担当。'};
+ for(const draft of ['候補者は研修を修了しました。','候補者はテレアポ研修で実績があります。','候補者は資格を取得しています。','候補者はリーダーとして営業を担当。','候補者には受賞経験があります。'])assert.ok(introductionEvidenceIssues(draft,'候補者',fields).includes('source-achievement'),draft);
+ assert.deepEqual(introductionEvidenceIssues('候補者は法人向けに電話をかけ、ヒアリングを行っていました。','候補者',fields),[]);
+ const grounded={...fields,achievements:'テレアポ研修を修了。資格を保有。チームリーダーとして勤務。社内表彰を受けた。'};assert.deepEqual(introductionEvidenceIssues('候補者は研修を修了し、資格を取得しています。リーダーとして勤務した経験と表彰を受けた経験があります。','候補者',grounded),[]);
+});
+test('declining an optional personal attribute only removes it from prepared sharing evidence',()=>{
+ for(const gender of ['回答しない','回答を控える','未回答']){const raw={...blankInterviewFields(),workHistory:'営業を担当。',gender},before=structuredClone(raw),review=reviewIntroductionSource(raw);assert.equal(review.fields.gender,'');assert.deepEqual(raw,before);}
+ const raw={...blankInterviewFields(),gender:'女性'};assert.equal(reviewIntroductionSource(raw).fields.gender,'女性');assert.equal(raw.gender,'女性');
+});
