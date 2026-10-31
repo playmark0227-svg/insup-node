@@ -135,7 +135,7 @@ test("saved preferences apply to successive candidates without any daily referen
   const saved = { ...preferences, version: "saved_version_123456", tone: "plain", targetLength: 600 };
   const h = harness({ availability: "available" }); await flush();
   h.render({ preferences: saved });
-  assert.match(h.text(), /保存済みの参考文の書式を毎回使います/);
+  assert.match(h.text(), /共通の紹介文ルールと保存済みの書式を毎回使います/);
   assert.ok(!nodes(h.render()).some(node => node.type === "textarea" && node.props.id.endsWith("-reference")));
   h.click("文章をAIで整理・仕上げる"); await flush();
   h.render({ identityKey: "account-one:next-candidate", candidateName: "次の架空候補者", preferences: saved }); await flush();
@@ -289,4 +289,14 @@ test('an adopted draft can restore the exact prior introduction and cannot overw
 
 test('unsupported model facts report only fixed useful reasons and never echo raw model diagnostics',async()=>{
  const h=harness({deviceIntroduction:async()=>{throw {code:'INVALID_RESPONSE',evidenceIssues:['rate-unit-changed','PRIVATE_MODEL_DETAIL']};}});await flush();h.click('文章をAIで整理・仕上げる');await flush();assert.match(h.text(),/時給・月額などの単位の取り違え/);assert.match(h.text(),/原文と現在の文章は残っています/);assert.doesNotMatch(h.text(),/PRIVATE_MODEL_DETAIL/);assert.equal(h.calls.applied.length,0);h.unmount();
+});
+
+
+test('meaning checks explain a rejected introduction without applying it or exposing model details',async()=>{
+ const checks=[['metric-period-changed','日次・月次'],['metric-qualifier-changed','最大・平均・目標・実績'],['experience-negation-changed','未経験・未使用'],['company-metric-changed','会社ごとの実績'],['metric-context-changed','数値が表す業務・実績'],['source-achievement','研修・資格・受賞・役職']];
+ for(const [issue,label] of checks){
+  const h=harness({deviceIntroduction:async()=>{throw {code:'INVALID_RESPONSE',evidenceIssues:[issue,'PRIVATE_GENERATION_OUTPUT']};}});
+  await flush();h.click('文章をAIで整理・仕上げる');await flush();
+  assert.ok(h.text().includes(label));assert.match(h.text(),/原文と現在の文章は残っています/);assert.doesNotMatch(h.text(),/PRIVATE_GENERATION_OUTPUT/);assert.equal(h.calls.applied.length,0);h.unmount();
+ }
 });

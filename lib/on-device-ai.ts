@@ -381,6 +381,7 @@ export async function generateCandidateIntroduction(input: CandidateIntroduction
     "面談メモの原文、自己反省、過去のAI助言を紹介文へ引用・転載しないでください。面談メモから使う場合も、共有に必要な確認済み事実だけを整理してください。" +
     "参考文章は書式だけを参考にし、そこに出てくる別人の情報や実績を候補者へ移さないでください。氏名は省略・変更せず、紹介文の本文に含めてください。" +
     introductionStyleGuide + "\n" +
+    "返答する前に、総評も含めて文ごとに入力資料と照合してください。資料にない研修・資格・受賞・役職・契約や、断定的な能力・環境の説明は加えず、その文を削ってください。読みやすさのために新しい話題を足す必要はありません。助詞・敬語・業務用語に不自然な誤変換がないかも読み直してください。" +
     "紹介文の本文だけをそのまま返してください。JSON、スキーマ、型定義、英語の内部項目名、コードフェンス、出力についての説明や命令文は一切付けないでください。",
     { 氏名: name, 面談の基本情報: profile, 面談メモ: memo, 表記の整理案:review.revisions.map(item=>({項目:item.label,原文:item.before,整理後:item.after})),共有本文へ含めない未確認項目:review.checks.filter(check=>check.fields.some(key=>!review.fields[key].trim())).map(check=>({項目:check.fields.map(key=>interviewFieldLabels[key]),確認内容:check.detail})),事実の取り扱い:review.notes,...(reference ? { 書式の参考文章: reference } : {}), 文章設定: format }, undefined, options, 2_000);
   const cleaned = checkedProse(cleanIntroductionPlaceholders(output, review.fields, memo), settings.targetLength);
