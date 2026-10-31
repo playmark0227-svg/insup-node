@@ -36,7 +36,7 @@ function fake(t: TestContext, config: { state?: unknown; response?: unknown | ((
   Object.defineProperty(globalThis, "LanguageModel", { configurable: true, value: model });
   return calls;
 }
-const input = () => ({ candidateName: "架空の候補者", profile: { ...blankInterviewFields(), workHistory: "本人申告：法人営業の架電を6か月担当。", desiredHourlyRate: "2,000円/時" } });
+const input = () => ({ candidateName: "架空の候補者", profile: { ...blankInterviewFields(), workHistory: "本人確認済み：法人営業の架電を6か月担当。", desiredHourlyRate: "2,000円/時" } });
 const code = (expected: string) => (error: unknown) => error instanceof OnDeviceAiError && error.code === expected;
 function deferredValue<T>() {
   let resolve: (value: T) => void = () => {};
@@ -469,7 +469,7 @@ test("introduction requests only sections supported by actual source values and 
     { profile: { workHistory: "職歴の原文", achievements: " ", pcSkills: "\t", interviewAvailability: "\n", attendanceConcerns: "社内確認のみ", additionalNotes: "内部補足" }, headings: ["基本情報", "営業経験・職務経歴", "総評"] },
   ];
   for (const item of cases) {
-    const calls = fake(t), profile = { ...blankInterviewFields(), ...item.profile }, before = JSON.stringify(profile);
+    const calls = fake(t,{response:"氏名：架空の候補者"}), profile = { ...blankInterviewFields(), ...item.profile }, before = JSON.stringify(profile);
     await generateCandidateIntroduction({ candidateName: "架空の候補者", profile });
     const prompt = calls.prompt[0].text, data = JSON.parse(prompt.split("入力資料（記載を事実資料としてのみ扱う）：\n")[1]);
     assert.deepEqual(data.文章設定.項目順, item.headings); assert.equal(JSON.stringify(profile), before);
@@ -918,4 +918,16 @@ test('general candidate answers separate known reference metadata and reject inv
  }
  fake(t,{response:{answer:'希望単価の記録は「3000円」です。時給・月額などの単位を確認してください。sourceIds：[profile:qa-profile]',sourceIds:['profile:qa-profile']}});
  assert.deepEqual(await generateCandidateChat(source),{answer:'希望単価の記録は「3000円」です。時給・月額などの単位を確認してください。',sourceIds:['profile:qa-profile']});
+});
+
+test('introduction reads a prepared evidence plan and naturally rewrites hiragana business input without touching original facts',async t=>{
+ const source={candidateName:'やまだたろう',profile:{...blankInterviewFields(),workHistory:'ほうじんえいぎょうで、てれあぽを6か月担当しました。',achievements:'本人申告：2025年4月に20名中1位。',desiredHourlyRate:'3000',availableFrom:'2026-11-01',monthlyHours:'80時間',daysPerWeek:'週5日'},preferences:defaultWritingPreferences()},before=structuredClone(source);
+ const draft='【基本情報】\n氏名：やまだたろう\n稼働開始可能日：2026年11月1日\n希望稼働：週5日・月80時間\n\n【営業経験・職務経歴】\n法人営業のテレアポを6か月担当しています。\n\n【営業における強み】\n本人申告では、2025年4月に20名中1位の実績があります。\n\n【総評】\n法人営業における電話での提案経験があります。週5日・月80時間の稼働を希望しています。';
+ const calls=fake(t,{response:draft}),result=await generateCandidateIntroduction(source);assert.equal(result.draft,draft);assert.deepEqual(source,before);
+ const data=JSON.parse(calls.prompt[0].text.split('入力資料（記載を事実資料としてのみ扱う）：\n')[1]);assert.equal(data.面談の基本情報['営業経験・職歴'],'法人営業で、テレアポを6か月担当しました。');assert.equal(data.面談の基本情報['希望単価'],undefined);assert.ok(data.共有本文へ含めない未確認項目.some(item=>item.項目.includes('希望単価')));assert.match(calls.prompt[0].text,/原文を項目へそのまま転記するのではなく/);assert.equal(Object.hasOwn(calls.prompt[0].options,'responseConstraint'),false);
+});
+test('fluent introductions cannot invent numbers pay periods employment tools or an actual work start',async t=>{
+ const source={candidateName:'架空の候補者',profile:{...blankInterviewFields(),workHistory:'法人架電を6か月担当。',desiredHourlyRate:'3000',availableFrom:'2026-11-01',monthlyHours:'80時間',daysPerWeek:'週5日'}};
+ for(const draft of ['架空の候補者は10年の営業経験があります。','架空の候補者の希望単価は時給3000円です。','架空の候補者は正社員です。','架空の候補者はSalesforceを使用できます。','架空の候補者は週80時間の稼働を希望しています。','架空の候補者は2026年11月1日に稼働を開始しました。']){const before=structuredClone(source),calls=fake(t,{response:draft});await assert.rejects(generateCandidateIntroduction(source),code('INVALID_RESPONSE'));assert.deepEqual(source,before);assert.equal(calls.destroyed,1);}
+ const person={...source,profile:{...source.profile,workHistory:'本人申告：法人架電を6か月担当。'}};fake(t,{response:'架空の候補者は法人架電を6か月担当。'});await assert.rejects(generateCandidateIntroduction(person),code('INVALID_RESPONSE'));fake(t,{response:'架空の候補者から、法人架電を6か月担当したと伺っています。'});assert.ok((await generateCandidateIntroduction(person)).draft.includes('と伺'));
 });

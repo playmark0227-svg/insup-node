@@ -1,6 +1,6 @@
 import { Fragment, useId, useState } from "react";
 import { ArrowRight, CalendarDays, ChevronDown, ChevronRight, MessageCircle, Trash2 } from "lucide-react";
-import type { CandidateGroup } from "@/lib/candidate-groups";
+import {candidateAppointments,type CandidateGroup} from "@/lib/candidate-groups";
 import { milestoneColumns, statusTone, valueAt } from "@/lib/management-data";
 import { activityInputMetrics } from "@/lib/performance-metrics";
 import { businessToday, type CandidateRecord, type SheetPlayer } from "@/lib/sheets-client";
@@ -34,17 +34,7 @@ export function candidateFollowUp(record:CandidateRecord) {
  return {label:"企業への提案状況を確認",reason:"提案完了日は未登録です。",active:true};
 }
 
-function nextAppointment(records:CandidateRecord[]) {
- const today=businessToday();
- return records.flatMap(record=>{
-  if(["closed","filled"].includes(statusTone(valueAt(record,7))))return [];
-  return [{date:valueAt(record,10),time:valueAt(record,11),label:"C面談",done:valueAt(record,17)},
-   {date:valueAt(record,18),time:valueAt(record,20),label:"合否回答期日",done:valueAt(record,21)},
-   {date:valueAt(record,23),time:"",label:"稼働開始予定",done:valueAt(record,24)}]
-   .filter(item=>!item.done&&hasDate(item.date))
-   .map(item=>({...item,recordId:record.recordId,company:valueAt(record,2),overdue:item.date<today}));
- }).sort((a,b)=>`${a.date} ${a.time}`.localeCompare(`${b.date} ${b.time}`))[0];
-}
+function nextAppointment(records:CandidateRecord[]) { return candidateAppointments(records,businessToday())[0]; }
 
 export function CandidateDirectory(props:DirectoryProps) {
  const {groups,players,busy,intakeEnabled,canDelete,onEdit,onBasic,onDelete,onChat}=props;

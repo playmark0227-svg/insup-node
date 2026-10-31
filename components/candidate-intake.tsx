@@ -82,6 +82,7 @@ export function InterviewIntakeEditor({ candidateName, fields, onFieldsChange, i
   }
   return <div className="interview-intake">
     <p className="intake-context">{candidateName || "この候補者"}の面談情報をまとめます。分かる項目だけ入力してください。</p>
+    {ai?.enabled&&<div className="intake-writing-workflow"><span>情報を入力 → AIで整理 → 原文と比べて採用</span><a href={`#${id}-writing-assistant`} className="text-button">文章をAIで整える</a></div>}
     <fieldset disabled={disabled} className="intake-section"><legend>基本情報・稼働条件</legend><div className="intake-grid">
       {field("age", { inputMode: "numeric", maxLength: 20 })}
       <label className="intake-field" htmlFor={`${id}-gender`}><span>性別 <small>任意</small></span><select id={`${id}-gender`} value={fields.gender} onChange={event => set("gender", event.target.value)}>{genderOptions.map(option => <option key={option} value={option}>{option || "未回答"}</option>)}</select></label>
@@ -114,12 +115,13 @@ export function InterviewIntakeEditor({ candidateName, fields, onFieldsChange, i
 
     <fieldset disabled={disabled} className="intake-section"><legend>その他・補足</legend><div className="intake-grid">{field("additionalNotes", { multiline: true, maxLength: 2000, placeholder: "他の項目に当てはまらない情報、元シートの補足など。出所の行番号もそのまま残せます。", hint: "元の記載を社内確認用として保存し、共有文に自動挿入しません。内容や評価を推測して追加しません。" })}</div></fieldset>
 
-    {ai?.enabled && <CandidateAiAssistant candidateName={candidateName} fields={fields} memo={memo}
+    {ai?.enabled && <div id={`${id}-writing-assistant`} className="intake-writing-assistant"><CandidateAiAssistant candidateName={candidateName} fields={fields} memo={memo}
       introduction={introduction} disabled={disabled} identityKey={ai.identityKey}
       preferences={ai.preferences} onReadKit={ai.onReadKit} onGenerateKit={ai.onGenerateKit}
       onNotesChange={({memo: note,reflection})=>onFieldsChange({...fields,interviewMemo:note,selfReflection:reflection})}
       onSaveAdvice={text=>onFieldsChange({...fields,interviewAdvice:text})}
-      onApplyIntroduction={text=>{autoManaged.current=false;setFormatResult(null);setCopied(false);onIntroductionChange(text);}}/>}
+      onFocusField={field=>{const element=document.getElementById(`${id}-${field}`);element?.scrollIntoView({block:"center",behavior:"auto"});element?.focus({preventScroll:true});}}
+      onApplyIntroduction={text=>{autoManaged.current=false;setFormatResult(null);setCopied(false);onIntroductionChange(text);}}/></div>}
     <section className="intake-introduction" aria-labelledby={`${id}-intro-heading`}><div className="intake-introduction-heading"><div><h3 id={`${id}-intro-heading`}>クライアント共有用の基本情報</h3><p>入力中は基本情報の下書きを自動作成します。直接編集・AI案の採用後は上書きしません。</p></div><button type="button" className="secondary-button" disabled={disabled} onClick={requestFormat}><FileText size={16}/>入力から整形</button></div>
       <p className="intake-privacy">この整形は端末内で行います。外部AIには送信しません。</p>
       {replaceDraft && <div className="intake-replace" role="alert"><p>現在の編集文を、入力情報から整形し直します。</p><div><button type="button" className="secondary-button" disabled={disabled} onClick={() => setReplaceDraft(false)}>編集文を残す</button><button type="button" className="primary-button" disabled={disabled} onClick={format}>整形し直す</button></div></div>}

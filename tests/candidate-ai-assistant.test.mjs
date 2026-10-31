@@ -5,6 +5,7 @@ import vm from "node:vm";
 import ts from "typescript";
 import { blankInterviewFields, normalizeInterviewFields, unicodeLength } from "../lib/candidate-intake.ts";
 import { defaultWritingPreferences } from "../lib/on-device-ai.ts";
+import * as introductionReview from "../lib/introduction-review.ts";
 
 const source = ts.transpileModule(fs.readFileSync(new URL("../components/candidate-ai-assistant.tsx", import.meta.url), "utf8"),
   { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX } }).outputText;
@@ -54,7 +55,7 @@ function harness(options = {}) {
     navigator: { clipboard: { writeText: async value => { if (options.clipboardError) throw new Error("denied"); calls.copied.push(value); } } },
     require: name => name === "react" ? react : name === "react/jsx-runtime" ? { jsx, jsxs: jsx } : name === "lucide-react" ? new Proxy({}, { get: (_, name) => name })
       : name.includes("candidate-intake") ? { normalizeInterviewFields, unicodeLength, introductionLimit: 1000 }
-      : name.includes("on-device-ai") ? local : name.includes("writing-ai") ? writing : {},
+      : name.includes("introduction-review") ? introductionReview : name.includes("on-device-ai") ? local : name.includes("writing-ai") ? writing : {},
   });
   vm.runInContext(source, context);
   function unmount() { slots.forEach(slot => slot?.cleanup?.()); }
@@ -73,11 +74,11 @@ function harness(options = {}) {
 
 test("cloud AI receives only the style enum; its candidate draft needs explicit replacement approval", async () => {
   const pending = deferred(), h = harness({ availability: "unavailable", generate: () => pending.promise }); await flush();
-  h.click("AI文章構成で作成"); await flush();
+  h.click("書式を取得して下書き"); await flush();
   assert.deepEqual(h.calls.generate, [["standard"]]); assert.deepEqual(h.calls.read, [["standard"]]);
   assert.equal(h.calls.applied.length, 0);
   pending.resolve(state(kit)); await flush();
-  assert.match(h.text(), /AIの構成＋原文を端末内で組み合わせ/);
+  assert.match(h.text(), /共通書式＋端末内の表記整理/);
   assert.match(h.text(), /本人申告の営業経験/); assert.equal(h.calls.applied.length, 0);
   h.click("この文章を使う"); assert.equal(h.calls.applied.length, 0);
   h.click("現在の文章を残す"); assert.equal(h.calls.applied.length, 0);
@@ -88,7 +89,7 @@ test("cloud AI receives only the style enum; its candidate draft needs explicit 
 
 test("editing source or the current introduction during generation never gets overwritten", async () => {
   const pending = deferred(), h = harness({ availability: "unavailable", generate: () => pending.promise }); await flush();
-  h.click("AI文章構成で作成");
+  h.click("書式を取得して下書き");
   h.render({ fields: { ...blankInterviewFields(), workHistory: "更新した面談情報" }, introduction: "作成中に手で直した文章" });
   pending.resolve(state(kit)); await flush();
   assert.match(h.text(), /変更前の結果/);
@@ -99,7 +100,7 @@ test("editing source or the current introduction during generation never gets ov
 
 test("cancelled cloud responses are ignored and the component does not lock navigation", async () => {
   const pending = deferred(), h = harness({ availability: "unavailable", generate: () => pending.promise }); await flush();
-  h.click("AI文章構成で作成"); assert.match(h.text(), /画面の移動は続けられます/);
+  h.click("書式を取得して下書き"); assert.match(h.text(), /画面の移動は続けられます/);
   h.click("面談準備・振り返り"); h.change("-reflection", "質問の順番を振り返る");
   h.click("キャンセル"); pending.resolve(state(kit)); await flush();
   assert.doesNotMatch(h.text(), /紹介文の候補|次の面談への準備/);
@@ -125,7 +126,7 @@ test("switching candidate/account remounts private notes and rejects previous mo
 test("an unavailable device AI never falls back to sending private content to the cloud", async () => {
   const h = harness({ availability: "unavailable" }); await flush(); h.click("端末AI対応するPCブラウザ");
   assert.match(h.text(), /この端末・ブラウザでは端末AIを利用できません/);
-  assert.equal(h.button("端末AIで紹介文を作成").props.disabled, true);
+  assert.equal(h.button("文章をAIで整理・仕上げる").props.disabled, true);
   assert.equal(h.calls.generate.length, 0); assert.equal(h.calls.deviceIntroduction.length, 0);
   h.unmount();
 });
@@ -134,11 +135,11 @@ test("saved preferences apply to successive candidates without any daily referen
   const saved = { ...preferences, version: "saved_version_123456", tone: "plain", targetLength: 600 };
   const h = harness({ availability: "available" }); await flush();
   h.render({ preferences: saved });
-  assert.match(h.text(), /登録済みの紹介文書式を自動使用/);
+  assert.match(h.text(), /保存済みの参考文の書式を毎回使います/);
   assert.ok(!nodes(h.render()).some(node => node.type === "textarea" && node.props.id.endsWith("-reference")));
-  h.click("端末AIで紹介文を作成"); await flush();
+  h.click("文章をAIで整理・仕上げる"); await flush();
   h.render({ identityKey: "account-one:next-candidate", candidateName: "次の架空候補者", preferences: saved }); await flush();
-  h.click("端末AIで紹介文を作成"); await flush();
+  h.click("文章をAIで整理・仕上げる"); await flush();
   assert.equal(h.calls.deviceIntroduction.length, 2);
   for (const [input] of h.calls.deviceIntroduction) {
     assert.equal(input.preferences.version, saved.version); assert.equal(input.preferences.tone, "plain");
@@ -166,14 +167,14 @@ test("copy errors retain the generated draft and working notes can be copied exp
   h.click("このメモをコピー"); await flush();
   assert.equal(h.calls.copied[0], "面談メモ\n確認済みの社内メモ\n\n自分の振り返り\n次回は希望曜日を確認");
   assert.equal(h.calls.generate.length, 0); h.unmount();
-  const failed = harness({ availability: "unavailable", clipboardError: true }); await flush(); failed.click("AI文章構成で作成"); await flush();
+  const failed = harness({ availability: "unavailable", clipboardError: true }); await flush(); failed.click("書式を取得して下書き"); await flush();
   failed.click("コピー"); await flush(); assert.match(failed.text(), /コピーできませんでした/);
   assert.match(failed.text(), /本人申告の営業経験/); assert.equal(failed.calls.applied.length, 0); failed.unmount();
 });
 
 test("a second click cannot start another request and manual introduction edits stay reviewable", async () => {
   const pending = deferred(), h = harness({ availability: "unavailable", generate: () => pending.promise }); await flush();
-  const start = h.button("AI文章構成で作成"); start.props.onClick(); start.props.onClick();
+  const start = h.button("書式を取得して下書き"); start.props.onClick(); start.props.onClick();
   assert.equal(h.calls.generate.length, 1);
   h.render({ introduction: "AIを待ちながら手動で書いた文章" }); pending.resolve(state(kit)); await flush();
   assert.match(h.text(), /作成中に現在の紹介文が編集されました/);
@@ -184,7 +185,7 @@ test("a second click cannot start another request and manual introduction edits 
 
 test("cached AI structures remain reusable after the daily generation limit", async () => {
   const h = harness({ availability: "unavailable", read: () => Promise.resolve({ ...state(kit), usage: { userRemaining: 0, teamRemaining: 0, resetAt: "2026-10-21T00:00:00+09:00" } }) });
-  await flush(); h.click("保存済みのAI構成で作成"); await flush();
+  await flush(); h.click("保存した書式で下書き"); await flush();
   assert.equal(h.calls.generate.length, 0); assert.match(h.text(), /紹介文の候補/); h.unmount();
 });
 
@@ -210,7 +211,7 @@ test("approved coaching enters a separate save field and that field never makes 
   const saved = [], h = harness({ availability: "unavailable" }); await flush();
   const fields = { ...blankInterviewFields(), workHistory: "本人申告の営業経験" };
   h.render({ fields, onSaveAdvice: value => saved.push(value) });
-  h.click("面談準備・振り返り"); h.click("AI文章構成で作成"); await flush();
+  h.click("面談準備・振り返り"); h.click("書式を取得して下書き"); await flush();
   assert.equal(saved.length, 0); h.click("この準備案を保存欄に反映");
   assert.equal(saved.length, 1); assert.match(saved[0], /作成日時：/); assert.match(saved[0], /面談で確認すること/); assert.match(saved[0], /次の行動/);
   assert.ok(unicodeLength(saved[0]) <= 5000);
@@ -224,9 +225,9 @@ test("supported desktop AI is the initial choice but model preparation still nee
   for (const availability of ["available", "downloadable", "downloading"]) {
     const h = harness({ availability }); await flush();
     assert.equal(h.button("端末AI対応するPCブラウザ").props["aria-pressed"], true);
-    assert.equal(h.button("AI文章構成PC・スマートフォン").props["aria-pressed"], false);
+    assert.equal(h.button("書式で下書きPC・スマートフォン").props["aria-pressed"], false);
     assert.equal(h.calls.deviceIntroduction.length, 0); assert.equal(h.calls.generate.length, 0);
-    h.click(availability === "available" ? "端末AIで紹介文を作成" : "モデルを準備して作成"); await flush();
+    h.click(availability === "available" ? "文章をAIで整理・仕上げる" : "モデルを準備して作成"); await flush();
     assert.equal(h.calls.deviceIntroduction.length, 1); assert.equal(h.calls.generate.length, 0);
     assert.equal(h.calls.deviceIntroduction[0][1].preparationTimeoutMs, 600000);
     assert.equal(h.calls.deviceIntroduction[0][1].timeoutMs, 120000);
@@ -237,21 +238,21 @@ test("supported desktop AI is the initial choice but model preparation still nee
 test("a delayed capability result never replaces the user's selected AI method", async () => {
   for (const [choice, resolved] of [["structure", "available"], ["device", "unavailable"]]) {
     const pending = deferred(), h = harness({ availabilityPromise: pending.promise }); await flush();
-    h.click(choice === "structure" ? "AI文章構成PC・スマートフォン" : "端末AI対応するPCブラウザ");
+    h.click(choice === "structure" ? "書式で下書きPC・スマートフォン" : "端末AI対応するPCブラウザ");
     pending.resolve(resolved); await flush();
-    assert.equal(h.button(choice === "structure" ? "AI文章構成PC・スマートフォン" : "端末AI対応するPCブラウザ").props["aria-pressed"], true);
-    if (choice === "structure") { h.click("AI文章構成で作成"); await flush(); assert.equal(h.calls.generate.length, 1); assert.equal(h.calls.deviceIntroduction.length, 0); }
-    else { assert.equal(h.button("端末AIで紹介文を作成").props.disabled, true); assert.match(h.text(), /この端末・ブラウザでは端末AIを利用できません/); }
+    assert.equal(h.button(choice === "structure" ? "書式で下書きPC・スマートフォン" : "端末AI対応するPCブラウザ").props["aria-pressed"], true);
+    if (choice === "structure") { h.click("書式を取得して下書き"); await flush(); assert.equal(h.calls.generate.length, 1); assert.equal(h.calls.deviceIntroduction.length, 0); }
+    else { assert.equal(h.button("文章をAIで整理・仕上げる").props.disabled, true); assert.match(h.text(), /この端末・ブラウザでは端末AIを利用できません/); }
     h.unmount();
   }
 });
 
 test("a late capability check cannot switch methods after a user has already started generation", async () => {
   const capability = deferred(), writing = deferred(), h = harness({ availabilityPromise: capability.promise, generate: () => writing.promise });
-  await flush(); h.click("AI文章構成で作成"); capability.resolve("available"); await flush();
-  assert.equal(h.button("AI文章構成PC・スマートフォン").props["aria-pressed"], true);
+  await flush(); h.click("書式を取得して下書き"); capability.resolve("available"); await flush();
+  assert.equal(h.button("書式で下書きPC・スマートフォン").props["aria-pressed"], true);
   writing.resolve(state(kit)); await flush();
-  assert.match(h.text(), /AIの構成＋原文を端末内で組み合わせ/); assert.equal(h.calls.deviceIntroduction.length, 0); h.unmount();
+  assert.match(h.text(), /共通書式＋端末内の表記整理/); assert.equal(h.calls.deviceIntroduction.length, 0); h.unmount();
 });
 
 test("model preparation timeout keeps edited notes and offers a retry without implying the download is still running", async () => {
@@ -277,4 +278,15 @@ test("generation timeout has a distinct safe message and leaves the existing int
   assert.equal(h.calls.deviceCoaching[0][1].timeoutMs, 120000);
   assert.match(h.text(), /文章の作成に時間がかかったため中止しました/); assert.match(h.text(), /入力内容と現在の文章は残っています/);
   assert.equal(h.calls.applied.length, 0); assert.equal(h.calls.generate.length, 0); h.unmount();
+});
+
+test('introduction checks separate missing units and spelling proposals from shareable output and can focus the original field',async()=>{
+ const h=harness({availability:'unavailable'});await flush();const fields={...blankInterviewFields(),workHistory:'ほうじんえいぎょうのてれあぽを6か月担当。',desiredHourlyRate:'3000'},before=structuredClone(fields),focused=[];h.render({fields,onFocusField:key=>focused.push(key)});assert.match(h.text(),/希望単価の単位を確認/);assert.match(h.text(),/表記を整理した箇所/);assert.match(h.text(),/原文は書き換えていません|元の入力は書き換えていません/);assert.equal(h.calls.generate.length,0);nodes(h.render()).find(node=>node.type==='button'&&text(node)==='該当する入力を確認').props.onClick();assert.deepEqual(focused,['desiredHourlyRate']);assert.deepEqual(fields,before);h.unmount();
+});
+test('an adopted draft can restore the exact prior introduction and cannot overwrite a later manual edit',async()=>{
+ const h=harness();await flush();h.click('文章をAIで整理・仕上げる');await flush();h.click('この文章を使う');h.click('確認して置き換える');assert.equal(h.calls.applied.at(-1),'端末AIの紹介文');h.render({introduction:'端末AIの紹介文'});assert.equal(h.button('採用前の文章に戻す').props.disabled,false);h.render({introduction:'採用後の手動編集'});assert.equal(h.button('採用前の文章に戻す').props.disabled,true);h.render({introduction:'端末AIの紹介文'});h.click('採用前の文章に戻す');assert.equal(h.calls.applied.at(-1),'現在の編集済み文章');assert.match(h.text(),/採用前の紹介文に戻しました/);h.unmount();
+});
+
+test('unsupported model facts report only fixed useful reasons and never echo raw model diagnostics',async()=>{
+ const h=harness({deviceIntroduction:async()=>{throw {code:'INVALID_RESPONSE',evidenceIssues:['rate-unit-changed','PRIVATE_MODEL_DETAIL']};}});await flush();h.click('文章をAIで整理・仕上げる');await flush();assert.match(h.text(),/時給・月額などの単位の取り違え/);assert.match(h.text(),/原文と現在の文章は残っています/);assert.doesNotMatch(h.text(),/PRIVATE_MODEL_DETAIL/);assert.equal(h.calls.applied.length,0);h.unmount();
 });

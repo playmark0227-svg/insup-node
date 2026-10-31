@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import vm from "node:vm";
 import ts from "typescript";
+import {projectSnapshotForCache,validSnapshotCacheAccess} from "../lib/snapshot-cache.ts";
 import {assertSnapshot, assertMutationReceipt, isUncertainWrite, validateEndpoint, SheetApiError} from "../lib/sheets-client.ts";
 import {correctionFields,correctedPayload,mutationDateErrors} from "../lib/save-correction.ts";
 import {pendingSaveResources,unlockPendingSaves as unlockRealPendingSaves,lockPendingSaves as lockRealPendingSaves} from "../lib/pending-saves.ts";
@@ -34,11 +35,11 @@ async function flush() { for (let i=0; i<35; i++) await Promise.resolve(); }
 
 // Execute the actual hook against a small deterministic hook runtime. This
 // exposes races and state restoration without adding a browser/test dependency.
-function harness(handle, {storedToken, malformedSession, deadlineController, makeDeadline, browser, manifestEndpoint=endpoint, storedEndpoint=endpoint, manifestFailure=false, production=false, pendingSaves=[], persistLocal, replaceLocal, readLocal} = {}) {
+function harness(handle, {storedToken, malformedSession, deadlineController, makeDeadline, browser, manifestEndpoint=endpoint, storedEndpoint=endpoint, manifestFailure=false, production=false, pendingSaves=[], persistLocal, replaceLocal, readLocal, cacheRead, cachePersist, storedCacheAvailable=false} = {}) {
   const slots = [], effects = [], calls = [];
   let cursor = 0, stateUpdates = 0;
   const localStorage = storage({[ENDPOINT_KEY]:storedEndpoint});
-  const sessionStorage = storage(storedToken ? {[SESSION_KEY]:JSON.stringify({endpoint,token:storedToken})} : malformedSession ? {[SESSION_KEY]:"invalid-json"} : {});
+  const sessionStorage = storage(storedToken ? {[SESSION_KEY]:JSON.stringify({endpoint,token:storedToken,...(storedCacheAvailable?{cacheAvailable:true}:{})})} : malformedSession ? {[SESSION_KEY]:"invalid-json"} : {});
   const depsEqual = (a,b) => a && b && a.length===b.length && a.every((x,i)=>Object.is(x,b[i]));
   const react = {
     useState(initial) {
@@ -67,6 +68,10 @@ function harness(handle, {storedToken, malformedSession, deadlineController, mak
     removePendingSave:async(_endpoint,_account,id)=>{pendingStore.delete(id);},
     unlockPendingSaves:(_endpoint,_account,secret)=>{unlocks.push(secret);unlockRealPendingSaves(_endpoint,_account,secret);},lockPendingSaves:()=>{locks.count++;lockRealPendingSaves();},purgeExpiredPendingSaves:async()=>0};
   const unlocks=[],locks={count:0};
+  const cacheReads=[],cacheWrites=[];
+  const cacheApi={validSnapshotCacheAccess,purgeSnapshotCache:async()=>undefined,
+    readSnapshotCache:async(target,access,current)=>{cacheReads.push({target,access});return cacheRead?cacheRead(target,access,current):null;},
+    persistSnapshotCache:async(target,access,value,current)=>{if(current()){const data=projectSnapshotForCache(value);cacheWrites.push({target,access,value:data});if(cachePersist)await cachePersist(target,access,data,current);}}};
   const exports={};
   const timeoutDurations=[];
   const deadlineSignals=AbortSignal;
@@ -74,11 +79,11 @@ function harness(handle, {storedToken, malformedSession, deadlineController, mak
   const context=vm.createContext({exports,module:{exports},AbortController,AbortSignal:deadlineSignals,JSON,Error,localStorage,sessionStorage,TEST_PRODUCTION:production,crypto,
     ...(browser || {}),
     fetch:async()=>{if(manifestFailure)throw new Error("設定取得失敗");return {ok:true,json:async()=>({endpoint:manifestEndpoint})};},
-    require:name=>name==="react" ? react : name.includes("abort-signal") ? deadlineApi : name.includes("save-correction") ? {correctionFields,correctedPayload,mutationDateErrors} : name.includes("pending-saves") ? pendingApi : name.includes("node-data") ? {initialPlayers:[player],makeDemoActivities:()=>[]} : name.includes("management-data") ? {matchingFields} : name.includes("candidate-intake") ? {interviewFieldLabels,interviewStringFields} : name.includes("writing-ai") ? {assertWritingKitState,validateWritingPreferences} : {assertSnapshot,assertMutationReceipt,isUncertainWrite,validateEndpoint,SheetApiError,sheetRequest}});
+    require:name=>name==="react" ? react : name.includes("snapshot-cache") ? cacheApi : name.includes("abort-signal") ? deadlineApi : name.includes("save-correction") ? {correctionFields,correctedPayload,mutationDateErrors} : name.includes("pending-saves") ? pendingApi : name.includes("node-data") ? {initialPlayers:[player],makeDemoActivities:()=>[]} : name.includes("management-data") ? {matchingFields} : name.includes("candidate-intake") ? {interviewFieldLabels,interviewStringFields} : name.includes("writing-ai") ? {assertWritingKitState,validateWritingPreferences} : {assertSnapshot,assertMutationReceipt,isUncertainWrite,validateEndpoint,SheetApiError,sheetRequest}});
   vm.runInContext(source,context);
   const render = () => {cursor=0; const result=exports.useSheetsConnection(); while(effects.length) effects.shift()(); return result;};
   render();
-  return {calls,pendingStore,localStorage,sessionStorage,timeoutDurations,render,unlocks,locks,updates:()=>stateUpdates,unmount:()=>slots.forEach(slot=>slot.cleanup?.())};
+  return {calls,pendingStore,cacheReads,cacheWrites,localStorage,sessionStorage,timeoutDurations,render,unlocks,locks,updates:()=>stateUpdates,unmount:()=>slots.forEach(slot=>slot.cleanup?.())};
 }
 
 test("a token is persisted before data loads and no submitted password is stored",async()=>{
@@ -1153,4 +1158,35 @@ test('late operational, regular and password saves cannot release a new session 
    assert.equal(h.calls.filter(call=>call.options.operationId==='third-operational').length,0,path);
   }finally{newWrite.resolve({managed:true});await current;h.unmount();}
  }
+});
+
+const displayGrant=(self={playerId:player.id,role:'player'})=>({version:1,self,scope:'S'.repeat(43),secret:'D'.repeat(43),expiresAt:Date.now()+3600000});
+test('warm login authenticates before reading cache and resolves with read-only shared totals while live data is pending',async()=>{
+ const auth=deferred(),fresh=deferred(),access=displayGrant(),cached=projectSnapshotForCache(snapshot),savedAt=Date.now()-1000;
+ const h=harness(call=>call.action==='login'?auth.promise:fresh.promise,{cacheRead:async()=>({snapshot:cached,savedAt})});await flush();
+ const pending=h.render().login('ND-001','only-test-password');await flush();assert.equal(h.cacheReads.length,0);assert.equal(h.render().snapshot,null);
+ auth.resolve({token,cacheAccess:access});await pending;const showing=h.render();assert.equal(showing.snapshotSource,'cache');assert.equal(showing.cachedAt,savedAt);assert.equal(showing.busy,false);assert.equal(showing.syncing,true);assert.equal(showing.snapshot.writesEnabled,false);assert.deepEqual(showing.snapshot.records,[]);assert.equal(h.cacheReads.length,1);assert.equal(h.calls[1].action,'snapshot');assert.equal(h.unlocks.length,0);
+ await assert.rejects(showing.submitMutation('updateRecord',{recordId:'r',changes:{13:'no'}},crypto.randomUUID()),{code:'READ_ONLY'});
+ fresh.resolve({...snapshot,cacheAccess:access});await flush();const live=h.render();assert.equal(live.snapshotSource,'live');assert.equal(live.cachedAt,null);assert.equal(live.snapshot.writesEnabled,true);assert.equal(h.unlocks.at(-1),snapshot.outboxKey);assert.equal(h.cacheWrites.length,1);assert.equal(h.cacheWrites[0].value.outboxKey,undefined);h.unmount();
+});
+test('a cached display stays explicitly read-only on live network failure and manual refresh can recover it',async()=>{
+ let fail=true;const access=displayGrant(),h=harness(call=>call.action==='login'?{token,cacheAccess:access}:fail?Promise.reject(new SheetApiError('NETWORK','network')):{...snapshot,cacheAccess:access},{cacheRead:async()=>({snapshot:projectSnapshotForCache(snapshot),savedAt:Date.now()-1000})});await flush();await h.render().login('ND-001','password');await flush();
+ assert.equal(h.render().snapshotSource,'cache');assert.equal(h.render().snapshot.writesEnabled,false);assert.match(h.render().syncError,/前回|再試行/);assert.equal(h.unlocks.length,0);
+ fail=false;await h.render().refresh();assert.equal(h.render().snapshotSource,'live');assert.equal(h.render().snapshot.writesEnabled,true);h.unmount();
+});
+test('malformed, expired, foreign and absent cache grants never unlock a previous account display',async()=>{
+ for(const access of [undefined,{...displayGrant(),expiresAt:Date.now()-1},{...displayGrant(),secret:'bad'},displayGrant({playerId:'ND-002',role:'player'})]){
+  const fresh=deferred(),h=harness(call=>call.action==='login'?{token,...(access?{cacheAccess:access}:{})}:fresh.promise,{cacheRead:async()=>({snapshot:projectSnapshotForCache(snapshot),savedAt:Date.now()})});await flush();const login=h.render().login('ND-001','password');await flush();assert.equal(h.cacheReads.length,0);assert.equal(h.render().snapshot,null);fresh.resolve(snapshot);await login;assert.equal(h.render().snapshotSource,'live');h.unmount();
+ }
+});
+test('issued-password and failed logins never read display cache or persist a cache decryption key',async()=>{
+ const access=displayGrant();for(const type of ['issued','wrong']){const h=harness(call=>{if(call.action==='login'){if(type==='wrong')throw new SheetApiError('INVALID_CREDENTIALS','wrong');return {token,cacheAccess:access,mustChangePassword:true};}throw new Error('Business read must not occur');},{cacheRead:async()=>{throw new Error('Cache must not open');}});await flush();try{await h.render().login('ND-001','private-password');}catch{}assert.equal(h.cacheReads.length,0);assert.equal(h.render().snapshot,null);const disk=JSON.stringify([...h.sessionStorage.values,...h.localStorage.values]);assert.ok(!disk.includes(access.secret));assert.ok(!disk.includes('private-password'));h.unmount();}
+});
+test('restored cache-capable sessions are freshly checked before cache opens and legacy sessions keep their old restore path',async()=>{
+ const access=displayGrant(),fresh=deferred(),h=harness(call=>call.action==='resumeSession'?{cacheAccess:access}:fresh.promise,{storedToken:token,storedCacheAvailable:true,cacheRead:async()=>({snapshot:projectSnapshotForCache(snapshot),savedAt:Date.now()-1000})});await flush();assert.equal(h.calls[0].action,'resumeSession');assert.equal(h.render().snapshotSource,'cache');assert.equal(h.calls[1].action,'snapshot');fresh.resolve({...snapshot,cacheAccess:access});await flush();assert.equal(h.render().snapshotSource,'live');h.unmount();
+ const denied=harness(()=>{throw new SheetApiError('UNAUTHENTICATED','revoked');},{storedToken:token,storedCacheAvailable:true,cacheRead:async()=>{throw new Error('must not read');}});await flush();assert.equal(denied.cacheReads.length,0);assert.equal(denied.render().snapshot,null);assert.equal(denied.render().authenticated,false);denied.unmount();
+});
+test('logout during cache decryption and late first reads cannot populate another login or rewrite cache',async()=>{
+ const access=displayGrant(),cache=deferred(),fresh=deferred(),h=harness(call=>call.action==='login'?{token,cacheAccess:access}:call.action==='logout'?{loggedOut:true}:fresh.promise,{cacheRead:async()=>cache.promise});await flush();const login=h.render().login('ND-001','password');await flush();await h.render().logout();cache.resolve({snapshot:projectSnapshotForCache(snapshot),savedAt:Date.now()});await login;assert.equal(h.render().snapshot,null);assert.equal(h.render().snapshotSource,null);assert.equal(h.cacheWrites.length,0);h.unmount();
+ const first=deferred(),otherToken='another-test-token-12345678901234567890123456789';let attempts=0;const j=harness(call=>call.action==='login'?{token:attempts++?otherToken:token,cacheAccess:access}:call.action==='logout'?{loggedOut:true}:call.options.token===token?first.promise:{...snapshot,cacheAccess:access},{cacheRead:async()=>({snapshot:projectSnapshotForCache(snapshot),savedAt:Date.now()})});await flush();await j.render().login('ND-001','password');await flush();await j.render().logout();await j.render().login('ND-001','password');await flush();const writes=j.cacheWrites.length;first.resolve({...snapshot,cacheAccess:access});await flush();assert.equal(j.cacheWrites.length,writes);assert.equal(JSON.parse(j.sessionStorage.getItem(SESSION_KEY)).token,otherToken);j.unmount();
 });

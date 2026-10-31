@@ -4,6 +4,7 @@ import {
   type InterviewFields, type IntroductionComposition,
 } from './candidate-intake.ts';
 import { defaultWritingPreferences, validateWritingPreferences as validateDevicePreferences, type WritingPreferences } from './on-device-ai.ts';
+import {reviewIntroductionSource} from './introduction-review.ts';
 
 export { defaultWritingPreferences, type WritingPreferences } from './on-device-ai.ts';
 export function validateWritingPreferences(value:unknown):WritingPreferences {
@@ -54,7 +55,7 @@ export function assertWritingKitState(value:unknown):asserts value is WritingKit
 
 /** All source values are inserted here, after the cloud request has finished. */
 export function composeWritingKitIntroduction(candidateName:string,raw:InterviewFields,kit:WritingKit,preferences?:WritingPreferences):IntroductionComposition {
-  const fields=normalizeInterviewFields(raw),prefs=preferences||defaultWritingPreferences();
+  const fields=reviewIntroductionSource(raw,[candidateName]).fields,prefs=preferences||defaultWritingPreferences();
   const value=(key:keyof InterviewFields|'candidateName')=>key==='candidateName'?candidateName.trim():Array.isArray(fields[key])?(fields[key] as string[]).join('・'):(fields[key] as string).trim();
   type Entry={key:keyof InterviewFields|'candidateName';value:string;weight:number;label:string};
   const entry=(key:Entry['key'],weight=1):Entry=>({key,value:value(key),weight,label:interviewFieldLabels[key]});
@@ -78,9 +79,12 @@ export function composeWritingKitIntroduction(candidateName:string,raw:Interview
   const render=(base:number)=>sections.map(s=>{
     const body=s.entries.map(e=>{
       const points=Array.from(e.value),n=Math.max(1,Math.floor(base*e.weight));
-      return `${e.label}：${points.length>n?points.slice(0,n-1).join('')+'…':e.value}`;
+      return `${e.key==='availableFrom'?'稼働開始可能日（希望）':e.label}：${points.length>n?points.slice(0,n-1).join('')+'…':e.value}`;
     }).join('\n');
-    return `【${s.template!.heading}】\n${[s.template!.lead.trim(),body].filter(Boolean).join('\n')}`;
+    // Generic AI leads are writing instructions, not candidate facts. They are
+    // never inserted into a client-facing paragraph as if verified evidence.
+    const summary=s.id==='summary'?[...new Set([fields.workHistory,fields.achievements,fields.strengths].filter(value=>value.trim()))].map(value=>{const points=Array.from(value.trim()),n=Math.max(1,Math.floor(base));return points.length>n?points.slice(0,n-1).join('')+'…':value.trim();}).join('\n'):'';
+    return `【${s.template!.heading}】\n${body||summary||(s.id==='summary'?'記載した基本情報に基づく紹介です。':'')}`;
   }).join('\n\n');
   if(unicodeLength(render(0))>limit){
     const shortHeadings = introductionHeadings;

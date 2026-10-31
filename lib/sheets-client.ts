@@ -18,6 +18,8 @@ export type InterviewAdvice = {summary:string;actions:string[];count:number;gene
 export type InterviewAdviceState = {advice:InterviewAdvice|null;stale:boolean;count:number;usage:InterviewAdviceUsage;configured:boolean;pending:boolean};
 export type DeletedCandidate = {changeId:string;playerId:string;candidateName:string;deletedAt:string;companies:string[];recordCount:number};
 export type SheetSnapshot = {
+  /** Authenticated display-cache key; never persisted with the snapshot. */
+  cacheAccess?: import("./snapshot-cache.ts").SnapshotCacheAccess;
   operationsFeature?: boolean;
   monthlyGoalsFeature?: boolean;
   monthlyGoals?: {playerId:string;month:string;target:number;version:string;updatedAt:string}[];

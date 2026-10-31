@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { filterCandidateGroups, groupCandidates } from "../lib/candidate-groups.ts";
+import { filterCandidateGroups, groupCandidates, sortCandidateGroups, candidateAppointments, candidateFilterCount } from "../lib/candidate-groups.ts";
 import type { CandidateRecord } from "../lib/sheets-client.ts";
 
 function record(id: string, name: string, playerId = "ND-001", row = 2): CandidateRecord {
@@ -111,4 +111,50 @@ test("group keys cannot collide when names or owner labels contain separator cha
   third.values[3] = "A";
   fourth.values[3] = "A|B";
   assert.equal(new Set(groupCandidates([first, second, third, fourth], "interview-desc").map(group => group.key)).size, 4);
+});
+
+
+test("expanded conditions must all match one proposal while retaining the complete candidate history", () => {
+ const first={...record("planned","同じ候補者","ND-001",2),profileId:"profile-a"}, second=record("waiting","同じ候補者","ND-001",3);
+ first.values[1]="架空会社A";first.values[6]="面談確定（面談実施待ち）";first.values[9]="2026-10-30";
+ second.values[1]="架空会社B";second.values[6]="提案完了";
+ const groups=groupCandidates([first,second],"registration-desc");
+ const filter={...all,statuses:["提案完了","面談確定（面談実施待ち）"],company:"架空会社A",appointment:"today" as const,profile:"with" as const};
+ assert.equal(candidateFilterCount(filter),4);
+ const found=filterCandidateGroups(groups,filter,"2026-10-30");assert.equal(found.length,1);assert.equal(found[0].records.length,2);assert.equal(found[0],groups[0]);
+ assert.equal(filterCandidateGroups(groups,{...filter,company:"架空会社B"},"2026-10-30").length,0,"another proposal cannot supply the date or profile");
+ assert.equal(filterCandidateGroups(groups,{...filter,statuses:["提案完了"]},"2026-10-30").length,0);
+ assert.equal(filterCandidateGroups(groups,{...all,statuses:["提案完了"],company:"架空会社B",appointment:"none",profile:"without"},"2026-10-30").length,1);
+ assert.equal(filterCandidateGroups(groups,{...all,company:null},"2026-10-30").length,0);
+});
+
+test("appointment filters share the displayed unfinished plans and ignore invalid or finished dates", () => {
+ const make=(id:string,date:string,status="提案候補")=>{const row=record(id,id);row.values[6]=status;row.values[9]=date;return row;};
+ const overdue=make("overdue","2026-10-29"),today=make("today","2026-10-30"),future=make("future","2026-11-01"),done=make("done","2026-10-30"),closed=make("closed","2026-10-30","辞退（本人希望）"),invalid=make("invalid","2026-02-31");done.values[16]="2026-10-30";
+ const groups=groupCandidates([future,invalid,today,closed,done,overdue],"registration-desc");
+ for(const [choice,expected] of [["overdue",["overdue"]],["today",["today"]],["future",["future"]],["none",["closed","done","invalid"]]] as const)assert.deepEqual(filterCandidateGroups(groups,{...all,appointment:choice},"2026-10-30").map(g=>g.name).sort(),[...expected].sort());
+ assert.equal(candidateAppointments([done,closed,invalid],"2026-10-30").length,0);
+ assert.equal(candidateAppointments([future,overdue,today],"2026-10-30")[0].recordId,"overdue");
+ assert.equal(filterCandidateGroups(groups,{...all,appointment:"injected" as never},"2026-10-30").length,0);
+});
+
+test("candidate sorting uses the latest interview and keeps missing values last in either direction", () => {
+ const a=record("a","候補者A","ND-001",2),oldA=record("a-old","候補者A","ND-001",3),b=record("b","候補者B","ND-001",4),none=record("none","","ND-001",5);
+ a.values[0]="2026-10-30";oldA.values[0]="2026-10-01";b.values[0]="2026-10-20";
+ const groups=groupCandidates([a,oldA,b,none],"registration-desc"),copy=structuredClone(groups);
+ assert.deepEqual(sortCandidateGroups(groups,{field:"interview",direction:"asc"}).map(g=>g.name),["候補者B","候補者A",""]);
+ assert.deepEqual(sortCandidateGroups(groups,{field:"interview",direction:"desc"}).map(g=>g.name),["候補者A","候補者B",""]);
+ assert.deepEqual(sortCandidateGroups(groups,{field:"name",direction:"asc"}).map(g=>g.name),["候補者A","候補者B",""]);
+ assert.deepEqual(sortCandidateGroups(groups,{field:"name",direction:"desc"}).map(g=>g.name),["候補者B","候補者A",""]);
+ assert.deepEqual(sortCandidateGroups(groups,{field:"records",direction:"desc"}).map(g=>g.name),["候補者A","","候補者B"]);
+ assert.deepEqual(groups,copy,"sorting never mutates proposals, group order or versions");
+});
+
+test("next-appointment sorting uses each person's earliest unfinished plan and stable identities for ties", () => {
+ const make=(id:string,name:string,date:string)=>{const row=record(id,name);row.values[9]=date;return row;};
+ const a=make("a","A","2026-11-05"),aEarlier=make("a-early","A","2026-10-29"),b=make("b","B","2026-10-30"),none=record("no-plan","C"),d=make("d","D","2026-10-30");
+ const groups=groupCandidates([a,aEarlier,b,none,d],"registration-desc");
+ assert.deepEqual(sortCandidateGroups(groups,{field:"appointment",direction:"asc"},"2026-10-30").map(g=>g.name),["A","B","D","C"]);
+ assert.deepEqual(sortCandidateGroups(groups,{field:"appointment",direction:"desc"},"2026-10-30").map(g=>g.name),["B","D","A","C"]);
+ assert.deepEqual(sortCandidateGroups([...groups].reverse(),{field:"appointment",direction:"desc"},"2026-10-30").map(g=>g.key),sortCandidateGroups(groups,{field:"appointment",direction:"desc"},"2026-10-30").map(g=>g.key));
 });
