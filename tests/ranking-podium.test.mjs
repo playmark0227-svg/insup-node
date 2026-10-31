@@ -37,13 +37,19 @@ test("zero results are never awarded a podium place even when another player has
 test("a sole positive player retains the first-place layout and trophy after filtering", () => {
   for (const ranking of [[player("A", 1, 1)], [player("A", 1, 1), player("B", 0, 2), player("C", 0, 2)]]) {
     const result = cards(ranking); assert.equal(result.length, 1);
-    assert.equal(result[0].props.className, "podium-player podium-first");
+    assert.equal(result[0].props.className, "podium-player podium-first podium-winner");
     assert.equal(nodes(result[0]).filter(node => node.type === "Trophy").length, 1);
   }
 });
 
 test("explicit podium positions preserve the server-derived shared ranks", () => {
   const result = cards([player("A", 4, 1), player("B", 4, 1), player("C", 2, 3)]);
-  assert.deepEqual(result.map(card => card.props.className), ["podium-player podium-second", "podium-player podium-first", "podium-player podium-third"]);
+  assert.deepEqual(result.map(card => card.props.className), ["podium-player podium-second podium-winner", "podium-player podium-first podium-winner", "podium-player podium-third"]);
   assert.deepEqual(result.map(card => text(nodes(card).find(node => node.props.className === "place-badge"))), ["1", "1", "3"]);
+});
+
+test("every tied first place receives the same celebration and decorative content stays hidden",()=>{
+ const result=cards([player("A",4,1),player("B",4,1),player("C",2,3)]);
+ for(const card of result.filter(card=>card.props.className.includes("podium-winner"))){assert.equal(nodes(card).filter(node=>node.type==="Trophy").length,1);assert.match(text(card),/同率1位、おめでとう/);const burst=nodes(card).find(node=>node.props.className==="winner-burst");assert.equal(burst.props["aria-hidden"],"true");assert.equal(nodes(burst).filter(node=>node.type==="svg").length,10);}
+ assert.equal(result.filter(card=>card.props.className.includes("podium-winner")).length,2);
 });

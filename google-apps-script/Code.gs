@@ -145,7 +145,7 @@ function withLock_(fn, waitMs) {
  * read, and rejected requests do not count. NODE_AI_QUOTA still governs Gemini.
  * Writes are not budgeted here; their reads are serialized by the script lock. A replayed operation
  * that answers with a snapshot writes nothing, so it is charged to the snapshot budget. */
-var NODE_READ_BUCKETS = Object.freeze({ snapshot: 'snapshot', readInterviewAdvice: 'report', readWorkspaceInsights: 'report', analyzeInterviewReviews: 'report', analyzeWorkspaceInsights: 'report', auditSecurity: 'report', readAccountManagement:'report', readOperationHistory:'report', readDataExport:'export', managementTables: 'table', managementTable: 'table', readWritingKit: 'kit', readWritingPreferences: 'kit', generateWritingKit: 'kit' });
+var NODE_READ_BUCKETS = Object.freeze({ snapshot: 'snapshot', resumeSession: 'snapshot', readInterviewAdvice: 'report', readWorkspaceInsights: 'report', analyzeInterviewReviews: 'report', analyzeWorkspaceInsights: 'report', auditSecurity: 'report', readAccountManagement:'report', readOperationHistory:'report', readDataExport:'export', managementTables: 'table', managementTable: 'table', readWritingKit: 'kit', readWritingPreferences: 'kit', generateWritingKit: 'kit' });
 var NODE_READ_LIMITS = Object.freeze({ snapshot: [40, 900], report: [20, 300], table: [40, 600], kit: [60, 1200], export:[2,10] });
 function readBudget_(id, action) {
   // id is always an ID the server already normalized (a session record or issueSession_), never request input.
@@ -177,6 +177,7 @@ function nodeHandle_(request) {
   // hasOwnProperty keeps inherited names such as 'constructor' answering BAD_REQUEST below.
   var budgeted = null;
   if (Object.prototype.hasOwnProperty.call(NODE_READ_BUCKETS, action)) { budgeted = authenticate_(request.token, false, passive); readBudget_(budgeted.id, action); }
+  if (action === 'resumeSession') {var accounts=readAccountStore_(),actor=activeActor_(accounts,budgeted);var access=snapshotCacheAccess_(accounts,actor);snapshotActor_(accounts,request.token);return {cacheAccess:access};}
   if (action === 'auditSecurity') return auditSecurity_(request);
   if (action === 'readAccountManagement') return readAccountManagement_(request);
   if (action === 'manageAccount') return manageAccount_(request);
@@ -427,7 +428,11 @@ function login_(payload) {
   var issued = issueSession_(payload);
   // An issued password grants no business data until its holder replaces it.
   if (issued.mustChange) return { token: issued.token, deviceToken: issued.deviceToken, mustChangePassword: true };
-  if (payload.sessionOnly === true) return { token: issued.token, deviceToken: issued.deviceToken };
+  if (payload.sessionOnly === true) {
+    var result={token:issued.token,deviceToken:issued.deviceToken};
+    if(payload.cacheSnapshot===true){var actor=activeActor_(issued.accountStore,authenticate_(issued.token));result.cacheAccess=snapshotCacheAccess_(issued.accountStore,actor);snapshotActor_(issued.accountStore,issued.token);}
+    return result;
+  }
   try {
     // Legacy logins return a full snapshot, so they share the snapshot budget. It is charged only
     // after the password check, so a wrong guess cannot spend another account's budget.
@@ -675,7 +680,7 @@ function readOperationHistory_(request) {
 function readDataExport_(request) {
   var access=accountManagementStore_(request.token),store=readStore_({readOnly:true},access.store),maxCells=50000,maxCharacters=2000000,total=store.records.length*26,tables=[];
   if(total>maxCells)fail_('EXPORT_LIMIT','アプリデータの書き出し上限です。');
-  var snapshot=buildSnapshot_(store,access.actor);delete snapshot.outboxKey;delete snapshot.destination;
+  var snapshot=buildSnapshot_(store,access.actor);delete snapshot.outboxKey;delete snapshot.cacheAccess;delete snapshot.destination;
   store.book.getSheets().filter(function(sheet){return managementTabAllowed_(sheet.getName());}).forEach(function(sheet){
     var rowCount=sheet.getLastRow(),columnCount=Math.min(100,sheet.getLastColumn()),rows=[];
     if(sheet.getLastColumn()>100||rowCount>2000||total+rowCount*columnCount>maxCells)fail_('EXPORT_LIMIT','アプリデータの書き出し上限です。管理表の範囲を整理してから再試行してください。');
@@ -940,6 +945,14 @@ function countActivities_(activities, players) {
   });
   return counts;
 }
+/** Keys unlock only an encrypted projection of shared ranking data, never candidate/private rows.
+ * The grant is issued after normal authentication and is invalidated by destination, role,
+ * roster/alias or credential-version changes. It grants no API capability on its own. */
+function snapshotCacheAccess_(store,user) {
+  var auth=authRecord_(user.id),pepper=props_().getProperty(NODE.pepperKey);if(!auth||!pepper)fail_('UNAUTHENTICATED','ログイン状態を確認してください。');
+  var scope=hmac_('display-cache-scope-v1|'+stableJson_({version:1,config:store.config,self:user,roster:store.players,authVersion:auth.version||null}),pepper);
+  return {version:1,self:{playerId:user.id,role:user.role},scope:scope,secret:hmac_('display-cache-encryption-v1|'+scope,pepper),expiresAt:Date.now()+3600000};
+}
 function publicPlayer_(player,user) { var own=user.role==='admin'||user.id===player.id;return { id: player.id, name: player.name, team: player.team, color: player.color, target: player.target, bio: own?player.bio:'', sheetNames: own?player.sheetNames.slice():[], active:player.active }; }
 function buildSnapshot_(store, user) {
   var all = activities_(store);
@@ -953,6 +966,7 @@ function buildSnapshot_(store, user) {
   var pepper=props_().getProperty(NODE.pepperKey);
   // Device drafts are encrypted with a key derived from this secret, so a browser
   // profile alone cannot decrypt them after the session ends.
+  if(pepper)snapshot.cacheAccess=snapshotCacheAccess_(store,user);
   if(pepper)snapshot.outboxKey=hmac_('outbox-v2|'+store.config.spreadsheetId+'|'+user.role+'|'+user.id,pepper);
   snapshot.records=store.schemaCompatible ? store.records.filter(function(r){return user.role==='admin'||r.playerId===user.id;}).map(publicRecord_) : [];
   if(user.role==='admin'){

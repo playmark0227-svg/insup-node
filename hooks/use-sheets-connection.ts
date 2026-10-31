@@ -1,3 +1,4 @@
+import {persistSnapshotCache,readSnapshotCache,purgeSnapshotCache,validSnapshotCacheAccess,type SnapshotCacheAccess} from "../lib/snapshot-cache";
 import {createDeadlineSignal, type RequestDeadline} from "../lib/abort-signal";
 import { persistPendingSave, readPendingSaves, removePendingSave, replacePendingSave, pendingSaveResources, unlockPendingSaves, lockPendingSaves, purgeExpiredPendingSaves, type PendingSave } from "../lib/pending-saves";
 import { correctionFields, correctedPayload, mutationDateErrors, type SaveCorrectionDraft } from "../lib/save-correction";
@@ -53,6 +54,8 @@ export function useSheetsConnection() {
   const [players, setPlayers] = useState<SheetPlayer[]>(initialPlayers);
   const [activities, setActivities] = useState<Activity[]>(makeDemoActivities);
   const [snapshot, setSnapshot] = useState<SheetSnapshot | null>(null);
+  const [snapshotSource,setSnapshotSource]=useState<"cache"|"live"|null>(null),[cachedAt,setCachedAt]=useState<number|null>(null);
+  const sourceRef=useRef<"cache"|"live"|null>(null),cacheAccessRef=useRef<SnapshotCacheAccess|null>(null),cacheEndpoint=useRef("");
   const [authenticated, setAuthenticated] = useState(false);
   const [loadPhase, setLoadPhase] = useState<ConnectionLoadPhase>(null);
   const [busy, setBusy] = useState(false);
@@ -114,6 +117,10 @@ export function useSheetsConnection() {
 
   const applySnapshot = useCallback((data: unknown) => {
     assertSnapshot(data);
+    sourceRef.current="live";setSnapshotSource("live");setCachedAt(null);
+    const access=validSnapshotCacheAccess(data.cacheAccess)?data.cacheAccess:null;cacheAccessRef.current=access;
+    const cacheGeneration=generation.current;latestSnapshot.current=data;
+    if(access)void persistSnapshotCache(pinnedEndpoint.current||cacheEndpoint.current,access,data,()=>isCurrent(cacheGeneration)&&sourceRef.current==="live"&&cacheAccessRef.current===access&&latestSnapshot.current===data&&!mutationRunning.current&&!hasPendingBackground()).catch(()=>undefined);
     latestSnapshot.current = data; setSnapshot(data); setPlayers(data.players); setActivities(data.activities); setError(""); setSyncError("");
     const job = backgroundJob.current;
     if (job?.state.status === "saved" && job.state.refreshing) {
@@ -121,12 +128,17 @@ export function useSheetsConnection() {
     }
   }, []);
 
+  const applyCachedSnapshot=(cached:{snapshot:SheetSnapshot;savedAt:number})=>{
+    sourceRef.current="cache";setSnapshotSource("cache");setCachedAt(cached.savedAt);
+    latestSnapshot.current=cached.snapshot;setSnapshot(cached.snapshot);setPlayers(cached.snapshot.players);setActivities([]);setError("");setSyncError("");
+  };
+
   const clearSession = useCallback(() => {
     activeRequest.current?.abort(); activeRequest.current = null; loginRunning.current = false;
     generation.current++; token.current = "";
     ++requestVersion.current;
     writeStorage(sessionStorage, SESSION_KEY, null);
-    lockPendingSaves();
+    lockPendingSaves();cacheAccessRef.current=null;sourceRef.current=null;setSnapshotSource(null);setCachedAt(null);
     setAuthenticated(false); setLoadPhase(null); setSyncing(false); setSyncError("");
     setSnapshot(null); latestSnapshot.current=null; setPlayers([]); setActivities([]); setCredentials(null); setMustChangePassword(false); setBusy(false); setLocalSaving(false);
     backgroundJob.current = null; backgroundQueue.current = []; outboxLoad.current = null; mutationRunning.current = false; setBackgroundSave(null);
@@ -138,6 +150,7 @@ export function useSheetsConnection() {
     mounted.current = true;
     // Expired drafts are removed on every start, even before anyone signs in.
     void purgeExpiredPendingSaves().catch(() => undefined);
+    void purgeSnapshotCache().catch(()=>undefined);
     const {controller, g} = beginLoad(null);
     (async () => {
       let target = "";
@@ -162,16 +175,27 @@ export function useSheetsConnection() {
       setMode("live"); setPlayers([]); setActivities([]);
       try {
         target = validateEndpoint(target);
-        setEndpoint(target); setMode("live"); setPlayers([]); setActivities([]);
+        setEndpoint(target);cacheEndpoint.current=target; setMode("live"); setPlayers([]); setActivities([]);
         // The login/recovery screen can explain progress while the Sheet loads.
         setReady(true);
         const stored = readStorage(sessionStorage, SESSION_KEY);
         if (stored) {
-          let session: {endpoint?: string; token?: string} | null = null;
+          let session: {endpoint?: string; token?: string;cacheAvailable?:boolean} | null = null;
           try { session = JSON.parse(stored); } catch { writeStorage(sessionStorage, SESSION_KEY, null); }
           if (session?.endpoint === target && typeof session.token === "string" && session.token.length >= 32) {
             token.current = session.token;
             setAuthenticated(true); setLoadPhase("restoring");
+            if(session.cacheAvailable===true){
+              try{
+                const resumed=await sheetRequest<{cacheAccess?:SnapshotCacheAccess}>(target,"resumeSession",{},{token:session.token,signal:controller.signal});
+                if(!isCurrent(g))return;
+                if(validSnapshotCacheAccess(resumed?.cacheAccess)){
+                  cacheAccessRef.current=resumed.cacheAccess;const cached=await readSnapshotCache(target,resumed.cacheAccess,()=>isCurrent(g),controller.signal);
+                  if(!isCurrent(g))return;
+                  if(cached){applyCachedSnapshot(cached);finishLoad(g,controller);void refreshLatest.current(true);return;}
+                }
+              }catch(e){if(!(e instanceof SheetApiError&&e.code==="BAD_REQUEST"))throw e;}
+            }
             const data = await sheetRequest<SheetSnapshot>(target, "snapshot", {}, {token: session.token, signal: controller.signal});
             if (isCurrent(g)) applySnapshot(data);
           } else writeStorage(sessionStorage, SESSION_KEY, null);
@@ -191,7 +215,7 @@ export function useSheetsConnection() {
     return () => {
       mounted.current = false; ++generation.current; ++requestVersion.current;
       activeRequest.current?.abort(); activeRequest.current = null; loginRunning.current = false;
-      backgroundJob.current = null; backgroundQueue.current = []; outboxLoad.current = null;
+      backgroundJob.current = null; backgroundQueue.current = []; outboxLoad.current = null;cacheAccessRef.current=null;sourceRef.current=null;
     };
   }, [applySnapshot, beginLoad, clearSession, finishLoad, isCurrent]);
 
@@ -216,7 +240,7 @@ export function useSheetsConnection() {
   const login = async (id: string, password: string) => {
     if (loginRunning.current) return;
     if (mutationRunning.current || hasPendingBackground()) throw new Error("保存が完了してからログインしてください。");
-    loginRunning.current = true;
+    clearSession();loginRunning.current = true;cacheEndpoint.current=endpoint;
     const {controller, g} = beginLoad("authenticating");
     // Authentication and its first read share one deadline, so splitting the
     // requests cannot double the total time before the recovery screen appears.
@@ -225,15 +249,22 @@ export function useSheetsConnection() {
       deadline = createDeadlineSignal(45_000, [controller.signal]);
       const signal = deadline.signal;
       const deviceToken = readDeviceToken(endpoint, id);
-      const data = await sheetRequest<{token: string; deviceToken?: string; snapshot?: SheetSnapshot; mustChangePassword?: boolean}>(endpoint, "login", {id, password, sessionOnly: true, idleAware: true, ...(deviceToken ? {deviceToken} : {})}, {signal});
+      const data = await sheetRequest<{token: string; deviceToken?: string; snapshot?: SheetSnapshot; mustChangePassword?: boolean;cacheAccess?:SnapshotCacheAccess}>(endpoint, "login", {id, password, sessionOnly: true, cacheSnapshot:true, idleAware: true, ...(deviceToken ? {deviceToken} : {})}, {signal});
       if (!isCurrent(g)) return;
       if (!data || typeof data.token !== "string" || data.token.length < 32) throw new Error("ログイン結果を確認できませんでした。");
+      const cacheAccepted=validSnapshotCacheAccess(data.cacheAccess)&&data.cacheAccess.self.playerId===id.trim().toUpperCase();
       writeDeviceToken(endpoint, id, data.deviceToken);
       token.current = data.token;
-      writeStorage(sessionStorage, SESSION_KEY, JSON.stringify({endpoint, token: data.token}));
+      writeStorage(sessionStorage, SESSION_KEY, JSON.stringify({endpoint, token: data.token,...(cacheAccepted?{cacheAvailable:true}:{})}));
       setAuthenticated(true); accepted = true;
       // An issued password only opens the change screen; no business data is requested.
       if (data.mustChangePassword === true) { setMustChangePassword(true); return; }
+      if(cacheAccepted&&data.cacheAccess){
+        cacheAccessRef.current=data.cacheAccess;
+        const cached=await readSnapshotCache(endpoint,data.cacheAccess,()=>isCurrent(g),signal);
+        if(!isCurrent(g))return;
+        if(cached){applyCachedSnapshot(cached);loginRunning.current=false;finishLoad(g,controller);void refreshLatest.current(true);return;}
+      }
       setLoadPhase("loading");
       // Older deployments include a snapshot; updated ones authenticate first.
       const dataSnapshot = data.snapshot === undefined
@@ -259,7 +290,7 @@ export function useSheetsConnection() {
     if (!token.current || mutationRunning.current || hasPendingBackground() || loginRunning.current || refreshRunning.current || activeRequest.current) return;
     // Avoid changing an editor's baseline or row revision while someone types,
     // including an editor opened while this request was already in flight.
-    if (background && editing()) return;
+    if (background && sourceRef.current!=="cache" && editing()) return;
     const seen = inputSeq.current, passive = background && seen === reportedInput.current;
     refreshRunning.current = true;
     const controller = new AbortController(), g = generation.current, version = ++requestVersion.current;
@@ -270,7 +301,7 @@ export function useSheetsConnection() {
       const data = await sheetRequest<SheetSnapshot>(endpoint, "snapshot", {}, {token: token.current, signal: controller.signal, ...(passive ? {background: true} : {})});
       // A server that could not record the activity (busy lock) says so; the next poll reports the input again.
       if (!passive && data?.activityDeferred !== true) report(seen);
-      if (isCurrent(g) && version === requestVersion.current && (!background || !editing())) { applySnapshot(data); setSyncError(""); }
+      if (isCurrent(g) && version === requestVersion.current && (!background || sourceRef.current==="cache" || !editing())) { applySnapshot(data); setSyncError(""); }
       return true;
     } catch (e) {
       if (isCurrent(g) && version === requestVersion.current) {
@@ -486,9 +517,9 @@ export function useSheetsConnection() {
     } finally { admissions.current--; if (isCurrent(g) && admissions.current === 0) setLocalSaving(false); }
   };
   useEffect(() => {
-    if (!authenticated || !snapshot) return;
+    if (!authenticated || !snapshot || snapshotSource==="cache") return;
     void ensureOutbox().catch(error => { if (mounted.current) setSyncError(error instanceof Error?error.message:"端末の保存状況を確認できませんでした。"); });
-  }, [authenticated, snapshot?.self.role, snapshot?.self.playerId, endpoint]);
+  }, [authenticated, snapshot?.self.role, snapshot?.self.playerId, endpoint, snapshotSource]);
 
   const retryBackgroundSave = () => {
     const job = backgroundQueue.current[0];
@@ -678,7 +709,7 @@ export function useSheetsConnection() {
     clearSession(); setMode("demo"); setPlayers(initialPlayers); setActivities(makeDemoActivities()); setError("");
   };
 
-  return { ready, endpoint, mode, players, setPlayers, activities, setActivities, snapshot, authenticated, mustChangePassword, loadPhase, busy, error,
+  return { ready, endpoint, mode, players, setPlayers, activities, setActivities, snapshot, snapshotSource, cachedAt, authenticated, mustChangePassword, loadPhase, busy, error,
     syncing, syncError, backgroundSave, hasPendingSave, submitMutation, retryBackgroundSave, dismissBackgroundSave, readBackgroundSaveCorrection, correctBackgroundSave, copyBackgroundIntakeInput, credentials, dismissCredentials:() => setCredentials(null), connect, login, logout, refresh, mutate, readManagement, readOperational, mutateOperational, analyzeReviews, readAdvice, analyzeInsights, readInsights, readWritingKit, generateWritingKit, readWritingPreferences, saveWritingPreferences, readSecurity, changePassword, showDemo };
 }
 

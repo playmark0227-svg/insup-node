@@ -4,6 +4,7 @@ import { interviewFieldLabels, interviewFieldLimits, interviewStringFields, norm
 import type { CandidateChatContext } from "./candidate-chat.ts";
 import { buildCandidateChatGuidance, renderCandidateChatChecks } from "./candidate-chat-guidance.ts";
 import { normalizeCandidateChatAnswer } from "./candidate-chat-response.ts";
+import {reviewIntroductionSource,introductionEvidenceIssues} from "./introduction-review.ts";
 
 /** These preferences contain format settings only; reference documents are never part of them. */
 export interface WritingPreferences {
@@ -32,11 +33,13 @@ const errorMessages: Record<OnDeviceAiErrorCode, string> = {
 export class OnDeviceAiError extends Error {
   readonly code: OnDeviceAiErrorCode;
   readonly phase?: "preparation" | "generation";
-  constructor(code: OnDeviceAiErrorCode, phase?: "preparation" | "generation") {
+  readonly evidenceIssues?: readonly string[];
+  constructor(code: OnDeviceAiErrorCode, phase?: "preparation" | "generation", evidenceIssues?:readonly string[]) {
     super(code === "TIMEOUT" && phase === "preparation"
       ? "AIモデルの準備に時間がかかったため、待機を終了しました。入力原文は残っています。再度作成するとChromeの準備状況を確認して進められます。"
       : errorMessages[code]);
     this.name = "OnDeviceAiError"; this.code = code; this.phase = phase;
+    if(evidenceIssues)this.evidenceIssues=[...evidenceIssues];
   }
 }
 
@@ -338,7 +341,10 @@ function emptyIntroductionHeading(value: string, name: string): boolean {
 }
 /** Returns a reviewable draft only. It never edits the caller's source or sends it to an API service. */
 export async function generateCandidateIntroduction(input: CandidateIntroductionInput, options: OnDeviceAiOptions = {}): Promise<{ draft: string }> {
-  const name = sourceText(input.candidateName, 120), profile = profileSource(input.profile), memo = sourceText(input.memo, 4_000), reference = sourceText(input.referenceText, 12_000);
+  // Validate the original schema before preparing a separate, read-only evidence plan.
+  profileSource(input.profile);
+  const name=sourceText(input.candidateName,120),review=reviewIntroductionSource(input.profile,[name]);
+  const profile = profileSource(review.fields), memo = sourceText(input.memo, 4_000), reference = sourceText(input.referenceText, 12_000);
   // Internal notes and attendance concerns are not client-shareable facts by default.
   delete profile[interviewFieldLabels.attendanceConcerns];
   delete profile[interviewFieldLabels.additionalNotes];
@@ -362,6 +368,10 @@ export async function generateCandidateIntroduction(input: CandidateIntroduction
     項目順: settings.sectionOrder.filter(section => availableSections[section]).map(section => japaneseSectionHeadings[section]),
   };
   const output = await generateRaw(`クライアント共有用の紹介文の本文を${settings.targetLength}文字以内を目安に作成してください。読みやすい改行と日本語の見出しを使い、記載された事実だけを整理してください。` +
+    "原文を項目へそのまま転記するのではなく、最初に経験・担当業務・実績・希望条件を読み分け、重複を除いてから、相手が一読で理解できる自然な日本語へ組み直してください。長い職歴は商材・営業手法・担当範囲・期間を中心に要約してください。" +
+    "確定できる業務用語のひらがな・表記ゆれは『表記の整理案』を利用して自然に整えてください。人名・企業名・地名を勝手に漢字へ変えず、不確かな漢字やツール名を推測しないでください。" +
+    "『共有本文へ含めない未確認項目』は値を推測せず本文から省き、本文には社内の確認リストや確認待ちの問いを書かないでください。確認事項はアプリが別欄に表示します。" +
+    "稼働開始の入力は稼働開始可能日または本人の希望です。実際に勤務・稼働を開始済みという実績に置き換えないでください。希望単価の時給・月額などの単位、数値、職歴の期間と本人申告の区別は変えないでください。" +
     "使用できる見出しは文章設定の『項目順』に挙げたものだけです。その順番で必要な本文を書き、紹介文全体のタイトルは付けないでください。" +
     "職歴の詳細は営業経験・職務経歴の項目に書き、同じ職歴を営業における強みへ移したり反復したりしないでください。強みは、その入力がある場合だけ記載してください。" +
     "紹介概要は入力済みの事実を短く再要約してください。概要では、営業経験や条件に書いた同じ事実を重複して要約して構いません。新しい関係や評価は加えないでください。" +
@@ -372,13 +382,15 @@ export async function generateCandidateIntroduction(input: CandidateIntroduction
     "参考文章は書式だけを参考にし、そこに出てくる別人の情報や実績を候補者へ移さないでください。氏名は省略・変更せず、紹介文の本文に含めてください。" +
     introductionStyleGuide + "\n" +
     "紹介文の本文だけをそのまま返してください。JSON、スキーマ、型定義、英語の内部項目名、コードフェンス、出力についての説明や命令文は一切付けないでください。",
-    { 氏名: name, 面談の基本情報: profile, 面談メモ: memo, ...(reference ? { 書式の参考文章: reference } : {}), 文章設定: format }, undefined, options, 2_000);
-  const cleaned = checkedProse(cleanIntroductionPlaceholders(output, input.profile, memo), settings.targetLength);
+    { 氏名: name, 面談の基本情報: profile, 面談メモ: memo, 表記の整理案:review.revisions.map(item=>({項目:item.label,原文:item.before,整理後:item.after})),共有本文へ含めない未確認項目:review.checks.filter(check=>check.fields.some(key=>!review.fields[key].trim())).map(check=>({項目:check.fields.map(key=>interviewFieldLabels[key]),確認内容:check.detail})),事実の取り扱い:review.notes,...(reference ? { 書式の参考文章: reference } : {}), 文章設定: format }, undefined, options, 2_000);
+  const cleaned = checkedProse(cleanIntroductionPlaceholders(output, review.fields, memo), settings.targetLength);
   const draft = checkedProse(formatIntroductionHeadings(cleaned), settings.targetLength);
   if (!draft.includes(name.trim()) || englishInternalHeading.test(draft) || emptyIntroductionPlaceholder.test(draft) || remainingIntroductionPlaceholder(draft) || emptyIntroductionHeading(draft, name.trim()) || /```|~~~|[{}]\s*$/.test(draft)) throw new OnDeviceAiError("INVALID_RESPONSE");
   // Reference writing demonstrates style only, never a factual company relationship.
   const factualSource = [name, ...Object.values(profile).map(value => Array.isArray(value) ? value.join("\n") : value), memo].join("\n");
   if (companyReferenceWords.some(word => draft.includes(word) && !factualSource.includes(word))) throw new OnDeviceAiError("INVALID_RESPONSE");
+  const issues=introductionEvidenceIssues(draft,name,review.fields,memo);
+  if(issues.length)throw new OnDeviceAiError("INVALID_RESPONSE",undefined,issues);
   return { draft };
 }
 

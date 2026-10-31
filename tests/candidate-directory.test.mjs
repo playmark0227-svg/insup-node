@@ -362,8 +362,10 @@ test("a deactivated draft owner does not block explicit same-operation confirmat
 
 test("historical candidate filtering retains inactive owners",()=>{
  const h=managerHarness('CandidateManager',{players:[{id:'ND-001',name:'停止した担当',active:false}]});
- const filter=nodes(h.render()).find(node=>node.type==='select'&&node.props['aria-label']==='候補者の担当者');
- assert.ok(nodes(filter).some(node=>node.type==='option'&&node.props.value==='ND-001'));
+ const controls=nodes(h.render()).find(node=>node.type==='CandidateListControls');
+ assert.ok(controls);assert.equal(controls.props.players[0].id,'ND-001');assert.equal(controls.props.players[0].active,false);
+ controls.props.onFilterChange({...controls.props.filter,owner:'ND-001'});
+ assert.equal(nodes(h.render()).find(node=>node.type==='CandidateDirectory').props.groups.length,1);
 });
 
 test("basic information opens the authoritative owned profile instead of the first stale link",()=>{
@@ -520,4 +522,13 @@ test("a progress draft keeps its original version across refresh and cannot lose
   assert.match(text(h.render()), /入力中の変更を保存するか戻してから/);
   await nodes(h.render()).find(node => node.type === "form").props.onSubmit({ preventDefault() {} });
   assert.equal(h.calls[0][0], "updateRecord"); assert.equal(h.calls[0][1].rowVersion, "version-current-record");
+});
+
+test('filter and sort controls reset pagination while preserving whole candidate histories',()=>{
+ const records=Array.from({length:40},(_,index)=>record(`record-${index}`,index%2?'架空会社B':'架空会社A',index+2,'ND-001',`架空候補者${index+1}`));
+ const h=managerHarness('CandidateManager',{records});h.render();h.click('次へ');h.click('次へ');assert.match(text(h.render()),/31〜40 \/ 40名/);
+ const controls=()=>nodes(h.render()).find(node=>node.type==='CandidateListControls');
+ controls().props.onFilterChange({...controls().props.filter,company:'架空会社A'});h.render();assert.match(text(h.render()),/1〜15 \/ 20名/);
+ controls().props.onSortChange({field:'name',direction:'desc'});h.render();let directory=nodes(h.render()).find(node=>node.type==='CandidateDirectory');assert.equal(directory.props.groups[0].name,'架空候補者39');assert.equal(controls().props.filter.company,'架空会社A');
+ h.render({records:[records[0]]});directory=nodes(h.render()).find(node=>node.type==='CandidateDirectory');assert.equal(directory.props.groups.length,1);assert.match(text(h.render()),/1〜1 \/ 1名/);
 });

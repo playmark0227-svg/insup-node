@@ -26,7 +26,7 @@ export function validateDataExport(value:unknown):Record<string,unknown> {
  if(!object(value)||value.schemaVersion!==1||value.scope!=="application-data"||typeof value.exportedAt!=="string"||!object(value.snapshot)||!Array.isArray(value.managementTables)||!object(value.limits))throw new Error("書き出しデータの形式を確認できませんでした。");
  const allowed=["schemaVersion","exportedAt","scope","snapshot","managementTables","limits"];
  if(Object.keys(value).some(k=>!allowed.includes(k)))throw new Error("書き出しに想定外の情報が含まれています。");
- const forbidden=new Set(["outboxKey","destination","credentials","password","token","deviceToken","pepper","apiKey","authRecord"]);
+ const forbidden=new Set(["outboxKey","destination","credentials","password","token","deviceToken","pepper","apiKey","authRecord","cacheAccess","secret"]);
  const stack:{value:unknown;depth:number}[]=[{value,depth:0}];let visited=0;
  while(stack.length){const item=stack.pop()!;if(++visited>1000000||item.depth>32)throw new Error("書き出しデータが上限を超えています。");if(item.value&&typeof item.value==="object")for(const [key,child] of Object.entries(item.value)){if(forbidden.has(key))throw new Error("認証情報を含むデータは書き出せません。");stack.push({value:child,depth:item.depth+1});}}
  if(JSON.stringify(value).length>2000000)throw new Error("書き出しデータが上限を超えています。");

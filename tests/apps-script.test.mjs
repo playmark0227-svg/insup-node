@@ -4588,3 +4588,43 @@ test('administrator may complete historical goals for stopped players without re
  assert.deepEqual(h.spreadsheet.getSheetById(MATCHING_SHEET_ID).values,business);
  const admin=assertSuccess(request(h,'snapshot',{}, {token:f.admin.token}));assert.deepEqual(admin.monthlyGoals,[goal]);assert.equal(admin.players.find(p=>p.id==='ND-001').active,false);
 });
+
+test('opt-in cached login grants only an account-bound key after normal authentication and reads no candidate rows',()=>{
+ const f=signedInFixture(),h=f.harness;h.spreadsheet.reads.length=0;h.metadataReads.length=0;h.spreadsheet.readObserver=read=>assert.equal(read.sheetId,8001,'Key grants only read the fresh roster, never candidate/profile data');
+ const login=assertSuccess(request(h,'login',{id:'ND-001',password:'correct-test-password',sessionOnly:true,cacheSnapshot:true,idleAware:true}));
+ assert.deepEqual(Object.keys(login),['token','deviceToken','cacheAccess']);assert.equal(login.cacheAccess.version,1);assert.deepEqual(login.cacheAccess.self,{playerId:'ND-001',role:'player'});assert.match(login.cacheAccess.scope,/^[A-Za-z0-9_-]{43}$/);assert.match(login.cacheAccess.secret,/^[A-Za-z0-9_-]{43}$/);assert.ok(login.cacheAccess.expiresAt>h.clock.milliseconds);assert.deepEqual(h.metadataReads,[]);
+ const same=assertSuccess(request(h,'resumeSession',{}, {token:login.token}));assert.equal(same.cacheAccess.scope,login.cacheAccess.scope);assert.equal(same.cacheAccess.secret,login.cacheAccess.secret);
+ const foreign=assertSuccess(request(h,'resumeSession',{}, {token:f.admin.token}));assert.notEqual(foreign.cacheAccess.scope,login.cacheAccess.scope);assert.notEqual(foreign.cacheAccess.secret,login.cacheAccess.secret);
+});
+test('display cache grants keep issued-password, disabled, wrong-password and revoked sessions behind existing gates',()=>{
+ for(const kind of ['wrong','disabled','revoked','issued']){
+  const f=signedInFixture(),h=f.harness;if(kind==='disabled')h.spreadsheet.getSheetById(8001).values[2][8]=false;
+  if(kind==='revoked')delete h.properties[h.context.sessionKey_(f.player.token)];
+  if(kind==='issued'){const auth=JSON.parse(h.properties['NODE_AUTH_ND-001']);auth.mustChange=true;h.properties['NODE_AUTH_ND-001']=JSON.stringify(auth);}
+  const response=kind==='wrong'||kind==='disabled'?request(h,'login',{id:'ND-001',password:kind==='wrong'?'wrong':'correct-test-password',sessionOnly:true,cacheSnapshot:true}):request(h,'resumeSession',{}, {token:f.player.token});
+  assertFailure(response);assert.equal(response.data?.cacheAccess,undefined,kind);assert.doesNotMatch(JSON.stringify(response),/display-cache-encryption|"secret"/);
+ }
+ const f=signedInFixture(),h=f.harness,auth=JSON.parse(h.properties['NODE_AUTH_ND-001']);auth.mustChange=true;h.properties['NODE_AUTH_ND-001']=JSON.stringify(auth);
+ const issued=assertSuccess(request(h,'login',{id:'ND-001',password:'correct-test-password',sessionOnly:true,cacheSnapshot:true}));assert.equal(issued.mustChangePassword,true);assert.equal(issued.cacheAccess,undefined);
+});
+test('cache scopes change with roster permissions, credential versions, roles and destination configuration',()=>{
+ for(const kind of ['alias','role','version','destination']){
+  const f=signedInFixture(),h=f.harness,before=assertSuccess(request(h,'resumeSession',{}, {token:f.player.token})).cacheAccess;
+  if(kind==='alias')h.spreadsheet.getSheetById(8001).values[2][6]=JSON.stringify(['新しい担当範囲']);
+  if(kind==='role')h.spreadsheet.getSheetById(8001).values[2][7]='admin';
+  if(kind==='version'){const auth=JSON.parse(h.properties['NODE_AUTH_ND-001']);auth.version='new-auth-version';h.properties['NODE_AUTH_ND-001']=JSON.stringify(auth);}
+  if(kind==='destination'){const config=JSON.parse(h.properties.NODE_CONFIG);config.ownerEmail='new-owner@example.test';h.properties.NODE_CONFIG=JSON.stringify(config);}
+  const login=assertSuccess(request(h,'login',{id:'ND-001',password:'correct-test-password',sessionOnly:true,cacheSnapshot:true}));assert.notEqual(login.cacheAccess.scope,before.scope,kind);assert.notEqual(login.cacheAccess.secret,before.secret,kind);
+ }
+});
+test('revocation or a role change while a cache grant is being prepared refuses to return it',()=>{
+ for(const kind of ['role','revoke']){
+  const f=signedInFixture(),h=f.harness,original=h.context.snapshotCacheAccess_;
+  h.context.snapshotCacheAccess_=(...args)=>{const grant=original(...args);if(kind==='role')h.spreadsheet.getSheetById(8001).values[2][7]='admin';else delete h.properties[h.context.sessionKey_(f.player.token)];return grant;};
+  const error=assertFailure(request(h,'resumeSession',{}, {token:f.player.token}));assert.ok(['UNAUTHENTICATED','BUSY'].includes(error.code));assert.ok(!JSON.stringify(error).includes('secret'));
+ }
+});
+test('fresh snapshots provide display keys in memory while data exports exclude every cache and outbox secret',()=>{
+ const f=signedInFixture(),h=f.harness,data=assertSuccess(request(h,'snapshot',{}, {token:f.admin.token}));assert.ok(data.cacheAccess);assert.notEqual(data.cacheAccess.secret,data.outboxKey);
+ const exported=assertSuccess(request(h,'readDataExport',{}, {token:f.admin.token}));assert.equal(exported.snapshot.cacheAccess,undefined);assert.equal(exported.snapshot.outboxKey,undefined);assert.ok(!JSON.stringify(exported).includes(data.cacheAccess.secret));
+});

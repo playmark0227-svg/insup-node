@@ -133,7 +133,7 @@ export function MeetingDashboard({ players, period, periodLabel, countAt, onRegi
       <div className="meeting-context"><span className="meeting-context-icon"><Presentation size={22}/></span><div><h2>成果ミーティング</h2><p>{players.length}名<span>·</span>{live ? "スプレッドシートの実績" : "サンプル実績"}{live && <><span>·</span><SyncedTime value={syncedAt}/></>}</p></div></div>
       <div className="meeting-actions">
         {live && <button className="meeting-button" onClick={onRefresh} disabled={busy} aria-label="スプレッドシートから実績を更新"><RefreshCw size={16} className={busy ? "meeting-spin" : ""}/>{busy ? "更新中" : "更新"}</button>}
-        <button className="meeting-button" onClick={downloadCsv} disabled={busy || !players.length || exportBlocked} title={exportBlocked ? "未保存の入力・同期中の処理が終わるとCSV保存できます" : `${periodTitle}の担当者別実績をCSVに保存`}><Download size={16}/>CSV保存</button>
+        <button className="meeting-button" onClick={downloadCsv} disabled={busy || !players.length || exportBlocked} title={exportBlocked ? "保存前の入力・同期・最新情報の確認が終わるとCSV保存できます" : `${periodTitle}の担当者別実績をCSVに保存`}><Download size={16}/>CSV保存</button>
         <button className={`meeting-button ${meetingMode ? "selected" : ""}`} aria-pressed={meetingMode} onClick={toggleMeetingMode}>{meetingMode ? <Minimize2 size={16}/> : <Maximize2 size={16}/>}会議用表示{meetingMode && "を終了"}</button>
       </div>
     </div>
