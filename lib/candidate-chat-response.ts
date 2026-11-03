@@ -80,6 +80,25 @@ function checkPayUnits(answer: string, context: CandidateChatContext): void {
   }
 }
 
+function recordedAmounts(value:string):Set<number> {
+ const amounts=new Set<number>();
+ for(const match of canonical(value).matchAll(/(\d+(?:\.\d+)?)\s*(万)?円/gu))amounts.add(Number(match[1])*(match[2]?10_000:1));
+ return amounts;
+}
+/** A correct pay period does not authorize changing the recorded amount. Narrow
+ * to monetary assertions so a numbered checklist is not mistaken for a fact. */
+function checkAmountClaims(answer:string,context:CandidateChatContext):void {
+ const known=new Set(context.sources.flatMap(source=>source.facts.flatMap(fact=>{
+  const amounts=[...recordedAmounts(fact.value)];
+  if(/希望(?:単価|報酬|時給)|^単価$|^報酬$/u.test(fact.label)&&/^\s*\d+(?:\.\d+)?\s*$/u.test(canonical(fact.value)))amounts.push(Number(canonical(fact.value).trim()));
+  return amounts;
+ })));
+ for(const sentence of answer.split(/\r?\n|(?<=[。！？!?])/u)){
+  if(checkOrUnknown(sentence))continue;
+  if([...recordedAmounts(sentence)].some(amount=>!known.has(amount)))reject();
+ }
+}
+
 function dateKeys(value: string): string[] {
   return [...canonical(value).matchAll(/(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})日?/gu)]
     .map(match => `${match[1]}-${Number(match[2])}-${Number(match[3])}`);
@@ -125,6 +144,7 @@ export function normalizeCandidateChatAnswer(body: Answer, context: CandidateCha
   const sourceIds = [...new Set([...body.sourceIds, ...separated.ids])];
   if (sourceIds.length > 12) return reject();
   checkPayUnits(answer, context);
+  checkAmountClaims(answer, context);
   checkAvailabilityClaims(answer, context);
   return { answer, sourceIds };
 }

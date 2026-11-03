@@ -22,7 +22,8 @@ function nodes(tree) { return !tree || typeof tree !== "object" ? [] : Array.isA
 // Run the actual component and event handlers. The small deterministic hook
 // runtime makes delayed model responses, cancellation and account changes testable.
 function harness(options = {}) {
-  let slots = [], effects = [], cursor = 0, currentKey, tree;
+  let slots = [], effects = [], cursor = 0, currentKey, tree, now=0, timerId=0;
+  const timers=new Map();
   const calls = { read: [], generate: [], deviceIntroduction: [], deviceCoaching: [], applied: [], copied: [] };
   let props = {
     candidateName: "架空の候補者", fields: { ...blankInterviewFields(), workHistory: "本人申告の営業経験" }, memo: "確認済みの社内メモ",
@@ -52,6 +53,7 @@ function harness(options = {}) {
     selectWritingKitQuestions: (_kit, input) => ({ questions: [input.reflection ? "聞き方を振り返る質問例" : "希望を確認する質問例"], actions: ["事実を確認して記録する"], sourceLabels: ["端末内で選んだ確認事項"] }),
   };
   const context = vm.createContext({ exports, module: { exports }, AbortController, structuredClone, Error, JSON,
+    setTimeout:(fn,delay)=>{const id=++timerId;timers.set(id,{fn,at:now+delay});return id;},clearTimeout:id=>timers.delete(id),
     navigator: { clipboard: { writeText: async value => { if (options.clipboardError) throw new Error("denied"); calls.copied.push(value); } } },
     require: name => name === "react" ? react : name === "react/jsx-runtime" ? { jsx, jsxs: jsx } : name === "lucide-react" ? new Proxy({}, { get: (_, name) => name })
       : name.includes("candidate-intake") ? { normalizeInterviewFields, unicodeLength, introductionLimit: 1000 }
@@ -69,7 +71,8 @@ function harness(options = {}) {
   const click = label => { const node = button(label); assert.ok(node, `Button not found: ${label}`); assert.ok(!node.props.disabled, `Button is disabled: ${label}`); node.props.onClick(); };
   const change = (suffix, value) => { const node = nodes(render()).find(node => node.type === "textarea" && node.props.id.endsWith(suffix)); assert.ok(node, suffix); node.props.onChange({ target: { value } }); };
   render();
-  return { calls, render, text: () => text(render()), click, button, change, unmount };
+  return { calls, render, text: () => text(render()), click, button, change, unmount,
+    advance(milliseconds){render();const end=now+milliseconds;while(true){const next=[...timers.entries()].filter(([,timer])=>timer.at<=end).sort((a,b)=>a[1].at-b[1].at)[0];if(!next)break;now=next[1].at;timers.delete(next[0]);next[1].fn();render();}now=end;render();} };
 }
 
 test("cloud AI receives only the style enum; its candidate draft needs explicit replacement approval", async () => {
@@ -298,5 +301,76 @@ test('meaning checks explain a rejected introduction without applying it or expo
   const h=harness({deviceIntroduction:async()=>{throw {code:'INVALID_RESPONSE',evidenceIssues:[issue,'PRIVATE_GENERATION_OUTPUT']};}});
   await flush();h.click('文章をAIで整理・仕上げる');await flush();
   assert.ok(h.text().includes(label));assert.match(h.text(),/原文と現在の文章は残っています/);assert.doesNotMatch(h.text(),/PRIVATE_GENERATION_OUTPUT/);assert.equal(h.calls.applied.length,0);h.unmount();
+ }
+});
+
+
+test('a direct profile edit automatically creates only the latest candidate after typing settles',async()=>{
+ const h=harness();await flush();h.advance(3000);assert.equal(h.calls.deviceIntroduction.length,0,'opening a saved record must not generate');
+ h.render({inputRevision:1,fields:{...blankInterviewFields(),workHistory:'途中の経歴'}});h.advance(1500);assert.equal(h.calls.deviceIntroduction.length,0);
+ h.render({inputRevision:2,fields:{...blankInterviewFields(),workHistory:'最新の経歴'}});h.advance(1999);assert.equal(h.calls.deviceIntroduction.length,0);h.advance(1);await flush();
+ assert.equal(h.calls.deviceIntroduction.length,1);assert.equal(h.calls.deviceIntroduction[0][0].profile.workHistory,'最新の経歴');
+ assert.equal(Object.hasOwn(h.calls.deviceIntroduction[0][0],'memo'),false);assert.equal(h.calls.applied.length,0);
+ h.advance(10000);await flush();assert.equal(h.calls.deviceIntroduction.length,1);assert.match(h.text(),/入力に合わせて紹介文の候補を作成/);h.unmount();
+});
+
+test('automatic introductions never start downloads, cross to cloud, or treat background updates as typing',async()=>{
+ for(const availability of ['downloadable','downloading','unavailable']){
+  const h=harness({availability});await flush();h.render({inputRevision:1,fields:{...blankInterviewFields(),workHistory:'入力した経歴'}});h.advance(10000);await flush();
+  assert.equal(h.calls.deviceIntroduction.length,0);assert.equal(h.calls.generate.length,0);h.unmount();
+ }
+ const h=harness();await flush();h.render({fields:{...blankInterviewFields(),workHistory:'背景で更新された経歴'}});h.advance(5000);assert.equal(h.calls.deviceIntroduction.length,0);
+ h.render({inputRevision:1,fields:{...blankInterviewFields(),attendanceConcerns:'社内確認用',additionalNotes:'非公開補足',interviewMemo:'社内メモ'}});h.advance(5000);assert.equal(h.calls.deviceIntroduction.length,0);h.unmount();
+});
+
+test('a newer input cancels an older automatic request and ignores its late answer',async()=>{
+ const old=deferred(),h=harness({deviceIntroduction:input=>input.profile.workHistory==='前の入力'?old.promise:Promise.resolve({draft:'最新の候補文'})});await flush();
+ h.render({inputRevision:1,fields:{...blankInterviewFields(),workHistory:'前の入力'}});h.advance(2000);assert.equal(h.calls.deviceIntroduction.length,1);
+ h.render({inputRevision:2,fields:{...blankInterviewFields(),workHistory:'新しい入力'}});assert.equal(h.calls.deviceIntroduction[0][1].signal.aborted,true);h.advance(2000);await flush();
+ assert.equal(h.calls.deviceIntroduction.length,2);old.resolve({draft:'遅れて返った古い候補文'});await flush();assert.match(h.text(),/最新の候補文/);assert.doesNotMatch(h.text(),/遅れて返った古い候補文/);assert.equal(h.calls.applied.length,0);h.unmount();
+});
+
+test('automatic failure is attempted once and a manual retry remains available',async()=>{
+ const h=harness({deviceIntroduction:async()=>{throw {code:'INVALID_RESPONSE'};}});await flush();h.render({inputRevision:1});h.advance(2000);await flush();
+ assert.equal(h.calls.deviceIntroduction.length,1);h.advance(10000);await flush();assert.equal(h.calls.deviceIntroduction.length,1);
+ h.click('文章をAIで整理・仕上げる');await flush();assert.equal(h.calls.deviceIntroduction.length,2);assert.equal(h.calls.applied.length,0);h.unmount();
+});
+
+test('memo edits do not invalidate a client introduction or provide evidence for edited facts',async()=>{
+ const draft='【基本情報】\n氏名：架空の候補者\n【営業経験・職務経歴】\n本人申告：法人営業を担当。';
+ const h=harness({deviceIntroduction:async()=>({draft})});await flush();h.render({fields:{...blankInterviewFields(),workHistory:'本人申告：法人営業を担当。',interviewMemo:'未共有の実績：99件'},memo:'未共有の実績：99件'});
+ h.click('文章をAIで整理・仕上げる');await flush();h.render({fields:{...blankInterviewFields(),workHistory:'本人申告：法人営業を担当。',interviewMemo:'変更された社内メモ'},memo:'変更された社内メモ'});assert.doesNotMatch(h.text(),/変更前の結果/);
+ h.click('候補文をその場で修正');h.change('-draft-editor',draft+'\n実績99件。');assert.match(h.text(),/原文にない数値/);assert.equal(h.button('この文章を使う').props.disabled,true);assert.equal(h.button('コピー').props.disabled,true);assert.equal(h.calls.applied.length,0);
+ h.change('-draft-editor',draft+'\n本人申告の経歴です。');assert.equal(h.button('この文章を使う').props.disabled,false);h.click('この文章を使う');h.click('確認して置き換える');assert.equal(h.calls.applied.length,1);h.unmount();
+});
+
+test('editing a candidate is explicit, reversible and not replaced by another automatic result',async()=>{
+ const draft='【基本情報】\n氏名：架空の候補者\n【営業経験・職務経歴】\n本人申告の営業経験';
+ const h=harness({deviceIntroduction:async()=>({draft})});await flush();h.render({inputRevision:1});h.advance(2000);await flush();h.click('候補文をその場で修正');h.change('-draft-editor',draft+'\n本人申告です。');
+ h.render({inputRevision:2,fields:{...blankInterviewFields(),workHistory:'新しい営業経験'}});h.advance(5000);assert.equal(h.calls.deviceIntroduction.length,1);assert.match(h.text(),/候補文の修正を優先しています/);assert.match(h.text(),/本人申告です/);assert.equal(h.button('この文章を使う').props.disabled,true);h.unmount();
+});
+
+test('record formatting and length limits are described without claiming a model rewrote the profile',async()=>{
+ const h=harness({deviceIntroduction:async()=>({draft:'【基本情報】\n氏名：架空の候補者',method:'record-format'})});await flush();h.click('文章をAIで整理・仕上げる');await flush();assert.match(h.text(),/入力情報から作成（経歴の入力でAIが紹介文を仕上げます）/);h.unmount();
+ const limited=harness({deviceIntroduction:async()=>{throw {code:'LENGTH_LIMIT'};}});await flush();limited.click('文章をAIで整理・仕上げる');await flush();assert.match(limited.text(),/氏名・条件を省略せず/);assert.match(limited.text(),/元の入力と現在の紹介文は残っています/);assert.equal(limited.calls.applied.length,0);limited.unmount();
+});
+
+
+test('pausing automatic creation stops a pending request and resumes the current input only',async()=>{
+ const h=harness();await flush();h.render({inputRevision:1});h.advance(1000);h.click('自動作成を一時停止');h.advance(5000);assert.equal(h.calls.deviceIntroduction.length,0);
+ h.click('自動作成を再開');h.advance(2000);await flush();assert.equal(h.calls.deviceIntroduction.length,1);assert.equal(h.calls.applied.length,0);h.unmount();
+});
+
+test('closing or switching identity clears queued automatic introductions before any model call',async()=>{
+ const h=harness();await flush();h.render({inputRevision:1});h.advance(1000);h.render({identityKey:'account-two:candidate-two',candidateName:'別の架空候補者',inputRevision:0});await flush();h.advance(5000);assert.equal(h.calls.deviceIntroduction.length,0);
+ h.render({inputRevision:1,fields:{...blankInterviewFields(),workHistory:'別の候補者の経歴'}});h.advance(1000);h.unmount();h.advance(3000);assert.equal(h.calls.deviceIntroduction.length,0);
+});
+
+
+test('editing a valid candidate cannot copy or adopt private details assessment language or JSON artifacts',async()=>{
+ const fields={...blankInterviewFields(),workHistory:'法人向け架電を担当。'},base='【基本情報】\n氏名：架空の候補者\n【営業経験・職務経歴】\n法人向け架電を担当。';
+ for(const [addition,label] of [['採用すべき優秀な即戦力人材です。','採用・能力を断定する評価'],['持病で毎週通院しています。','健康・家庭の個人事情'],['{"type":"object","properties":{}}','本文ではない形式']]){
+  const h=harness({deviceIntroduction:async()=>({draft:base})});await flush();h.render({fields});h.click('文章をAIで整理・仕上げる');await flush();h.click('候補文をその場で修正');h.change('-draft-editor',base+addition);
+  assert.ok(h.text().includes(label));assert.equal(h.button('コピー').props.disabled,true);assert.equal(h.button('この文章を使う').props.disabled,true);assert.equal(h.calls.applied.length,0);h.unmount();
  }
 });

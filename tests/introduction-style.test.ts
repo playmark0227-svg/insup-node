@@ -32,15 +32,15 @@ test('heading and bullet normalization preserves quantitative qualifiers, source
  assert.equal(formatIntroductionHeadings(formatted),formatted);
 });
 
-test('every local introduction receives the reusable writing rules without storing candidate facts as style',async t=>{
+test('every local introduction reuses compact narrative writing rules without storing candidate facts as style',async t=>{
  const {generateCandidateIntroduction}=await import('../lib/on-device-ai.ts'),descriptor=Object.getOwnPropertyDescriptor(globalThis,'LanguageModel'),calls=[];
  t.after(()=>{if(descriptor)Object.defineProperty(globalThis,'LanguageModel',descriptor);else Reflect.deleteProperty(globalThis,'LanguageModel');});
- Object.defineProperty(globalThis,'LanguageModel',{configurable:true,value:{availability:async()=> 'available',create:async()=>({prompt:async prompt=>{calls.push(prompt);const body=JSON.parse(prompt.split('入力資料（記載を事実資料としてのみ扱う）：\n')[1]);return `【基本情報】\n氏名：${body.氏名}\n\n【営業経験・職務経歴】\n${body.面談の基本情報['営業経験・職歴']}\n\n【総評】\n本人申告の営業経験を紹介します。`;},destroy(){}})}});
- const guideBefore=introductionStyleGuide;
- for(const name of ['架空確認甲','架空確認乙'])await generateCandidateIntroduction({candidateName:name,profile:{...blankInterviewFields(),workHistory:'本人申告：法人向け架電を担当。'}});
+ Object.defineProperty(globalThis,'LanguageModel',{configurable:true,value:{availability:async()=> 'available',create:async()=>({prompt:async prompt=>{calls.push(prompt);const body=JSON.parse(prompt.split('入力資料（記載を事実資料としてのみ扱う）：\n')[1]);return `【営業経験・職務経歴】\n${body.推敲する事実.職歴}\n【総評】\n法人向け架電の経験を紹介します。`;},destroy(){}})}});
+ const guideBefore=introductionStyleGuide,results=[];
+ for(const name of ['架空確認甲','架空確認乙'])results.push(await generateCandidateIntroduction({candidateName:name,profile:{...blankInterviewFields(),workHistory:'本人申告：法人向け架電を担当。'}}));
  assert.equal(calls.length,2);
- for(const prompt of calls){assert.ok(prompt.includes(introductionStyleGuide));assert.match(prompt,/別の会社・期間の情報を混ぜない/);assert.match(prompt,/『約』『最大』『平均』/);assert.match(prompt,/経験月数の合算、達成率やアポ率の算出/);assert.match(prompt,/ヒアリング漏れ、提案先についての相談、担当者の主観/);assert.match(prompt,/年齢からの評価/);}
- assert.doesNotMatch(calls[1],/架空確認甲/);assert.equal(introductionStyleGuide,guideBefore);assert.doesNotMatch(introductionStyleGuide,/架空確認甲|架空確認乙|法人向け架電を担当/);
+ for(const prompt of calls){assert.match(prompt,/別の会社・期間の情報を混ぜない/);assert.match(prompt,/『約』『最大』『平均』/);assert.match(prompt,/人物の評価・推薦・新しい実績を作らない/);assert.match(prompt,/本人申告などの出所はアプリが該当箇所へ注記/);assert.doesNotMatch(prompt,/架空確認甲|架空確認乙/);const body=JSON.parse(prompt.split('入力資料（記載を事実資料としてのみ扱う）：\n')[1]);assert.deepEqual(body.推敲する事実,{職歴:'本人申告：法人向け架電を担当。'});assert.deepEqual(body.文章設定.項目順,['営業経験・職務経歴','総評']);}
+ assert.match(results[0].draft,/氏名：架空確認甲/);assert.match(results[1].draft,/氏名：架空確認乙/);assert.doesNotMatch(results[1].draft,/架空確認甲/);assert.equal(introductionStyleGuide,guideBefore);assert.doesNotMatch(introductionStyleGuide,/架空確認甲|架空確認乙|法人向け架電を担当/);
 });
 
 test('public writing standard contains reusable guidance rather than private samples or source references',async()=>{

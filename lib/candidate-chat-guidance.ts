@@ -11,7 +11,7 @@ const followup = /^(?:他には?|ほかには?|他にも|ほかにも|それ(?:�
 const moreChecks = /^(?:他には?|ほかには?|他にも|ほかにも)[?？。!！]*$/;
 const noFurtherChecks = "これまで提示した以外に追加すべき内容は、この範囲では特定できません。";
 
-function explicitQuestion(question: string, history: ChatHistory): string {
+export function resolveCandidateChatQuestion(question: string, history: ChatHistory = []): string {
   if (!followup.test(normalized(question))) return question;
   for (let index = history.length - 1; index >= Math.max(0, history.length - 30); index--) {
     const message = history[index];
@@ -25,6 +25,8 @@ function explicitIntent(question: string): CandidateChatIntent {
   const asksSummary = /要約|まとめ|整理|概要|状況|全体像|どんな(?:人|候補者)|今どう|今の状態/.test(text);
   const excludesMissing = /不足(?:は|が)?(?:ない|なし)|不足(?:ではなく|じゃなく)|(?:追記|追加|不足確認|確認)(?:は|が)?(?:不要|いらない|要らない)|不足.*(?:聞いてない|聞いていない)|(?:概要|要約|まとめ|状況)(?:だけ|のみ)/.test(text);
   if (asksSummary && excludesMissing) return "summary";
+  // A dated appointment question is a lookup, even when it says 次回/次の.
+  if (/(?:次回|次の).*(?:面談|商談|予定).*(?:いつ|何日|何時|日時|日程)|(?:次回|次の)(?:面談|商談|予定)(?:は|が)?[?？]?$/.test(text)) return asksSummary ? "summary" : "question";
   if (/次(?:に|は|回|の対応|の行動)|今後|これから|どう(?:進め|すれば|したら|動け)|何を(?:すれば|したら)|(?:対応|行動|進め方|連絡|準備).*(?:提案|教え|すべき|したら)|(?:提案|教え).*(?:対応|行動|進め方)/.test(text)
     && !/不足|足り|追記|追加|入れ(?:るべき|た(?:方|ほう)|たら)/.test(text)) return "next-actions";
   // Asking which data to add is different from asking for a profile summary.
@@ -36,7 +38,7 @@ function explicitIntent(question: string): CandidateChatIntent {
 
 /** History can supply conversational intent, never candidate facts. */
 export function classifyCandidateChatIntent(question: string, history: ChatHistory = []): CandidateChatIntent {
-  return explicitIntent(explicitQuestion(question, history));
+  return explicitIntent(resolveCandidateChatQuestion(question, history));
 }
 
 function requestedFields(question: string): Set<string> {
@@ -90,7 +92,7 @@ function hasLinkedInterviewSchedule(profile: CandidateChatSource, sources: Candi
 /** Suggestions stay source-specific: a condition from one profile never fills another profile. */
 export function buildCandidateChatGuidance(context: CandidateChatContext, question: string, history: ChatHistory = []): CandidateChatGuidance {
   const intent = classifyCandidateChatIntent(question, history);
-  const focus = requestedFields(explicitQuestion(question, history));
+  const focus = requestedFields(resolveCandidateChatQuestion(question, history));
   const candidates: Array<CandidateChatCheck & { priority: number }> = [];
   const profiles = context.sources.filter(source => source.kind === "profile");
   const add = (source: CandidateChatSource, field: string, priority: number, reason: string, nextQuestion: string) => {

@@ -88,7 +88,7 @@ test('client introduction preserves confirmed source units and source provenance
  const fields={...blankInterviewFields(),age:'40',gender:'回答しない',residence:'架空県',desiredHourlyRate:'2,000円/時',workHistory:'本人申告：法人向け架電を6か月。',achievements:'本人申告：アポ3件。未確認。',strengths:'本人申告：記録をこまめに残す。',crmTools:['Salesforce','その他'],crmOther:'社内CRM',chatTools:['Slack'],interviewAvailability:'平日午後。要調整。'};
  const before=clone(fields),result=composeWritingKitIntroduction('架空の候補者',fields,kit());
  assert.equal(result.truncated,false);assert.deepEqual(result.omittedFields,[]);assert.match(result.text,/氏名：架空の候補者/);assert.match(result.text,/希望単価：2,000円\/時/);assert.match(result.text,/本人申告：アポ3件。未確認。/);assert.match(result.text,/CRM：Salesforce/);assert.match(result.text,/その他のCRM：社内CRM/);assert.doesNotMatch(result.text,/CRM：Salesforce・その他/);assert.deepEqual(fields,before);
- for(const label of Object.values(headings))assert.ok(result.text.includes(`【${label}】`));assert.doesNotMatch(result.text,/優秀|おすすめ|即戦力|採用すべき|適性|推薦/);
+ for(const [id,label] of Object.entries(headings))if(id!=="summary")assert.ok(result.text.includes(`【${label}】`));assert.doesNotMatch(result.text,/【総評】/);assert.doesNotMatch(result.text,/優秀|おすすめ|即戦力|採用すべき|適性|推薦/);
 });
 
 test('missing client data remains absent and internal fields cannot populate a blank introduction',()=>{
@@ -117,7 +117,7 @@ test('standard and concise client introductions fit 1000 and 600 Unicode codepoi
   const result=composeWritingKitIntroduction('架空の候補者🧑‍💻',fields,template,preferences);
   assert.ok(unicodeLength(result.text)<=limit,`${style}/${targetLength}: ${unicodeLength(result.text)}`);assert.equal(result.truncated,true);assert.ok(result.omittedFields.includes('workHistory'));assert.ok(!result.omittedFields.includes('attendanceConcerns'));assert.ok(!result.omittedFields.includes('additionalNotes'));
   assert.doesNotMatch(result.text,/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
-  for(const section of Object.values(headings))assert.ok(result.text.includes(`【${section}】`));
+  for(const [id,section] of Object.entries(headings))if(id!=="summary")assert.ok(result.text.includes(`【${section}】`));
   assert.deepEqual({fields,template,preferences},before);assert.deepEqual(composeWritingKitIntroduction('架空の候補者🧑‍💻',fields,template,preferences),result);
  }
 });
@@ -156,4 +156,19 @@ test('local question helper does not call cloud transport or forward profile tex
  const previous=globalThis.fetch;let called=false;globalThis.fetch=async()=>{called=true;throw new Error('Network must not be used');};
  try {const result=selectWritingKitQuestions(kit(),{fields:longFields(),memo:'秘密の稼働予定',reflection:'秘密の会話の振り返り'});assert.equal(called,false);assert.ok(result.questions.length>0);assert.ok(!JSON.stringify(result).includes('秘密'));}
  finally {globalThis.fetch=previous;}
+});
+
+
+test('a basic-only template does not invent an empty review or reintroduce declined attributes',()=>{
+ const fields={...blankInterviewFields(),gender:'回答しない',availableFrom:'来月以降',desiredHourlyRate:'単位未確認'};
+ const result=composeWritingKitIntroduction('架空検証',fields,kit());
+ assert.match(result.text,/稼働開始可能日（希望）：来月以降/);assert.doesNotMatch(result.text,/【総評】|記載した基本情報に基づく|性別：|希望単価：/);
+});
+
+
+test('structure-only drafting spends its budget on source facts instead of repeating a pseudo-summary',()=>{
+ const fields={...blankInterviewFields(),workHistory:'本人申告：架空商材の説明と顧客対応を担当。',achievements:'本人申告：記録を毎日整理。',strengths:'確認事項を記録する。'};
+ const result=composeWritingKitIntroduction('架空検証',fields,kit());
+ assert.doesNotMatch(result.text,/【総評】|記載した基本情報に基づく/);
+ for(const fact of [fields.workHistory,fields.achievements,fields.strengths])assert.equal(result.text.split(fact).length-1,1);
 });

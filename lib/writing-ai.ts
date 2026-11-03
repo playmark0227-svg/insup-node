@@ -74,17 +74,16 @@ export function composeWritingKitIntroduction(candidateName:string,raw:Interview
     const template=kit.sections.find(section=>section.id===id);
     return {id,template:template?{...template,heading:introductionHeadings[id]}:undefined,entries:groups[id].filter(e=>e.value)};
   })
-    .filter(s=>s.template&&(s.entries.length||s.id==='summary'&&prefs.includeSummary&&!!candidateName.trim()));
+    // A generic structure cannot write an individual assessment. Reserve the
+    // length budget for actual facts instead of repeating them under 総評.
+    .filter(s=>s.template&&s.id!=='summary'&&s.entries.length);
   const limit=Math.min(1000,prefs.targetLength,kit.style==='concise'?600:1000);
   const render=(base:number)=>sections.map(s=>{
     const body=s.entries.map(e=>{
       const points=Array.from(e.value),n=Math.max(1,Math.floor(base*e.weight));
       return `${e.key==='availableFrom'?'稼働開始可能日（希望）':e.label}：${points.length>n?points.slice(0,n-1).join('')+'…':e.value}`;
     }).join('\n');
-    // Generic AI leads are writing instructions, not candidate facts. They are
-    // never inserted into a client-facing paragraph as if verified evidence.
-    const summary=s.id==='summary'?[...new Set([fields.workHistory,fields.achievements,fields.strengths].filter(value=>value.trim()))].map(value=>{const points=Array.from(value.trim()),n=Math.max(1,Math.floor(base));return points.length>n?points.slice(0,n-1).join('')+'…':value.trim();}).join('\n'):'';
-    return `【${s.template!.heading}】\n${body||summary||(s.id==='summary'?'記載した基本情報に基づく紹介です。':'')}`;
+    return `【${s.template!.heading}】\n${body}`;
   }).join('\n\n');
   if(unicodeLength(render(0))>limit){
     const shortHeadings = introductionHeadings;

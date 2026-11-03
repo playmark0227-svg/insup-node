@@ -98,3 +98,17 @@ test("unmounting or disabling the editor cancels pending automatic drafts", () =
   disabled.advance(1000); assert.equal(disabled.introductions.length, 0);
   disabled.render({ disabled: false }); disabled.advance(250); assert.equal(disabled.introductions.length, 1); disabled.unmount();
 });
+
+
+test("only direct shareable profile edits advance automatic AI input revision",()=>{
+ const h=harness({introduction:"既存の紹介文"});
+ const aiProps=()=>nodes(h.render()).find(node=>node.type==="CandidateAiAssistant").props;
+ assert.equal(aiProps().inputRevision,0);
+ h.render({fields:{...h.fields(),workHistory:"背景取得した経歴"}});assert.equal(aiProps().inputRevision,0);
+ h.change("-workHistory","入力した経歴");assert.equal(aiProps().inputRevision,1);
+ h.change("-attendanceConcerns","社内の稼働確認");h.change("-additionalNotes","内部補足");assert.equal(aiProps().inputRevision,1);
+ aiProps().onNotesChange({memo:"面談用メモ",reflection:"面談者の振り返り"});assert.equal(aiProps().inputRevision,1);
+ aiProps().onSaveAdvice("保存する準備案");assert.equal(aiProps().inputRevision,1);
+ h.adoptAi("採用したAI紹介文");h.change("-introduction","手で修正した紹介文");assert.equal(aiProps().inputRevision,1);
+ const checkbox=nodes(h.render()).find(node=>node.type==="input"&&node.props.type==="checkbox");checkbox.props.onChange();assert.equal(aiProps().inputRevision,2);h.unmount();
+});

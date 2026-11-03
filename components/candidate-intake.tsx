@@ -32,6 +32,9 @@ export function InterviewIntakeEditor({ candidateName, fields, onFieldsChange, i
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState("");
   const [inputError, setInputError] = useState("");
+  const [inputRevision,setInputRevision]=useState(0);
+  const [aiStatus,setAiStatus]=useState<"idle"|"waiting"|"running"|"ready"|"error">("idle");
+  const previousName=useRef(candidateName);
   const autoManaged = useRef(!introduction.trim());
   const currentSource = JSON.stringify([candidateName, fields]);
   // Only the untouched immediate template follows input. User/AI drafts are explicit.
@@ -45,7 +48,14 @@ export function InterviewIntakeEditor({ candidateName, fields, onFieldsChange, i
     return () => clearTimeout(timer);
   }, [currentSource, introduction, disabled, onIntroductionChange]);
   const changedAfterFormat = !!formatResult && formatSource !== currentSource;
-  const set = (key: InterviewStringField, value: string) => onFieldsChange({ ...fields, [key]: value });
+  // A background snapshot, a saved AI result and opening an existing profile are
+  // not typing. Only edits in this editor may ask for an automatic AI candidate.
+  const set = (key: InterviewStringField, value: string) => {
+    if(fields[key]===value)return;
+    onFieldsChange({ ...fields, [key]: value });
+    if(!["attendanceConcerns","additionalNotes","interviewMemo","selfReflection","interviewAdvice"].includes(key))setInputRevision(value=>value+1);
+  };
+  useEffect(()=>{if(previousName.current!==candidateName){previousName.current=candidateName;if(inputRevision>0)setInputRevision(value=>value+1);}},[candidateName]);
   const field = (key: InterviewStringField, options?: { placeholder?: string; multiline?: boolean; maxLength?: number; hint?: string; inputMode?: "numeric" }) => {
     const fieldId = `${id}-${key}`, hintId = `${fieldId}-hint`;
     return <label className={options?.multiline ? "intake-field intake-wide" : "intake-field"} htmlFor={fieldId} key={key}>
@@ -61,6 +71,7 @@ export function InterviewIntakeEditor({ candidateName, fields, onFieldsChange, i
   };
   function toggle(key: "crmTools" | "chatTools", value: string) {
     onFieldsChange({ ...fields, [key]: fields[key].includes(value) ? fields[key].filter(item => item !== value) : [...fields[key], value] });
+    setInputRevision(value=>value+1);
   }
   function format() {
     autoManaged.current = false;
@@ -82,7 +93,7 @@ export function InterviewIntakeEditor({ candidateName, fields, onFieldsChange, i
   }
   return <div className="interview-intake">
     <p className="intake-context">{candidateName || "この候補者"}の面談情報をまとめます。分かる項目だけ入力してください。</p>
-    {ai?.enabled&&<div className="intake-writing-workflow"><span>情報を入力 → AIで整理 → 原文と比べて採用</span><a href={`#${id}-writing-assistant`} className="text-button">文章をAIで整える</a></div>}
+    {ai?.enabled&&<div className="intake-writing-workflow"><span role="status">{aiStatus==="running"?"紹介文の候補を作成中です。入力は続けられます。":aiStatus==="waiting"?"入力が落ち着いたら紹介文の候補を作成します。":aiStatus==="ready"?"紹介文の候補ができました。内容を確認して採用できます。":aiStatus==="error"?"紹介文の確認事項があります。入力と作成済みの文章は残っています。":"情報を入力 → 紹介文の候補を自動作成 → 確認して採用"}</span><a href={`#${id}-writing-assistant`} className="text-button">{aiStatus==="error"?"確認事項を見る":"紹介文の候補を見る"}</a></div>}
     <fieldset disabled={disabled} className="intake-section"><legend>基本情報・稼働条件</legend><div className="intake-grid">
       {field("age", { inputMode: "numeric", maxLength: 20 })}
       <label className="intake-field" htmlFor={`${id}-gender`}><span>性別 <small>任意</small></span><select id={`${id}-gender`} value={fields.gender} onChange={event => set("gender", event.target.value)}>{genderOptions.map(option => <option key={option} value={option}>{option || "未回答"}</option>)}</select></label>
@@ -116,7 +127,7 @@ export function InterviewIntakeEditor({ candidateName, fields, onFieldsChange, i
     <fieldset disabled={disabled} className="intake-section"><legend>その他・補足</legend><div className="intake-grid">{field("additionalNotes", { multiline: true, maxLength: 2000, placeholder: "他の項目に当てはまらない情報、元シートの補足など。出所の行番号もそのまま残せます。", hint: "元の記載を社内確認用として保存し、共有文に自動挿入しません。内容や評価を推測して追加しません。" })}</div></fieldset>
 
     {ai?.enabled && <div id={`${id}-writing-assistant`} className="intake-writing-assistant"><CandidateAiAssistant candidateName={candidateName} fields={fields} memo={memo}
-      introduction={introduction} disabled={disabled} identityKey={ai.identityKey}
+      introduction={introduction} disabled={disabled} identityKey={ai.identityKey} inputRevision={inputRevision} onIntroductionStatus={setAiStatus}
       preferences={ai.preferences} onReadKit={ai.onReadKit} onGenerateKit={ai.onGenerateKit}
       onNotesChange={({memo: note,reflection})=>onFieldsChange({...fields,interviewMemo:note,selfReflection:reflection})}
       onSaveAdvice={text=>onFieldsChange({...fields,interviewAdvice:text})}

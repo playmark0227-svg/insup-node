@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {blankInterviewFields} from '../lib/candidate-intake.ts';
-import {reviewIntroductionSource,introductionEvidenceIssues,introductionDocument} from '../lib/introduction-review.ts';
+import {reviewIntroductionSource,introductionEvidenceIssues,introductionDocument,editedIntroductionIssues,introductionContentIssues} from '../lib/introduction-review.ts';
 
 const source=()=>({...blankInterviewFields(),workHistory:'ほうじんえいぎょうで、てれあぽを6か月担当。ひありんぐとりすとさくせい。',achievements:'1位',desiredHourlyRate:'3000',availableFrom:'2026-11-01',timeWindow:'9:00〜12:00',daysPerWeek:'週2日',monthlyHours:'月100時間'});
 test('source review proposes business spelling without replacing original or guessing names and places',()=>{
@@ -132,4 +132,38 @@ test('unsupported concrete career events are rejected without requiring source-i
 test('declining an optional personal attribute only removes it from prepared sharing evidence',()=>{
  for(const gender of ['回答しない','回答を控える','未回答']){const raw={...blankInterviewFields(),workHistory:'営業を担当。',gender},before=structuredClone(raw),review=reviewIntroductionSource(raw);assert.equal(review.fields.gender,'');assert.deepEqual(raw,before);}
  const raw={...blankInterviewFields(),gender:'女性'};assert.equal(reviewIntroductionSource(raw).fields.gender,'女性');assert.equal(raw.gender,'女性');
+});
+
+test('edited suggestions preserve the actual labelled candidate and still reject changes supported only by private notes',()=>{
+ const raw={...blankInterviewFields(),workHistory:'法人向け架電を担当。',additionalNotes:'内部のみ99件',interviewMemo:'社内メモ99件'},prepared=reviewIntroductionSource(raw).fields;
+ const okay='【基本情報】\n氏名：架空検証\n【営業経験・職務経歴】\n法人向けの架電を担当しています。';
+ assert.deepEqual(editedIntroductionIssues(okay,'架空検証',prepared),[]);
+ assert.ok(editedIntroductionIssues('氏名：別の候補者\n架空検証について記載。','架空検証',prepared).includes('candidate-name'));
+ assert.ok(editedIntroductionIssues(okay+'\n架電99件。','架空検証',prepared).includes('source-number'));
+ assert.ok(editedIntroductionIssues('','架空検証',prepared).includes('empty-draft'));
+ assert.ok(editedIntroductionIssues(okay+'文'.repeat(1001),'架空検証',prepared).includes('draft-length'));
+});
+
+
+test('personal reasons mixed into shared fields are withheld as whole fields while the original is preserved',()=>{
+ const raw={...blankInterviewFields(),workHistory:'法人営業を担当。家族の介護で退職。',pcSkills:'表計算を使用。持病で毎週通院しています',residence:'架空県',additionalNotes:'社内の健康確認'},before=structuredClone(raw);
+ const result=reviewIntroductionSource(raw);
+ assert.equal(result.fields.workHistory,'');assert.equal(result.fields.pcSkills,'');assert.equal(result.fields.residence,'架空県');
+ const check=result.checks.find(check=>check.code==='private-detail');assert.ok(check);assert.deepEqual(check.fields,['workHistory','pcSkills']);assert.match(check.detail,/原文は入力欄に残っています/);
+ assert.equal(result.revisions.length,0);assert.deepEqual(raw,before);
+});
+
+test('caregiving and healthcare occupations stay available while explicit personal family reasons are separated',()=>{
+ for(const history of ['介護職として施設で生活支援を担当。','看護師として病院勤務。患者の通院を支援。','保育施設で子どもの送迎を担当。']){
+  const result=reviewIntroductionSource({...blankInterviewFields(),workHistory:history});assert.equal(result.fields.workHistory,history);assert.ok(!result.checks.some(check=>check.code==='private-detail'));
+ }
+ for(const history of ['法人営業。子どもの送迎があり、午後は調整。','電話対応。子どもの発熱で休む可能性がある。'])assert.equal(reviewIntroductionSource({...blankInterviewFields(),workHistory:history}).fields.workHistory,'');
+});
+
+test('edited candidates cannot bypass the model content boundary with assessments private reasons or schema output',()=>{
+ const fields={...blankInterviewFields(),workHistory:'法人向けの架電を担当。'},base='【基本情報】\n氏名：架空検証\n【営業経験・職務経歴】\n法人向けの架電を担当。';
+ assert.ok(editedIntroductionIssues(base+'採用すべき優秀な即戦力人材です。','架空検証',fields).includes('source-assessment'));
+ assert.ok(editedIntroductionIssues(base+'持病で毎週通院しています。','架空検証',fields).includes('source-private-detail'));
+ for(const artifact of ['{"draft":"架空検証"}','{"type":"object","properties":{}}',JSON.stringify(JSON.stringify({draft:'架空検証'}))])assert.ok(introductionContentIssues(artifact).includes('source-format'));
+ assert.deepEqual(introductionContentIssues('介護職や看護師として病院勤務の経験を紹介します。'),[]);
 });
