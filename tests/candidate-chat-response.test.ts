@@ -97,3 +97,15 @@ test("the reported response cannot pass by merely separating its valid source me
   const text = `架空候補者の現在の状況をご説明します。稼働開始は2026年11月1日です。希望単価は月3000円です。sourceIds：[${recordId}, ${profileId}]`;
   assert.throws(() => normalizeCandidateChatAnswer(answer(text), context()), invalid);
 });
+
+test('a recorded payment period does not authorize inventing a different amount',()=>{
+ const source=context('時給1,850円');
+ for(const text of ['希望単価は時給9,300円です。','希望単価は9,300円/時と登録されています。','報酬は時給1,850円です。別途5,000円が必要です。'])assert.throws(()=>normalizeCandidateChatAnswer(answer(text,[profileId]),source),invalid,text);
+ const body=answer('希望単価は時給1,850円です。',[profileId]);assert.deepEqual(normalizeCandidateChatAnswer(body,source),body);
+});
+
+test('monetary notation normalization and numbered operational advice stay readable',()=>{
+ assert.equal(normalizeCandidateChatAnswer(answer('希望単価は月額300,000円です。',[profileId]),context('月額30万円')).answer,'希望単価は月額300,000円です。');
+ const prose='まず次の3点を確認してください。\n1. 希望単価の単位を確認。\n2. 面談候補日を確認。\n3. 担当者と進め方を相談。';
+ assert.equal(normalizeCandidateChatAnswer(answer(prose,[]),context()).answer,prose);
+});

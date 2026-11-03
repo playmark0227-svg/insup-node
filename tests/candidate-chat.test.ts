@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { answerCandidateFacts, buildCandidateChatContext, candidateChatProfileChoices, type CandidateChatContext } from "../lib/candidate-chat.ts";
+import { answerCandidateFacts, buildCandidateChatContext, candidateChatProfileChoices, selectCandidateChatContext, type CandidateChatContext } from "../lib/candidate-chat.ts";
 import { groupCandidates, type CandidateGroup } from "../lib/candidate-groups.ts";
 import { blankInterviewFields, type CandidateProfile } from "../lib/candidate-intake.ts";
 import type { CandidateRecord, InterviewReview } from "../lib/sheets-client.ts";
@@ -272,4 +272,82 @@ test("answers bound lengthy excerpts and cite displayed sources only; source rec
   assert.ok(answer.text.length < 8_000); assert.ok(answer.sourceIds.length <= 10); assert.match(answer.text, /省略/);
   assert.ok(answer.sourceIds.every(id => context.sources.some(source => source.id === id && answer.text.includes(source.label))));
   assert.deepEqual(records, before);
+});
+
+test('a factual followup resolves the user topic without importing assistant statements as evidence',()=>{
+ const p=profile();p.fields.desiredHourlyRate='時給1,850円';p.fields.workHistory='架空の電話営業経験';
+ const context=buildCandidateChatContext({group:group(),profiles:[p]});
+ const result=answerCandidateFacts(context,'それ詳しく',[{role:'user',content:'希望単価は？'},{role:'assistant',content:'時給9,300円です。'}]);
+ assert.match(result.text,/1,850円/);assert.doesNotMatch(result.text,/9,300|電話営業|記録は見つかりません/);
+ assert.deepEqual(result.sourceIds,['profile:p1']);
+});
+
+test('next interview lookup does not turn into a generic preparation or completion report',()=>{
+ const r=row();r.values[9]='2099-11-10';r.values[10]='12:00';r.values[16]='2000-10-20';r.values[22]='2099-12-01';
+ const result=answerCandidateFacts(buildCandidateChatContext({group:group([r]),profiles:[]}), '次回のC面談はいつ？');
+ assert.match(result.text,/C面談予定日：2099-11-10/);assert.match(result.text,/C面談予定開始時刻：12:00/);
+ assert.doesNotMatch(result.text,/2000-10-20|2099-12-01|希望単価|希望時間帯/);
+});
+
+test('next actions follow each proposal stage rather than repeat the full profile',()=>{
+ const scheduled=row('scheduled','山田太郎','ND-001','架空日程社');scheduled.values[9]='2099-11-10';scheduled.values[10]='12:00';
+ const resultWaiting=row('waiting','山田太郎','ND-001','架空回答社');resultWaiting.row=3;resultWaiting.values[16]='2000-10-20';resultWaiting.values[6]='面談実施（合否待ち）';
+ const context=buildCandidateChatContext({group:group([scheduled,resultWaiting]),profiles:[]});
+ const result=answerCandidateFacts(context,'次に確認することは？');
+ assert.match(result.text,/架空回答社：.*合否回答/);assert.match(result.text,/架空日程社：.*予定を確認/);
+ assert.ok(result.text.indexOf('架空回答社')<result.text.indexOf('架空日程社'));
+ assert.match(result.text,/未実施・不成立と断定できません/);assert.doesNotMatch(result.text,/希望単価が未登録|年齢|性別/);
+ assert.deepEqual(result.sourceIds,['waiting','scheduled']);
+});
+
+test('question context selects the exact condition and leaves raw records untouched',()=>{
+ const p=profile();p.fields.desiredHourlyRate='時給1,850円';p.fields.workHistory='この質問には関係しない長い職歴';p.fields.age='30';p.fields.interviewMemo='内部の面談メモ';
+ const context=buildCandidateChatContext({group:group(),profiles:[p]}),before=JSON.stringify(context);
+ const selected=selectCandidateChatContext(context,'それ詳しく',[{role:'user',content:'希望単価は？'},{role:'assistant',content:'別の金額です。'}]);
+ assert.equal(JSON.stringify(context),before);assert.equal(selected.sources.length,1);assert.deepEqual(selected.sources[0].facts,[{label:'希望単価',value:'時給1,850円'}]);
+ assert.doesNotMatch(JSON.stringify(selected),/内部の面談メモ|関係しない|年齢/);
+});
+
+test('question context uses exact company records and their linked profile rather than name substrings',()=>{
+ const a=row(),b=row('r2','山田太郎','ND-001','Alpha社第二支店');b.row=3;b.values[6]='別会社の進捗';
+ const p=profile('shared',['r1','r2']);p.fields.desiredHourlyRate='時給1,850円';
+ const context=buildCandidateChatContext({group:group([a,b]),profiles:[p]});
+ const selected=selectCandidateChatContext(context,'Alpha社の進捗は？');
+ assert.deepEqual(selected.sources.filter(source=>source.kind==='record').map(source=>source.id),['r1']);
+ assert.doesNotMatch(JSON.stringify(selected),/別会社の進捗/);
+});
+
+test('missing-information selection preserves an explicitly linked future appointment',()=>{
+ const r=row();r.values[9]='2099-11-10';r.values[6]='面談確定（面談実施待ち）';
+ const p=profile();p.fields.desiredHourlyRate='時給1,850円';p.fields.interviewAvailability='';
+ const context=buildCandidateChatContext({group:group([r]),profiles:[p]});
+ const selected=selectCandidateChatContext(context,'不足は？');
+ assert.ok(selected.sources.some(source=>source.facts.some(fact=>fact.label==='C面談予定日')));
+ assert.doesNotMatch(answerCandidateFacts(selected,'不足は？').text,/面談調整に使う候補日時/);
+});
+
+test('selected native context is bounded and marks source excerpts without changing identity boundaries',()=>{
+ const records=Array.from({length:28},(_,i)=>{const r=row(`selected-${i}`,'山田太郎','ND-001',`架空会社${i}`);r.row=i+2;r.values[12]='長い確認メモ'.repeat(350);return r;});
+ const p=profile('shared',records.map(record=>record.recordId));p.fields.workHistory='長い職歴'.repeat(1200);
+ const context=buildCandidateChatContext({group:group(records),profiles:[p]}),before=JSON.stringify(context);
+ const selected=selectCandidateChatContext(context,'職歴と各社の進捗をまとめて');
+ assert.ok(JSON.stringify(selected).length<=10_500);assert.ok(selected.sources.some(source=>source.kind==='profile'));assert.ok(selected.sources.length<=12);assert.match(JSON.stringify(selected),/省略/);assert.equal(JSON.stringify(context),before);
+ const blocked={...context,identityIssue:{code:'IDENTITY_SELECTION_REQUIRED' as const,message:'参照先を選択してください。'}};
+ assert.deepEqual(selectCandidateChatContext(blocked,'進捗は？').sources,[]);
+});
+
+test('context selection preserves familiar progress and career aliases without rewriting source fields',()=>{
+ const context:CandidateChatContext={candidateName:'架空確認者',omittedRecords:0,sources:[
+  {id:'legacy-r',kind:'record',label:'架空会社',facts:[{label:'会社名',value:'架空会社'},{label:'進捗',value:'C面談日程を確認中'}]},
+  {id:'legacy-p',kind:'profile',label:'面談基本情報',facts:[{label:'営業経験',value:'法人向けの電話営業を担当。'}]},
+ ]};
+ const before=JSON.stringify(context),progress=selectCandidateChatContext(context,'会社ごとの進捗と次の対応は？'),career=selectCandidateChatContext(context,'営業経験は？');
+ assert.ok(progress.sources[0].facts.some(fact=>fact.label==='進捗'&&fact.value==='C面談日程を確認中'));
+ assert.ok(career.sources.some(source=>source.facts.some(fact=>fact.label==='営業経験'&&fact.value==='法人向けの電話営業を担当。')));
+ assert.match(answerCandidateFacts(context,'営業経験は？').text,/法人向けの電話営業を担当/);assert.equal(JSON.stringify(context),before);
+});
+
+test('a context with only unrelated metadata does not pretend to contain an answer',()=>{
+ const context:CandidateChatContext={candidateName:'架空確認者',omittedRecords:0,sources:[{id:'metadata-only',kind:'record',label:'情報未登録',facts:[{label:'記録行',value:'2'},{label:'担当',value:'担当者'}]}]};
+ assert.deepEqual(selectCandidateChatContext(context,'希望単価は？').sources,[]);
 });

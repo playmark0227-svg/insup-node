@@ -237,3 +237,8 @@ test("other additions exclude exact previously displayed questions but detailed 
   ]);
   assert.equal(incorrectSummary.checks.length, 5);
 });
+
+test('next interview date is a factual lookup while next interview preparation remains an action request',()=>{
+ for(const question of ['次回の面談はいつ？','次のC面談は何時？','次回面談の日時を教えて'])assert.equal(classifyCandidateChatIntent(question),'question',question);
+ for(const question of ['次回面談の前に何を準備すればいい？','次回の面談に向けて確認することは？'])assert.equal(classifyCandidateChatIntent(question),'next-actions',question);
+});

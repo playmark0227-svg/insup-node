@@ -1,4 +1,4 @@
-import {interviewFieldLabels, normalizeInterviewFields, unicodeLength, type InterviewFields, type InterviewStringField} from "./candidate-intake.ts";
+import {interviewFieldLabels,interviewStringFields, normalizeInterviewFields, unicodeLength, type InterviewFields, type InterviewStringField} from "./candidate-intake.ts";
 
 export type IntroductionCheck = {code:string;fields:InterviewStringField[];title:string;detail:string};
 export type IntroductionRevision = {field:InterviewStringField;label:string;before:string;after:string};
@@ -19,6 +19,9 @@ const editableBusinessFields:InterviewStringField[]=["workHistory","achievements
 const numericText=(value:string)=>value.normalize("NFKC").replace(/(\d),(?=\d{3}(?:\D|$))/g,"$1");
 const ratePatterns=[/(?:時給|(?:円|万円)\s*[\/／]\s*(?:時(?:間)?|h)|(?:時(?:間)?)\s*(?:単価|(?:あたり|当たり)(?=\s*(?:約)?\d[\d,]*\s*(?:円|万円)))|\/hour\b)/i,/(?:日給|(?:円|万円)\s*[\/／]\s*日|日\s*(?:単価|(?:あたり|当たり)(?=\s*(?:約)?\d[\d,]*\s*(?:円|万円)))|日\s*\d[\d,]*\s*(?:円|万円)|\/day\b)/i,/(?:月給|月額|(?:円|万円)\s*[\/／]\s*月|月\s*(?:単価|(?:あたり|当たり)(?=\s*(?:約)?\d[\d,]*\s*(?:円|万円)))|月\s*\d[\d,]*\s*(?:円|万円)|\/month\b)/i,/(?:年収|年俸|(?:円|万円)\s*[\/／]\s*年|年\s*(?:単価|(?:あたり|当たり)(?=\s*(?:約)?\d[\d,]*\s*(?:円|万円)))|\/year\b)/i];
 const withRateUnit=(value:string)=>ratePatterns.some(pattern=>pattern.test(numericText(value)));
+// Explicit personal reasons, not occupations such as 介護職/看護師/病院勤務.
+// This is intentionally bounded; it is not a general health-data classifier.
+const personalDetail=/(?:持病(?:で|が|の治療|を治療|あり|有り)|通院(?:しています|しております|しており|しているため|をしています|をしております|中です|予定です)|(?:毎週|定期的に|週\d+回|月\d+回)[^。\n]{0,8}通院|(?:家族|両親|親|父|母|祖父|祖母)の介護(?:で|のため|があり|中|をして|に伴|により|に専念|が必要|と両立|による)|(?:子ども|子供|お子様|息子|娘)(?:の|が)[^。\n]{0,10}(?:発熱|体調不良|送迎|通院|入院)(?:で|のため|があり|あり|への対応|によ|をして|をする|が必要|など|[：:]|$))/;
 function businessSpelling(value:string,names:readonly string[]):string {
  const ranges:{start:number;end:number}[]=[];
  for(const match of value.matchAll(/「[^」\n]*」|『[^』\n]*』|(?:株式会社|有限会社|合同会社|一般社団法人|NPO法人)[^\s、。，,\n「」()（）]*|[^\s、。，,\n「」()（）]+(?:株式会社|有限会社|合同会社)|(?:氏名|会社名|企業名|勤務先|所属)[：:][^\n]+/g))ranges.push({start:match.index,end:match.index+match[0].length});
@@ -31,10 +34,13 @@ function businessSpelling(value:string,names:readonly string[]):string {
 /** Read-only preparation: fact checks and spelling proposals never mutate saved fields. */
 export function reviewIntroductionSource(raw:InterviewFields,protectedNames:readonly string[]=[]):IntroductionReview {
  const fields=normalizeInterviewFields(raw),checks:IntroductionCheck[]=[],revisions:IntroductionRevision[]=[],notes:string[]=[];
+ const add=(code:string,keys:InterviewStringField[],title:string,detail:string)=>checks.push({code,fields:keys,title,detail});
  // An explicit choice not to disclose an attribute is not client-facing evidence.
  if(/^(?:回答しない|回答を控える|未回答)$/.test(fields.gender.trim()))fields.gender="";
+ const privateFields:InterviewStringField[]=[];
+ for(const field of interviewStringFields)if(!["attendanceConcerns","additionalNotes","interviewMemo","selfReflection","interviewAdvice"].includes(field)&&personalDetail.test(fields[field])){privateFields.push(field);fields[field]="";}
+ if(privateFields.length)add("private-detail",privateFields,"共有文に入れない個人事情を分離",`${privateFields.map(field=>interviewFieldLabels[field]).join("・")}に個人の健康・家庭事情を含む記載があります。この項目は共有文から一旦省いています。共有できる経歴・条件と社内確認用の事情を分けて記録してください。原文は入力欄に残っています。`);
  for(const field of editableBusinessFields){const before=fields[field],after=businessSpelling(before,protectedNames);if(after!==before){fields[field]=after;revisions.push({field,label:interviewFieldLabels[field],before,after});}}
- const add=(code:string,keys:InterviewStringField[],title:string,detail:string)=>checks.push({code,fields:keys,title,detail});
  if(fields.desiredHourlyRate.trim()&&(/単位未確認|不明|どちら|未定|要確認/.test(fields.desiredHourlyRate)||/[\d０-９]/.test(fields.desiredHourlyRate)&&!withRateUnit(fields.desiredHourlyRate))){
   add("rate-unit",["desiredHourlyRate"],"希望単価の単位を確認","時給・日給・月額などの単位が読み取れません。単位を確認するまで、希望単価は共有本文へ入れません。原文は入力欄に残っています。");
   fields.desiredHourlyRate="";
@@ -193,7 +199,7 @@ function unsupportedAchievement(draft:string,source:string):boolean {
 
 /** Conservative, deterministic checks for material inventions; this is not a factual guarantee. */
 export function introductionEvidenceIssues(draft:string,candidateName:string,prepared:InterviewFields,memo=""):string[] {
- const source=[candidateName,factualFields(prepared),memo].join("\n"),knownNumbers=numbers(source),issues:string[]=[];
+ const source=[candidateName,factualFields(prepared),memo].join("\n"),knownNumbers=numbers(source),issues:string[]=introductionContentIssues(draft);
  const sourceParts=[...Object.entries(prepared).filter(([key])=>!["attendanceConcerns","additionalNotes","interviewMemo","selfReflection","interviewAdvice"].includes(key)).map(([,value])=>Array.isArray(value)?value.join(" "):value),memo];
  if([...numbers(draft)].some(value=>!knownNumbers.has(value)))issues.push("source-number");
  const lower=source.toLowerCase();if(tools.some(tool=>draft.toLowerCase().includes(tool.toLowerCase())&&!lower.includes(tool.toLowerCase())))issues.push("source-tool");
@@ -207,6 +213,30 @@ export function introductionEvidenceIssues(draft:string,candidateName:string,pre
  if(negatedExperienceIssues(draft,sourceParts))issues.push("experience-negation-changed");
  if(unsupportedAchievement(draft,source))issues.push("source-achievement");
  return [...new Set(issues)];
+}
+
+/** A user can polish the proposed wording without silently adding new facts. */
+export function editedIntroductionIssues(draft:string,candidateName:string,prepared:InterviewFields):string[] {
+ const issues:string[]=[];
+ if(!draft.trim())issues.push("empty-draft");
+ if(unicodeLength(draft)>1000)issues.push("draft-length");
+ const labelledName=draft.match(/(?:^|\n)\s*(?:氏名|候補者名|名前)\s*[：:]\s*([^\n]+)/)?.[1].trim();
+ if(candidateName.trim()&&(!draft.includes(candidateName.trim())||labelledName!==undefined&&labelledName!==candidateName.trim()))issues.push("candidate-name");
+ return [...new Set([...issues,...introductionEvidenceIssues(draft,candidateName,prepared)])];
+}
+
+/** Apply the same content boundary to a model draft or a manually polished candidate. */
+export function introductionContentIssues(draft:string):string[] {
+ const issues:string[]=[];
+ if(personalDetail.test(draft))issues.push("source-private-detail");
+ if(/採用(?:すべき|を推奨|適性|可否)|不採用(?:を推奨|にすべき)|(?:能力|適性|人物)(?:評価|スコア|点数)|\d+\s*点満点|即戦力(?:です|として|と判断|人材|の人材)|優秀な(?:人材|候補者)|ポテンシャル(?:が高|の高|に期待)|成長が期待/.test(draft))issues.push("source-assessment");
+ const schemaArtifact=/["'](?:\$schema|properties|required|additionalProperties|responseConstraint|minLength|maxLength|minItems|maxItems|draft|summary|questions|actions)["']\s*:|["']type["']\s*:\s*["'](?:object|array|string|integer|number|boolean|null)["']|```(?:json)?\s*[\[{]/i;
+ let decoded=draft;
+ for(let depth=0;depth<3;depth++){
+  if(schemaArtifact.test(decoded)){issues.push("source-format");break;}
+  try{const value:unknown=JSON.parse(decoded);if(value!==null&&typeof value==="object"){issues.push("source-format");break;}if(typeof value!=="string"||value===decoded)break;decoded=value;}catch{break;}
+ }
+ return issues;
 }
 
 /** Presentation-only parsing; all text remains escaped by React and copied unchanged. */
