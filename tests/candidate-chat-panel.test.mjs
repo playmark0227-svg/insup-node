@@ -23,7 +23,7 @@ function record(id, company, row) {
 }
 const initialGroup = () => ({ key: '["assigned","ND-001","架空候補者"]', name: "架空候補者", playerId: "ND-001",
   records: [record("record-a", "架空会社A", 2), record("record-b", "架空会社B", 3)] });
-const profileWithAmbiguities = () => ({ profileId: "profile-a", playerId: "ND-001", recordIds: ["record-a"],
+const profileWithAmbiguities = () => ({ profileId: "profile-a", playerId: "ND-001", recordIds: ["record-a", "record-b"],
   version: "profile-version", updatedAt: "2026-10-21T10:00:00Z", introduction: "",
   fields: { ...blankInterviewFields(), age: "20", gender: "男性", residence: "北海道札幌市",
     availableFrom: "2026-11-01", daysPerWeek: "週5日", monthlyHours: "80時間", desiredHourlyRate: "3000円",
@@ -121,6 +121,35 @@ test("same-name profiles cannot be sent together and choosing a profile scopes e
  assert.deepEqual(Array.from(context.sources,source=>source.id),['record-b','profile:profile-b']);
  assert.match(JSON.stringify(context),/人物B専用/);assert.doesNotMatch(JSON.stringify(context),/Salesforce|3000円|架空会社A/);
  h.unmount();
+});
+
+test("one known profile and an unlinked same-name record require a choice without losing the question",async()=>{
+ const group=initialGroup();group.records[0].profileId='profile-a';group.records[1].values[12]='未紐付けの別人メモ';
+ const profile={...profileWithAmbiguities(),recordIds:['record-a']};
+ const h=harness({props:{group,profiles:[profile]}});await flush();
+ const scopeOptions=nodes(h.render()).filter(node=>node.type==='option');
+ assert.equal(scopeOptions.find(node=>node.props.value==='all').props.disabled,true);
+ assert.ok(scopeOptions.some(node=>node.props.value==='profile:profile-a'),'the single known profile is an explicit choice');
+ h.change('希望条件を教えて');h.submit();await flush();
+ assert.equal(h.calls.device.length,0);assert.equal(h.calls.facts.length,0);assert.equal(h.input().props.value,'希望条件を教えて');
+ assert.match(h.text(),/基本情報に紐づいていない記録/);
+ h.scope('profile:profile-a');h.submit();await flush();
+ assert.equal(h.calls.device.length,1);assert.deepEqual(Array.from(h.calls.device[0][0].context.sources,source=>source.id),['record-a','profile:profile-a']);
+ assert.doesNotMatch(JSON.stringify(h.calls.device[0][0].context),/未紐付けの別人メモ|架空会社B/);
+ h.scope('record-b');h.change('メモは？');h.submit();await flush();
+ assert.equal(h.calls.device.length,2);assert.deepEqual(Array.from(h.calls.device[1][0].context.sources,source=>source.id),['record-b']);
+ assert.match(JSON.stringify(h.calls.device[1][0].context),/未紐付けの別人メモ/);
+ assert.doesNotMatch(JSON.stringify(h.calls.device[1][0].context),/3000円|profile-a|Salesforce/);
+ assert.equal(h.calls.device[1][0].history.length,0);h.unmount();
+});
+
+test("unlinked legacy history remains available by company while the identity uncertainty is visible",async()=>{
+ const h=harness({availability:'unavailable'});await flush();
+ assert.match(h.text(),/同じ名前だけで同一人物と決めず、会社・記録ごとに確認/);
+ assert.equal(nodes(h.render()).find(node=>node.type==='option'&&node.props.value==='all').props.disabled,false);
+ h.change('提案先ごとの進捗は？');h.submit();await flush();
+ assert.equal(h.calls.facts.length,1);assert.match(text(h.assistant()[0]),/架空会社A/);assert.match(text(h.assistant()[0]),/架空会社B/);
+ h.scope('record-b');assert.doesNotMatch(h.text(),/同じ名前だけで同一人物と決めず/);h.unmount();
 });
 
 test("selecting one record resolves multiple explicit identities without requiring profile documents",async()=>{

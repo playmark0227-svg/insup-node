@@ -116,6 +116,38 @@ test("multiple proposals sharing one profile remain usable without an unnecessar
  assert.equal(candidateChatProfileChoices(group([first,second]),[p]).length,1);
 });
 
+test("one known profile cannot absorb an unlinked same-name record or its review",()=>{
+ const first={...row(),profileId:'person-a'},unknown=row('r2','山田太郎','ND-001','別人の提案先');unknown.row=3;unknown.values[12]='別人の未紐付けメモ';
+ const person=profile('person-a',['r1']);person.fields.desiredHourlyRate='本人Aの単価';
+ const grouped=group([first,unknown]),reviews=[review('r1'),{...review('r2'),memo:'別人の未紐付け振り返り'}];
+ const blocked=buildCandidateChatContext({group:grouped,profiles:[person],reviews});
+ assert.equal(blocked.identityIssue?.code,'IDENTITY_SELECTION_REQUIRED');assert.deepEqual(blocked.sources,[]);
+ assert.match(blocked.identityIssue.message,/紐づいていない記録/);
+ assert.doesNotMatch(serialized(blocked),/本人Aの単価|別人の未紐付け/);
+ const selected=buildCandidateChatContext({group:grouped,profiles:[person],reviews,selectedProfileId:'person-a'});
+ assert.equal(selected.identityIssue,undefined);assert.deepEqual(selected.sources.map(source=>source.id),['r1','profile:person-a','review:r1']);
+ assert.match(serialized(selected),/本人Aの単価/);assert.doesNotMatch(serialized(selected),/別人の提案先|別人の未紐付け/);
+ const recordOnly=buildCandidateChatContext({group:{...grouped,records:[unknown]},profiles:[person],reviews});
+ assert.equal(recordOnly.identityIssue,undefined);assert.deepEqual(recordOnly.sources.map(source=>source.id),['r2','review:r2']);
+ assert.match(serialized(recordOnly),/別人の未紐付け/);assert.doesNotMatch(serialized(recordOnly),/本人Aの単価|profile:person-a/);
+ assert.equal(recordOnly.omittedRecords,0);
+});
+
+test("one profile's explicit legacy recordIds can establish a shared proposal history",()=>{
+ const first=row(),second=row('r2','山田太郎','ND-001','Beta社'),shared=profile('same-person',['r1','r2']);
+ shared.fields.workHistory='本人に紐づいた職歴';
+ const context=buildCandidateChatContext({group:group([first,second]),profiles:[shared]});
+ assert.equal(context.identityIssue,undefined);assert.deepEqual(context.sources.map(source=>source.id),['r1','r2','profile:same-person']);
+});
+
+test("a single explicit identity with unavailable profile data still excludes unbound legacy rows",()=>{
+ const known={...row(),profileId:'known-person'},unknown=row('r2');
+ const context=buildCandidateChatContext({group:group([known,unknown]),profiles:[]});
+ assert.equal(context.identityIssue?.code,'IDENTITY_SELECTION_REQUIRED');assert.deepEqual(context.sources,[]);
+ const selected=buildCandidateChatContext({group:group([known,unknown]),profiles:[],selectedProfileId:'known-person'});
+ assert.deepEqual(selected.sources.map(source=>source.id),['r1']);
+});
+
 test("single long field truncation and omitted profile documents have an explicit omission fact", () => {
   const p = profile(); p.fields.workHistory = "営業経験".repeat(2_000);
   const one = buildCandidateChatContext({ group: group(), profiles: [p] });
@@ -315,6 +347,19 @@ test('question context uses exact company records and their linked profile rathe
  const selected=selectCandidateChatContext(context,'Alpha社の進捗は？');
  assert.deepEqual(selected.sources.filter(source=>source.kind==='record').map(source=>source.id),['r1']);
  assert.doesNotMatch(JSON.stringify(selected),/別会社の進捗/);
+});
+
+test('company questions use explicit profile relationships even when the sixth company is absent from the shortened display label',()=>{
+ const records=Array.from({length:6},(_,index)=>{const record=row(`long-${index}`,'山田太郎','ND-001',`架空の長い会社名${index}ホールディングス株式会社`);record.row=index+2;record.profileId='shared';return record;});
+ const shared=profile('shared',records.map(record=>record.recordId));shared.fields.desiredHourlyRate='時給2,000円';shared.fields.timeWindow='平日9:00〜18:00';
+ const grouped=group(records),last=grouped.records[5],context=buildCandidateChatContext({group:grouped,profiles:[shared]}),before=serialized(context),company=last.values[1];
+ assert.doesNotMatch(context.sources.find(source=>source.kind==='profile').label,new RegExp(company));
+ const query=`${company}向けの希望単価と希望時間帯は？`,selected=selectCandidateChatContext(context,query);
+ assert.deepEqual(selected.sources.filter(source=>source.kind==='record').map(source=>source.id),[last.recordId]);
+ assert.deepEqual(selected.sources.filter(source=>source.kind==='profile').map(source=>source.id),['profile:shared']);
+ assert.match(serialized(selected),/時給2,000円|平日9:00〜18:00/);
+ const answer=answerCandidateFacts(context,query);assert.match(answer.text,/希望単価：時給2,000円/);assert.match(answer.text,/希望時間帯：平日9:00〜18:00/);
+ assert.ok(answer.sourceIds.includes('profile:shared'));assert.equal(serialized(context),before);
 });
 
 test('missing-information selection preserves an explicitly linked future appointment',()=>{

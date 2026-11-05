@@ -7,7 +7,7 @@ import * as management from "../lib/management-data.ts";
 import * as performance from "../lib/performance-metrics.ts";
 import * as candidateGroups from "../lib/candidate-groups.ts";
 import { businessToday } from "../lib/sheets-client.ts";
-import { linkedCandidateProfile } from "../lib/candidate-intake.ts";
+import { linkedCandidateProfile, introductionSourceKey } from "../lib/candidate-intake.ts";
 
 const source = ts.transpileModule(fs.readFileSync(new URL("../components/candidate-directory.tsx", import.meta.url), "utf8"), {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX },
@@ -292,7 +292,7 @@ function managerHarness(component, overrides = {}) {
           : name.includes("sheets-client") ? { businessToday }
             : name.includes("save-correction") ? { mutationDateErrors: () => ({}) }
               : name.includes("candidate-groups") ? candidateGroups
-                : name.includes("candidate-intake") && !name.includes("components") ? { linkedCandidateProfile,blankInterviewFields: () => ({ workHistory: "" }) }
+                : name.includes("candidate-intake") && !name.includes("components") ? { linkedCandidateProfile,introductionSourceKey,blankInterviewFields: () => ({ workHistory: "" }) }
                   : name.includes("node-data") ? { statuses: ["提案候補"], positions: ["アポインター", "FS"] }
                     : new Proxy({}, { get: (_, key) => key }),
   });
@@ -406,6 +406,24 @@ test("basic information retains the initial row and profile versions when saving
   assert.equal(h.calls[0][1].rowVersion, "version-current-record");
   assert.equal(h.calls[0][1].profileVersion, "initial-profile-version");
   assert.equal(h.calls[0][1].introduction, "確認した紹介文");
+});
+
+test("a changed saved condition cannot bypass introduction review by saving and reopening the profile",async()=>{
+ const original={version:'profile-original',fields:{workHistory:'確認した職歴',desiredHourlyRate:'時給2000円'},introduction:'共有本文：時給2000円'};
+ const h=managerHarness('BasicInfoDialog',{profile:original});
+ const editor=()=>nodes(h.render()).find(node=>node.type==='InterviewIntakeEditor');
+ assert.equal(h.button('基本情報を保存').props.disabled,true,'unchanged initial profile has no save');
+ const initialCallback=editor().props.onIntroductionReviewChange;
+ editor().props.onFieldsChange({...editor().props.fields,desiredHourlyRate:'時給3000円'});h.render();initialCallback(false);
+ assert.equal(h.button('基本情報を保存').props.disabled,true);
+ await nodes(h.render()).find(node=>node.type==='form').props.onSubmit({preventDefault(){}});
+ assert.equal(h.calls.length,0);assert.equal(h.closed(),0,'an unreviewed version cannot be saved and reopened as a fresh baseline');
+ editor().props.onIntroductionChange('共有本文：時給3000円');assert.equal(h.button('基本情報を保存').props.disabled,true);
+ editor().props.onIntroductionReviewChange(false);await nodes(h.render()).find(node=>node.type==='form').props.onSubmit({preventDefault(){}});
+ assert.equal(h.calls.length,1);assert.equal(h.closed(),1);
+ const persisted=h.calls[0][1],reopened=managerHarness('BasicInfoDialog',{profile:{...original,fields:persisted.fields,introduction:persisted.introduction}});
+ assert.equal(nodes(reopened.render()).find(node=>node.type==='InterviewIntakeEditor').props.introduction,'共有本文：時給3000円');
+ assert.doesNotMatch(text(reopened.render()),/紹介文が変更前の面談情報のまま/);
 });
 
 test("a home registration request waits for eligibility and is consumed only once", () => {

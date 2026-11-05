@@ -39,7 +39,7 @@ export type FollowUpTask = {
   candidateName: string;
   companyName: string;
   playerId: string;
-  kind: "interview_overdue" | "interview_today" | "result_waiting" | "start_overdue" | "missing_review" | "schedule_missing";
+  kind: "interview_overdue" | "interview_today" | "result_waiting" | "start_overdue" | "start_today" | "start_date_missing" | "missing_review" | "schedule_missing";
   urgency: "overdue" | "today" | "followup";
   title: string;
   evidence: string;
@@ -71,7 +71,7 @@ export function previousInsightPeriod(period: string): string | null {
 }
 const daysBetween = (earlier: string, later: string) => Math.floor((Date.parse(`${later}T00:00:00Z`) - Date.parse(`${earlier}T00:00:00Z`)) / 86_400_000);
 const endedStatus = (record: CandidateRecord) => /^(落選|辞退|案件枠埋まり|合格後離脱|稼働後離脱|C面談ブッチ)/.test(valueAt(record, 7)) || validInsightDate(valueAt(record, 26));
-const finishedRecord = (record: CandidateRecord) => endedStatus(record) || validInsightDate(valueAt(record, 24)) || valueAt(record, 7) === "稼働開始";
+const finishedRecord = (record: CandidateRecord) => endedStatus(record) || validInsightDate(valueAt(record, 24));
 
 /** Restrict records again even when a malformed client snapshot contains other owners. */
 export function scopedInsightRecords(snapshot: SheetSnapshot): CandidateRecord[] {
@@ -92,8 +92,10 @@ export function buildFollowUpTasks(snapshot: SheetSnapshot, today = insightToday
     const base = { recordId: record.recordId, candidateName: record.candidateName, companyName: valueAt(record, 2), playerId: record.playerId };
     const add = (task: Omit<FollowUpTask, keyof typeof base | "id">) => tasks.push({ ...base, ...task, id: `${record.recordId}:${task.kind}` });
     if (!finishedRecord(record)) {
-      if (validInsightDate(plannedStart) && plannedStart < today) {
-        add({ kind: "start_overdue", urgency: "overdue", title: "稼働開始の状況を確認", evidence: `稼働予定 ${plannedStart} · 開始日は未記録`, suggestedAction: "実際の開始日、または予定の変更を確認して記録する。", date: plannedStart });
+      if (validInsightDate(plannedStart) && plannedStart <= today) {
+        add({ kind: plannedStart===today?"start_today":"start_overdue", urgency: plannedStart===today?"today":"overdue", title: plannedStart===today?"今日の稼働開始を確認":"稼働開始の状況を確認", evidence: `稼働予定 ${plannedStart} · 開始日は未記録`, suggestedAction: "実際の開始日、または予定の変更を確認して記録する。", date: plannedStart });
+      } else if(valueAt(record,7)==="稼働開始") {
+        add({kind:"start_date_missing",urgency:"followup",title:"稼働開始日を確認",evidence:`進捗は稼働開始${validInsightDate(plannedStart)?` · 稼働予定 ${plannedStart}`:""} · 開始日は未記録`,suggestedAction:"開始済みか、進捗または予定日の入力違いかを確認する。実際に開始した場合だけ実施日を記録する。",date:validInsightDate(plannedStart)?plannedStart:today});
       } else if (validInsightDate(scheduled) && !validInsightDate(interviewed) && scheduled <= today) {
         add({ kind: scheduled === today ? "interview_today" : "interview_overdue", urgency: scheduled === today ? "today" : "overdue", title: scheduled === today ? "今日のC面談を確認" : "C面談の実施状況を確認", evidence: `C面談予定 ${scheduled}${valueAt(record, 11) ? ` ${valueAt(record, 11)}` : ""} · 実施日は未記録`, suggestedAction: scheduled === today ? "参加意思と日時を確認し、面談後に実施日を記録する。" : "実施、延期、辞退のいずれかを確認し、日付と進捗を更新する。", date: scheduled });
       } else if (validInsightDate(proposed) && proposed <= today && !scheduled && !interviewed && !offered && !matched && !plannedStart && !/^(提案なし|面談実施|合格|マッチ|稼働予定)/.test(valueAt(record, 7))) {

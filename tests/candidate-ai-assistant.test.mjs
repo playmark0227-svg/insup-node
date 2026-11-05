@@ -290,6 +290,15 @@ test('an adopted draft can restore the exact prior introduction and cannot overw
  const h=harness();await flush();h.click('文章をAIで整理・仕上げる');await flush();h.click('この文章を使う');h.click('確認して置き換える');assert.equal(h.calls.applied.at(-1),'端末AIの紹介文');h.render({introduction:'端末AIの紹介文'});assert.equal(h.button('採用前の文章に戻す').props.disabled,false);h.render({introduction:'採用後の手動編集'});assert.equal(h.button('採用前の文章に戻す').props.disabled,true);h.render({introduction:'端末AIの紹介文'});h.click('採用前の文章に戻す');assert.equal(h.calls.applied.at(-1),'現在の編集済み文章');assert.match(h.text(),/採用前の紹介文に戻しました/);h.unmount();
 });
 
+test('an old-source introduction cannot be restored as if it confirmed newer profile conditions',async()=>{
+ const h=harness();await flush();h.click('文章をAIで整理・仕上げる');await flush();h.click('この文章を使う');h.click('確認して置き換える');h.render({introduction:'端末AIの紹介文'});
+ assert.equal(h.button('採用前の文章に戻す').props.disabled,false);
+ const before=h.calls.applied.length;
+ h.render({fields:{...blankInterviewFields(),workHistory:'本人申告の営業経験',desiredHourlyRate:'時給3000円'}});
+ assert.equal(h.button('採用前の文章に戻す').props.disabled,true);assert.match(h.text(),/作成後に入力・設定が変わりました/);
+ h.button('採用前の文章に戻す').props.onClick();assert.equal(h.calls.applied.length,before,'a retained handler cannot mark old prose as reviewed');h.unmount();
+});
+
 test('unsupported model facts report only fixed useful reasons and never echo raw model diagnostics',async()=>{
  const h=harness({deviceIntroduction:async()=>{throw {code:'INVALID_RESPONSE',evidenceIssues:['rate-unit-changed','PRIVATE_MODEL_DETAIL']};}});await flush();h.click('文章をAIで整理・仕上げる');await flush();assert.match(h.text(),/時給・月額などの単位の取り違え/);assert.match(h.text(),/原文と現在の文章は残っています/);assert.doesNotMatch(h.text(),/PRIVATE_MODEL_DETAIL/);assert.equal(h.calls.applied.length,0);h.unmount();
 });

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {parseTeamWorkspace,teamCommentsFor,type TeamWorkspaceData} from "../lib/team-workspace.ts";
+import {parseTeamWorkspace,parseTeamWorkspaceExport,teamCommentsFor,type TeamWorkspaceData} from "../lib/team-workspace.ts";
 
 const id=(n:number)=>`00000000-0000-4000-8000-${String(n).padStart(12,"0")}`;
 const time="2026-11-05T01:00:00.000Z";
@@ -29,4 +29,16 @@ test("unsupported feature malformed dates roles statuses and duplicate identitie
 test("comment listing stays within a current published candidate and sorts reproducibly",()=>{
  const input=fixture();input.comments.push({...input.comments[0],commentId:id(10),createdAt:"2026-11-05T00:00:00.000Z"});
  assert.deepEqual(teamCommentsFor(input,id(1)).map(p=>p.commentId),[id(10),id(5)]);assert.deepEqual(teamCommentsFor(input,id(99)),[]);input.candidates[0].published=false;assert.deepEqual(teamCommentsFor(input,id(1)),[]);
+});
+
+
+test("admin archive retains comments on withdrawn publications while the shared-screen parser still refuses them",()=>{
+ const shared=fixture(),archive={...shared,scope:"all-saved-internal-shares",deletedCommentBodiesRedacted:true,players:shared.players.map(player=>({...player,active:false}))};archive.candidates[0].published=false;
+ const result=parseTeamWorkspaceExport(archive);assert.equal(result.candidates[0].published,false);assert.equal(result.comments.length,1);assert.equal(result.comments[0].body,"条件を確認します");assert.equal(result.players[0].active,false);assert.throws(()=>parseTeamWorkspace(archive),/非公開候補者/);
+});
+test("archive validation requires its explicit scope and redacted deleted-comment tombstones",()=>{
+ const shared=fixture(),archive={...shared,scope:"all-saved-internal-shares",deletedCommentBodiesRedacted:true,players:shared.players.map(player=>({...player,active:true}))};
+ assert.throws(()=>parseTeamWorkspaceExport({...archive,scope:"published-only"}));assert.throws(()=>parseTeamWorkspaceExport({...archive,deletedCommentBodiesRedacted:false}));
+ archive.comments[0].deleted=true;assert.throws(()=>parseTeamWorkspaceExport(archive),/削除済みコメントの本文/);archive.comments[0].body="";archive.comments[0].mentionIds=[];assert.equal(parseTeamWorkspaceExport(archive).comments[0].body,"");
+ archive.comments[0].publicationId=id(99);assert.throws(()=>parseTeamWorkspaceExport(archive),/共有先/);
 });

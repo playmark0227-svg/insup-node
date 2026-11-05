@@ -8,6 +8,8 @@ import * as management from '../lib/management-data.ts';
 import * as nodeData from '../lib/node-data.ts';
 import * as sheets from '../lib/sheets-client.ts';
 import * as correction from '../lib/save-correction.ts';
+import * as candidateGroups from '../lib/candidate-groups.ts';
+import * as performance from '../lib/performance-metrics.ts';
 
 const transpile = path => ts.transpileModule(fs.readFileSync(new URL(path, import.meta.url), 'utf8'), {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX },
@@ -20,7 +22,7 @@ const plain = value => JSON.parse(JSON.stringify(value));
 
 /** Exercise the actual parent form and its shared-editor contract. The child
  * editor's own typing/debounce behavior is covered by candidate-intake-editor. */
-function registration(overrides = {}) {
+function registration(overrides = {}, parent = false) {
   let cursor = 0, saveResult = true;
   const slots = [], effects = [], listeners = new Set(), saved = [], closed = [], registered = [];
   const react = {
@@ -36,7 +38,7 @@ function registration(overrides = {}) {
   } };
   const props = {
     players: [{ id: 'ND-001', name: '架空担当A', active: true }, { id: 'ND-002', name: '架空担当B', active: true }],
-    records: [], clients: [], knownNames: [], intakeEnabled: true, save,
+    records: [], clients: [], knownNames: [], intakeEnabled: true, save, busy:false, canWrite:true, live:false, admin:false, onSave:async()=>({}),
     ai: { enabled: true, identityKey: 'fictional-test-session', preferences: {}, onReadKit: async () => null, onGenerateKit: async () => null },
     onClose: () => closed.push(true), onExisting: () => {}, onRegistered: (...args) => registered.push(args), ...overrides,
   };
@@ -46,11 +48,12 @@ function registration(overrides = {}) {
       : name === '@/components/candidate-intake' ? { InterviewIntakeEditor: 'InterviewIntakeEditor' }
         : name === '@/lib/management-data' ? management : name === '@/lib/node-data' ? nodeData
           : name === '@/lib/sheets-client' ? sheets : name === '@/lib/save-correction' ? correction
+            : name === '@/lib/candidate-groups' ? candidateGroups : name === '@/lib/performance-metrics' ? performance
             : name.endsWith('.css') ? {} : new Proxy({}, { get: (_, key) => key });
   const window = { addEventListener: (_, listener) => listeners.add(listener), removeEventListener: (_, listener) => listeners.delete(listener) };
   vm.runInNewContext(unsavedSource, { exports: unsaved, module: { exports: unsaved }, require: dependencies, window });
   vm.runInNewContext(source, { exports, module: { exports }, require: dependencies });
-  function render(next = {}) { Object.assign(props, next); cursor = 0; const tree = exports.CreateCandidate(props); while (effects.length) effects.shift()(); return tree; }
+  function render(next = {}) { Object.assign(props, next); cursor = 0; const tree = parent ? exports.CandidateManager(props) : exports.CreateCandidate(props); while (effects.length) effects.shift()(); return tree; }
   const all = () => nodes(render());
   const input = suffix => { const node = all().find(node => node.props.id?.endsWith(suffix)); assert.ok(node, suffix); return node; };
   const editor = () => { const node = all().find(node => node.type === 'InterviewIntakeEditor'); assert.ok(node, 'shared interview editor exists'); return node; };
@@ -95,6 +98,7 @@ test('one registration submits shared interview fields introduction and optional
   h.editor().props.onFieldsChange(fields); h.render();
   h.editor().props.onIntroductionChange('【基本情報】\n氏名：架空太郎\n【営業経験・職務経歴】\n法人への架電を担当しています。');
   const date = sheets.businessToday(); h.change('-interview', date);
+  h.editor().props.onIntroductionReviewChange(false);
   assert.equal(h.editor().props.candidateName, '架空太郎'); assert.match(h.editor().props.ai.identityKey, /:new:ND-002$/);
   assert.equal(h.saved.length, 0, 'entering facts and prose does not save implicitly');
   await h.submit();
@@ -109,6 +113,7 @@ test('a refused save preserves candidate profile prose and date and allows retry
   const h = registration(); h.change('-name', '架空花子'); h.change('-interview', sheets.businessToday());
   const fields = { ...intake.blankInterviewFields(), pcEnvironment: 'Windows', strengths: '確認事項を記録する。' };
   h.editor().props.onFieldsChange(fields); h.render(); h.editor().props.onIntroductionChange('共有する文章の下書き'); h.render();
+  h.editor().props.onIntroductionReviewChange(false);
   h.setSaveResult(false); await h.submit();
   assert.equal(h.saved.length, 1); assert.equal(h.closed.length, 0); assert.equal(h.registered.length, 0);
   assert.equal(h.input('-name').props.value, '架空花子'); assert.equal(h.input('-interview').props.value, sheets.businessToday());
@@ -116,6 +121,26 @@ test('a refused save preserves candidate profile prose and date and allows retry
   assert.match(text(h.render()), /保存を開始できませんでした/);
   h.setSaveResult(true); await h.submit();
   assert.deepEqual(h.saved[1].payload, h.saved[0].payload); assert.deepEqual(h.registered, [['架空花子', 'ND-001']]); h.unmount();
+});
+
+test('registration cannot persist an unreviewed introduction and an older owner callback cannot confirm it',async()=>{
+ const h=registration();h.change('-name','架空確認候補者');
+ h.editor().props.onFieldsChange({...intake.blankInterviewFields(),desiredHourlyRate:'時給2000円'});h.render();
+ h.editor().props.onIntroductionChange('本文：時給2000円');h.editor().props.onIntroductionReviewChange(false);h.render();
+ const priorCallback=h.editor().props.onIntroductionReviewChange;
+ h.editor().props.onFieldsChange({...h.editor().props.fields,desiredHourlyRate:'時給3000円'});h.render();
+ priorCallback(false);assert.equal(h.button('候補者を登録').props.disabled,true);
+ await h.submit();assert.equal(h.saved.length,0);assert.equal(h.registered.length,0);assert.equal(h.editor().props.introduction,'本文：時給2000円');
+ h.editor().props.onIntroductionChange('本文：時給3000円');assert.equal(h.button('候補者を登録').props.disabled,true);
+ h.editor().props.onIntroductionReviewChange(false);assert.equal(h.button('候補者を登録').props.disabled,false);
+ const ownerCallback=h.editor().props.onIntroductionReviewChange;h.change('-owner','ND-002');ownerCallback(false);
+ assert.equal(h.button('候補者を登録').props.disabled,true,'previous-owner notification cannot approve the new registration target');
+ h.editor().props.onIntroductionReviewChange(false);await h.submit();assert.equal(h.saved.length,1);assert.equal(h.saved[0].payload.fields.desiredHourlyRate,'時給3000円');assert.equal(h.saved[0].payload.introduction,'本文：時給3000円');h.unmount();
+});
+
+test('registration can save fields with no introduction without waiting for a prose review',async()=>{
+ const h=registration();h.change('-name','架空本文なし候補者');h.editor().props.onFieldsChange({...intake.blankInterviewFields(),workHistory:'確認した職歴'});
+ assert.equal(h.button('候補者を登録').props.disabled,false);await h.submit();assert.equal(h.saved.length,1);assert.equal(h.saved[0].payload.introduction,'');h.unmount();
 });
 
 test('automatic prose callbacks do not save and a cancelled discard keeps all registration inputs', () => {
@@ -144,4 +169,21 @@ test('a protocol downgrade cannot silently drop an open interview draft and an o
  const fields={...intake.blankInterviewFields(),workHistory:'保存前の職歴を保持'};h.editor().props.onFieldsChange(fields);h.editor().props.onIntroductionChange('共有用の紹介文を保持');h.render({intakeEnabled:false});
  assert.ok(h.editor());assert.equal(h.button('候補者を登録').props.disabled,true);await h.submit();assert.equal(h.saved.length,0);assert.equal(h.editor().props.introduction,'共有用の紹介文を保持');assert.equal(h.editor().props.fields.workHistory,'保存前の職歴を保持');h.unmount();
  const old=registration({intakeEnabled:false});old.change('-name','架空旧連携');await old.submit();assert.equal(old.saved.length,1);assert.equal(Object.hasOwn(old.saved[0].payload,'fields'),false);assert.equal(Object.hasOwn(old.saved[0].payload,'introduction'),false);assert.equal(Object.hasOwn(old.saved[0].payload,'interviewDate'),false);old.unmount();
+});
+
+
+test('after registration the parent only offers basic information when that backend feature is supported',()=>{
+ for(const enabled of [false,true]){
+  const h=registration({intakeEnabled:enabled},true);
+  h.click('候補者を登録');
+  const create=h.all().find(node=>typeof node.type==='function'&&node.type.name==='CreateCandidate');
+  assert.ok(create);create.props.onRegistered('架空互換候補','ND-001');
+  const values=Array(26).fill('');values[2]='架空互換候補';values[3]='架空担当A';values[6]='提案候補';
+  h.render({records:[{recordId:'compatibility-candidate-record',rowVersion:'compatibility-version',row:2,playerId:'ND-001',candidateName:'架空互換候補',source:'',values,formulaColumns:[]}]});
+  const label=enabled?'登録した基本情報・紹介文を開く':'登録した候補者の提案・履歴を確認';
+  h.click(label);
+  assert.ok(h.all().some(node=>typeof node.type==='function'&&node.type.name===(enabled?'BasicInfoDialog':'RecordEditor')));
+  assert.ok(!h.all().some(node=>typeof node.type==='function'&&node.type.name===(enabled?'RecordEditor':'BasicInfoDialog')));
+  h.unmount();
+ }
 });
