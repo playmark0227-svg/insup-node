@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { filterCandidateGroups, groupCandidates, sortCandidateGroups, candidateAppointments, candidateFilterCount } from "../lib/candidate-groups.ts";
 import type { CandidateRecord } from "../lib/sheets-client.ts";
+import { blankInterviewFields, type CandidateProfile } from "../lib/candidate-intake.ts";
 
 function record(id: string, name: string, playerId = "ND-001", row = 2): CandidateRecord {
   const values: CandidateRecord["values"] = Array(26).fill("");
@@ -157,4 +158,57 @@ test("next-appointment sorting uses each person's earliest unfinished plan and s
  assert.deepEqual(sortCandidateGroups(groups,{field:"appointment",direction:"asc"},"2026-10-30").map(g=>g.name),["A","B","D","C"]);
  assert.deepEqual(sortCandidateGroups(groups,{field:"appointment",direction:"desc"},"2026-10-30").map(g=>g.name),["B","D","A","C"]);
  assert.deepEqual(sortCandidateGroups([...groups].reverse(),{field:"appointment",direction:"desc"},"2026-10-30").map(g=>g.key),sortCandidateGroups(groups,{field:"appointment",direction:"desc"},"2026-10-30").map(g=>g.key));
+});
+
+function profile(row:CandidateRecord,fields:Partial<CandidateProfile["fields"]>,id=row.profileId||`profile-${row.recordId}`):CandidateProfile {
+ return {profileId:id,playerId:row.playerId,recordIds:[row.recordId],version:"version",updatedAt:"2026-11-05T00:00:00Z",fields:{...blankInterviewFields(),...fields},introduction:"紹介文だけの内容は検索しない"};
+}
+
+test("professional profile words are searchable only through an exact, unambiguous record and owner relationship",()=>{
+ const row={...record("same-name-a","同じ氏名","ND-001"),profileId:"profile-a"},other={...record("same-name-b","同じ氏名","ND-002"),profileId:"profile-b"};
+ const profiles=[profile(row,{workHistory:"法人営業でテレアポ",achievements:"月20件",strengths:"ヒアリング",pcSkills:"表計算",pcEnvironment:"Windows",networkEnvironment:"光回線",crmTools:["kintone"],chatTools:["Slack"],timeWindow:"平日9時〜18時",daysPerWeek:"週3日",monthlyHours:"月80時間",availableFrom:"11月中旬",workStyle:"在宅",sideJob:"副業",desiredHourlyRate:"2000円/時",interviewAvailability:"火曜日午後"}),profile(other,{workHistory:"別の担当の専門商材"})];
+ const groups=groupCandidates([row,other],"registration-desc"),before=structuredClone({groups,profiles});
+ for(const query of ["法人営業 テレアポ","月20件","ヒアリング","表計算","Windows kintone","Slack","平日9時","週3日 月80時間","11月中旬","在宅 副業","2000円/時","火曜日午後"]){const matches=filterCandidateGroups(groups,{...all,search:query},"2026-11-05",profiles);assert.deepEqual(matches.map(group=>group.playerId),["ND-001"],query);}
+ assert.equal(filterCandidateGroups(groups,{...all,owner:"ND-001",search:"別の担当の専門商材"},"2026-11-05",profiles).length,0);
+ assert.equal(filterCandidateGroups(groups,{...all,search:"紹介文だけの内容"},"2026-11-05",profiles).length,0);
+ assert.deepEqual({groups,profiles},before,"searching does not change saved profiles or proposals");
+ const stale={...profiles[0],profileId:"stale-profile"};assert.equal(filterCandidateGroups(groups,{...all,search:"法人営業"},"2026-11-05",[stale]).length,0);
+ const wrongOwner={...profiles[0],playerId:"ND-002"};assert.equal(filterCandidateGroups(groups,{...all,search:"法人営業"},"2026-11-05",[wrongOwner]).length,0);
+ const ambiguous=[profiles[0],{...profiles[0],version:"duplicate"}];assert.equal(filterCandidateGroups(groups,{...all,search:"法人営業"},"2026-11-05",ambiguous).length,0);
+ const noLink={...profiles[0],recordIds:[other.recordId]};assert.equal(filterCandidateGroups(groups,{...all,search:"法人営業"},"2026-11-05",[noLink]).length,0);
+});
+
+test("manual tool and condition filters must match the same proposal as its company and progress",()=>{
+ const first={...record("professional-a","候補者","ND-001",2),profileId:"profile-a"},second={...record("professional-b","候補者","ND-001",3),profileId:"profile-b"};
+ first.values[1]="会社A";first.values[6]="提案候補";second.values[1]="会社B";second.values[6]="提案完了";
+ const profiles=[profile(first,{pcEnvironment:"Windows",crmTools:["kintone"],workHistory:"法人営業を担当",strengths:"ヒアリング",timeWindow:"平日",daysPerWeek:"週3日"}),profile(second,{pcEnvironment:"MacBook",crmTools:["Salesforce"],workHistory:"カスタマーサポート",timeWindow:"土日"})];
+ const groups=groupCandidates([first,second],"registration-desc"),filter={...all,company:"会社A",status:"提案候補",pcEnvironment:"Windows",crmTool:"kintone",experienceKeyword:"法人営業 ヒアリング",availabilityKeyword:"平日 週3日"};
+ assert.equal(candidateFilterCount(filter),6);
+ const result=filterCandidateGroups(groups,filter,"2026-11-05",profiles);assert.equal(result.length,1);assert.equal(result[0].records.length,2,"all proposal history remains visible");
+ for(const change of [{company:"会社B"},{status:"提案完了"},{pcEnvironment:"MacBook"},{crmTool:"Salesforce"},{experienceKeyword:"カスタマーサポート"},{availabilityKeyword:"土日"}])assert.equal(filterCandidateGroups(groups,{...filter,...change},"2026-11-05",profiles).length,0,JSON.stringify(change));
+});
+
+test("free-text negation cannot become registered CRM experience or inferred candidate suitability",()=>{
+ const row={...record("unexperienced","候補者"),profileId:"profile-no-experience"},profiles=[profile(row,{workHistory:"営業未経験。コールセンターは未経験。",crmOther:"Salesforce未経験",attendanceConcerns:"社内だけの個人事情",additionalNotes:"社内だけの補足",interviewMemo:"社内だけの面談メモ",selfReflection:"担当者の反省",interviewAdvice:"以前のAI助言",age:"99歳",gender:"検索対象外の属性"})],groups=groupCandidates([row],"registration-desc");
+ assert.equal(filterCandidateGroups(groups,{...all,experienceKeyword:"営業未経験"},"2026-11-05",profiles).length,1,"literal recorded words may be searched");
+ assert.equal(filterCandidateGroups(groups,{...all,experienceKeyword:"営業経験あり"},"2026-11-05",profiles).length,0);
+ assert.equal(filterCandidateGroups(groups,{...all,crmTool:"Salesforce"},"2026-11-05",profiles).length,0,"mentioning a tool in prose does not select that experience");
+ for(const query of ["社内だけの個人事情","社内だけの補足","社内だけの面談メモ","担当者の反省","以前のAI助言","99歳","検索対象外の属性"])assert.equal(filterCandidateGroups(groups,{...all,search:query},"2026-11-05",profiles).length,0,query);
+});
+
+test("missing tool filters include missing linked profiles while positive filters require a recorded value",()=>{
+ const blank=record("blank-profile","記載なし"),noProfile=record("no-profile","基本情報なし"),known=record("known-profile","記載あり"),profiles=[profile(blank,{}),profile(known,{pcEnvironment:"Windows",crmTools:["kintone"]})],groups=groupCandidates([blank,noProfile,known],"registration-desc");
+ for(const filter of [{pcEnvironment:null},{crmTool:null}])assert.deepEqual(filterCandidateGroups(groups,{...all,...filter},"2026-11-05",profiles).map(group=>group.name).sort(),["基本情報なし","記載なし"].sort());
+ assert.deepEqual(filterCandidateGroups(groups,{...all,pcEnvironment:"Windows"},"2026-11-05",profiles).map(group=>group.name),["記載あり"]);
+ assert.equal(filterCandidateGroups(groups,{...all,pcEnvironment:"MacBook"},"2026-11-05",profiles).length,0);
+ assert.equal(candidateFilterCount({...all,experienceKeyword:"   ",availabilityKeyword:"\t"}),0);
+});
+
+test("tomorrow prepares unfinished appointments across year and leap-month boundaries",()=>{
+ const make=(id:string,date:string,kind=10)=>{const row=record(id,id);row.values[kind-1]=date;return row;};
+ const nextYear=make("next-year","2027-01-01"),later=make("later","2027-01-02"),today=make("today","2026-12-31"),done=make("done","2027-01-01");done.values[16]="2027-01-01";
+ assert.deepEqual(filterCandidateGroups(groupCandidates([nextYear,later,today,done],"registration-desc"),{...all,appointment:"tomorrow"},"2026-12-31").map(group=>group.name),["next-year"]);
+ const leap=make("leap","2028-02-29",18),march=make("march","2028-03-01",23),groups=groupCandidates([leap,march],"registration-desc");
+ assert.deepEqual(filterCandidateGroups(groups,{...all,appointment:"tomorrow"},"2028-02-28").map(group=>group.name),["leap"]);
+ assert.deepEqual(filterCandidateGroups(groups,{...all,appointment:"tomorrow"},"2028-02-29").map(group=>group.name),["march"]);
 });

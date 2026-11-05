@@ -54,6 +54,27 @@ test("provenance is attached only to the narrative fields that contain self repo
   assert.match(all.attributionNotes.summary, /^総評の職歴・実績・強みに関する記載には本人申告/);
 });
 
+test("self report wording already present in a narrative is not prefixed with a duplicate source note",()=>{
+ const plan=buildIntroductionPlan("架空確認卯",{...blankInterviewFields(),workHistory:"本人申告：法人営業を担当。",achievements:"本人申告：営業会社で1位。"},settings());
+ const bodies={experience:"本人申告：法人営業を担当していました。",results:"営業会社で1位の実績があるとの申告です。",summary:"本人から法人営業の担当経験を伺っています。"};
+ const text=composeIntroductionPlan(plan,bodies);
+ assert.match(text,/【営業経験・職務経歴】\n本人申告：法人営業/);
+ assert.doesNotMatch(text,/職歴には本人申告の内容を含みます|実績には本人申告の内容を含みます|総評の職歴・実績/);
+ assert.equal((text.match(/本人申告/g)||[]).length,1);
+ const withoutQualification=composeIntroductionPlan(plan,{experience:"法人営業を担当していました。"});
+ assert.match(withoutQualification,/【営業経験・職務経歴】\n職歴には本人申告の内容を含みます。\n法人営業/);
+});
+
+test("a rank keeps the source's unconfirmed period and comparison scope even when the model omits them",()=>{
+ const fields={...blankInterviewFields(),workHistory:"本人申告：法人営業を3年担当。",achievements:"営業会社で1位の実績。本人申告。期間と比較した人数は未確認。"},before=structuredClone(fields);
+ const plan=buildIntroductionPlan("架空確認辰",fields,settings());
+ const omitted=composeIntroductionPlan(plan,{experience:"法人営業を3年担当していました。",results:"営業会社で1位の実績があります。",summary:"法人営業の経験があり、営業会社で1位の実績があります。"});
+ assert.equal((omitted.match(/順位の確認範囲：期間と比較した人数は未確認。/g)||[]).length,2);
+ const retained=composeIntroductionPlan(plan,{results:"営業会社で1位の実績。期間と比較人数は未確認です。"});
+ assert.doesNotMatch(retained,/順位の確認範囲/);assert.match(retained,/実績には本人申告/);
+ assert.deepEqual(fields,before);
+});
+
 test("saved order and summary setting control assembly and unsupported bodies cannot alter fixed facts", () => {
   const prefs = { ...settings(), sectionOrder: ["tools", "results", "basic", "availability", "experience", "summary"] as IntroductionPlanSettings["sectionOrder"], includeSummary: false };
   const plan = buildIntroductionPlan("架空確認庚", { ...blankInterviewFields(), pcEnvironment: "Windows", workHistory: "接客を担当。", strengths: "応対内容を記録。" }, prefs);

@@ -495,6 +495,7 @@ export function useSheetsConnection() {
     let owned: unknown;
     try { owned = JSON.parse(JSON.stringify(payload)); } catch { throw new SheetApiError("INVALID_PAYLOAD", "入力内容を確認してください。"); }
     if (!operationId || !owned || typeof owned !== "object") throw new SheetApiError("INVALID_PAYLOAD", "入力内容を確認してください。");
+    if(action==="createCandidate"&&Object.hasOwn(owned,"fields")&&!current.candidateRegistrationFeature)throw new SheetApiError("FEATURE_UNAVAILABLE","一括登録の連携更新が必要です。入力を残したまま接続状態を確認してください。");
     const dateErrors=mutationDateErrors(action,owned);
     if(Object.keys(dateErrors).length)throw new SheetApiError("INVALID_DATE",Object.values(dateErrors)[0]);
     const g=generation.current, savedToken=token.current, account=`${current.self.role}:${current.self.playerId}`;
@@ -694,6 +695,24 @@ export function useSheetsConnection() {
     finally{if(isCurrent(g)){mutationRunning.current=false;setBusy(false);}}
   };
 
+  // Bind collaborative requests to this exact login, including callbacks held by a hidden panel.
+  const teamGeneration=generation.current,teamToken=token.current;
+  const readTeamWorkspace=async<T,>():Promise<T>=>{
+    if(!teamToken||!snapshot||!isCurrent(teamGeneration)||token.current!==teamToken)throw new SheetApiError("STALE_SESSION","ログイン状態が変わりました。社内共有を開き直してください。");
+    try{const result=await sheetRequest<T>(endpoint,"readTeamWorkspace",{},{token:teamToken,background:true});if(!isCurrent(teamGeneration)||token.current!==teamToken)throw new SheetApiError("STALE_SESSION","ログイン状態が変わりました。");return result;}
+    catch(error){if(isCurrent(teamGeneration)&&isExpired(error))expire(error);throw error;}
+  };
+  const mutateTeam=async(action:"publishTeamCandidate"|"unpublishTeamCandidate"|"saveTeamComment"|"saveTeamJob",payload:unknown,operationId:string):Promise<void>=>{
+    if(!teamToken||!snapshot||!isCurrent(teamGeneration)||token.current!==teamToken)throw new SheetApiError("STALE_SESSION","ログイン状態が変わりました。社内共有を開き直してください。");
+    if(!latestSnapshot.current?.teamWorkspaceFeature||!latestSnapshot.current.writesEnabled)throw new SheetApiError("READ_ONLY","社内共有は現在保存できません。接続状態を確認してください。");
+    if(!["publishTeamCandidate","unpublishTeamCandidate","saveTeamComment","saveTeamJob"].includes(action))throw new SheetApiError("INVALID_ACTION","社内共有の操作を確認してください。");
+    if(mutationRunning.current||hasPendingBackground()||loginRunning.current)throw new SheetApiError("MUTATION_PENDING","右上の保存結果を確認してから社内共有を保存してください。");
+    mutationRunning.current=true;++requestVersion.current;activeRequest.current?.abort();activeRequest.current=null;setBusy(true);
+    try{const result=await sheetRequest<MutationReceipt>(endpoint,action,payload,{token:teamToken,operationId,responseMode:"receipt"});if(!isCurrent(teamGeneration)||token.current!==teamToken)throw new SheetApiError("STALE_SESSION","ログイン状態が変わりました。保存結果を確認してください。");assertMutationReceipt(result,operationId);}
+    catch(error){if(isCurrent(teamGeneration)&&isExpired(error))expire(error);throw error;}
+    finally{if(isCurrent(teamGeneration)){mutationRunning.current=false;setBusy(false);resumeBackgroundLatest.current();}}
+  };
+
   const logout = async () => {
     // Older deployments return no outbox secret and cannot accept new local
     // saves. They must still let the user clear this session without deleting
@@ -710,7 +729,7 @@ export function useSheetsConnection() {
   };
 
   return { ready, endpoint, mode, players, setPlayers, activities, setActivities, snapshot, snapshotSource, cachedAt, authenticated, mustChangePassword, loadPhase, busy, error,
-    syncing, syncError, backgroundSave, hasPendingSave, submitMutation, retryBackgroundSave, dismissBackgroundSave, readBackgroundSaveCorrection, correctBackgroundSave, copyBackgroundIntakeInput, credentials, dismissCredentials:() => setCredentials(null), connect, login, logout, refresh, mutate, readManagement, readOperational, mutateOperational, analyzeReviews, readAdvice, analyzeInsights, readInsights, readWritingKit, generateWritingKit, readWritingPreferences, saveWritingPreferences, readSecurity, changePassword, showDemo };
+    syncing, syncError, backgroundSave, hasPendingSave, submitMutation, retryBackgroundSave, dismissBackgroundSave, readBackgroundSaveCorrection, correctBackgroundSave, copyBackgroundIntakeInput, credentials, dismissCredentials:() => setCredentials(null), connect, login, logout, refresh, mutate, readManagement, readOperational, mutateOperational, readTeamWorkspace, mutateTeam, analyzeReviews, readAdvice, analyzeInsights, readInsights, readWritingKit, generateWritingKit, readWritingPreferences, saveWritingPreferences, readSecurity, changePassword, showDemo };
 }
 
 function saveLabel(action: string) {
@@ -744,7 +763,7 @@ function backgroundIntakeBody(action:string,payload:unknown):Record<string,unkno
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
   const data=payload as Record<string,unknown>;
   const activity=data.activity && typeof data.activity === "object" && !Array.isArray(data.activity) ? data.activity as Record<string,unknown> : null;
-  const raw=action === "saveCandidateProfile" ? data : action === "saveActivity" ? activity?.interviewProfile : null;
+  const raw=(action === "saveCandidateProfile" || action === "createCandidate") ? data : action === "saveActivity" ? activity?.interviewProfile : null;
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const body=raw as Record<string,unknown>;
   return body.fields && typeof body.fields === "object" && !Array.isArray(body.fields) ? body : null;

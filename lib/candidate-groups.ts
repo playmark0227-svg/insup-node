@@ -1,5 +1,6 @@
 import { sortCandidateRecords, statusTone, valueAt, type CandidateSort } from "./management-data.ts";
 import type { CandidateRecord } from "./sheets-client.ts";
+import { linkedCandidateProfile, type CandidateProfile, type InterviewFields } from "./candidate-intake.ts";
 
 export type CandidateGroup = {
   key: string;
@@ -8,12 +9,14 @@ export type CandidateGroup = {
   records: CandidateRecord[];
 };
 
-export type CandidateAppointmentFilter = "all" | "overdue" | "today" | "future" | "none";
+export type CandidateAppointmentFilter = "all" | "overdue" | "today" | "tomorrow" | "future" | "none";
 export type CandidateProfileFilter = "all" | "with" | "without";
 export type CandidateGroupFilter = {
   owner: string; status: string; search: string;
   statuses?: string[]; company?: string | null;
   appointment?: CandidateAppointmentFilter; profile?: CandidateProfileFilter;
+  pcEnvironment?: string | null; crmTool?: string | null;
+  experienceKeyword?: string; availabilityKeyword?: string;
 };
 export type CandidateGroupSort = { field: "interview" | "name" | "appointment" | "records"; direction: "asc" | "desc" };
 export const candidateSortFields = [
@@ -26,6 +29,7 @@ export const candidateAppointmentFilters = [
   { value: "all", label: "すべての予定" },
   { value: "overdue", label: "予定日を過ぎたもの" },
   { value: "today", label: "今日の予定" },
+  { value: "tomorrow", label: "明日の予定・前日準備" },
   { value: "future", label: "明日以降の予定" },
   { value: "none", label: "予定の登録なし" },
 ] as const;
@@ -55,8 +59,22 @@ export function candidateAppointments(records: readonly CandidateRecord[], today
 export function candidateFilterCount(filter: CandidateGroupFilter): number {
   return Number(filter.owner !== "all") + Number(!!filter.statuses?.length || filter.status !== "all")
     + Number(filter.company !== undefined) + Number(!!filter.appointment && filter.appointment !== "all")
-    + Number(!!filter.profile && filter.profile !== "all");
+    + Number(!!filter.profile && filter.profile !== "all")
+    + Number(filter.pcEnvironment !== undefined) + Number(filter.crmTool !== undefined)
+    + Number(!!filter.experienceKeyword?.trim()) + Number(!!filter.availabilityKeyword?.trim());
 }
+
+const availabilityFields = ["availableFrom", "timeWindow", "daysPerWeek", "monthlyHours", "workStyle", "sideJob", "desiredHourlyRate", "interviewAvailability"] as const;
+const experienceFields = ["workHistory", "achievements", "strengths", "pcSkills"] as const;
+/** Search only explicitly linked, recorded professional fields. Dedicated
+ * attendance concerns, internal notes and protected-attribute fields are excluded. */
+const searchableProfileFields = [...experienceFields, ...availabilityFields, "pcEnvironment", "networkEnvironment", "crmOther", "chatOther"] as const;
+const normalizedSearch = (value:string) => value.normalize("NFKC").toLocaleLowerCase("ja");
+const matchesWords = (value:string, query:string) => {
+  const recorded=normalizedSearch(value);
+  return normalizedSearch(query).trim().split(/\s+/).filter(Boolean).every(word=>recorded.includes(word));
+};
+const profileText = (fields:InterviewFields|undefined, keys:readonly (keyof InterviewFields)[]) => fields ? keys.flatMap(key=>fields[key]).join(" ") : "";
 
 /** Optional dates/names stay at the end in both directions; equal values use a stable identity order. */
 export function sortCandidateGroups(groups: readonly CandidateGroup[], sort: CandidateGroupSort, today = businessDate()): CandidateGroup[] {
@@ -96,25 +114,42 @@ export function groupCandidates(records: CandidateRecord[], sort: CandidateSort)
 }
 
 /** Keep all proposals when one proposal matches both the progress and search filters. */
-export function filterCandidateGroups(groups: CandidateGroup[], filter: CandidateGroupFilter, today = businessDate()): CandidateGroup[] {
-  const search = filter.search.trim().toLowerCase();
+export function filterCandidateGroups(groups: CandidateGroup[], filter: CandidateGroupFilter, today = businessDate(), profiles:readonly CandidateProfile[]=[]): CandidateGroup[] {
+  const search = filter.search.trim();
   const statuses = filter.statuses?.length ? filter.statuses : filter.status !== "all" ? [filter.status] : [];
+  const tomorrow = validDate(today) ? new Date(Date.parse(`${today}T00:00:00Z`)+86_400_000).toISOString().slice(0,10) : "";
+  const profileLinks=new Map<string,CandidateProfile[]>();
+  for(const profile of profiles)for(const recordId of new Set(profile.recordIds)){
+    const key=JSON.stringify([profile.playerId,recordId]),linked=profileLinks.get(key)||[];
+    linked.push(profile);profileLinks.set(key,linked);
+  }
   function appointmentMatches(record: CandidateRecord): boolean {
     const choice = filter.appointment || "all";
     if (choice === "all") return true;
-    if (!["overdue", "today", "future", "none"].includes(choice)) return false;
+    if (!["overdue", "today", "tomorrow", "future", "none"].includes(choice)) return false;
     const appointments = candidateAppointments([record], today);
     if (choice === "none") return !appointments.length;
-    return appointments.some(item => choice === "overdue" ? item.date < today : choice === "today" ? item.date === today : item.date > today);
+    return appointments.some(item => choice === "overdue" ? item.date < today : choice === "today" ? item.date === today : choice === "tomorrow" ? item.date === tomorrow : item.date > today);
+  }
+  function profileMatches(fields:InterviewFields|undefined):boolean {
+    if(filter.pcEnvironment!==undefined&&(filter.pcEnvironment===null ? !!fields?.pcEnvironment.trim() : fields?.pcEnvironment!==filter.pcEnvironment))return false;
+    // A dropdown selection is recorded tool experience. Free text such as
+    // "Salesforce未経験" must not become an inferred positive tool selection.
+    if(filter.crmTool!==undefined&&(filter.crmTool===null ? !!fields&&(fields.crmTools.length>0||!!fields.crmOther.trim()) : !fields?.crmTools.includes(filter.crmTool)))return false;
+    return (!filter.experienceKeyword?.trim()||matchesWords(profileText(fields,experienceFields),filter.experienceKeyword))
+      &&(!filter.availabilityKeyword?.trim()||matchesWords(profileText(fields,availabilityFields),filter.availabilityKeyword));
   }
   return groups.filter(group =>
     (filter.owner === "all" || (filter.owner === "unassigned" ? !group.playerId : group.playerId === filter.owner)) &&
-    group.records.some(record =>
+    group.records.some(record => {
+      const fields=linkedCandidateProfile(profileLinks.get(JSON.stringify([record.playerId,record.recordId]))||[],record)?.fields;
+      return (
       (!statuses.length || statuses.includes(valueAt(record, 7))) &&
       (filter.company === undefined || (filter.company === null ? !valueAt(record, 2).trim() : valueAt(record, 2) === filter.company)) &&
       (filter.profile === undefined || filter.profile === "all" || (filter.profile === "with" ? !!record.profileId : !record.profileId)) &&
       appointmentMatches(record) &&
-      (!search || `${record.candidateName} ${record.values.join(" ")}`.toLowerCase().includes(search))
-    )
+      profileMatches(fields) &&
+      (!search || matchesWords(`${record.candidateName} ${group.name} ${record.values.join(" ")} ${profileText(fields,searchableProfileFields)} ${fields?.crmTools.join(" ")||""} ${fields?.chatTools.join(" ")||""}`,search))
+    );})
   );
 }

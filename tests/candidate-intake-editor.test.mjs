@@ -4,6 +4,7 @@ import fs from "node:fs";
 import vm from "node:vm";
 import ts from "typescript";
 import * as intake from "../lib/candidate-intake.ts";
+import * as introductionReview from "../lib/introduction-review.ts";
 
 const source = ts.transpileModule(fs.readFileSync(new URL("../components/candidate-intake.tsx", import.meta.url), "utf8"),
   { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX } }).outputText;
@@ -36,7 +37,7 @@ function harness(initial = {}) {
     setTimeout: (fn, delay) => { const id = ++timerId; timers.set(id, { at: now + delay, fn }); return id; },
     clearTimeout: id => timers.delete(id),
     require: name => name === "react" ? react : name === "react/jsx-runtime" ? { jsx, jsxs: jsx } : name === "lucide-react" ? new Proxy({}, { get: (_, name) => name })
-      : name.includes("candidate-intake") ? intake : name.includes("candidate-ai-assistant") ? { CandidateAiAssistant: "CandidateAiAssistant" } : {},
+      : name.includes("introduction-review") ? introductionReview : name.includes("candidate-intake") ? intake : name.includes("candidate-ai-assistant") ? { CandidateAiAssistant: "CandidateAiAssistant" } : {},
   });
   vm.runInContext(source, context);
   function render(next = {}) { props = { ...props, ...next }; cursor = 0; tree = exports.InterviewIntakeEditor(props); while (effects.length) effects.shift()(); return tree; }
@@ -111,4 +112,25 @@ test("only direct shareable profile edits advance automatic AI input revision",(
  aiProps().onSaveAdvice("保存する準備案");assert.equal(aiProps().inputRevision,1);
  h.adoptAi("採用したAI紹介文");h.change("-introduction","手で修正した紹介文");assert.equal(aiProps().inputRevision,1);
  const checkbox=nodes(h.render()).find(node=>node.type==="input"&&node.props.type==="checkbox");checkbox.props.onChange();assert.equal(aiProps().inputRevision,2);h.unmount();
+});
+
+test("interview questions begin with PC and tools in reading and keyboard order at every entry point",()=>{
+ const h=harness(),sections=nodes(h.render()).filter(node=>node.type==="fieldset");
+ const legends=sections.map(section=>nodes(section).find(node=>node.type==="legend")?.props.children);
+ assert.deepEqual(legends,["PC・使用ツール","基本情報・稼働条件","営業経験・実績","面談可能日","その他・補足"]);
+ const inputs=nodes(sections[0]).filter(node=>["input","select","textarea"].includes(node.type));
+ assert.ok(inputs[0].props.id.endsWith("-pc"));
+ assert.ok(inputs[1].props.id.endsWith("-networkEnvironment"));
+ assert.ok(inputs[2].props.id.endsWith("-pcSkills"));
+ assert.ok(inputs.slice(3).every(node=>node.props.type==="checkbox"));
+ const allInputs=nodes(h.render()).filter(node=>["input","select","textarea"].includes(node.type));
+ assert.ok(allInputs.findIndex(node=>node.props.id?.endsWith("-pc"))<allInputs.findIndex(node=>node.props.id?.endsWith("-age")));
+ assert.equal(inputs.some(node=>node.props.tabIndex>0),false);
+ h.unmount();
+});
+
+
+test("the immediate shared draft formats explicit clock ranges without rewriting the original intake",()=>{
+ const h=harness({fields:{...intake.blankInterviewFields(),timeWindow:"900-1800",workHistory:"法人営業を2年間担当。"}});
+ h.advance(250);h.render();assert.match(h.introduction(),/9:00〜18:00/);assert.equal(h.fields().timeWindow,"900-1800");h.unmount();
 });

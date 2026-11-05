@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import ts from 'typescript';
 import * as groups from '../lib/candidate-groups.ts';
+import * as intake from '../lib/candidate-intake.ts';
 const source=ts.transpileModule(fs.readFileSync(new URL('../components/candidate-list-controls.tsx',import.meta.url),'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,jsx:ts.JsxEmit.ReactJSX}}).outputText;
 const nodes=tree=>!tree||typeof tree!=='object'?[]:Array.isArray(tree)?tree.flatMap(nodes):[tree,...nodes(tree.props?.children)];
 const text=tree=>tree==null||typeof tree==='boolean'?'':typeof tree==='string'||typeof tree==='number'?String(tree):Array.isArray(tree)?tree.map(text).join(''):text(tree.props?.children);
@@ -12,7 +13,7 @@ function harness(overrides={}){
  const props={filter:{owner:'all',status:'all',statuses:[],search:'検索は保持',appointment:'all',profile:'all'},onFilterChange:value=>{changes.push(value);props.filter=value;},sort:{field:'interview',direction:'desc'},onSortChange:value=>{sorts.push(value);props.sort=value;},players:[{id:'ND-001',name:'利用中の担当'},{id:'ND-002',name:'停止した担当',active:false}],statuses:['提案候補','提案完了',''],companies:['架空会社A','架空会社B','all','none',''],admin:true,intakeEnabled:true,...overrides};
  const react={useState(initial){const i=cursor++;const slot=slots[i]||={value:typeof initial==='function'?initial():initial};return [slot.value,value=>slot.value=typeof value==='function'?value(slot.value):value];},useId(){return 'controls-test';},useRef(initial){return slots[cursor++]||={current:initial};}};
  const jsx=(type,props,key)=>{if(type==='button'&&props?.ref)props.ref.current={focus:()=>focus.push(props['aria-label'])};return {type,props:props||{},key};},exports={};
- vm.runInNewContext(source,{exports,module:{exports},require:name=>name==='react'?react:name==='react/jsx-runtime'?{jsx,jsxs:jsx}:name.includes('candidate-groups')?groups:name.endsWith('.css')?{}:new Proxy({},{get:(_,key)=>key})});
+ vm.runInNewContext(source,{exports,module:{exports},require:name=>name==='react'?react:name==='react/jsx-runtime'?{jsx,jsxs:jsx}:name.includes('candidate-groups')?groups:name.includes('candidate-intake')?intake:name.endsWith('.css')?{}:new Proxy({},{get:(_,key)=>key})});
  const render=next=>{Object.assign(props,next);cursor=0;return exports.CandidateListControls(props);};
  const find=(type,label)=>nodes(render()).find(n=>n.type===type&&(n.props['aria-label']===label||text(n)===label));
  const click=label=>{const node=find('button',label);assert.ok(node,label);assert.ok(!node.props.disabled,`${label} enabled`);node.props.onClick();};
@@ -49,4 +50,22 @@ test('player controls do not offer administrator owner filters or unavailable pr
 
 test('a selected company, owner or status removed by a refresh remains visible as a recoverable filter',()=>{
  const h=harness({filter:{owner:'ND-OLD',status:'all',statuses:['旧進捗'],search:'',company:'過去の提案先',appointment:'all',profile:'all'}});h.click('候補者のフィルター');assert.match(text(h.find('select','候補者の担当者')),/以前の担当者（現在は名簿なし）/);assert.match(text(h.find('select','候補者の提案先で絞り込み')),/過去の提案先（現在は該当なし）/);assert.equal(h.find('input','進捗：旧進捗').props.checked,true);h.check('進捗：旧進捗',false);assert.equal(h.props.filter.statuses.length,0);h.click('フィルターを解除');assert.equal(groups.candidateFilterCount(h.props.filter),0);
+});
+
+test('recorded PC, CRM, experience and availability controls are optional, immediate and resettable',()=>{
+ const h=harness();h.click('候補者のフィルター');
+ assert.match(text(h.render()),/追加入力は不要/);assert.match(text(h.render()),/経験や適性は推定しません/);
+ h.select('候補者のPC環境で絞り込み',JSON.stringify(['Windows']));h.select('候補者の登録CRMで絞り込み',JSON.stringify(['kintone']));
+ h.find('input','候補者の経験・強みの記載で絞り込み').props.onChange({target:{value:'法人営業 テレアポ'}});
+ h.find('input','候補者の稼働条件の記載で絞り込み').props.onChange({target:{value:'平日 週3日'}});
+ assert.equal(h.props.filter.pcEnvironment,'Windows');assert.equal(h.props.filter.crmTool,'kintone');assert.equal(h.props.filter.experienceKeyword,'法人営業 テレアポ');assert.equal(h.props.filter.availabilityKeyword,'平日 週3日');assert.equal(groups.candidateFilterCount(h.props.filter),4);
+ assert.equal(h.find('input','候補者の経験・強みの記載で絞り込み').props.maxLength,200);
+ h.select('候補者のPC環境で絞り込み','none');h.select('候補者の登録CRMで絞り込み','none');assert.equal(h.props.filter.pcEnvironment,null);assert.equal(h.props.filter.crmTool,null);
+ const count=h.changes.length;h.select('候補者のPC環境で絞り込み','injected');h.select('候補者の登録CRMで絞り込み',JSON.stringify(['Unknown CRM']));assert.equal(h.changes.length,count);
+ h.click('フィルターを解除');assert.equal(groups.candidateFilterCount(h.props.filter),0);assert.equal(h.props.filter.experienceKeyword,undefined);assert.equal(h.props.filter.availabilityKeyword,undefined);assert.equal(h.props.filter.search,'検索は保持');
+});
+
+test('tomorrow is a separate visible appointment choice and profile controls stay hidden when unavailable',()=>{
+ const h=harness();h.click('候補者のフィルター');assert.match(text(h.find('select','候補者の予定で絞り込み')),/明日の予定・前日準備/);h.select('候補者の予定で絞り込み','tomorrow');assert.equal(h.props.filter.appointment,'tomorrow');
+ const unavailable=harness({intakeEnabled:false});unavailable.click('候補者のフィルター');for(const label of ['候補者のPC環境で絞り込み','候補者の登録CRMで絞り込み'])assert.equal(unavailable.find('select',label),undefined);for(const label of ['候補者の経験・強みの記載で絞り込み','候補者の稼働条件の記載で絞り込み'])assert.equal(unavailable.find('input',label),undefined);
 });

@@ -1,5 +1,6 @@
 import { unicodeLength, type InterviewFields } from "./candidate-intake.ts";
 import { introductionHeadings } from "./introduction-style.ts";
+import { introductionRankQualifications, missingIntroductionRankQualification } from "./introduction-review.ts";
 
 export type IntroductionNarrativeSection = "experience" | "results" | "summary";
 export type IntroductionFixedSection = "basic" | "tools" | "availability";
@@ -15,6 +16,7 @@ export type IntroductionPlan = {
   narrativeSections: IntroductionNarrativeSection[];
   narrativeFacts: Partial<Record<"職歴" | "実績" | "強み", string>>;
   attributionNotes: Record<IntroductionNarrativeSection, string>;
+  rankQualifications: Record<IntroductionNarrativeSection, string[]>;
   sectionOrder: IntroductionPlanSection[];
   tone: IntroductionPlanSettings["tone"];
   limit: number;
@@ -72,6 +74,11 @@ export function buildIntroductionPlan(name: string, preparedFields: InterviewFie
     results: resultSources.length ? `${resultSources.join("・")}には本人申告の内容を含みます。` : "",
     summary: sources.length ? `総評の${sources.join("・")}に関する記載には本人申告を含みます。` : "",
   };
+  const rankQualifications:IntroductionPlan["rankQualifications"]={
+    experience:introductionRankQualifications(fields.workHistory),
+    results:[...introductionRankQualifications(fields.achievements),...introductionRankQualifications(fields.strengths)],
+    summary:[...introductionRankQualifications(fields.workHistory),...introductionRankQualifications(fields.achievements),...introductionRankQualifications(fields.strengths)],
+  };
   const sectionOrder = [...new Set(settings.sectionOrder)];
   const availableNarrative: Record<IntroductionNarrativeSection, boolean> = {
     experience: hasExperience,
@@ -86,13 +93,26 @@ export function buildIntroductionPlan(name: string, preparedFields: InterviewFie
   const reserved = sectionOrder.flatMap(id => {
     if (narrativeKeys.has(id)) {
       const key = id as IntroductionNarrativeSection;
-      return narrativeSections.includes(key) ? [section(key, attributionNotes[key] ? `${attributionNotes[key]}\n` : "")] : [];
+      return narrativeSections.includes(key) ? [section(key, [attributionNotes[key],rankQualifications[key].length?`順位の確認範囲：${rankQualifications[key].join("。")}。`:""].filter(Boolean).map(note=>`${note}\n`).join(""))] : [];
     }
     const body = fixed[id as IntroductionFixedSection];
     return body ? [section(id, body)] : [];
   }).join("\n\n");
   const budget = limit - unicodeLength(reserved);
-  return { fixed, narrativeSections, narrativeFacts, attributionNotes, sectionOrder, tone: settings.tone, limit, budget, overflow: budget < 0 };
+  return { fixed, narrativeSections, narrativeFacts, attributionNotes, rankQualifications, sectionOrder, tone: settings.tone, limit, budget, overflow: budget < 0 };
+}
+
+function narrativeSection(plan:IntroductionPlan,key:IntroductionNarrativeSection,value:string|undefined):string|null {
+ if(!plan.narrativeSections.includes(key)||!value?.trim())return null;
+ const body=value.trim(),note=plan.attributionNotes[key];
+ const attributed=/(?:本人申告|本人による|本人から|と伺|と聞|とのこと|との申告)/.test(body);
+ const qualification=missingIntroductionRankQualification(body,plan.rankQualifications[key])?`順位の確認範囲：${plan.rankQualifications[key].join("。")}。`:"";
+ return section(key,[note&&!attributed?note:"",body,qualification].filter(Boolean).join("\n"));
+}
+
+/** The same bounded source notes must be present in validation and presentation. */
+export function composeIntroductionNarrative(plan:IntroductionPlan,bodies:Partial<Record<IntroductionNarrativeSection,string>>):string {
+ return plan.narrativeSections.map(key=>narrativeSection(plan,key,bodies[key])).filter((text):text is string=>!!text).join("\n\n");
 }
 
 /**
@@ -104,11 +124,8 @@ export function composeIntroductionPlan(plan: IntroductionPlan, narrativeBodies:
   return plan.sectionOrder.flatMap(id => {
     if (narrativeKeys.has(id)) {
       const key = id as IntroductionNarrativeSection;
-      if (!plan.narrativeSections.includes(key)) return [];
-      const body = narrativeBodies[key]?.trim();
-      if (!body) return [];
-      const note = plan.attributionNotes[key];
-      return [section(key, note ? `${note}\n${body}` : body)];
+      const value=narrativeSection(plan,key,narrativeBodies[key]);
+      return value?[value]:[];
     }
     const body = plan.fixed[id as IntroductionFixedSection];
     return body ? [section(id, body)] : [];

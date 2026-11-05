@@ -19,6 +19,40 @@ test('scheduling contradictions are concrete checks and withheld rather than sil
  const wrongPeriod=reviewIntroductionSource({...blankInterviewFields(),monthlyHours:'週80時間',workHistory:'担当経験'});assert.ok(wrongPeriod.checks.some(c=>c.code==='hours-unit'));assert.equal(wrongPeriod.fields.monthlyHours,'');
  const normal=reviewIntroductionSource({...blankInterviewFields(),timeWindow:'9:00〜17:00',daysPerWeek:'週5日',monthlyHours:'月160時間',workHistory:'担当経験'});assert.ok(!normal.checks.some(c=>c.code.startsWith('hours')));assert.equal(normal.fields.monthlyHours,'月160時間');
 });
+
+test('separated compact clock ranges are expanded only in prepared sharing text with an explicit revision',()=>{
+ for(const [input,expected] of [
+  ['900-1800','9:00〜18:00'],['0900〜1800','9:00〜18:00'],['平日 ９００－１８００','平日 9:00〜18:00'],
+  ['平日900-1800、土曜1000〜1500','平日9:00〜18:00、土曜10:00〜15:00'],['0930〜18:15','9:30〜18:15'],
+  ['2300〜翌0600','23:00〜翌6:00'],['900-2400','9:00〜24:00'],
+ ] as const){
+  const raw={...blankInterviewFields(),timeWindow:input,workHistory:'法人への架電を担当。'},before=structuredClone(raw),review=reviewIntroductionSource(raw);
+  assert.equal(review.fields.timeWindow,expected,input);assert.deepEqual(raw,before,input);
+  assert.deepEqual(review.revisions.filter(revision=>revision.field==='timeWindow'),[{field:'timeWindow',label:'希望時間帯',before:input,after:expected}],input);
+  assert.ok(!review.checks.some(check=>check.code==='time-window'),input);
+  assert.deepEqual(introductionEvidenceIssues(`候補者の希望時間帯は${expected}です。`,'候補者',review.fields),[],input);
+ }
+});
+
+test('ambiguous and impossible clock entries are confirmation items rather than guessed ranges',()=>{
+ for(const input of ['9001800','09001800','900 1800','9時18時','9時\t18時','900-1860','2500-2700','25:00〜27:00','9:00〜18:75','9:000〜18:00','9:7〜18:00','25時','9時75分','1800-900','900-900','900-1800-2000','900']){
+  const raw={...blankInterviewFields(),timeWindow:input},before=structuredClone(raw),review=reviewIntroductionSource(raw),check=review.checks.find(check=>check.code==='time-window');
+  assert.ok(check,input);assert.deepEqual(check.fields,['timeWindow'],input);assert.match(check.detail,/原文は入力欄に残っています/);
+  assert.equal(review.fields.timeWindow,'',input);assert.equal(review.revisions.some(revision=>revision.field==='timeWindow'),false,input);assert.deepEqual(raw,before,input);
+ }
+});
+
+test('normal times and explicit date notes remain as entered, and expanded times still undergo scheduling checks',()=>{
+ for(const input of ['9:00〜18:00','9時〜18時','午前中','平日午後','2026-11-05 9:00〜18:00','２０２６－１１－０５ 9:00〜18:00','2026年11月5日 9:00〜18:00','22:00〜翌6:00','9〜18時間で相談']){
+  const raw={...blankInterviewFields(),timeWindow:input},review=reviewIntroductionSource(raw);
+  assert.equal(review.fields.timeWindow,input,input);assert.ok(!review.checks.some(check=>check.code==='time-window'),input);assert.ok(!review.revisions.some(revision=>revision.field==='timeWindow'),input);
+ }
+ const raw={...blankInterviewFields(),timeWindow:'900-1200',daysPerWeek:'週2日',monthlyHours:'月100時間',desiredHourlyRate:'3000'},before=structuredClone(raw),review=reviewIntroductionSource(raw);
+ assert.ok(review.revisions.some(revision=>revision.field==='timeWindow'&&revision.after==='9:00〜12:00'));
+ assert.ok(review.checks.some(check=>check.code==='hours-consistency'));assert.ok(review.checks.some(check=>check.code==='rate-unit'));
+ for(const field of ['timeWindow','daysPerWeek','monthlyHours','desiredHourlyRate'] as const)assert.equal(review.fields[field],'');
+ assert.deepEqual(raw,before);
+});
 test('experience gaps, rank context and long original histories are visible without creating facts',()=>{
  const minimal=reviewIntroductionSource(blankInterviewFields());assert.ok(minimal.checks.some(c=>c.code==='experience-missing'));
  const rank=reviewIntroductionSource({...blankInterviewFields(),workHistory:'営業を担当',achievements:'営業1位'});assert.ok(rank.checks.some(c=>c.code==='achievement-scope'));
@@ -166,4 +200,28 @@ test('edited candidates cannot bypass the model content boundary with assessment
  assert.ok(editedIntroductionIssues(base+'持病で毎週通院しています。','架空検証',fields).includes('source-private-detail'));
  for(const artifact of ['{"draft":"架空検証"}','{"type":"object","properties":{}}',JSON.stringify(JSON.stringify({draft:'架空検証'}))])assert.ok(introductionContentIssues(artifact).includes('source-format'));
  assert.deepEqual(introductionContentIssues('介護職や看護師として病院勤務の経験を紹介します。'),[]);
+});
+
+test('ordinary sales work cannot become unrecorded praise or speculative business outcomes',()=>{
+ const fields={...blankInterviewFields(),workHistory:'法人営業のテレアポを3年担当。',strengths:'相手の要望を整理し、確認事項を残す。'};
+ for(const claim of ['顧客満足度向上に貢献しました。','要望の整理に長けています。','課題解決に貢献できる可能性があります。','チームの成果に寄与できます。','これらの経験や工夫を活かし、今後の業務に貢献することが期待できます。','活躍が期待できます。']){
+  assert.ok(introductionEvidenceIssues(claim,'架空検証',fields).includes('source-assessment'),claim);
+  assert.ok(editedIntroductionIssues(`氏名：架空検証\n${claim}`,'架空検証',fields).includes('source-assessment'),claim);
+ }
+ assert.deepEqual(introductionEvidenceIssues('法人営業のテレアポを3年担当し、相手の要望を整理して確認事項を記録します。','架空検証',fields),[]);
+ const explicit={...fields,achievements:'本人申告：顧客満足度の向上に貢献。'};
+ assert.deepEqual(introductionEvidenceIssues('本人申告として、顧客満足度の向上に貢献したとのことです。','架空検証',explicit),[]);
+ assert.ok(introductionEvidenceIssues('本人申告：課題解決に貢献しました。','架空検証',{...fields,achievements:'本人申告：チームに貢献しました。'}).includes('source-assessment'));
+});
+
+test('placeholder ranks names and amounts cannot become shareable introduction prose',()=>{
+ for(const draft of ['実績の〇〇位です。','氏名：○○','希望金額：□□円','月XX件を担当しました。'])assert.ok(introductionContentIssues(draft).includes('source-format'),draft);
+ assert.deepEqual(introductionContentIssues('営業会社で1位の実績。期間と比較人数は未確認です。'),[]);
+ assert.deepEqual(introductionContentIssues('二〇〇六年に勤務を開始し、二〇〇〇年の資料も整理しました。'),[]);
+});
+
+test('rank uncertainty must remain with each ranking claim rather than an unrelated section or tool check',()=>{
+ const fields={...blankInterviewFields(),achievements:'営業会社で1位の実績。本人申告。期間と比較した人数は未確認。'};
+ for(const draft of ['本人申告：営業会社で1位の実績があります。','本人申告：営業会社でNo.1です。','【営業における強み】\n本人申告：1位の実績。期間と比較人数は未確認。\n【総評】\n営業会社で1位の実績があります。','### 営業における強み\n本人申告：1位の実績。期間と比較人数は未確認。\n### 総評\n営業会社で1位の実績があります。','本人申告：営業会社で1位の実績。使用ツールは未確認です。'])assert.ok(introductionEvidenceIssues(draft,'架空検証',fields).includes('rank-scope-removed'),draft);
+ assert.deepEqual(introductionEvidenceIssues('本人申告：営業会社で1位の実績があるとのことです。期間と比較した人数は未確認です。','架空検証',fields),[]);
 });

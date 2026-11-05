@@ -33,4 +33,4 @@ export function validateDataExport(value:unknown):Record<string,unknown> {
  return value;
 }
 export const accountActionLabels:Record<AccountAction,string>={stop:"利用を停止",resume:"利用を再開",revokeSessions:"全端末からログアウト"};
-export const operationLabels:Record<string,string>={saveActivity:"成果登録",updateStatus:"進捗更新",updateProfile:"プロフィール更新",createPlayer:"ID発行",createCandidate:"候補者登録",updateRecord:"候補者の記録更新",deleteCandidate:"候補者削除",cancelAchievement:"成果の取り消し",restoreChange:"変更の復元",saveManagementRow:"管理表更新",saveInterviewReview:"振り返り保存",saveCandidateProfile:"基本情報保存",saveClient:"取引先更新",manageAccount:"利用状況の変更",saveMonthlyTarget:"月別目標の保存"};
+export const operationLabels:Record<string,string>={publishTeamCandidate:"紹介文を社内共有",unpublishTeamCandidate:"社内共有を停止",saveTeamComment:"社内コメント",saveTeamJob:"募集案件",saveActivity:"成果登録",updateStatus:"進捗更新",updateProfile:"プロフィール更新",createPlayer:"ID発行",createCandidate:"候補者登録",updateRecord:"候補者の記録更新",deleteCandidate:"候補者削除",cancelAchievement:"成果の取り消し",restoreChange:"変更の復元",saveManagementRow:"管理表更新",saveInterviewReview:"振り返り保存",saveCandidateProfile:"基本情報保存",saveClient:"取引先更新",manageAccount:"利用状況の変更",saveMonthlyTarget:"月別目標の保存"};

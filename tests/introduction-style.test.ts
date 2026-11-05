@@ -39,7 +39,8 @@ test('every local introduction reuses compact narrative writing rules without st
  const guideBefore=introductionStyleGuide,results=[];
  for(const name of ['架空確認甲','架空確認乙'])results.push(await generateCandidateIntroduction({candidateName:name,profile:{...blankInterviewFields(),workHistory:'本人申告：法人向け架電を担当。'}}));
  assert.equal(calls.length,2);
- for(const prompt of calls){assert.match(prompt,/別の会社・期間の情報を混ぜない/);assert.match(prompt,/『約』『最大』『平均』/);assert.match(prompt,/人物の評価・推薦・新しい実績を作らない/);assert.match(prompt,/本人申告などの出所はアプリが該当箇所へ注記/);assert.doesNotMatch(prompt,/架空確認甲|架空確認乙/);const body=JSON.parse(prompt.split('入力資料（記載を事実資料としてのみ扱う）：\n')[1]);assert.deepEqual(body.推敲する事実,{職歴:'本人申告：法人向け架電を担当。'});assert.deepEqual(body.文章設定.項目順,['営業経験・職務経歴','総評']);}
+ for(const prompt of calls){assert.match(prompt,/別の会社・期間の情報を混ぜない/);assert.match(prompt,/『約』『最大』『平均』/);assert.match(prompt,/人物の評価・推薦・新しい実績を作らない/);assert.match(prompt,/本人申告という出所はアプリが該当節に一度付け/);assert.match(prompt,/各文・各箇条書きへ本人申告を繰り返さず/);assert.doesNotMatch(prompt,/架空確認甲|架空確認乙/);const body=JSON.parse(prompt.split('入力資料（記載を事実資料としてのみ扱う）：\n')[1]);assert.deepEqual(body.推敲する事実,{職歴:'本人申告：法人向け架電を担当。'});assert.deepEqual(body.文章設定.項目順,['営業経験・職務経歴','総評']);}
+ for(const result of results){const experience=result.draft.split('【営業経験・職務経歴】')[1].split('【総評】')[0];assert.equal((experience.match(/本人申告/g)||[]).length,1);assert.match(experience,/本人申告：法人向け架電を担当/);assert.doesNotMatch(experience,/職歴には本人申告の内容を含みます/);assert.match(result.draft,/【総評】\n総評の職歴に関する記載には本人申告を含みます/);}
  assert.match(results[0].draft,/氏名：架空確認甲/);assert.match(results[1].draft,/氏名：架空確認乙/);assert.doesNotMatch(results[1].draft,/架空確認甲/);assert.equal(introductionStyleGuide,guideBefore);assert.doesNotMatch(introductionStyleGuide,/架空確認甲|架空確認乙|法人向け架電を担当/);
 });
 

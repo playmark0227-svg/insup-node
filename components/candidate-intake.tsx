@@ -10,6 +10,8 @@ import {
 import "@/app/intake.css";
 import { CandidateAiAssistant } from "@/components/candidate-ai-assistant";
 import type { CandidateAiConnection } from "@/lib/writing-ai";
+import {reviewIntroductionSource} from "@/lib/introduction-review";
+const composeReviewedIntroduction=(name:string,fields:InterviewFields)=>composeCandidateIntroduction(name,reviewIntroductionSource(fields,[name]).fields);
 
 export type InterviewIntakeEditorProps = {
   candidateName: string;
@@ -41,7 +43,7 @@ export function InterviewIntakeEditor({ candidateName, fields, onFieldsChange, i
   useEffect(() => {
     if (!autoManaged.current || disabled) return;
     const timer = setTimeout(() => {
-      const result = composeCandidateIntroduction(candidateName, fields);
+      const result = composeReviewedIntroduction(candidateName, fields);
       if (result.text !== introduction) onIntroductionChange(result.text);
       setFormatResult(result); setFormatSource(currentSource);
     }, 250);
@@ -75,12 +77,12 @@ export function InterviewIntakeEditor({ candidateName, fields, onFieldsChange, i
   }
   function format() {
     autoManaged.current = false;
-    const result = composeCandidateIntroduction(candidateName, fields);
+    const result = composeReviewedIntroduction(candidateName, fields);
     onIntroductionChange(result.text); setFormatResult(result); setFormatSource(currentSource);
     setReplaceDraft(false); setInputError(""); setCopied(false); setCopyError("");
   }
   function requestFormat() {
-    const result = composeCandidateIntroduction(candidateName, fields);
+    const result = composeReviewedIntroduction(candidateName, fields);
     if (introduction.trim() && introduction !== result.text) setReplaceDraft(true);
     else format();
   }
@@ -94,6 +96,14 @@ export function InterviewIntakeEditor({ candidateName, fields, onFieldsChange, i
   return <div className="interview-intake">
     <p className="intake-context">{candidateName || "この候補者"}の面談情報をまとめます。分かる項目だけ入力してください。</p>
     {ai?.enabled&&<div className="intake-writing-workflow"><span role="status">{aiStatus==="running"?"紹介文の候補を作成中です。入力は続けられます。":aiStatus==="waiting"?"入力が落ち着いたら紹介文の候補を作成します。":aiStatus==="ready"?"紹介文の候補ができました。内容を確認して採用できます。":aiStatus==="error"?"紹介文の確認事項があります。入力と作成済みの文章は残っています。":"情報を入力 → 紹介文の候補を自動作成 → 確認して採用"}</span><a href={`#${id}-writing-assistant`} className="text-button">{aiStatus==="error"?"確認事項を見る":"紹介文の候補を見る"}</a></div>}
+    <fieldset disabled={disabled} className="intake-section"><legend>PC・使用ツール</legend><div className="intake-grid">
+      <label className="intake-field" htmlFor={`${id}-pc`}><span>PC環境 <small>任意</small></span><select id={`${id}-pc`} value={fields.pcEnvironment} onChange={event => set("pcEnvironment", event.target.value)}><option value="">未確認</option>{pcOptions.map(option => <option key={option}>{option}</option>)}</select></label>
+      {field("networkEnvironment", { placeholder: "光回線／Wi-Fiなど" })}
+      {field("pcSkills", { multiline: true, maxLength: 400, placeholder: "タイピング、表計算、オンライン面談の操作など" })}
+      <div className="intake-tool-group intake-wide" role="group" aria-labelledby={`${id}-crm-label`}><span id={`${id}-crm-label`}>CRM経験 <small>複数選択可</small></span><div className="intake-checks">{crmOptions.map(option => <label key={option}><input type="checkbox" checked={fields.crmTools.includes(option)} onChange={() => toggle("crmTools", option)}/><span>{option}</span></label>)}</div>{(fields.crmTools.includes("その他") || !!fields.crmOther) && field("crmOther", { placeholder: "使用したCRM名" })}</div>
+      <div className="intake-tool-group intake-wide" role="group" aria-labelledby={`${id}-chat-label`}><span id={`${id}-chat-label`}>チャット経験 <small>複数選択可</small></span><div className="intake-checks">{chatOptions.map(option => <label key={option}><input type="checkbox" checked={fields.chatTools.includes(option)} onChange={() => toggle("chatTools", option)}/><span>{option}</span></label>)}</div>{(fields.chatTools.includes("その他") || !!fields.chatOther) && field("chatOther", { placeholder: "使用したチャット名" })}</div>
+    </div></fieldset>
+
     <fieldset disabled={disabled} className="intake-section"><legend>基本情報・稼働条件</legend><div className="intake-grid">
       {field("age", { inputMode: "numeric", maxLength: 20 })}
       <label className="intake-field" htmlFor={`${id}-gender`}><span>性別 <small>任意</small></span><select id={`${id}-gender`} value={fields.gender} onChange={event => set("gender", event.target.value)}>{genderOptions.map(option => <option key={option} value={option}>{option || "未回答"}</option>)}</select></label>
@@ -112,14 +122,6 @@ export function InterviewIntakeEditor({ candidateName, fields, onFieldsChange, i
       {field("workHistory", { multiline: true, maxLength: 6000, placeholder: "経験期間／商材／営業手法／担当した業務など。複数の職歴をそのまま入力できます。", hint: "入力内容をもとに文章を整えます。実績や評価は追加しません。" })}
       {field("achievements", { multiline: true, maxLength: 1500, placeholder: "架電数・アポ率・過去の順位など、確認できた実績" })}
       {field("strengths", { multiline: true, maxLength: 1500, placeholder: "本人が話した強み・面談で確認できたことなど" })}
-    </div></fieldset>
-
-    <fieldset disabled={disabled} className="intake-section"><legend>PC・使用ツール</legend><div className="intake-grid">
-      <label className="intake-field" htmlFor={`${id}-pc`}><span>PC環境 <small>任意</small></span><select id={`${id}-pc`} value={fields.pcEnvironment} onChange={event => set("pcEnvironment", event.target.value)}><option value="">未確認</option>{pcOptions.map(option => <option key={option}>{option}</option>)}</select></label>
-      {field("networkEnvironment", { placeholder: "光回線／Wi-Fiなど" })}
-      {field("pcSkills", { multiline: true, maxLength: 400, placeholder: "タイピング、表計算、オンライン面談の操作など" })}
-      <div className="intake-tool-group intake-wide" role="group" aria-labelledby={`${id}-crm-label`}><span id={`${id}-crm-label`}>CRM経験 <small>複数選択可</small></span><div className="intake-checks">{crmOptions.map(option => <label key={option}><input type="checkbox" checked={fields.crmTools.includes(option)} onChange={() => toggle("crmTools", option)}/><span>{option}</span></label>)}</div>{(fields.crmTools.includes("その他") || !!fields.crmOther) && field("crmOther", { placeholder: "使用したCRM名" })}</div>
-      <div className="intake-tool-group intake-wide" role="group" aria-labelledby={`${id}-chat-label`}><span id={`${id}-chat-label`}>チャット経験 <small>複数選択可</small></span><div className="intake-checks">{chatOptions.map(option => <label key={option}><input type="checkbox" checked={fields.chatTools.includes(option)} onChange={() => toggle("chatTools", option)}/><span>{option}</span></label>)}</div>{(fields.chatTools.includes("その他") || !!fields.chatOther) && field("chatOther", { placeholder: "使用したチャット名" })}</div>
     </div></fieldset>
 
     <fieldset disabled={disabled} className="intake-section"><legend>面談可能日</legend><div className="intake-grid">{field("interviewAvailability", { multiline: true, maxLength: 400, placeholder: "候補日・時間帯・調整が必要な条件など" })}</div></fieldset>
