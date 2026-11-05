@@ -82,7 +82,7 @@ test("invalid dates and stop markers cannot become scheduled tasks or date miles
     record("started-status", { 7: "稼働開始", 23: "2026-10-10" }),
     record("completed", { 10: "2026-10-10", 17: "2026-10-11", 22: "2026-10-13" }),
   ]);
-  assert.deepEqual(buildFollowUpTasks(data, "2026-10-14"), []);
+  assert.deepEqual(buildFollowUpTasks(data, "2026-10-14").map(task=>[task.recordId,task.kind]), [["started-status","start_overdue"]]);
   assert.throws(() => buildFollowUpTasks(data, "2026-02-31"));
 });
 
@@ -161,7 +161,8 @@ test("proposed candidates without an interview schedule get a factual scheduling
     record("other-owner", { 8: "2026-10-13" }, "ND-002"),
   ], [], "player");
   const tasks = buildFollowUpTasks(data, "2026-10-14");
-  assert.deepEqual(tasks.map(task => [task.recordId, task.kind, task.urgency]), [["waiting-schedule", "schedule_missing", "followup"], ["booked-no-schedule", "schedule_missing", "followup"]]);
+  assert.deepEqual(tasks.filter(task=>task.kind==="schedule_missing").map(task => [task.recordId, task.kind, task.urgency]), [["waiting-schedule", "schedule_missing", "followup"], ["booked-no-schedule", "schedule_missing", "followup"]]);
+  assert.deepEqual(tasks.filter(task=>task.kind==="start_date_missing").map(task=>task.recordId),["later-status-5"]);
   assert.match(tasks[0].evidence, /提案完了 2026-10-13.*予定日は未登録/);
   assert.match(tasks[0].suggestedAction, /面談日時を確認/);
   assert.doesNotMatch(tasks[0].evidence, /連絡済み|落選|不成立/);
@@ -176,4 +177,28 @@ test("monthly insights use only the explicitly saved goals of that month",()=>{
  assert.equal(buildWorkspaceInsightAggregate(value,"2026-10","2026-10-30").proposalTarget,8);
  assert.equal(buildWorkspaceInsightAggregate(value,"2026-09","2026-10-30").proposalTarget,null);
  value.self={role:"player",playerId:"ND-001"};assert.equal(buildWorkspaceInsightAggregate(value,"2026-10","2026-10-30").proposalTarget,0);
+});
+
+
+test("daily follow-up includes today's planned start without turning future starts into today's work",()=>{
+ const data=snapshot([
+  record("start-today",{7:"稼働予定日確定（稼働開始待ち）",22:"2026-10-10",23:"2026-10-14"}),
+  record("start-tomorrow",{7:"稼働予定日確定（稼働開始待ち）",22:"2026-10-10",23:"2026-10-15"}),
+  record("start-yesterday",{23:"2026-10-13"}),
+  record("actual-start",{7:"稼働開始",23:"2026-10-14",24:"2026-10-14"}),
+  record("declined-start",{7:"辞退（本人希望）",23:"2026-10-14"}),
+  record("closed-start",{7:"稼働後離脱",23:"2026-10-13"}),
+ ]),before=structuredClone(data);
+ const tasks=buildFollowUpTasks(data,"2026-10-14");assert.deepEqual(tasks.map(task=>[task.recordId,task.kind,task.urgency]),[["start-yesterday","start_overdue","overdue"],["start-today","start_today","today"]]);assert.match(tasks[1].title,/今日/);assert.match(tasks[1].evidence,/開始日は未記録/);assert.deepEqual(data,before);
+});
+test("a started status never proves an actual start and contradictory future plans stay a record check",()=>{
+ const data=snapshot([
+  record("status-only",{7:"稼働開始"}),
+  record("status-future-plan",{7:"稼働開始",23:"2026-10-15"}),
+  record("status-invalid-actual",{7:"稼働開始",24:"停止"}),
+  record("actual-with-waiting-status",{7:"稼働予定日確定（稼働開始待ち）",23:"2026-10-13",24:"2026-10-14"}),
+  record("departed",{7:"稼働開始",23:"2026-10-14",26:"2026-10-14"}),
+ ]);
+ data.counts["2026-10"]["ND-002"]["稼働開始"]=0;
+ const tasks=buildFollowUpTasks(data,"2026-10-14");assert.deepEqual(tasks.map(task=>[task.recordId,task.kind,task.urgency]),[["status-invalid-actual","start_date_missing","followup"],["status-only","start_date_missing","followup"],["status-future-plan","start_date_missing","followup"]]);assert.ok(tasks.every(task=>task.urgency!=="today"));assert.ok(tasks.every(task=>/実際に開始した場合だけ/.test(task.suggestedAction)));assert.equal(buildWorkspaceInsightAggregate(data,"2026-10","2026-10-14").metrics.find(metric=>metric.key==="starts")?.count,0);
 });

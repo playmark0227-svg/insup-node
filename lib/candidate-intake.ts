@@ -25,6 +25,12 @@ export type CandidateProfile = {
   introduction: string;
 };
 
+/** Only client-facing facts affect whether an existing introduction needs review. */
+export function introductionSourceKey(candidateName:string,fields:InterviewFields):string {
+  const privateFields=new Set(["attendanceConcerns","additionalNotes","interviewMemo","selfReflection","interviewAdvice"]);
+  return JSON.stringify([candidateName,Object.fromEntries(Object.entries(fields).filter(([key])=>!privateFields.has(key)))]);
+}
+
 /** Only an exact, unambiguous record relationship may prefill an editor or AI input.
  * A same-name match or a stale recordIds entry cannot override its owner/profile ID. */
 export function linkedCandidateProfile(profiles:readonly CandidateProfile[],record:{recordId:string;playerId:string;profileId?:string}|undefined):CandidateProfile|undefined {

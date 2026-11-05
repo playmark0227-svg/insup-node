@@ -686,6 +686,7 @@ function readDataExport_(request) {
   var access=accountManagementStore_(request.token),store=readStore_({readOnly:true},access.store),maxCells=50000,maxCharacters=2000000,total=store.records.length*26,tables=[];
   if(total>maxCells)fail_('EXPORT_LIMIT','アプリデータの書き出し上限です。');
   var snapshot=buildSnapshot_(store,access.actor);delete snapshot.outboxKey;delete snapshot.cacheAccess;delete snapshot.destination;
+  var teamExport=teamWorkspaceExport_(store,access.actor);total+=teamExport.cells;if(total>maxCells)fail_('EXPORT_LIMIT','社内共有を含むアプリデータの書き出し上限です。');
   store.book.getSheets().filter(function(sheet){return managementTabAllowed_(sheet.getName());}).forEach(function(sheet){
     var rowCount=sheet.getLastRow(),columnCount=Math.min(100,sheet.getLastColumn()),rows=[];
     if(sheet.getLastColumn()>100||rowCount>2000||total+rowCount*columnCount>maxCells)fail_('EXPORT_LIMIT','アプリデータの書き出し上限です。管理表の範囲を整理してから再試行してください。');
@@ -694,9 +695,9 @@ function readDataExport_(request) {
     tables.push({sheetId:sheet.getSheetId(),title:sheet.getName(),rowCount:rowCount,columnCount:columnCount,rows:rows});
   });
   if(total>maxCells)fail_('EXPORT_LIMIT','アプリデータの書き出し上限です。');
-  var result={schemaVersion:1,exportedAt:new Date().toISOString(),scope:'application-data',snapshot:snapshot,managementTables:tables,limits:{maxCells:maxCells,maxCharacters:maxCharacters}};
+  var result={schemaVersion:1,exportedAt:new Date().toISOString(),scope:'application-data',snapshot:snapshot,managementTables:tables,teamWorkspace:teamExport.data,limits:{maxCells:maxCells,maxCharacters:maxCharacters}};
   if(JSON.stringify(result).length>maxCharacters)fail_('EXPORT_LIMIT','アプリデータが書き出し上限を超えています。');
-  requireAdmin_(snapshotActor_(store,request.token));return result;
+  revalidateIntakePlan_(store,access.actor,{intakeTableChecks:teamExport.checks});requireAdmin_(snapshotActor_(store,request.token));return result;
 }
 
 /* Explicit monthly goals are historical business data. Missing and zero stay distinct. */
@@ -1992,7 +1993,7 @@ function previousInsightPeriod(period) {
 }
 const daysBetween = (earlier, later) => Math.floor((Date.parse(`${later}T00:00:00Z`) - Date.parse(`${earlier}T00:00:00Z`)) / 86400000);
 const endedStatus = (record) => /^(落選|辞退|案件枠埋まり|合格後離脱|稼働後離脱|C面談ブッチ)/.test(valueAt(record, 7)) || validInsightDate(valueAt(record, 26));
-const finishedRecord = (record) => endedStatus(record) || validInsightDate(valueAt(record, 24)) || valueAt(record, 7) === "稼働開始";
+const finishedRecord = (record) => endedStatus(record) || validInsightDate(valueAt(record, 24));
 /** Restrict records again even when a malformed client snapshot contains other owners. */
 function scopedInsightRecords(snapshot) {
     const owners = new Set(snapshot.players.filter(player => player.id !== "ADMIN" && (snapshot.self.role === "admin" || player.id === snapshot.self.playerId)).map(player => player.id));
@@ -2013,8 +2014,11 @@ function buildFollowUpTasks(snapshot, today = insightToday()) {
         const base = { recordId: record.recordId, candidateName: record.candidateName, companyName: valueAt(record, 2), playerId: record.playerId };
         const add = (task) => tasks.push({ ...base, ...task, id: `${record.recordId}:${task.kind}` });
         if (!finishedRecord(record)) {
-            if (validInsightDate(plannedStart) && plannedStart < today) {
-                add({ kind: "start_overdue", urgency: "overdue", title: "稼働開始の状況を確認", evidence: `稼働予定 ${plannedStart} · 開始日は未記録`, suggestedAction: "実際の開始日、または予定の変更を確認して記録する。", date: plannedStart });
+            if (validInsightDate(plannedStart) && plannedStart <= today) {
+                add({ kind: plannedStart === today ? "start_today" : "start_overdue", urgency: plannedStart === today ? "today" : "overdue", title: plannedStart === today ? "今日の稼働開始を確認" : "稼働開始の状況を確認", evidence: `稼働予定 ${plannedStart} · 開始日は未記録`, suggestedAction: "実際の開始日、または予定の変更を確認して記録する。", date: plannedStart });
+            }
+            else if (valueAt(record, 7) === "稼働開始") {
+                add({ kind: "start_date_missing", urgency: "followup", title: "稼働開始日を確認", evidence: `進捗は稼働開始${validInsightDate(plannedStart) ? ` · 稼働予定 ${plannedStart}` : ""} · 開始日は未記録`, suggestedAction: "開始済みか、進捗または予定日の入力違いかを確認する。実際に開始した場合だけ実施日を記録する。", date: validInsightDate(plannedStart) ? plannedStart : today });
             }
             else if (validInsightDate(scheduled) && !validInsightDate(interviewed) && scheduled <= today) {
                 add({ kind: scheduled === today ? "interview_today" : "interview_overdue", urgency: scheduled === today ? "today" : "overdue", title: scheduled === today ? "今日のC面談を確認" : "C面談の実施状況を確認", evidence: `C面談予定 ${scheduled}${valueAt(record, 11) ? ` ${valueAt(record, 11)}` : ""} · 実施日は未記録`, suggestedAction: scheduled === today ? "参加意思と日時を確認し、面談後に実施日を記録する。" : "実施、延期、辞退のいずれかを確認し、日付と進捗を更新する。", date: scheduled });
@@ -3556,4 +3560,18 @@ function verifyNodeTeamWorkspaceReadOnly(){
   tables:{candidates:{exists:!!candidates.sheet,count:candidates.entries.length},comments:{exists:!!comments.sheet,count:comments.entries.length},jobs:{exists:!!jobs.sheet,count:jobs.entries.length}},
   capabilities:{explicitPublication:true,ownerScopedSource:true,internalComments:true,adminManagedJobs:true,atomicSourceDeletion:true}};
  if(stableJson_(config_())!==stableJson_(config))fail_('BUSY','接続設定が確認中に更新されました。もう一度確認してください。');assertManagedBook_(accounts.book);requireOwner_();Logger.log(JSON.stringify(result));return result;
+}
+
+/** Admin archive is broader than the collaborative view only within this already
+ * authorized export. Retain withdrawn threads; deleted comment prose is omitted. */
+function teamWorkspaceExport_(store,user){
+ requireAdmin_(user);var candidates=teamCandidateTable_(store.book),comments=teamCommentTable_(store.book),jobs=teamJobTable_(store.book),checks=[];
+ [[TEAM_CANDIDATE_TAB,TEAM_CANDIDATE_HEADERS,candidates],[TEAM_COMMENT_TAB,TEAM_COMMENT_HEADERS,comments],[TEAM_JOB_TAB,TEAM_JOB_HEADERS,jobs]].forEach(function(item){var state=item[2];checks.push({title:item[0],headers:item[1],fingerprint:state.fingerprint,sheetId:state.sheet?state.sheet.getSheetId():null});});
+ var data={feature:true,scope:'all-saved-internal-shares',deletedCommentBodiesRedacted:true,
+  candidates:candidates.entries.map(function(p){return {publicationId:p.publicationId,ownerId:p.ownerId,sourceRecordId:p.sourceRecordId,sourceProfileId:p.sourceProfileId,sourceRowVersion:p.sourceRowVersion,sourceProfileVersion:p.sourceProfileVersion,candidateName:p.candidateName,introduction:p.introduction,published:p.published,version:p.version,createdAt:p.createdAt,updatedAt:p.updatedAt,publishedAt:p.publishedAt,canManage:true};}),
+  comments:comments.entries.map(function(p){return {commentId:p.commentId,publicationId:p.publicationId,parentId:p.parentId,authorId:p.authorId,body:p.deleted?'':p.body,mentionIds:p.deleted?[]:p.mentionIds,deleted:p.deleted,version:p.version,createdAt:p.createdAt,updatedAt:p.updatedAt,canManage:true};}),
+  jobs:jobs.entries.map(function(p){return {jobId:p.jobId,company:p.company,title:p.title,description:p.description,requirements:p.requirements,workConditions:p.workConditions,status:p.status,version:p.version,createdBy:p.createdBy,updatedBy:p.updatedBy,createdAt:p.createdAt,updatedAt:p.updatedAt};}),
+  players:store.players.map(function(p){return {id:p.id,name:p.name,role:p.role,active:p.active};})};
+ var cells=(candidates.rows.length+(candidates.sheet?1:0))*TEAM_CANDIDATE_HEADERS.length+(comments.rows.length+(comments.sheet?1:0))*TEAM_COMMENT_HEADERS.length+(jobs.rows.length+(jobs.sheet?1:0))*TEAM_JOB_HEADERS.length+store.players.length*4;
+ return {data:data,cells:cells,checks:checks};
 }

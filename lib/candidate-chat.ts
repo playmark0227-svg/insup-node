@@ -9,6 +9,8 @@ export type CandidateChatSource = {
   label: string;
   kind: "record" | "profile" | "review";
   facts: { label: string; value: string }[];
+  /** Exact local relationships used for selection, never part of the model prompt. */
+  recordIds?: string[];
 };
 export type CandidateChatContext = { candidateName: string; sources: CandidateChatSource[]; omittedRecords: number;
   identityIssue?: {code:"IDENTITY_SELECTION_REQUIRED"; message:string};
@@ -87,8 +89,11 @@ export function buildCandidateChatContext({ group, profiles, reviews = [], selec
 }): CandidateChatContext {
   let owned = ownedRecords(group);
   const choices=candidateChatProfileChoices(group,profiles),selected=selectedProfileId?choices.find(choice=>choice.profileId===selectedProfileId):undefined;
-  if(selectedProfileId&&!selected||!selectedProfileId&&choices.length>1)return {candidateName:short(group.name,120),sources:[],omittedRecords:0,
-    identityIssue:{code:"IDENTITY_SELECTION_REQUIRED",message:selectedProfileId?"選択した基本情報を参照できなくなりました。参照する記録・基本情報を選び直してください。":"同じ名前に複数の基本情報が紐づいています。別の人の情報を混ぜないため、参照する記録または基本情報を1つ選んでください。"}};
+  // A single known profile does not establish the identity of the remaining
+  // same-name legacy rows. Only explicitly linked rows can share its facts.
+  const hasUnlinkedRecords=choices.length===1&&owned.some(record=>!choices[0].recordIds.includes(record.recordId));
+  if(selectedProfileId&&!selected||!selectedProfileId&&(choices.length>1||hasUnlinkedRecords))return {candidateName:short(group.name,120),sources:[],omittedRecords:0,
+    identityIssue:{code:"IDENTITY_SELECTION_REQUIRED",message:selectedProfileId?"選択した基本情報を参照できなくなりました。参照する記録・基本情報を選び直してください。":hasUnlinkedRecords?"同じ名前に、基本情報に紐づいていない記録があります。別の人の情報を混ぜないため、参照する記録または基本情報を1つ選んでください。":"同じ名前に複数の基本情報が紐づいています。別の人の情報を混ぜないため、参照する記録または基本情報を1つ選んでください。"}};
   if(selected)owned=owned.filter(record=>selected.recordIds.includes(record.recordId));
   const totalRecords=selected?owned.length:group.records.length;
   const records = owned.filter(record => record.recordId.length <= 200).slice(0, 30);
@@ -107,6 +112,7 @@ export function buildCandidateChatContext({ group, profiles, reviews = [], selec
   });
   const profileSources: CandidateChatSource[] = eligibleProfiles.slice(0, 20).map(profile => ({
     id: `profile:${profile.profileId}`, kind: "profile",
+    recordIds:linkedRecords(profile).map(record=>record.recordId),
     label: short(`基本情報 · ${linkedRecords(profile).map(recordLabel).join(" / ")}`, 200),
     facts: interviewStringFields.filter(key => key !== "interviewAdvice")
       .map(key => fact(interviewFieldLabels[key], profile.fields[key]))
@@ -119,6 +125,7 @@ export function buildCandidateChatContext({ group, profiles, reviews = [], selec
   });
   const reviewSources: CandidateChatSource[] = eligibleReviews.slice(0, 30).map(review => ({
     id: `review:${review.recordId}`, kind: "review",
+    recordIds:[review.recordId],
     label: short(`面談の振り返り · ${recordLabel(records.find(record => record.recordId === review.recordId)!)}`, 200),
     // nextAction may contain an earlier generated AI recommendation; do not re-ground it as fact.
     facts: [fact("C面談実施日", review.interviewDate), fact("記録された未マッチ理由", review.category), fact("確認した理由・事実", review.memo)].filter(nonempty),
@@ -183,7 +190,8 @@ function companyFocus(context:CandidateChatContext,query:string):string|undefine
 function companySources(context:CandidateChatContext,company:string|undefined):CandidateChatSource[] {
  if(!company)return context.sources;
  const records=context.sources.filter(source=>source.kind==="record"&&sourceValue(source,"会社名")===company);
- return context.sources.filter(source=>records.includes(source)||source.kind!=="record"&&records.some(record=>source.label.includes(record.label)));
+ const ids=new Set(records.map(record=>record.id));
+ return context.sources.filter(source=>source.kind==="record"?ids.has(source.id):source.recordIds?.some(id=>ids.has(id)));
 }
 
 /** Select registered evidence for the current question before native inference. Never
@@ -291,12 +299,11 @@ export function answerCandidateFacts(context: CandidateChatContext, question: st
   for (const label of Object.values(interviewFieldLabels)) if (query.includes(label) && (label !== "稼働開始" || specificConditions.has(label))) requested.add(label);
   if (mode === "summary") for (const label of summaryLabels) requested.add(label);
   if (mode === "checks") for (const label of ["会社名", "ステータス", "C面談予定日", "C面談実施日", "希望単価", "稼働開始", "希望時間帯", "週の稼働日数", "面談可能日"]) requested.add(label);
-  const companies = context.sources.flatMap(source => source.kind === "record" ? source.facts.filter(entry => entry.label === "会社名").map(entry => entry.value) : []);
-  const company = companies.sort((a, b) => b.length - a.length).find(value => value && query.toLocaleLowerCase().includes(value.toLocaleLowerCase()));
+  const company=companyFocus(context,query);
   if (company && !requested.size) { requested.add("会社名"); requested.add("ステータス"); }
   if (!requested.size) return { text: "その項目に対応する記録は見つかりません。会社・進捗・面談日・予定・希望条件・経験・メモについて確認できます。", sourceIds: [] };
-  const matches = context.sources.map(source => ({ source, facts: source.facts.filter(entry => requested.has(canonicalChatLabel(entry.label))) }))
-    .filter(({ source, facts }) => facts.length && (!company || source.label.toLocaleLowerCase().includes(company.toLocaleLowerCase())));
+  const matches = companySources(context,company).map(source => ({ source, facts: source.facts.filter(entry => requested.has(canonicalChatLabel(entry.label))) }))
+    .filter(({ facts }) => facts.length);
   const missing = [...requested].filter(label => !matches.some(match => match.facts.some(entry => canonicalChatLabel(entry.label) === label)));
   const sections: string[] = [], sourceIds: string[] = [];
   let omitted = 0;

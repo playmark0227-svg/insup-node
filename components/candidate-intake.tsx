@@ -4,7 +4,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import { Check, Copy, FileText } from "lucide-react";
 import {
   chatOptions, composeCandidateIntroduction, crmOptions, genderOptions, introductionLimit,
-  interviewFieldLabels, interviewFieldLimits, pcOptions, unicodeLength,
+  interviewFieldLabels, interviewFieldLimits, introductionSourceKey, pcOptions, unicodeLength,
   type InterviewFields, type InterviewStringField, type IntroductionComposition,
 } from "@/lib/candidate-intake";
 import "@/app/intake.css";
@@ -19,6 +19,7 @@ export type InterviewIntakeEditorProps = {
   onFieldsChange: (fields: InterviewFields) => void;
   introduction: string;
   onIntroductionChange: (introduction: string) => void;
+  onIntroductionReviewChange?: (needsReview:boolean) => void;
   disabled?: boolean;
   ai?: CandidateAiConnection;
   memo?: string;
@@ -26,10 +27,13 @@ export type InterviewIntakeEditorProps = {
 
 /** Inline content: the parent supplies the dialog and save operation. */
 export function InterviewIntakeEditor({ candidateName, fields, onFieldsChange, introduction,
-  onIntroductionChange, disabled = false, ai, memo }: InterviewIntakeEditorProps) {
+  onIntroductionChange, onIntroductionReviewChange, disabled = false, ai, memo }: InterviewIntakeEditorProps) {
   const id = useId();
   const [formatResult, setFormatResult] = useState<IntroductionComposition | null>(null);
-  const [formatSource, setFormatSource] = useState("");
+  const currentShareSource=introductionSourceKey(candidateName,fields);
+  // A saved/approved introduction has a baseline too. Changing a field must not
+  // silently rewrite it, or let a one-character text edit dismiss the review.
+  const [reviewedSource,setReviewedSource]=useState(currentShareSource);
   const [replaceDraft, setReplaceDraft] = useState(false);
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState("");
@@ -45,11 +49,13 @@ export function InterviewIntakeEditor({ candidateName, fields, onFieldsChange, i
     const timer = setTimeout(() => {
       const result = composeReviewedIntroduction(candidateName, fields);
       if (result.text !== introduction) onIntroductionChange(result.text);
-      setFormatResult(result); setFormatSource(currentSource);
+      setFormatResult(result);setReviewedSource(currentShareSource);
     }, 250);
     return () => clearTimeout(timer);
   }, [currentSource, introduction, disabled, onIntroductionChange]);
-  const changedAfterFormat = !!formatResult && formatSource !== currentSource;
+  const introductionNeedsReview=!!introduction.trim()&&reviewedSource!==currentShareSource;
+  useEffect(()=>{onIntroductionReviewChange?.(introductionNeedsReview);},[introductionNeedsReview,onIntroductionReviewChange]);
+  useEffect(()=>{setCopied(false);},[currentShareSource]);
   // A background snapshot, a saved AI result and opening an existing profile are
   // not typing. Only edits in this editor may ask for an automatic AI candidate.
   const set = (key: InterviewStringField, value: string) => {
@@ -78,7 +84,7 @@ export function InterviewIntakeEditor({ candidateName, fields, onFieldsChange, i
   function format() {
     autoManaged.current = false;
     const result = composeReviewedIntroduction(candidateName, fields);
-    onIntroductionChange(result.text); setFormatResult(result); setFormatSource(currentSource);
+    onIntroductionChange(result.text);setFormatResult(result);setReviewedSource(currentShareSource);
     setReplaceDraft(false); setInputError(""); setCopied(false); setCopyError("");
   }
   function requestFormat() {
@@ -87,6 +93,7 @@ export function InterviewIntakeEditor({ candidateName, fields, onFieldsChange, i
     else format();
   }
   async function copy() {
+    if(introductionNeedsReview||!introduction.trim()||unicodeLength(introduction)>introductionLimit)return;
     setCopyError(""); setCopied(false);
     try {
       if (!navigator.clipboard?.writeText) throw new Error("clipboard unavailable");
@@ -134,12 +141,12 @@ export function InterviewIntakeEditor({ candidateName, fields, onFieldsChange, i
       onNotesChange={({memo: note,reflection})=>onFieldsChange({...fields,interviewMemo:note,selfReflection:reflection})}
       onSaveAdvice={text=>onFieldsChange({...fields,interviewAdvice:text})}
       onFocusField={field=>{const element=document.getElementById(`${id}-${field}`);element?.scrollIntoView({block:"center",behavior:"auto"});element?.focus({preventScroll:true});}}
-      onApplyIntroduction={text=>{autoManaged.current=false;setFormatResult(null);setCopied(false);onIntroductionChange(text);}}/></div>}
+      onApplyIntroduction={text=>{autoManaged.current=false;setFormatResult(null);setReviewedSource(currentShareSource);setCopied(false);onIntroductionChange(text);}}/></div>}
     <section className="intake-introduction" aria-labelledby={`${id}-intro-heading`}><div className="intake-introduction-heading"><div><h3 id={`${id}-intro-heading`}>クライアント共有用の基本情報</h3><p>入力中は基本情報の下書きを自動作成します。直接編集・AI案の採用後は上書きしません。</p></div><button type="button" className="secondary-button" disabled={disabled} onClick={requestFormat}><FileText size={16}/>入力から整形</button></div>
       <p className="intake-privacy">この整形は端末内で行います。外部AIには送信しません。</p>
       {replaceDraft && <div className="intake-replace" role="alert"><p>現在の編集文を、入力情報から整形し直します。</p><div><button type="button" className="secondary-button" disabled={disabled} onClick={() => setReplaceDraft(false)}>編集文を残す</button><button type="button" className="primary-button" disabled={disabled} onClick={format}>整形し直す</button></div></div>}
       {formatResult?.truncated && <p className="intake-notice" role="status">1000文字以内に収めるため、一部を省略しました。{formatResult.omittedFields.map(key => interviewFieldLabels[key]).join("・")}の入力原文は残っています。内容を確認して調整してください。</p>}
-      {changedAfterFormat && <p className="intake-notice" role="status">面談情報を変更しました。共有用の文章は前回のままです。必要に応じて整形し直してください。</p>}
+      {introductionNeedsReview&&<div className="intake-notice" role="status"><p>面談情報を変更しました。共有用の文章は前回のままです。入力から整形し直すか、最新のAI案を採用してください。本文を直接直す場合は、変更した条件・経歴が反映されていることを確認してください。確認が終わるまでコピーを保留しています。</p><button type="button" className="secondary-button" disabled={disabled} onClick={()=>{if(!disabled){setReviewedSource(currentShareSource);setCopied(false);}}}>本文を確認した</button></div>}
       <label className="intake-field" htmlFor={`${id}-introduction`}><span>基本情報の文章</span><textarea id={`${id}-introduction`} rows={13} value={introduction} disabled={disabled}
         placeholder="面談情報を入力し「入力から整形」を押すと、共有用の文章を作れます。直接の入力・修正もできます。"
         aria-describedby={`${id}-counter${inputError ? ` ${id}-input-error` : ""}`} onChange={event => {
@@ -147,7 +154,7 @@ export function InterviewIntakeEditor({ candidateName, fields, onFieldsChange, i
           if (unicodeLength(value) > introductionLimit) { setInputError("1000文字を超えるため、変更を反映していません。現在の文章を残しました。短くして入力してください。"); return; }
           autoManaged.current = false; setInputError(""); setCopied(false); onIntroductionChange(value);
         }}/></label>
-      <div className="intake-copy-row"><span id={`${id}-counter`} className={unicodeLength(introduction) > introductionLimit ? "intake-error" : ""}>{unicodeLength(introduction).toLocaleString()} / {introductionLimit.toLocaleString()}文字</span><button type="button" className="secondary-button" disabled={!introduction.trim() || unicodeLength(introduction) > introductionLimit} onClick={() => void copy()}>{copied ? <Check size={16}/> : <Copy size={16}/>}{copied ? "コピー済み" : "文章をコピー"}</button></div>
+      <div className="intake-copy-row"><span id={`${id}-counter`} className={unicodeLength(introduction) > introductionLimit ? "intake-error" : ""}>{unicodeLength(introduction).toLocaleString()} / {introductionLimit.toLocaleString()}文字</span><button type="button" className="secondary-button" disabled={introductionNeedsReview||!introduction.trim() || unicodeLength(introduction) > introductionLimit} onClick={() => void copy()}>{copied ? <Check size={16}/> : <Copy size={16}/>}{copied ? "コピー済み" : "文章をコピー"}</button></div>
       {inputError && <p className="intake-error" id={`${id}-input-error`} role="alert">{inputError}</p>}{copyError && <p className="intake-error" role="alert">{copyError}</p>}<span className="intake-sr-only" role="status">{copied ? "基本情報の文章をコピーしました" : ""}</span>
     </section>
   </div>;

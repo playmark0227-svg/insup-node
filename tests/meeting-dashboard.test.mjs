@@ -211,3 +211,10 @@ test("confirmed monthly zero is visible, historical targets are stable and inact
  h.click("合成担当2の発表画面を開く");assert.match(text(h.byClass("meeting-person-goal")[0]),/5 \/ 0 件/);assert.match(text(h.byClass("meeting-person-goal")[0]),/目標0件・達成率なし/);
  h.render({exportBlocked:true});assert.equal(h.button("CSV保存").props.disabled,true);
 });
+
+
+test("meeting presentations do not call zero proposals first place and preserve positive ties",()=>{
+ const empty=harness({counts:{}});empty.click("一人ずつ発表");assert.match(text(empty.byClass("meeting-speaker-heading")[0]),/提案実績未登録/);assert.doesNotMatch(text(empty.byClass("meeting-speaker-heading")[0]),/提案数.*位/);
+ const mixed=harness({counts:{"2026-10":{"ND-001":{"提案":0},"ND-002":{"提案":3}}}});mixed.click("検証 一郎の発表画面を開く");assert.doesNotMatch(text(mixed.byClass("meeting-speaker-heading")[0]),/提案数.*位/);mixed.click("次の人");assert.match(text(mixed.byClass("meeting-speaker-heading")[0]),/提案数 1位/);
+ const tied=harness({counts:{"2026-10":{"ND-001":{"提案":3},"ND-002":{"提案":3}}}});tied.click("一人ずつ発表");assert.match(text(tied.byClass("meeting-speaker-heading")[0]),/提案数 1位/);tied.click("次の人");assert.match(text(tied.byClass("meeting-speaker-heading")[0]),/提案数 1位/);
+});

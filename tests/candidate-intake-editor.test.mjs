@@ -9,11 +9,12 @@ import * as introductionReview from "../lib/introduction-review.ts";
 const source = ts.transpileModule(fs.readFileSync(new URL("../components/candidate-intake.tsx", import.meta.url), "utf8"),
   { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX } }).outputText;
 const nodes = node => !node || typeof node !== "object" ? [] : Array.isArray(node) ? node.flatMap(nodes) : [node, ...nodes(node.props?.children)];
+const text = node => node == null || typeof node==='boolean'?'':typeof node==='string'||typeof node==='number'?String(node):Array.isArray(node)?node.map(text).join(''):text(node.props?.children);
 
 // The real intake component is run with controlled parent props and a fake clock.
 // This tests its delayed edits rather than looking for implementation strings.
 function harness(initial = {}) {
-  const slots = [], effects = [], timers = new Map(), introductions = [], fieldChanges = [];
+  const slots = [], effects = [], timers = new Map(), introductions = [], fieldChanges = [], copied=[];
   let cursor = 0, now = 0, timerId = 0, tree;
   let props = {
     candidateName: "架空の候補者", fields: { ...intake.blankInterviewFields(), workHistory: "最初の職歴" }, introduction: "",
@@ -33,7 +34,7 @@ function harness(initial = {}) {
   };
   const exports = {}, jsx = (type, props, key) => ({ type, props: props || {}, key });
   const context = vm.createContext({ exports, module: { exports }, JSON, Error,
-    navigator: { clipboard: { writeText: async () => {} } },
+    navigator: { clipboard: { writeText: async value => {copied.push(value);} } },
     setTimeout: (fn, delay) => { const id = ++timerId; timers.set(id, { at: now + delay, fn }); return id; },
     clearTimeout: id => timers.delete(id),
     require: name => name === "react" ? react : name === "react/jsx-runtime" ? { jsx, jsxs: jsx } : name === "lucide-react" ? new Proxy({}, { get: (_, name) => name })
@@ -52,9 +53,10 @@ function harness(initial = {}) {
   }
   function change(suffix, value) { const node = nodes(render()).find(node => node.props.id?.endsWith(suffix)); assert.ok(node, suffix); node.props.onChange({ target: { value } }); render(); }
   function adoptAi(value) { const node = nodes(render()).find(node => node.type === "CandidateAiAssistant"); assert.ok(node); node.props.onApplyIntroduction(value); render(); }
+  function button(label) { const node=nodes(render()).find(node=>node.type==='button'&&text(node)===label);assert.ok(node,label);return node; }
   function unmount() { slots.forEach(slot => slot?.cleanup?.()); }
   render();
-  return { render, advance, change, adoptAi, unmount, introductions, fieldChanges, pendingTimers: () => timers.size,
+  return { render, advance, change, adoptAi, button, copied, text:()=>text(render()), unmount, introductions, fieldChanges, pendingTimers: () => timers.size,
     introduction: () => props.introduction, fields: () => props.fields };
 }
 
@@ -90,6 +92,49 @@ test("adopting an AI preview preserves it through later source edits and cancels
   h.change("-workHistory", "AI採用後の修正原文"); h.advance(2000);
   assert.equal(h.introduction(), "確認して採用したAI文章"); assert.equal(h.introductions.length, updates);
   assert.equal(h.fields().workHistory, "AI採用後の修正原文"); h.unmount();
+});
+
+test("editing a saved profile preserves its introduction but requires explicit review before copying changed conditions",async()=>{
+ const h=harness({fields:{...intake.blankInterviewFields(),desiredHourlyRate:'時給2000円'},introduction:'保存済み本文：時給2000円'});
+ assert.equal(h.button('文章をコピー').props.disabled,false);
+ h.change('-attendanceConcerns','社内だけの確認');h.change('-additionalNotes','内部メモの更新');
+ const ai=nodes(h.render()).find(node=>node.type==='CandidateAiAssistant');ai.props.onNotesChange({memo:'面談の内部メモ',reflection:'内部の振り返り'});
+ assert.equal(h.button('文章をコピー').props.disabled,false,'private notes do not invalidate client copy');
+ h.change('-desiredHourlyRate','時給3000円');
+ assert.equal(h.introduction(),'保存済み本文：時給2000円');assert.match(h.text(),/コピーを保留/);
+ assert.equal(h.button('文章をコピー').props.disabled,true);
+ await h.button('文章をコピー').props.onClick();assert.deepEqual(h.copied,[],'the handler also rejects a stale copy');
+ h.change('-introduction','手修正：時給3000円');assert.equal(h.button('文章をコピー').props.disabled,true,'typing does not silently confirm the new source');
+ h.button('本文を確認した').props.onClick();assert.equal(h.button('文章をコピー').props.disabled,false);
+ await h.button('文章をコピー').props.onClick();assert.deepEqual(h.copied,['手修正：時給3000円']);
+ h.change('-timeWindow','平日午後');assert.equal(h.button('文章をコピー').props.disabled,true,'another condition change needs another review');h.unmount();
+});
+
+test("an adopted AI introduction is retained and withheld from copying until the latest candidate is adopted",()=>{
+ const h=harness({fields:{...intake.blankInterviewFields(),desiredHourlyRate:'時給2000円'}});
+ h.adoptAi('採用済み本文：時給2000円');assert.equal(h.button('文章をコピー').props.disabled,false);
+ h.change('-desiredHourlyRate','時給3000円');h.advance(2000);
+ assert.equal(h.introduction(),'採用済み本文：時給2000円');assert.equal(h.button('文章をコピー').props.disabled,true);
+ h.change('-introduction','採用済み本文：時給2000円。');assert.equal(h.button('文章をコピー').props.disabled,true);
+ h.adoptAi('最新の採用本文：時給3000円');assert.equal(h.button('文章をコピー').props.disabled,false);assert.doesNotMatch(h.text(),/コピーを保留/);h.unmount();
+});
+
+test("explicit reformatting resets the shared-source baseline only after replacement is confirmed",()=>{
+ const h=harness({fields:{...intake.blankInterviewFields(),desiredHourlyRate:'時給2000円'}});
+ h.advance(250);h.render();assert.equal(h.button('文章をコピー').props.disabled,false);
+ h.change('-introduction','自分で整えた本文：時給2000円');h.change('-desiredHourlyRate','時給3000円');
+ assert.equal(h.button('文章をコピー').props.disabled,true);
+ h.button('入力から整形').props.onClick();assert.equal(h.button('文章をコピー').props.disabled,true);assert.equal(h.introduction(),'自分で整えた本文：時給2000円');
+ h.button('整形し直す').props.onClick();assert.equal(h.button('文章をコピー').props.disabled,false);assert.match(h.introduction(),/時給3000円/);
+ h.change('-desiredHourlyRate','時給4000円');assert.equal(h.button('文章をコピー').props.disabled,true);h.unmount();
+});
+
+test("the editor notifies its initial review state and clears a temporary auto-template review after updating",()=>{
+ const notifications=[],h=harness({onIntroductionReviewChange:required=>notifications.push(required)});
+ assert.deepEqual(notifications,[false]);h.advance(250);h.render();
+ h.change('-workHistory','最新の確認済み経歴');assert.equal(notifications.at(-1),true);
+ h.advance(250);h.render();h.render();assert.equal(notifications.at(-1),false);assert.match(h.introduction(),/最新の確認済み経歴/);
+ h.change('-additionalNotes','内部メモの更新');assert.equal(notifications.at(-1),false);assert.equal(h.button('文章をコピー').props.disabled,false);h.unmount();
 });
 
 test("unmounting or disabling the editor cancels pending automatic drafts", () => {

@@ -7,7 +7,7 @@ import ts from "typescript";
 import * as data from "../lib/node-data.ts";
 import * as management from "../lib/management-data.ts";
 import * as metrics from "../lib/performance-metrics.ts";
-import { blankInterviewFields, linkedCandidateProfile } from "../lib/candidate-intake.ts";
+import { blankInterviewFields, linkedCandidateProfile, introductionSourceKey } from "../lib/candidate-intake.ts";
 import { isUncertainWrite } from "../lib/sheets-client.ts";
 
 const workspace = ts.createSourceFile("node-workspace.tsx", fs.readFileSync(new URL("../components/node-workspace.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
@@ -35,7 +35,7 @@ function harness() {
   const window = { addEventListener(name, fn) { if (name === "beforeunload") listeners.add(fn); }, removeEventListener(name, fn) { if (name === "beforeunload") listeners.delete(fn); } };
   const guard = {}; vm.runInNewContext(guardSource, { exports: guard, module: { exports: guard }, require, window });
   const exports = {}, components = Object.fromEntries(["Dialog", "DialogContent", "DialogHeader", "DialogTitle", "DialogDescription", "Picker", "Input", "Checkbox", "ClientNameInput", "InterviewIntakeEditor", "CheckCircle2", "Plus"].map(name => [name, name]));
-  vm.runInNewContext(dialogSource, { exports, module: { exports }, require, crypto: { randomUUID }, ...components, ...data, ...management, ...metrics, blankInterviewFields, linkedCandidateProfile, isUncertainWrite,
+  vm.runInNewContext(dialogSource, { exports, module: { exports }, require, crypto: { randomUUID }, ...components, ...data, ...management, ...metrics, blankInterviewFields, linkedCandidateProfile, introductionSourceKey, isUncertainWrite,
     useUnsavedFormGuard: guard.useUnsavedFormGuard, UnsavedWorkPrompt: guard.UnsavedWorkPrompt, toast: { info() {}, error() {} },
   });
   const props = { today: "2026-10-30", open: true, activities: [], records: [], playerId: "ND-001", players: [{ id: "ND-001", name: "架空担当", team: "架空チーム", color: "blue", target: 20, bio: "" }], admin: false, detail: null, live: true, intakeEnabled: true, profiles: [], clients: [],
@@ -79,6 +79,28 @@ test("adopting interview fields or an introduction programmatically protects the
     else assert.equal(h.editor().props.introduction, "確認して採用した架空の紹介文");
     assert.equal(h.saved.length, 0); h.unmount();
   }
+});
+
+test("activity registration cannot persist changed profile conditions with an unreviewed older introduction",async()=>{
+ const h=harness();h.changeName('架空紹介文確認');
+ h.editor().props.onFieldsChange({...blankInterviewFields(),desiredHourlyRate:'時給2000円'});h.render();
+ h.editor().props.onIntroductionChange('共有本文：時給2000円');h.editor().props.onIntroductionReviewChange(false);h.render();
+ const oldCallback=h.editor().props.onIntroductionReviewChange;
+ h.editor().props.onFieldsChange({...h.editor().props.fields,desiredHourlyRate:'時給3000円'});h.render();oldCallback(false);
+ assert.equal(h.button('記録して反映').props.disabled,true);await h.submit();assert.equal(h.saved.length,0);assert.equal(h.closed.length,0);
+ h.editor().props.onIntroductionChange('共有本文：時給3000円');assert.equal(h.button('記録して反映').props.disabled,true);
+ h.editor().props.onIntroductionReviewChange(false);assert.equal(h.button('記録して反映').props.disabled,false);
+ await h.submit();assert.equal(h.saved.length,1);assert.equal(h.saved[0].interviewProfile.fields.desiredHourlyRate,'時給3000円');assert.equal(h.saved[0].interviewProfile.introduction,'共有本文：時給3000円');h.unmount();
+});
+
+test("an earlier candidate's review callback cannot approve or lock the newly selected candidate",()=>{
+ const h=harness(),a=waitingRecord('review-A'),b=waitingRecord('review-B');
+ h.render({records:[a,b],profiles:[profile(a),profile(b)]});candidateSelect(h).props.onChange({target:{value:a.candidateId}});
+ const aCallback=h.editor().props.onIntroductionReviewChange;aCallback(false);
+ candidateSelect(h).props.onChange({target:{value:b.candidateId}});h.editor().props.onIntroductionReviewChange(false);aCallback(true);
+ assert.equal(h.editor().props.candidateName,b.candidateName);assert.equal(h.button('記録して反映').props.disabled,false);
+ h.editor().props.onFieldsChange({...h.editor().props.fields,desiredHourlyRate:'時給3000円'});h.render();aCallback(false);
+ assert.equal(h.button('記録して反映').props.disabled,true);assert.equal(h.saved.length,0);h.unmount();
 });
 
 test("a save in progress and an uncertain receipt lock all closing and discard paths", async () => {

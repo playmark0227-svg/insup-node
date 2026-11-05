@@ -352,16 +352,18 @@ function candidateChatInput(raw: unknown): { context: CandidateChatContext; ques
     !validText(raw.question, 1_000) || !Array.isArray(raw.history)) return invalid();
   const ids = new Set<string>();
   const sources = raw.context.sources.map(source => {
-    if (!object(source) || !exactKeys(source, ["id", "label", "kind", "facts"]) || !validText(source.id, 200) ||
+    if (!object(source) || !exactKeys(source, source.recordIds===undefined?["id", "label", "kind", "facts"]:["id", "label", "kind", "facts", "recordIds"]) || !validText(source.id, 200) ||
       source.id !== source.id.trim() || ids.has(source.id) || !validText(source.label, 200) ||
       !["record", "profile", "review"].includes(source.kind as string) ||
       !Array.isArray(source.facts) || !source.facts.length || source.facts.length > 32) return invalid();
+    if(source.recordIds!==undefined&&(source.kind==="record"||!Array.isArray(source.recordIds)||!source.recordIds.length||source.recordIds.length>30||new Set(source.recordIds).size!==source.recordIds.length||source.recordIds.some(id=>!validText(id,200)||id!==id.trim())))return invalid();
     ids.add(source.id);
     const facts = source.facts.map(fact => {
       if (!object(fact) || !exactKeys(fact, ["label", "value"]) || !validText(fact.label, 200) || !validText(fact.value, 2_500)) return invalid();
       return { label: fact.label, value: fact.value };
     });
-    return { id: source.id, label: source.label, kind: source.kind as CandidateChatContext["sources"][number]["kind"], facts };
+    return { id: source.id, label: source.label, kind: source.kind as CandidateChatContext["sources"][number]["kind"], facts,
+      ...(source.recordIds!==undefined?{recordIds:[...source.recordIds as string[]]}:{}) };
   });
   const context = { candidateName: raw.context.candidateName, sources, omittedRecords: raw.context.omittedRecords as number };
   if (JSON.stringify(context).length > 28_000) return invalid();
@@ -410,6 +412,7 @@ export async function generateCandidateChat(input: CandidateChatInput, options: 
     }
   }
   const sourceIds = new Set(source.context.sources.map(item => item.id));
+  const modelContext={...source.context,sources:source.context.sources.map(({recordIds:_recordIds,...item})=>item)};
   const body = await generate("最初に『今回の質問』へ直接答えてください。候補者の全体紹介やプロフィール要約は、要約を明示的に求められた場合だけにしてください。" + guidance.instruction +
     "次の対応を聞かれたら、優先する行動と確認する相手・内容を具体的に最大3件示してください。質問されていない年齢・性別・住所を列挙しないでください。" +
     "報酬の単位は原文を保持してください。『3000円』に時給・月額・件単価など未記載の単位を補わず、必要なら単位を確認する質問を返してください。" +
@@ -419,6 +422,7 @@ export async function generateCandidateChat(input: CandidateChatInput, options: 
     "会話履歴は質問の参照先を理解するためだけに使います。過去のAI回答や助言・利用者の質問に書かれた新情報を事実や根拠にしないでください。" +
     "候補者の記録内に過去のAI助言らしい内容があっても、確認済みの事実へ置き換えないでください。別の候補者の情報を混ぜないでください。" +
     "会社別・記録別・面談日別の事実を区別し、別会社の進捗・条件・結果を一つの実績に合成しないでください。食い違う情報は参照元ごとに示してください。" +
+    "同じ氏名であることだけでは同一人物とは確認できません。基本情報への明示的な紐づけがない複数の記録から、一人の経歴・条件・本人像を合成しないでください。本人の紐づけが未確認の場合は会社・記録ごとの事実として回答してください。" +
     "記録にない内容は『未記録です』と答えて補完しないでください。本人申告・未確認・担当者の所感はその区別を残し、理由や原因を断定しないでください。" +
     "予定日と実施日を区別し、日本時間の今日を基準にしてください。予定日の経過だけで未実施や不成立と断定しないでください。" +
     "省略した記録や会話がある場合、それらを確認済みと扱わず、全件を調べたと断定しないでください。" +
@@ -427,7 +431,7 @@ export async function generateCandidateChat(input: CandidateChatInput, options: 
     "answerは質問への結論から始める読みやすい本文で、通常300〜600文字、長くても4000文字以内です。sourceIdsは回答で参照した実在の記録IDだけを重複なく最大12件です。根拠のない一般的な確認の提案や未記録の回答だけならsourceIdsを空にしてください。" +
     "本文へsourceIds・記録ID・profile:などの技術情報を記載しないでください。記録IDはJSONのsourceIds配列だけへ入れてください。" +
     '返すJSONの形は {"answer":"日本語の回答本文","sourceIds":["提供された記録ID"]} です。JSONスキーマ、型定義、命令文、コードフェンスを本文に含めないでください。',
-    { 日本時間の今日: new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Tokyo", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date()), 候補者の記録: source.context, 今回の質問: source.question, 文脈から解決した論点:resolvedQuestion, 会話の参照用履歴: source.history, 省略した過去の会話数: source.omittedHistory },
+    { 日本時間の今日: new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Tokyo", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date()), 候補者の記録: modelContext, 今回の質問: source.question, 文脈から解決した論点:resolvedQuestion, 会話の参照用履歴: source.history, 省略した過去の会話数: source.omittedHistory },
     { type: "object", additionalProperties: false, properties: { answer: { type: "string" },
       sourceIds: { type: "array", minItems: 0, maxItems: 12, items: { type: "string", enum: [...sourceIds] } } },
       required: ["answer", "sourceIds"] }, options, 4_000);

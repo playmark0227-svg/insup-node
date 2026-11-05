@@ -54,3 +54,11 @@ test('application export accepts a large valid management table below the server
  assert.equal(rows.length*rows[0].cells.length,17600);assert.ok(JSON.stringify(data).length<2000000);
  assert.equal(operations.validateDataExport(data),data);
 });
+
+
+test('data export accepts a dedicated optional team archive and still rejects credentials anywhere inside it',()=>{
+ const legacy={schemaVersion:1,exportedAt:'2026-11-06T00:00:00.000Z',scope:'application-data',snapshot:{players:[]},managementTables:[],limits:{maxCells:50000,maxCharacters:2000000}},teamWorkspace={feature:true,scope:'all-saved-internal-shares',deletedCommentBodiesRedacted:true,candidates:[],comments:[],jobs:[],players:[{id:'ADMIN',name:'合成管理者',role:'admin',active:true}]};
+ assert.equal(operations.validateDataExport(legacy),legacy);const result=operations.validateDataExport({...legacy,teamWorkspace});assert.equal(result.teamWorkspace.scope,'all-saved-internal-shares');assert.equal(result.teamWorkspace.players[0].active,true);
+ for(const key of ['outboxKey','credentials','token','apiKey','password','cacheAccess','secret'])assert.throws(()=>operations.validateDataExport({...legacy,teamWorkspace:{...teamWorkspace,nested:{[key]:'never export'}}}));
+ assert.throws(()=>operations.validateDataExport({...legacy,teamWorkspace:{...teamWorkspace,deletedCommentBodiesRedacted:false}}));
+});
