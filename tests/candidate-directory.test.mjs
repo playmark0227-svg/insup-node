@@ -422,11 +422,11 @@ test("a home registration request waits for eligibility and is consumed only onc
 
 test("searching to zero offers a filter reset and preserves the existing directory", () => {
   const h = managerHarness("CandidateManager");
-  h.change("候補者・会社・メモを検索", "一致しない架空検索語");
+  h.change("候補者・職歴・スキル・会社を検索", "一致しない架空検索語");
   assert.match(text(h.render()), /条件に合う候補者が見つかりません/);
   assert.doesNotMatch(text(h.render()), /最初の候補者を登録/);
   h.click("すべての候補者を表示");
-  assert.equal(h.input("候補者・会社・メモを検索").props.value, "");
+  assert.equal(h.input("候補者・職歴・スキル・会社を検索").props.value, "");
   const directory = nodes(h.render()).find(node => node.type === "CandidateDirectory");
   assert.equal(directory.props.groups.length, 1); assert.equal(directory.props.groups[0].records[0].recordId, "current-record");
 });
@@ -531,4 +531,14 @@ test('filter and sort controls reset pagination while preserving whole candidate
  controls().props.onFilterChange({...controls().props.filter,company:'架空会社A'});h.render();assert.match(text(h.render()),/1〜15 \/ 20名/);
  controls().props.onSortChange({field:'name',direction:'desc'});h.render();let directory=nodes(h.render()).find(node=>node.type==='CandidateDirectory');assert.equal(directory.props.groups[0].name,'架空候補者39');assert.equal(controls().props.filter.company,'架空会社A');
  h.render({records:[records[0]]});directory=nodes(h.render()).find(node=>node.type==='CandidateDirectory');assert.equal(directory.props.groups.length,1);assert.match(text(h.render()),/1〜1 \/ 1名/);
+});
+
+
+test("the full candidate directory can be shown without paging, while keeping the sort and filter",()=>{
+ const records=Array.from({length:60},(_,index)=>({...record(`list-${index}`,index%2?"架空会社B":"架空会社A",index+2),candidateName:`架空人物${index}`}));
+ const h=managerHarness("CandidateManager",{records});
+ const choose=(value)=>nodes(h.render()).find(node=>node.type==="select"&&node.props["aria-label"]==="候補者一覧の表示件数").props.onChange({target:{value}});
+ const directory=()=>nodes(h.render()).find(node=>node.type==="CandidateDirectory");
+ assert.equal(directory().props.groups.length,15);choose("50");assert.equal(directory().props.groups.length,50);choose("all");assert.equal(directory().props.groups.length,60);
+ const controls=nodes(h.render()).find(node=>node.type==="CandidateListControls");controls.props.onFilterChange({...controls.props.filter,company:"架空会社A"});assert.equal(directory().props.groups.length,30);assert.match(text(h.render()),/1〜30 \/ 30名/);
 });

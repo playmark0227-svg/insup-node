@@ -145,7 +145,7 @@ function withLock_(fn, waitMs) {
  * read, and rejected requests do not count. NODE_AI_QUOTA still governs Gemini.
  * Writes are not budgeted here; their reads are serialized by the script lock. A replayed operation
  * that answers with a snapshot writes nothing, so it is charged to the snapshot budget. */
-var NODE_READ_BUCKETS = Object.freeze({ snapshot: 'snapshot', resumeSession: 'snapshot', readInterviewAdvice: 'report', readWorkspaceInsights: 'report', analyzeInterviewReviews: 'report', analyzeWorkspaceInsights: 'report', auditSecurity: 'report', readAccountManagement:'report', readOperationHistory:'report', readDataExport:'export', managementTables: 'table', managementTable: 'table', readWritingKit: 'kit', readWritingPreferences: 'kit', generateWritingKit: 'kit' });
+var NODE_READ_BUCKETS = Object.freeze({ readTeamWorkspace: 'table', snapshot: 'snapshot', resumeSession: 'snapshot', readInterviewAdvice: 'report', readWorkspaceInsights: 'report', analyzeInterviewReviews: 'report', analyzeWorkspaceInsights: 'report', auditSecurity: 'report', readAccountManagement:'report', readOperationHistory:'report', readDataExport:'export', managementTables: 'table', managementTable: 'table', readWritingKit: 'kit', readWritingPreferences: 'kit', generateWritingKit: 'kit' });
 var NODE_READ_LIMITS = Object.freeze({ snapshot: [40, 900], report: [20, 300], table: [40, 600], kit: [60, 1200], export:[2,10] });
 function readBudget_(id, action) {
   // id is always an ID the server already normalized (a session record or issueSession_), never request input.
@@ -169,7 +169,7 @@ function nodeHandle_(request) {
   var action = request.action;
   // Only an automatic snapshot poll or session check that says so is passive. Sessions from frontends built
   // before the idle timeout are never idle-checked (see sessionIdle_), so they keep today's 6-hour behavior.
-  var passive = (action === 'snapshot' || action === 'touch') && request.background === true;
+  var passive = (action === 'snapshot' || action === 'touch' || action === 'readTeamWorkspace') && request.background === true;
   if (action === 'health') return health_();
   if (action === 'login') return login_(request.payload || {});
   if (action === 'changePassword') return changePassword_(request);
@@ -184,11 +184,12 @@ function nodeHandle_(request) {
   if (action === 'saveMonthlyTarget') return saveMonthlyTarget_(request);
   if (action === 'readOperationHistory') return readOperationHistory_(request);
   if (action === 'readDataExport') return readDataExport_(request);
+  if (action === 'readTeamWorkspace') return readTeamWorkspace_(request);
   // Real input while an editor is open: records activity without reading the business table. A background
   // touch only checks the session (idle and absolute limits) while a pending save pauses the polls.
   // deferred: the due refresh was not written (busy lock), so the client keeps the input to report again.
   if (action === 'touch') { var touched = authenticate_(request.token, false, passive); return passive ? { touched: false } : touched.touchDeferred ? { touched: false, deferred: true } : { touched: true }; }
-  if (['snapshot','logout','saveActivity','updateStatus','updateProfile','createPlayer','updateRecord','deleteCandidate','cancelAchievement','restoreChange','managementTables','managementTable','saveManagementRow','createCandidate','saveInterviewReview','saveCandidateProfile','saveClient','analyzeInterviewReviews','readInterviewAdvice','readWorkspaceInsights','analyzeWorkspaceInsights','readWritingKit','generateWritingKit','readWritingPreferences','saveWritingPreferences'].indexOf(action) < 0) fail_('BAD_REQUEST', '対応していない操作です。');
+  if (['snapshot','logout','saveActivity','updateStatus','updateProfile','createPlayer','updateRecord','deleteCandidate','cancelAchievement','restoreChange','managementTables','managementTable','saveManagementRow','createCandidate','saveInterviewReview','saveCandidateProfile','saveClient','analyzeInterviewReviews','readInterviewAdvice','readWorkspaceInsights','analyzeWorkspaceInsights','readWritingKit','generateWritingKit','readWritingPreferences','saveWritingPreferences','publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob'].indexOf(action) < 0) fail_('BAD_REQUEST', '対応していない操作です。');
   if (action === 'readWritingKit') return readWritingKit_(request);
   if (action === 'generateWritingKit') return generateWritingKit_(request);
   if (action === 'readWritingPreferences') return readWritingPreferences_(request);
@@ -215,7 +216,7 @@ function nodeHandle_(request) {
     var user = authenticate_(request.token, action === 'logout', action === 'logout');
     if (action === 'logout') { props_().deleteProperty(sessionKey_(request.token)); return { loggedOut: true }; }
     var activity = request.payload && request.payload.activity;
-    var existingRow = ['saveInterviewReview','saveCandidateProfile','saveClient','updateStatus','updateRecord','deleteCandidate','cancelAchievement'].indexOf(action) >= 0 || action === 'saveActivity' && activity && activity.recordId;
+    var existingRow = ['publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','saveInterviewReview','saveCandidateProfile','saveClient','updateStatus','updateRecord','deleteCandidate','cancelAchievement'].indexOf(action) >= 0 || action === 'saveActivity' && activity && activity.recordId;
     // Existing-row edits only need named candidate rows. New rows still inspect
     // the entire template, preserving blank-row and formula protection.
     var store = readStore_({ readOnly: !!existingRow });
@@ -232,7 +233,7 @@ function nodeHandle_(request) {
       if (previous.actorId !== user.id || previous.action !== action || previous.payloadHash !== payloadHash) fail_('OPERATION_CONFLICT', '同じ保存IDを別の内容に使うことはできません。');
       // A replay writes nothing, so a replay answered with a full snapshot is a read and spends the
       // snapshot budget. A receipt replay (the outbox retry) stays free, as genuine writes do.
-      if (request.responseMode !== 'receipt' || action === 'createPlayer') readBudget_(user.id, 'snapshot');
+      if ((!teamMutationAction_(action)&&request.responseMode !== 'receipt') || action === 'createPlayer') readBudget_(user.id, 'snapshot');
       return { user:user, result:previous.result, operationId:operationId, config:store.config };
     }
     var plan;
@@ -244,6 +245,10 @@ function nodeHandle_(request) {
     if (action === 'createCandidate') plan = planCandidate_(store,user,payload);
     if (action === 'saveCandidateProfile') plan = planCandidateProfile_(store,user,payload);
     if (action === 'saveClient') plan = planClient_(store,user,payload);
+    if (action === 'publishTeamCandidate') plan = planTeamCandidate_(store,user,payload);
+    if (action === 'unpublishTeamCandidate') plan = planUnpublishTeamCandidate_(store,user,payload);
+    if (action === 'saveTeamComment') plan = planTeamComment_(store,user,payload);
+    if (action === 'saveTeamJob') plan = planTeamJob_(store,user,payload);
     if (action === 'updateRecord') plan = planRecord_(store,user,payload);
     if (action === 'deleteCandidate') plan = planDeleteCandidate_(store,user,payload,operationId);
     if (action === 'cancelAchievement') plan = planCancelAchievement_(store,user,payload);
@@ -253,7 +258,7 @@ function nodeHandle_(request) {
     return { user:user, result:plan.result || {}, operationId:operationId, config:store.config, secret:plan.secret };
   });
   if (action === 'logout') return committed;
-  if (request.responseMode === 'receipt' && action !== 'createPlayer') {
+  if ((request.responseMode === 'receipt' || teamMutationAction_(action)) && action !== 'createPlayer') {
     // The atomic batch and its idempotency record have completed. Return a
     // receipt without making the caller wait for a second business-table scan.
     var accounts = readAccountStore_(), actor = activeActor_(accounts, authenticate_(request.token));
@@ -667,7 +672,7 @@ function manageAccount_(request) {
   });
 }
 function rowUpdateAccountActive_(sheetId,row,active){return {updateCells:{range:{sheetId:sheetId,startRowIndex:row-1,endRowIndex:row,startColumnIndex:8,endColumnIndex:9},rows:[{values:[cell_(active)]}],fields:'userEnteredValue'}};}
-var NODE_OPERATION_SUMMARIES=Object.freeze({saveActivity:'実績日を登録',updateStatus:'進捗を更新',updateProfile:'プロフィール・目標を更新',createPlayer:'プレイヤーIDを発行',createCandidate:'候補者を登録',saveCandidateProfile:'候補者の基本情報を更新',saveClient:'取引先を更新',updateRecord:'候補者の進捗・実績を更新',deleteCandidate:'候補者・提案を削除',cancelAchievement:'実績を取り消し',restoreChange:'変更を復元',saveManagementRow:'管理表を更新',saveInterviewReview:'面談の振り返りを保存',manageAccount:'アカウントの利用状態を管理',saveMonthlyTarget:'月別目標を更新'});
+var NODE_OPERATION_SUMMARIES=Object.freeze({publishTeamCandidate:'候補者紹介文を社内共有',unpublishTeamCandidate:'候補者の社内共有を停止',saveTeamComment:'社内コメントを更新',saveTeamJob:'募集案件を更新',saveActivity:'実績日を登録',updateStatus:'進捗を更新',updateProfile:'プロフィール・目標を更新',createPlayer:'プレイヤーIDを発行',createCandidate:'候補者を登録',saveCandidateProfile:'候補者の基本情報を更新',saveClient:'取引先を更新',updateRecord:'候補者の進捗・実績を更新',deleteCandidate:'候補者・提案を削除',cancelAchievement:'実績を取り消し',restoreChange:'変更を復元',saveManagementRow:'管理表を更新',saveInterviewReview:'面談の振り返りを保存',manageAccount:'アカウントの利用状態を管理',saveMonthlyTarget:'月別目標を更新'});
 function readOperationHistory_(request) {
   var access=accountManagementStore_(request.token),store=access.store,payload=request.payload||{},limit=payload.limit===undefined?25:payload.limit,cursor=payload.cursor;
   if(!Number.isInteger(limit)||limit<1||limit>50||cursor!==undefined&&(!Number.isInteger(cursor)||cursor<2))fail_('VALIDATION','履歴の表示範囲を確認してください。');
@@ -958,7 +963,7 @@ function buildSnapshot_(store, user) {
   var all = activities_(store);
   var snapshot={ self: { playerId: user.id, role: user.role }, players: store.players.filter(function (p) { return p.role === 'player' && (user.role==='admin'||p.active); }).map(function(player){return publicPlayer_(player,user);}), activities: all.filter(function (a) { return user.role === 'admin' || a.playerId === user.id; }), counts: countActivities_(all, store.players.filter(function(p){return user.role==='admin'||p.active;})), syncedAt: new Date().toISOString(), warnings: store.warnings.slice(), writesEnabled: store.schemaCompatible&&writesEnabled_(store.config) && store.book.getSpreadsheetTimeZone() === 'Asia/Tokyo' };
   snapshot.interviewReviews=readInterviewReviews_(store,user);
-  snapshot.intakeFeature=true; snapshot.candidateProfiles=readCandidateProfiles_(store,user); snapshot.clients=clientEntries_(store.book);
+  snapshot.candidateRegistrationFeature=true; snapshot.teamWorkspaceFeature=true; snapshot.intakeFeature=true; snapshot.candidateProfiles=readCandidateProfiles_(store,user); snapshot.clients=clientEntries_(store.book);
   snapshot.deletionFeature=true; snapshot.deletedCandidates=deletedCandidates_(store,user);
   snapshot.writingFeature=true; snapshot.writingPreferences=writingPreferences_();
   snapshot.reviewFeature=true; snapshot.monthlyGoalsFeature=true; snapshot.monthlyGoals=readMonthlyGoals_(store,user);
@@ -1172,6 +1177,7 @@ function commit_(store, user, action, operationId, payloadHash, plan, token) {
   if (plan.profileRow && store.playerSheet.getRange(plan.profileRow,1,1,NODE.playerHeaders.length).getFormulas()[0].some(Boolean)) fail_('FORMULA_PROTECTED', 'プロフィールの入力先に数式があります。');
   revalidateManagementPlan_(store,user,plan);
   revalidateIntakePlan_(store,user,plan);
+  revalidateTeamPlan_(store,user,plan);
   if(token)snapshotActor_(store,token);
   Array.prototype.push.apply(requests, plan.requests || []);
   if(JSON.stringify(plan.result||{}).length>48000)fail_('VALIDATION','変更履歴が大きすぎます。長いメモは項目を分けて保存してください。');
@@ -1286,8 +1292,8 @@ function probeReservation_(store,actorId,allowExpired) {
   return probe;
 }
 function guardProbeBusinessMutation_(store,user,action,payload) {
-  if(['saveActivity','updateStatus','updateRecord','deleteCandidate','cancelAchievement','restoreChange','saveManagementRow','createCandidate','saveCandidateProfile','saveClient'].indexOf(action)<0)return;
-  if((action==='restoreChange'||action==='saveManagementRow'||action==='createCandidate'||action==='saveCandidateProfile'||action==='saveClient')&&probeReservation_(store,user.id,false))fail_('FORBIDDEN','検証専用アカウントにはこの操作は許可されていません。');
+  if(['publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','saveActivity','updateStatus','updateRecord','deleteCandidate','cancelAchievement','restoreChange','saveManagementRow','createCandidate','saveCandidateProfile','saveClient'].indexOf(action)<0)return;
+  if((['publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob'].indexOf(action)>=0||action==='restoreChange'||action==='saveManagementRow'||action==='createCandidate'||action==='saveCandidateProfile'||action==='saveClient')&&probeReservation_(store,user.id,false))fail_('FORBIDDEN','検証専用アカウントにはこの操作は許可されていません。');
   var activity=payload.activity||{},recordId=action==='saveActivity'?activity.recordId:payload.recordId,record=recordId?findRecord_(store,recordId):null;
   var targetId=record?record.playerId:action==='saveActivity'?activity.playerId:null;
   var probe=probeReservation_(store,user.id,false),targetProbe=targetId&&targetId!==user.id?probeReservation_(store,targetId,false):null;
@@ -1639,7 +1645,7 @@ function planDeleteCandidate_(store,user,payload,operationId) {
   });
   var plan=combinedChangePlan_(groups,record.name+'の'+(payload.scope==='candidate'?'候補者を削除':'提案を削除'));plan.recordChecks=targets.map(function(r){return {recordId:r.recordId,row:r.row,version:r.version};});
   if(payload.scope==='candidate')plan.candidateDeleteCheck={playerId:record.playerId,candidateId:record.candidateId,ids:targets.map(function(r){return r.recordId;}).sort()};
-  plan.result.deletedCount=targets.length;return plan;
+  unpublishTeamForDeletedRecords_(store,user,plan,targets);plan.result.deletedCount=targets.length;return plan;
 }
 
 function planCancelAchievement_(store,user,payload) {
@@ -1697,7 +1703,11 @@ function planCandidate_(store,user,payload) {
   if(!owner||!owner.sheetNames.length)fail_('VALIDATION','担当者を選んでください。');
   if(user.role!=='admin'&&user.id!==owner.id)fail_('FORBIDDEN','本人の候補者だけ登録できます。');
   var name=shortText_(payload.candidateName,60,true);if(name!==normalizeName_(name))fail_('VALIDATION','候補者名はスペースなしで入力してください。');
-  var plan=newPlan_(store,null,owner.id,user.id);setPatch_(plan,3,name);setPatch_(plan,4,owner.sheetNames[0]);setPatch_(plan,2,shortText_(payload.company,100,false));setPatch_(plan,6,choice_(payload.position,NODE.positions));setPatch_(plan,7,'提案候補');plan.result={recordId:plan.recordId};return plan;
+  var interviewDate='';
+  if(payload.interviewDate!==undefined){if(typeof payload.interviewDate!=='string')fail_('INVALID_DATE','面談実施日を確認してください。');if(payload.interviewDate){interviewDate=day_(payload.interviewDate);if(!interviewDate||interviewDate!==payload.interviewDate||interviewDate>today_())fail_('INVALID_DATE','面談実施日は実施済みの有効な日付を指定してください。');}}
+  var plan=newPlan_(store,null,owner.id,user.id);setPatch_(plan,3,name);setPatch_(plan,4,owner.sheetNames[0]);setPatch_(plan,2,shortText_(payload.company,100,false));setPatch_(plan,6,choice_(payload.position,NODE.positions));setPatch_(plan,7,'提案候補');if(interviewDate)setPatch_(plan,1,dayDate_(interviewDate));plan.result={recordId:plan.recordId};
+  if(payload.fields!==undefined){if(payload.profileVersion!=='')fail_('CONFLICT','新規候補者の面談情報は新しいバージョンで登録してください。');addCandidateProfileToPlan_(store,user,plan,null,owner.id,{fields:payload.fields,introduction:payload.introduction,profileVersion:payload.profileVersion});}
+  return plan;
 }
 
 /** Owner-only verification on the already registered disposable copy. Never changes production configuration or sessions. */
@@ -3424,3 +3434,126 @@ exports.derive = derive;
 return exports;
 })({});
 /* END GENERATED PASSWORD KDF */
+
+/* Explicit internal publication workspace. Private matching/profile snapshots retain
+ * their existing owner scopes. Reading never creates these app-owned tables. */
+var TEAM_CANDIDATE_TAB='_NODE_team_candidates';
+var TEAM_CANDIDATE_HEADERS=['publicationId','ownerId','sourceRecordId','sourceProfileId','sourceRowVersion','sourceProfileVersion','candidateName','introduction','published','version','createdAt','updatedAt','publishedAt'];
+var TEAM_COMMENT_TAB='_NODE_team_comments';
+var TEAM_COMMENT_HEADERS=['commentId','publicationId','parentId','authorId','body','mentionIds','deleted','version','createdAt','updatedAt'];
+var TEAM_JOB_TAB='_NODE_team_jobs';
+var TEAM_JOB_HEADERS=['jobId','company','title','description','requirements','workConditions','status','version','createdBy','updatedBy','createdAt','updatedAt'];
+var TEAM_JOB_STATUSES=['open','paused','closed'];
+function teamMutationAction_(action){return ['publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob'].indexOf(action)>=0;}
+function teamObject_(payload){if(!payload||typeof payload!=='object'||Array.isArray(payload))fail_('VALIDATION','社内共有の入力内容を確認してください。');return payload;}
+function teamId_(value){if(!intakeId_(value))fail_('VALIDATION','社内共有の管理IDを確認してください。');return value;}
+function teamAccount_(value){if(typeof value!=='string'||!(/^[A-Za-z0-9_-]{1,30}$/).test(value))fail_('SCHEMA_MISMATCH','社内共有の担当者を確認してください。');return value;}
+function teamTime_(value,empty){if(empty&&value==='')return '';if(typeof value!=='string'||!/^\d{4}-\d{2}-\d{2}T/.test(value)||!isFinite(Date.parse(value)))fail_('SCHEMA_MISMATCH','社内共有の更新日を確認してください。');return value;}
+function teamText_(value,max,required){return intakeText_(shortText_(value,max,required),max);}
+function teamSchema_(fn){try{return fn();}catch(error){if(error.nodeCode==='FORMULA_PROTECTED'||error.nodeCode==='INTAKE_LIMIT')throw error;fail_('SCHEMA_MISMATCH','社内共有の管理タブに不正な値があります。管理者に確認してください。');}}
+function teamCandidateTable_(book){
+ var state=intakeTable_(book,TEAM_CANDIDATE_TAB,TEAM_CANDIDATE_HEADERS),seen=Object.create(null);
+ state.entries=state.rows.map(function(row,index){return teamSchema_(function(){
+  var id=teamId_(row[0]);if(seen[id]||typeof row[8]!=='boolean')fail_('SCHEMA_MISMATCH','共有候補者の管理IDまたは状態を確認してください。');seen[id]=true;
+  return {publicationId:id,ownerId:teamAccount_(row[1]),sourceRecordId:teamId_(row[2]),sourceProfileId:teamId_(row[3]),sourceRowVersion:shortText_(row[4],128,true),sourceProfileVersion:teamId_(row[5]),candidateName:teamText_(row[6],60,true),introduction:teamText_(row[7],1000,true),published:row[8],version:teamId_(row[9]),createdAt:teamTime_(row[10]),updatedAt:teamTime_(row[11]),publishedAt:teamTime_(row[12],true),row:index+2};
+ });});return state;
+}
+function teamMentions_(value,players,stored){
+ if(!Array.isArray(value)||value.length>20||value.some(function(id){return typeof id!=='string'||!/^[A-Za-z0-9_-]{1,30}$/.test(id);})||new Set(value).size!==value.length)fail_(stored?'SCHEMA_MISMATCH':'VALIDATION','メンション先は有効な社内メンバーを20人以内で指定してください。');
+ if(!stored&&value.some(function(id){return !players.some(function(p){return p.id===id&&p.active&&(p.role==='player'||p.role==='admin');});}))fail_('VALIDATION','停止中または存在しないメンバーをメンションできません。');return value.slice();
+}
+function teamCommentTable_(book){
+ var state=intakeTable_(book,TEAM_COMMENT_TAB,TEAM_COMMENT_HEADERS),seen=Object.create(null);
+ state.entries=state.rows.map(function(row,index){return teamSchema_(function(){
+  var id=teamId_(row[0]),mentions;try{mentions=JSON.parse(row[5]);}catch(_){fail_('SCHEMA_MISMATCH','コメントの宛先を確認してください。');}
+  if(seen[id]||typeof row[6]!=='boolean')fail_('SCHEMA_MISMATCH','コメントのIDまたは状態を確認してください。');seen[id]=true;
+  return {commentId:id,publicationId:teamId_(row[1]),parentId:row[2]?teamId_(row[2]):'',authorId:teamAccount_(row[3]),body:teamText_(row[4],2000,true),mentionIds:teamMentions_(mentions,[],true),deleted:row[6],version:teamId_(row[7]),createdAt:teamTime_(row[8]),updatedAt:teamTime_(row[9]),row:index+2};
+ });});return state;
+}
+function teamJobTable_(book){
+ var state=intakeTable_(book,TEAM_JOB_TAB,TEAM_JOB_HEADERS),seen=Object.create(null);
+ state.entries=state.rows.map(function(row,index){return teamSchema_(function(){var id=teamId_(row[0]);if(seen[id])fail_('SCHEMA_MISMATCH','案件IDを確認してください。');seen[id]=true;
+  return {jobId:id,company:teamText_(row[1],100,true),title:teamText_(row[2],120,true),description:teamText_(row[3],3000,false),requirements:teamText_(row[4],2000,false),workConditions:teamText_(row[5],2000,false),status:choice_(row[6],TEAM_JOB_STATUSES),version:teamId_(row[7]),createdBy:teamAccount_(row[8]),updatedBy:teamAccount_(row[9]),createdAt:teamTime_(row[10]),updatedAt:teamTime_(row[11]),row:index+2};
+ });});return state;
+}
+function teamTableCheck_(plan,title,headers,state){plan.intakeTableChecks=plan.intakeTableChecks||[];if(!plan.intakeTableChecks.some(function(c){return c.title===title;}))plan.intakeTableChecks.push({title:title,headers:headers,fingerprint:state.fingerprint,sheetId:state.sheet?state.sheet.getSheetId():null});}
+function teamCanManage_(user,publication){return user.role==='admin'||publication.ownerId===user.id;}
+function teamPublication_(state,id){teamId_(id);var publication=state.entries.find(function(p){return p.publicationId===id;});if(!publication)fail_('NOT_FOUND','共有する候補者が見つかりません。');return publication;}
+function teamVisible_(publication,players){return publication.published&&players.some(function(p){return p.id===publication.ownerId&&p.active&&p.role==='player';});}
+function readTeamWorkspace_(request){
+ var session=authenticate_(request.token,false,request.background===true),accounts=readAccountStore_(),user=activeActor_(accounts,session),candidates=teamCandidateTable_(accounts.book),comments=teamCommentTable_(accounts.book),jobs=teamJobTable_(accounts.book);
+ var visible=candidates.entries.filter(function(p){return teamVisible_(p,accounts.players);}),ids=new Set(visible.map(function(p){return p.publicationId;}));
+ var result={feature:true,candidates:candidates.entries.filter(function(p){return ids.has(p.publicationId)||teamCanManage_(user,p);}).map(function(p){
+  var canManage=teamCanManage_(user,p),out={publicationId:p.publicationId,ownerId:p.ownerId,candidateName:p.candidateName,introduction:p.introduction,published:ids.has(p.publicationId),version:p.version,createdAt:p.createdAt,updatedAt:p.updatedAt,publishedAt:p.publishedAt,canManage:canManage};
+  if(canManage){out.sourceRecordId=p.sourceRecordId;out.sourceProfileId=p.sourceProfileId;out.sourceRowVersion=p.sourceRowVersion;out.sourceProfileVersion=p.sourceProfileVersion;}return out;
+ }),jobs:jobs.entries.map(function(p){return {jobId:p.jobId,company:p.company,title:p.title,description:p.description,requirements:p.requirements,workConditions:p.workConditions,status:p.status,version:p.version,createdBy:p.createdBy,updatedBy:p.updatedBy,createdAt:p.createdAt,updatedAt:p.updatedAt};}),comments:comments.entries.filter(function(p){return ids.has(p.publicationId);}).map(function(p){return {commentId:p.commentId,publicationId:p.publicationId,parentId:p.parentId,authorId:p.authorId,body:p.deleted?'':p.body,mentionIds:p.deleted?[]:p.mentionIds,deleted:p.deleted,version:p.version,createdAt:p.createdAt,updatedAt:p.updatedAt,canManage:user.role==='admin'||p.authorId===user.id};}),players:accounts.players.filter(function(p){return p.active&&(p.role==='player'||p.role==='admin');}).map(function(p){return {id:p.id,name:p.name,role:p.role};})};
+ // A concurrent unpublish must not leave comments from an earlier table scan visible.
+ if(teamCandidateTable_(accounts.book).fingerprint!==candidates.fingerprint)fail_('BUSY','社内共有が更新されました。もう一度読み込んでください。');
+ snapshotActor_(accounts,request.token);return result;
+}
+function teamCandidateValues_(p){return [p.publicationId,p.ownerId,p.sourceRecordId,p.sourceProfileId,p.sourceRowVersion,p.sourceProfileVersion,p.candidateName,p.introduction,p.published,p.version,p.createdAt,p.updatedAt,p.publishedAt];}
+function planTeamCandidate_(store,user,payload){
+ teamObject_(payload);if(payload.confirmPublication!==true)fail_('VALIDATION','社内全員へ氏名と紹介文を共有することを確認してください。');
+ var record=findRecord_(store,payload.recordId);actorOwns_(user,record);checkVersion_(record,payload.rowVersion);
+ var owner=store.players.find(function(p){return p.id===record.playerId&&p.active&&p.role==='player';});if(!owner)fail_('FORBIDDEN','有効な担当者の候補者だけ共有できます。');
+ var profiles=candidateProfileTable_(store.book),profile=matchingProfile_(store,profiles,record,record.playerId);if(!profile||payload.profileVersion!==profile.version)fail_('CONFLICT','最新の基本情報・紹介文を保存してから共有してください。');
+ var introduction=teamText_(profile.introduction,1000,true),state=teamCandidateTable_(store.book),previous=payload.publicationId?teamPublication_(state,payload.publicationId):null;
+ // Only the already prepared client-shareable prose is copied; fields, notes, scores,
+ // attendance concerns, reflection and inferred suitability never enter this table.
+ if(/持病|通院|家族.{0,10}介護|子(?:ども|供).{0,12}(?:発熱|送迎|看病)|精神疾患|妊娠|治療中/.test(introduction))fail_('VALIDATION','紹介文に健康・家庭の個人事情が含まれています。共有用の文章を確認・保存してから再度共有してください。');
+ if(previous){if(!teamCanManage_(user,previous)||previous.ownerId!==record.playerId||previous.sourceProfileId!==profile.profileId)fail_('FORBIDDEN','別の候補者の共有内容を置き換えることはできません。');if(payload.version!==previous.version)fail_('CONFLICT','共有内容が更新されています。再取得してください。');}
+ else {if(payload.version!==undefined&&payload.version!=='')fail_('CONFLICT','新しい共有に古いバージョンを指定できません。');if(state.entries.some(function(p){return p.ownerId===record.playerId&&p.sourceProfileId===profile.profileId;}))fail_('CONFLICT','この基本情報の共有は登録済みです。既存の共有を更新してください。');}
+ var now=new Date().toISOString(),publication={publicationId:previous?previous.publicationId:Utilities.getUuid(),ownerId:record.playerId,sourceRecordId:record.recordId,sourceProfileId:profile.profileId,sourceRowVersion:record.version,sourceProfileVersion:profile.version,candidateName:record.name,introduction:introduction,published:true,version:Utilities.getUuid(),createdAt:previous?previous.createdAt:now,updatedAt:now,publishedAt:now},plan={requests:[],result:{publicationId:previous?previous.publicationId:publication.publicationId}};
+ intakeWritePlan_(store,plan,TEAM_CANDIDATE_TAB,TEAM_CANDIDATE_HEADERS,state,previous?previous.row:state.rows.length+2,teamCandidateValues_(publication));teamTableCheck_(plan,CANDIDATE_PROFILE_TAB,CANDIDATE_PROFILE_HEADERS,profiles);addProfileRecordChecks_(plan,[record]);addProfileGroupCheck_(store,plan,profile.profileId);return plan;
+}
+function planUnpublishTeamCandidate_(store,user,payload){
+ teamObject_(payload);var state=teamCandidateTable_(store.book),previous=teamPublication_(state,payload.publicationId);if(!teamCanManage_(user,previous))fail_('FORBIDDEN','この候補者の共有を変更できません。');if(payload.version!==previous.version)fail_('CONFLICT','共有内容が更新されています。再取得してください。');
+ var next=Object.assign({},previous,{published:false,version:Utilities.getUuid(),updatedAt:new Date().toISOString()}),plan={requests:[],result:{publicationId:previous.publicationId}};intakeWritePlan_(store,plan,TEAM_CANDIDATE_TAB,TEAM_CANDIDATE_HEADERS,state,previous.row,teamCandidateValues_(next));return plan;
+}
+function planTeamComment_(store,user,payload){
+ teamObject_(payload);var candidates=teamCandidateTable_(store.book),publication=teamPublication_(candidates,payload.publicationId);if(!teamVisible_(publication,store.players))fail_('FORBIDDEN','現在共有されている候補者にだけコメントできます。');
+ var state=teamCommentTable_(store.book),previous=payload.commentId?state.entries.find(function(p){return p.commentId===teamId_(payload.commentId);}):null;
+ if(payload.commentId&&!previous)fail_('NOT_FOUND','コメントが見つかりません。');
+ if(previous){if(previous.publicationId!==publication.publicationId||user.role!=='admin'&&previous.authorId!==user.id)fail_('FORBIDDEN','このコメントを変更できません。');if(payload.version!==previous.version)fail_('CONFLICT','コメントが更新されています。再取得してください。');}
+ else if(payload.version!==undefined&&payload.version!=='')fail_('CONFLICT','新しいコメントに古いバージョンを指定できません。');
+ if(payload.deleted!==undefined&&typeof payload.deleted!=='boolean'||!previous&&payload.deleted===true)fail_('VALIDATION','コメントの状態を確認してください。');
+ var parentId=payload.parentId===undefined?(previous?previous.parentId:''):payload.parentId?teamId_(payload.parentId):'';
+ if(previous&&parentId!==previous.parentId)fail_('VALIDATION','コメントの返信先は変更できません。');
+ if(parentId){var parent=state.entries.find(function(p){return p.commentId===parentId;});if(!parent||parent.publicationId!==publication.publicationId||!previous&&parent.deleted)fail_('VALIDATION','同じ候補者の有効なコメントへ返信してください。');}
+ var deleted=payload.deleted===undefined?false:payload.deleted,body=deleted&&previous?previous.body:teamText_(payload.body,2000,true),mentions=deleted&&previous?previous.mentionIds:teamMentions_(payload.mentionIds===undefined?previous?previous.mentionIds:[]:payload.mentionIds,store.players,false),now=new Date().toISOString(),id=previous?previous.commentId:Utilities.getUuid(),plan={requests:[],result:{commentId:id,publicationId:publication.publicationId}};
+ intakeWritePlan_(store,plan,TEAM_COMMENT_TAB,TEAM_COMMENT_HEADERS,state,previous?previous.row:state.rows.length+2,[id,publication.publicationId,parentId,previous?previous.authorId:user.id,body,JSON.stringify(mentions),deleted,Utilities.getUuid(),previous?previous.createdAt:now,now]);teamTableCheck_(plan,TEAM_CANDIDATE_TAB,TEAM_CANDIDATE_HEADERS,candidates);plan.teamMentions=deleted?[]:mentions;return plan;
+}
+function planTeamJob_(store,user,payload){
+ requireAdmin_(user);teamObject_(payload);var state=teamJobTable_(store.book),previous=payload.jobId?state.entries.find(function(p){return p.jobId===teamId_(payload.jobId);}):null;
+ if(payload.jobId&&!previous)fail_('NOT_FOUND','案件が見つかりません。');if(previous?payload.version!==previous.version:payload.version!==undefined&&payload.version!=='')fail_('CONFLICT','案件が更新されています。再取得してから保存してください。');
+ var id=previous?previous.jobId:Utilities.getUuid(),now=new Date().toISOString(),plan={requests:[],result:{jobId:id}};
+ intakeWritePlan_(store,plan,TEAM_JOB_TAB,TEAM_JOB_HEADERS,state,previous?previous.row:state.rows.length+2,[id,teamText_(payload.company,100,true),teamText_(payload.title,120,true),teamText_(payload.description,3000,false),teamText_(payload.requirements,2000,false),teamText_(payload.workConditions,2000,false),choice_(payload.status,TEAM_JOB_STATUSES),Utilities.getUuid(),previous?previous.createdBy:user.id,user.id,previous?previous.createdAt:now,now]);plan.teamAdminRequired=true;return plan;
+}
+function revalidateTeamPlan_(store,user,plan){if(plan.teamAdminRequired)requireAdmin_(activeActor_({players:readPlayers_(store.playerSheet)},user));if(plan.teamMentions)teamMentions_(plan.teamMentions,readPlayers_(store.playerSheet),false);}
+
+function unpublishTeamForDeletedRecords_(store,user,plan,records){
+ var state=teamCandidateTable_(store.book),ids=records.map(function(r){return r.recordId;}),now=new Date().toISOString();
+ state.entries.filter(function(p){return p.published&&ids.indexOf(p.sourceRecordId)>=0;}).forEach(function(previous){
+  actorOwns_(user,records.find(function(record){return record.recordId===previous.sourceRecordId;}));
+  var next=Object.assign({},previous,{published:false,version:Utilities.getUuid(),updatedAt:now});
+  intakeWritePlan_(store,plan,TEAM_CANDIDATE_TAB,TEAM_CANDIDATE_HEADERS,state,previous.row,teamCandidateValues_(next));
+ });
+}
+
+/** Editor-only readiness check. Missing optional tables stay missing. The result
+ * contains no names, source IDs, introduction text, comments, jobs or credentials. */
+function verifyNodeTeamWorkspaceReadOnly(){
+ requireOwner_();var config=config_();assertManagedBook_(config.spreadsheetId);
+ var accounts=readAccountStore_(config),tabs=resolveBusinessTabs_(accounts.book);
+ if(tabs.matchingSheetId!==Number(config.matchingSheetId)||tabs.kpiSheetId!==Number(config.kpiSheetId))fail_('SCHEMA_MISMATCH','接続先の業務タブと管理IDが一致しません。');
+ var candidates=teamCandidateTable_(accounts.book),comments=teamCommentTable_(accounts.book),jobs=teamJobTable_(accounts.book),known=Object.create(null),publications=Object.create(null),commentIds=Object.create(null);
+ accounts.players.forEach(function(player){known[player.id]=true;});candidates.entries.forEach(function(p){if(!known[p.ownerId])fail_('SCHEMA_MISMATCH','共有候補者の担当者が名簿にありません。');publications[p.publicationId]=p;});
+ comments.entries.forEach(function(p){if(!known[p.authorId]||!publications[p.publicationId]||p.mentionIds.some(function(id){return !known[id];}))fail_('SCHEMA_MISMATCH','コメントの担当者・共有先・宛先を確認してください。');commentIds[p.commentId]=p;});
+ comments.entries.forEach(function(p){if(p.parentId&&(!commentIds[p.parentId]||commentIds[p.parentId].publicationId!==p.publicationId))fail_('SCHEMA_MISMATCH','コメントの返信先が共有先と一致しません。');});
+ jobs.entries.forEach(function(p){if(!known[p.createdBy]||!known[p.updatedBy])fail_('SCHEMA_MISMATCH','案件の更新者を名簿で確認してください。');});
+ var result={verified:true,readOnly:true,managedCopy:true,originalProtected:true,schemaCompatible:true,accountsReadable:true,
+  activeAccounts:accounts.players.filter(function(p){return p.active;}).length,activePlayers:accounts.players.filter(function(p){return p.active&&p.role==='player';}).length,activeAdmins:accounts.players.filter(function(p){return p.active&&p.role==='admin';}).length,
+  tables:{candidates:{exists:!!candidates.sheet,count:candidates.entries.length},comments:{exists:!!comments.sheet,count:comments.entries.length},jobs:{exists:!!jobs.sheet,count:jobs.entries.length}},
+  capabilities:{explicitPublication:true,ownerScopedSource:true,internalComments:true,adminManagedJobs:true,atomicSourceDeletion:true}};
+ if(stableJson_(config_())!==stableJson_(config))fail_('BUSY','接続設定が確認中に更新されました。もう一度確認してください。');assertManagedBook_(accounts.book);requireOwner_();Logger.log(JSON.stringify(result));return result;
+}

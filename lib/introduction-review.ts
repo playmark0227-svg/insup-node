@@ -31,6 +31,55 @@ function businessSpelling(value:string,names:readonly string[]):string {
  for(const range of merged){result+=normalize(value.slice(cursor,range.start))+value.slice(range.start,range.end);cursor=range.end;}return result+normalize(value.slice(cursor));
 }
 
+const rankMention=/(?:[0-9０-９一二三四五六七八九十]+\s*位|トップ|top\s*\d+|No[.．]?\s*[0-9０-９]+|ナンバーワン|首位)/i;
+/** Preserve only uncertainty already written alongside a rank, never invent its
+ * period, comparison group, or a supposedly verified achievement. */
+export function introductionRankQualifications(value:string):string[] {
+ if(!rankMention.test(value))return [];
+ return [...new Set(value.split(/[。\n]/).map(part=>part.trim()).filter(part=>/(?:未確認|不明|確認中|要確認)/.test(part)&&/(?:期間|時期|比較|人数|対象|名中|人中)/.test(part)))];
+}
+export function missingIntroductionRankQualification(body:string,qualifications:readonly string[]):boolean {
+ if(!rankMention.test(body)||!qualifications.length)return false;
+ const retained=introductionRankQualifications(body).join("\n"),source=qualifications.join("\n");
+ return /期間|時期/.test(source)&&!(/期間|時期/.test(retained))||/比較|人数|対象|名中|人中/.test(source)&&!(/比較|人数|対象|名中|人中/.test(retained));
+}
+
+/** Expand only separated clock ranges. A free-form note is never split into two
+ * guessed times, and impossible/overnight-ambiguous times need confirmation. */
+function preparedTimeWindow(raw:string):{value:string;needsConfirmation:boolean} {
+ const clock="[0-9０-９]{1,4}(?:[：:][0-9０-９]{2}|時(?:[0-9０-９]{1,2}分)?)?";
+ const ranges=new RegExp(`(?<![0-9０-９:：.])(${clock})[\\t ]*([〜～~\\-－–—])[\\t ]*(翌(?:日)?[\\t ]*)?(${clock})(?![0-9０-９:：.])`,"g");
+ const dates=[...raw.matchAll(/[0-9０-９]{4}(?:[-－/／][0-9０-９]{1,2}[-－/／][0-9０-９]{1,2}|年[0-9０-９]{1,2}月[0-9０-９]{1,2}日)/g)].map(match=>({start:match.index,end:match.index+match[0].length}));
+ const protectedDate=(start:number,end:number)=>dates.some(date=>start<date.end&&end>date.start);
+ const parsed=(token:string)=>{
+  const normalized=token.normalize("NFKC"),colon=normalized.match(/^(\d{1,2}):(\d{2})$/),japanese=normalized.match(/^(\d{1,2})時(?:(\d{1,2})分)?$/);
+  const compact=/^\d{3,4}$/.test(normalized);
+  const hour=colon||japanese?Number((colon||japanese)![1]):compact?Number(normalized.slice(0,-2)):Number(normalized);
+  const minute=colon||japanese?Number((colon||japanese)![2]||0):compact?Number(normalized.slice(-2)):0;
+  return {hour,minute,compact,valid:hour>=0&&hour<=24&&minute>=0&&minute<60&&(hour!==24||minute===0),text:`${hour}:${String(minute).padStart(2,"0")}`};
+ };
+ let value="",cursor=0,needsConfirmation=false;
+ const consumed:{start:number;end:number}[]=[];
+ for(const match of raw.matchAll(ranges)){
+  const start=match.index,end=start+match[0].length;
+  if(protectedDate(start,end)||/^(?:時間|h\b|日|か月|ヶ月|ケ月|年|件|円|%)/i.test(raw.slice(end)))continue;
+  const from=parsed(match[1]),to=parsed(match[4]),following=raw.slice(end),preceding=raw.slice(0,start);
+  const chained=new RegExp(`^[\\t ]*[〜～~\\-－–—][\\t ]*${clock}`).test(following)||new RegExp(`${clock}[\\t ]*[〜～~\\-－–—][\\t ]*$`).test(preceding);
+  if(!from.valid||!to.valid||from.hour===24||!match[3]&&to.hour*60+to.minute<=from.hour*60+from.minute||chained)needsConfirmation=true;
+  consumed.push({start,end});
+  value+=raw.slice(cursor,start)+(from.compact||to.compact?`${from.text}〜${match[3]||""}${to.text}`:match[0]);cursor=end;
+ }
+ value+=raw.slice(cursor);
+ const unused=(start:number,end:number)=>!protectedDate(start,end)&&!consumed.some(range=>start>=range.start&&end<=range.end);
+ // An isolated compact time, concatenated range, or adjacent clock tokens has
+ // no reliable range boundary. Explicit dates and durations stay untouched.
+ for(const match of raw.matchAll(/(?<![0-9０-９.])([0-9０-９]{3,8})(?![0-9０-９.]|年|月|日|時間|h\b|件|円)/gi))if(unused(match.index,match.index+match[0].length))needsConfirmation=true;
+ for(const match of raw.matchAll(new RegExp(`(?<![0-9０-９:：.])(${clock})[\\t ]+(${clock})(?![0-9０-９:：.])`,"g")))if(unused(match.index,match.index+match[0].length))needsConfirmation=true;
+ for(const match of raw.matchAll(/(?<![0-9０-９:：.])[0-9０-９]{1,2}時(?:[0-9０-９]{1,2}分)?[\t ]*[0-9０-９]{1,2}時(?:[0-9０-９]{1,2}分)?/g))if(unused(match.index,match.index+match[0].length))needsConfirmation=true;
+ for(const match of raw.matchAll(/(?<![0-9０-９:：.])[0-9０-９]{1,3}(?:[：:][0-9０-９]{1,3}|時(?:[0-9０-９]{1,3}分)?)(?![0-9０-９:：.])/g))if(unused(match.index,match.index+match[0].length)&&!parsed(match[0]).valid)needsConfirmation=true;
+ return {value:needsConfirmation?raw:value,needsConfirmation};
+}
+
 /** Read-only preparation: fact checks and spelling proposals never mutate saved fields. */
 export function reviewIntroductionSource(raw:InterviewFields,protectedNames:readonly string[]=[]):IntroductionReview {
  const fields=normalizeInterviewFields(raw),checks:IntroductionCheck[]=[],revisions:IntroductionRevision[]=[],notes:string[]=[];
@@ -41,6 +90,9 @@ export function reviewIntroductionSource(raw:InterviewFields,protectedNames:read
  for(const field of interviewStringFields)if(!["attendanceConcerns","additionalNotes","interviewMemo","selfReflection","interviewAdvice"].includes(field)&&personalDetail.test(fields[field])){privateFields.push(field);fields[field]="";}
  if(privateFields.length)add("private-detail",privateFields,"共有文に入れない個人事情を分離",`${privateFields.map(field=>interviewFieldLabels[field]).join("・")}に個人の健康・家庭事情を含む記載があります。この項目は共有文から一旦省いています。共有できる経歴・条件と社内確認用の事情を分けて記録してください。原文は入力欄に残っています。`);
  for(const field of editableBusinessFields){const before=fields[field],after=businessSpelling(before,protectedNames);if(after!==before){fields[field]=after;revisions.push({field,label:interviewFieldLabels[field],before,after});}}
+ const timeWindow=preparedTimeWindow(fields.timeWindow);
+ if(timeWindow.needsConfirmation){add("time-window",["timeWindow"],"希望時間帯の時刻を確認","時刻の区切りや実在する時間を確認してください。『9:00〜18:00』のように開始・終了を分け、日をまたぐ場合は『翌』を記録してください。確認するまで希望時間帯は共有本文へ入れません。原文は入力欄に残っています。");fields.timeWindow="";}
+ else if(timeWindow.value!==fields.timeWindow){const before=fields.timeWindow;fields.timeWindow=timeWindow.value;revisions.push({field:"timeWindow",label:interviewFieldLabels.timeWindow,before,after:timeWindow.value});}
  if(fields.desiredHourlyRate.trim()&&(/単位未確認|不明|どちら|未定|要確認/.test(fields.desiredHourlyRate)||/[\d０-９]/.test(fields.desiredHourlyRate)&&!withRateUnit(fields.desiredHourlyRate))){
   add("rate-unit",["desiredHourlyRate"],"希望単価の単位を確認","時給・日給・月額などの単位が読み取れません。単位を確認するまで、希望単価は共有本文へ入れません。原文は入力欄に残っています。");
   fields.desiredHourlyRate="";
@@ -197,6 +249,18 @@ function unsupportedAchievement(draft:string,source:string):boolean {
  return topics.some(([claim,evidence])=>claim.test(draft)&&!evidence.test(source));
 }
 
+/** Concrete additions observed in small-model introductions. Only explicit
+ * source claims can support these outcomes; ordinary work is not their proof. */
+function unsupportedNarrativeAssessment(draft:string,source:string):boolean {
+ if(/(?:今後|将来|これから)[^。\n]{0,50}(?:貢献|寄与|活躍|期待)|(?:貢献|寄与|活躍)(?:すること|できること)?(?:が|を)?(?:期待|見込)|(?:貢献|寄与|活躍)できる(?:可能性|と考え|と思い)/.test(draft))return true;
+ const patterns:readonly RegExp[]=[
+  /長け(?:て|る)/,/秀で(?:て|る)/,/卓越(?:した|する)/,/高度な能力/,/高度なスキル/,/高い能力/,/高い専門性/,/高い適応力/,
+  /顧客満足(?:度)?[^。\n]{0,12}(?:向上|改善)/,
+  ...["課題(?:の|を)?解決","チーム","組織","事業","売上","利益","成果","業績","生産性"].map(topic=>new RegExp(`${topic}[^。\\n]{0,20}(?:貢献|寄与)`)),
+ ];
+ return patterns.some(pattern=>pattern.test(draft)&&!pattern.test(source));
+}
+
 /** Conservative, deterministic checks for material inventions; this is not a factual guarantee. */
 export function introductionEvidenceIssues(draft:string,candidateName:string,prepared:InterviewFields,memo=""):string[] {
  const source=[candidateName,factualFields(prepared),memo].join("\n"),knownNumbers=numbers(source),issues:string[]=introductionContentIssues(draft);
@@ -212,6 +276,9 @@ export function introductionEvidenceIssues(draft:string,candidateName:string,pre
  issues.push(...metricEvidenceIssues(draft,sourceParts));
  if(negatedExperienceIssues(draft,sourceParts))issues.push("experience-negation-changed");
  if(unsupportedAchievement(draft,source))issues.push("source-achievement");
+ if(unsupportedNarrativeAssessment(draft,source))issues.push("source-assessment");
+ const rankQualifications=sourceParts.flatMap(introductionRankQualifications);
+ if(draft.split(/【[^】\n]+】|(?:^|\n)[\t ]*(?:#{1,6}[\t ]+|\*\*)[^\n]+/).some(part=>missingIntroductionRankQualification(part,rankQualifications)))issues.push("rank-scope-removed");
  return [...new Set(issues)];
 }
 
@@ -230,6 +297,7 @@ export function introductionContentIssues(draft:string):string[] {
  const issues:string[]=[];
  if(personalDetail.test(draft))issues.push("source-private-detail");
  if(/採用(?:すべき|を推奨|適性|可否)|不採用(?:を推奨|にすべき)|(?:能力|適性|人物)(?:評価|スコア|点数)|\d+\s*点満点|即戦力(?:です|として|と判断|人材|の人材)|優秀な(?:人材|候補者)|ポテンシャル(?:が高|の高|に期待)|成長が期待/.test(draft))issues.push("source-assessment");
+ if(/(?<![〇零一二三四五六七八九十百千万億0-9０-９])[〇○◯●□]{2,}(?![〇零一二三四五六七八九十百千万億0-9０-９])|(?:\b|[：:])X{2,}(?=\b|[位件円年名社])/i.test(draft))issues.push("source-format");
  const schemaArtifact=/["'](?:\$schema|properties|required|additionalProperties|responseConstraint|minLength|maxLength|minItems|maxItems|draft|summary|questions|actions)["']\s*:|["']type["']\s*:\s*["'](?:object|array|string|integer|number|boolean|null)["']|```(?:json)?\s*[\[{]/i;
  let decoded=draft;
  for(let depth=0;depth<3;depth++){

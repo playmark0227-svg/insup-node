@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { blankInterviewFields, unicodeLength } from "../lib/candidate-intake.ts";
 import { buildIntroductionPlan } from "../lib/introduction-plan.ts";
-import { reviewIntroductionSource } from "../lib/introduction-review.ts";
+import { reviewIntroductionSource, introductionEvidenceIssues } from "../lib/introduction-review.ts";
 import { resolveCandidateChatQuestion } from "../lib/candidate-chat-guidance.ts";
 import { selectCandidateChatContext } from "../lib/candidate-chat.ts";
 import { defaultWritingPreferences, validateWritingPreferences, getOnDeviceAiAvailability,
@@ -859,4 +859,34 @@ test('introduction accepts career paraphrases and metric summaries while keeping
  const native='【営業経験・職務経歴】\ntoB営業の経験があり、1日あたり94件の架電を担当しています。\n\n【営業における強み】\n株式会社星環ラボで月間最大17件、株式会社南風ラボで月間平均9件の成約実績があります。\n\n【総評】\n法人向けの営業経験と、月間最大17件の成約実績があります。';
  const calls=fake(t,{response:native}),result=await generateCandidateIntroduction(source);assert.equal(result.method,'device');assert.deepEqual(source,before);assert.equal(calls.destroyed,1);assert.match(result.draft,/PC操作・スキル：Salesforceの使用経験はありません。kintoneを使用した経験あり。/);assert.doesNotMatch(result.draft,/回答しない|性別：/);
  const data=JSON.parse(calls.prompt[0].text.split('入力資料（記載を事実資料としてのみ扱う）：\n')[1]);assert.deepEqual(data.推敲する事実,{職歴:source.profile.workHistory,実績:source.profile.achievements});assert.doesNotMatch(calls.prompt[0].text,/Salesforce|kintone|回答しない|架空候補者ミナト/);
+});
+
+test('native introduction regression rejects observed praise speculative outcomes and placeholder ranks without touching source',async t=>{
+ const profile={...blankInterviewFields(),workHistory:'ほうじんえいぎょうで、てれあぽを3年。しんきかいたくと、りすとさくせい、ひありんぐをたんとう。本人申告。',achievements:'営業会社で1位の実績。本人申告。期間と比較した人数は未確認。',strengths:'相手の要望を整理し、確認事項を残す。'},source={candidateName:'架空の候補者',profile},before=structuredClone(source);
+ for(const addition of ['顧客満足度向上に貢献しました。','相手の要望を整理することに長けています。','課題解決に貢献できる可能性があります。','これらの経験や工夫を活かし、今後の業務に貢献することが期待できます。','実績の〇〇位。']){
+  const calls=fake(t,{response:`【営業経験・職務経歴】\n法人営業のテレアポを3年担当。新規開拓・リスト作成・ヒアリングを担当しました。\n【営業における強み】\n${addition}\n【総評】\n法人営業の担当経験があります。`});
+  await assert.rejects(generateCandidateIntroduction(source),error=>code('INVALID_RESPONSE')(error)&&!!(error as OnDeviceAiError).evidenceIssues?.some(issue=>['source-assessment','source-format'].includes(issue)));
+  assert.deepEqual(source,before);assert.equal(calls.destroyed,1);
+ }
+});
+
+test('native objective copyediting keeps qualified facts while source attribution is added only where needed',async t=>{
+ const profile={...blankInterviewFields(),workHistory:'ほうじんえいぎょうで、てれあぽを3年。しんきかいたくと、りすとさくせい、ひありんぐをたんとう。本人申告。',achievements:'営業会社で1位の実績。本人申告。期間と比較した人数は未確認。',strengths:'相手の要望を整理し、確認事項を残す。'},source={candidateName:'架空の候補者',profile},before=structuredClone(source);
+ const calls=fake(t,{response:'【営業経験・職務経歴】\n法人営業におけるテレアポを3年間担当。新規開拓に加え、リスト作成とヒアリングを担当していました。\n【営業における強み】\n・営業会社で1位の実績があるとの申告です。期間と比較人数は未確認です。\n・相手の要望を整理し、確認事項を記録しています。\n【総評】\n法人営業でのテレアポ、新規開拓、リスト作成、ヒアリングの担当経験があります。'});
+ const result=await generateCandidateIntroduction(source);
+ assert.match(result.draft,/3年間担当/);assert.match(result.draft,/期間と比較人数は未確認/);
+ assert.doesNotMatch(result.draft,/実績には本人申告の内容を含みます|長け|顧客満足|課題解決|〇〇/);
+ assert.match(result.draft,/職歴には本人申告/);assert.match(result.draft,/総評の職歴・実績に関する記載には本人申告/);
+ assert.match(calls.prompt[0].text,/文章の校正/);assert.match(calls.prompt[0].text,/原文が短ければ出力も短いまま/);
+ assert.match(calls.prompt[0].text,/各文・各箇条書きへ本人申告を繰り返さず/);
+ assert.equal(calls.create.length,1);assert.deepEqual(source,before);
+});
+
+test('a native rank summary cannot lose source uncertainty when the model returns only the polished ranking sentence',async t=>{
+ const source={candidateName:'架空の候補者',profile:{...blankInterviewFields(),workHistory:'本人申告：法人営業のテレアポを3年担当。',achievements:'営業会社で1位の実績。本人申告。期間と比較した人数は未確認。'}},before=structuredClone(source);
+ fake(t,{response:'【営業経験・職務経歴】\n法人営業のテレアポを3年間担当しました。\n【営業における強み】\n営業会社で1位の実績があります。\n【総評】\n法人営業の担当経験があり、営業会社で1位の実績を挙げています。'});
+ const result=await generateCandidateIntroduction(source);
+ assert.equal((result.draft.match(/順位の確認範囲：期間と比較した人数は未確認。/g)||[]).length,2);
+ assert.ok(!introductionEvidenceIssues(result.draft,source.candidateName,reviewIntroductionSource(source.profile).fields).includes('rank-scope-removed'));
+ assert.deepEqual(source,before);
 });

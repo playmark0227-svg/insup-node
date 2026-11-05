@@ -369,7 +369,7 @@ test('closing or switching identity clears queued automatic introductions before
 
 test('editing a valid candidate cannot copy or adopt private details assessment language or JSON artifacts',async()=>{
  const fields={...blankInterviewFields(),workHistory:'法人向け架電を担当。'},base='【基本情報】\n氏名：架空の候補者\n【営業経験・職務経歴】\n法人向け架電を担当。';
- for(const [addition,label] of [['採用すべき優秀な即戦力人材です。','採用・能力を断定する評価'],['持病で毎週通院しています。','健康・家庭の個人事情'],['{"type":"object","properties":{}}','本文ではない形式']]){
+ for(const [addition,label] of [['採用すべき優秀な即戦力人材です。','原文にない能力評価・将来の貢献への期待'],['今後の業務に貢献することが期待できます。','原文にない能力評価・将来の貢献への期待'],['持病で毎週通院しています。','健康・家庭の個人事情'],['{"type":"object","properties":{}}','本文ではない形式']]){
   const h=harness({deviceIntroduction:async()=>({draft:base})});await flush();h.render({fields});h.click('文章をAIで整理・仕上げる');await flush();h.click('候補文をその場で修正');h.change('-draft-editor',base+addition);
   assert.ok(h.text().includes(label));assert.equal(h.button('コピー').props.disabled,true);assert.equal(h.button('この文章を使う').props.disabled,true);assert.equal(h.calls.applied.length,0);h.unmount();
  }

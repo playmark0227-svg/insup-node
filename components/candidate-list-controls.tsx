@@ -2,6 +2,7 @@ import { useId, useRef, useState } from "react";
 import { ArrowDownWideNarrow, ArrowUpNarrowWide, Check, Filter, SlidersHorizontal, X } from "lucide-react";
 import { candidateAppointmentFilters, candidateFilterCount, candidateProfileFilters, candidateSortFields, type CandidateGroupFilter, type CandidateGroupSort } from "@/lib/candidate-groups";
 import type { SheetPlayer } from "@/lib/sheets-client";
+import { pcOptions, crmOptions } from "@/lib/candidate-intake";
 import "./candidate-list-controls.css";
 
 export type CandidateListControlsProps = {
@@ -20,6 +21,7 @@ export function CandidateListControls({ filter, onFilterChange, sort, onSortChan
   const count = candidateFilterCount(filter), selectedStatuses = filter.statuses || (filter.status !== "all" ? [filter.status] : []);
   const knownCompanies = unique(companies.filter(company => !!company.trim()));
   const companyOptions = unique([...knownCompanies, ...(typeof filter.company === "string" ? [filter.company] : [])]), statusOptions = unique([...statuses, ...selectedStatuses]);
+  const pcChoices=unique([...pcOptions,...(typeof filter.pcEnvironment==="string"?[filter.pcEnvironment]:[])]),crmChoices=unique([...crmOptions,...(typeof filter.crmTool==="string"?[filter.crmTool]:[])]);
   const missingOwner = admin && !["all", "unassigned", ...players.map(player => player.id)].includes(filter.owner);
   const sortLabel = candidateSortFields.find(option => option.value === sort.field)?.label || "最終面談日";
   const patch = (next: Partial<CandidateGroupFilter>) => onFilterChange({ ...filter, ...next });
@@ -38,6 +40,12 @@ export function CandidateListControls({ filter, onFilterChange, sort, onSortChan
         <label>提案先<select aria-label="候補者の提案先で絞り込み" value={companyValue(filter.company)} onChange={event => { const value = event.target.value; if (value === "all") patch({ company: undefined }); else if (value === "none") patch({ company: null }); else { const company = companyOptions.find(item => companyValue(item) === value); if (company !== undefined) patch({ company }); } }}><option value="all">すべての提案先</option><option value="none">提案先が未登録</option>{companyOptions.map(company => <option key={company} value={companyValue(company)}>{company}{!knownCompanies.includes(company) ? "（現在は該当なし）" : ""}</option>)}</select></label>
         <label>次の予定<select aria-label="候補者の予定で絞り込み" value={filter.appointment || "all"} onChange={event => { const option = candidateAppointmentFilters.find(option => option.value === event.target.value); if (option) patch({ appointment: option.value }); }}>{candidateAppointmentFilters.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
         {intakeEnabled && <label>面談の基本情報<select aria-label="候補者の基本情報で絞り込み" value={filter.profile || "all"} onChange={event => { const option = candidateProfileFilters.find(option => option.value === event.target.value); if (option) patch({ profile: option.value }); }}>{candidateProfileFilters.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>}
+        {intakeEnabled&&<fieldset className="candidate-profile-options"><legend>基本情報の登録内容から探す</legend><p>追加入力は不要です。記載された言葉・選択値で絞り込み、経験や適性は推定しません。</p><div>
+          <label>PC環境<select aria-label="候補者のPC環境で絞り込み" value={companyValue(filter.pcEnvironment)} onChange={event=>{const value=event.target.value;if(value==="all")patch({pcEnvironment:undefined});else if(value==="none")patch({pcEnvironment:null});else{const choice=pcChoices.find(item=>companyValue(item)===value);if(choice!==undefined)patch({pcEnvironment:choice});}}}><option value="all">すべてのPC環境</option><option value="none">PC環境の記載なし</option>{pcChoices.map(choice=><option key={choice} value={companyValue(choice)}>{choice}</option>)}</select></label>
+          <label>登録されたCRM<select aria-label="候補者の登録CRMで絞り込み" value={companyValue(filter.crmTool)} onChange={event=>{const value=event.target.value;if(value==="all")patch({crmTool:undefined});else if(value==="none")patch({crmTool:null});else{const choice=crmChoices.find(item=>companyValue(item)===value);if(choice!==undefined)patch({crmTool:choice});}}}><option value="all">すべてのCRM</option><option value="none">CRMの登録なし</option>{crmChoices.map(choice=><option key={choice} value={companyValue(choice)}>{choice}</option>)}</select></label>
+          <label>経験・強みの記載キーワード<input aria-label="候補者の経験・強みの記載で絞り込み" type="search" value={filter.experienceKeyword||""} onChange={event=>patch({experienceKeyword:event.target.value})} maxLength={200} placeholder="例：法人営業 テレアポ"/><small>営業経験・職歴、実績、強み、PCスキルの記載を検索</small></label>
+          <label>稼働条件の記載キーワード<input aria-label="候補者の稼働条件の記載で絞り込み" type="search" value={filter.availabilityKeyword||""} onChange={event=>patch({availabilityKeyword:event.target.value})} maxLength={200} placeholder="例：平日 週3日"/><small>開始可能日、時間帯、日数、時間数、稼働形態などを検索</small></label>
+        </div></fieldset>}
         <fieldset className="candidate-progress-options"><legend>企業ごとの進捗 <small>複数選択可・未選択ですべて</small></legend><div>{statusOptions.map(status => <label key={status || "empty-status"}><input type="checkbox" aria-label={`進捗：${status || "未設定"}`} checked={selectedStatuses.includes(status)} onChange={event => statusChanged(status, event.target.checked)}/><span>{status || "進捗未設定"}</span></label>)}</div></fieldset>
       </div><footer><p>予定は未完了のC面談・合否回答期日・稼働開始予定です。該当する方の他の履歴も残して表示します。</p><button type="button" className="text-button" disabled={!count} onClick={reset}><X size={14}/>フィルターを解除</button></footer>
     </section>}

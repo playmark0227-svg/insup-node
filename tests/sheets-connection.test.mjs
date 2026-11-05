@@ -1190,3 +1190,103 @@ test('logout during cache decryption and late first reads cannot populate anothe
  const access=displayGrant(),cache=deferred(),fresh=deferred(),h=harness(call=>call.action==='login'?{token,cacheAccess:access}:call.action==='logout'?{loggedOut:true}:fresh.promise,{cacheRead:async()=>cache.promise});await flush();const login=h.render().login('ND-001','password');await flush();await h.render().logout();cache.resolve({snapshot:projectSnapshotForCache(snapshot),savedAt:Date.now()});await login;assert.equal(h.render().snapshot,null);assert.equal(h.render().snapshotSource,null);assert.equal(h.cacheWrites.length,0);h.unmount();
  const first=deferred(),otherToken='another-test-token-12345678901234567890123456789';let attempts=0;const j=harness(call=>call.action==='login'?{token:attempts++?otherToken:token,cacheAccess:access}:call.action==='logout'?{loggedOut:true}:call.options.token===token?first.promise:{...snapshot,cacheAccess:access},{cacheRead:async()=>({snapshot:projectSnapshotForCache(snapshot),savedAt:Date.now()})});await flush();await j.render().login('ND-001','password');await flush();await j.render().logout();await j.render().login('ND-001','password');await flush();const writes=j.cacheWrites.length;first.resolve({...snapshot,cacheAccess:access});await flush();assert.equal(j.cacheWrites.length,writes);assert.equal(JSON.parse(j.sessionStorage.getItem(SESSION_KEY)).token,otherToken);j.unmount();
 });
+
+const teamSnapshot={...snapshot,teamWorkspaceFeature:true};
+test('team callbacks retained by a previous login cannot read or save through the next login token',async()=>{
+ const freshToken=token+'-team-next';
+ const h=harness(call=>call.action==='snapshot'?teamSnapshot:call.action==='logout'?{loggedOut:true}:call.action==='login'?{token:freshToken,snapshot:teamSnapshot}:call.action==='readTeamWorkspace'?{revision:'next'}:{committed:true,operationId:call.options.operationId},{storedToken:token});
+ await flush();const old=h.render();await old.logout();await h.render().login('ND-001','test-new-login-password');
+ const before=h.calls.length;
+ await assert.rejects(old.readTeamWorkspace(),{code:'STALE_SESSION'});
+ await assert.rejects(old.mutateTeam('saveTeamComment',{body:'old private draft'},'old-team-operation'),{code:'STALE_SESSION'});
+ assert.equal(h.calls.length,before,'No old callback can issue a request with the new token');
+ assert.deepEqual(await h.render().readTeamWorkspace(),{revision:'next'});
+ await h.render().mutateTeam('saveTeamComment',{body:'current draft'},'current-team-operation');
+ const writes=h.calls.filter(call=>call.action==='saveTeamComment'),reads=h.calls.filter(call=>call.action==='readTeamWorkspace');
+ assert.equal(writes.length,1);assert.equal(reads.length,1);assert.equal(writes[0].options.token,freshToken);assert.equal(reads[0].options.token,freshToken);h.unmount();
+});
+
+test('team writes require a connected account an enabled feature and write permission before transmission',async()=>{
+ const disconnected=harness(()=>{throw new Error('No business request expected');});await flush();
+ await assert.rejects(disconnected.render().mutateTeam('saveTeamJob',{company:'fictional'},'unconnected-team'),{code:'STALE_SESSION'});assert.equal(disconnected.calls.length,0);disconnected.unmount();
+ for(const disabled of [{...teamSnapshot,teamWorkspaceFeature:false},{...teamSnapshot,writesEnabled:false}]){
+  const h=harness(call=>call.action==='snapshot'?disabled:Promise.reject(new Error('Disabled write must not be sent')),{storedToken:token});await flush();const before=h.calls.length;
+  await assert.rejects(h.render().mutateTeam('saveTeamJob',{company:'fictional'},'disabled-team'),{code:'READ_ONLY'});assert.equal(h.calls.length,before);h.unmount();
+ }
+});
+
+test('a team write callback rechecks the latest permissions within the same login',async()=>{
+ for(const disabled of [{...teamSnapshot,teamWorkspaceFeature:false},{...teamSnapshot,writesEnabled:false}]){
+  let current=teamSnapshot;
+  const h=harness(call=>call.action==='snapshot'?current:{committed:true,operationId:call.options.operationId},{storedToken:token});await flush();
+  const earlier=h.render().mutateTeam;current=disabled;await h.render().refresh();const before=h.calls.length;
+  await assert.rejects(earlier('saveTeamComment',{body:'must stay local'},'stale-team-permission'),{code:'READ_ONLY'});
+  assert.equal(h.calls.length,before,'A stale editor cannot transmit after write permission is removed');h.unmount();
+ }
+});
+
+test('team writes wait for background saves instead of racing their receipt and preserve the queued input',async()=>{
+ const background=deferred(),operation='background-before-team';
+ const h=harness(call=>call.action==='snapshot'?teamSnapshot:call.action==='updateRecord'?background.promise:{committed:true,operationId:call.options.operationId},{storedToken:token});await flush();
+ await h.render().submitMutation('updateRecord',{recordId:'one',changes:{13:'original queued input'}},operation);await flush();
+ const before=h.calls.length;
+ await assert.rejects(h.render().mutateTeam('saveTeamComment',{body:'next comment'},'team-after-background'),{code:'MUTATION_PENDING'});
+ assert.equal(h.calls.length,before);assert.equal(h.pendingStore.get(operation).payload.changes[13],'original queued input');
+ background.resolve({committed:true,operationId:operation});await flush();
+ await h.render().mutateTeam('saveTeamComment',{body:'next comment'},'team-after-background');
+ assert.equal(h.pendingStore.size,0);assert.equal(h.calls.filter(call=>call.action==='updateRecord').length,1);assert.equal(h.calls.filter(call=>call.action==='saveTeamComment').length,1);h.unmount();
+});
+
+test('a stale background callback during a team save retains its local input and starts the queued save after the team receipt',async()=>{
+ const team=deferred(),operation='background-after-team';
+ const h=harness(call=>call.action==='snapshot'?teamSnapshot:call.action==='saveTeamComment'?team.promise:{committed:true,operationId:call.options.operationId},{storedToken:token});await flush();
+ const previousBackgroundCallback=h.render().submitMutation;
+ const saving=h.render().mutateTeam('saveTeamComment',{body:'first comment'},'team-before-background');
+ await previousBackgroundCallback('updateRecord',{recordId:'one',changes:{13:'retained later input'}},operation);
+ await flush();assert.equal(h.calls.filter(call=>call.action==='updateRecord').length,0,'No overlapping network write');
+ assert.equal(h.pendingStore.get(operation).payload.changes[13],'retained later input');assert.equal(h.pendingStore.get(operation).attempted,false);
+ team.resolve({committed:true,operationId:'team-before-background'});await saving;await flush();
+ assert.equal(h.calls.filter(call=>call.action==='updateRecord').length,1,'An accepted local save must not stay stuck behind the released team mutex');
+ assert.equal(h.pendingStore.size,0);assert.equal(h.render().hasPendingSave,false);h.unmount();
+});
+
+test('a different operation receipt cannot confirm a team write and retry keeps the same input and operation',async()=>{
+ let mismatch=true;
+ const h=harness(call=>call.action==='snapshot'?teamSnapshot:{committed:true,operationId:mismatch?'another-operation':call.options.operationId},{storedToken:token});await flush();
+ const payload={body:'preserve this exact comment',candidateShareId:'fictional-share'};
+ await assert.rejects(h.render().mutateTeam('saveTeamComment',payload,'team-receipt-operation'),{code:'INVALID_RESPONSE'});
+ assert.equal(h.render().busy,false);assert.deepEqual(payload,{body:'preserve this exact comment',candidateShareId:'fictional-share'});
+ mismatch=false;await h.render().mutateTeam('saveTeamComment',payload,'team-receipt-operation');
+ const writes=h.calls.filter(call=>call.action==='saveTeamComment');assert.equal(writes.length,2);
+ assert.ok(writes.every(call=>call.options.operationId==='team-receipt-operation'&&call.options.responseMode==='receipt'));
+ assert.deepEqual(writes[0].payload,writes[1].payload);h.unmount();
+});
+
+test('late team responses after unmount cannot publish private reads or update hook state',async()=>{
+ for(const action of ['read','write']){
+  const response=deferred(),h=harness(call=>call.action==='snapshot'?teamSnapshot:response.promise,{storedToken:token});await flush();
+  const pending=action==='read'?h.render().readTeamWorkspace():h.render().mutateTeam('saveTeamComment',{body:'private draft'},'unmounted-team-operation');
+  const observed=pending.catch(error=>error);h.unmount();const updates=h.updates();
+  response.resolve(action==='read'?{candidateText:'must never reach a removed view'}:{committed:true,operationId:'unmounted-team-operation'});
+  const error=await observed;assert.equal(error.code,'STALE_SESSION',action);assert.equal(h.updates(),updates,action);
+ }
+});
+
+test('an expired old team read and a late team write cannot release a new login mutation mutex',async()=>{
+ const oldWrite=deferred(),oldRead=deferred(),newWrite=deferred(),freshToken=token+'-new-team';
+ const h=harness(call=>{
+  if(call.action==='snapshot')return teamSnapshot;
+  if(call.action==='login')return {token:freshToken,snapshot:teamSnapshot};
+  if(call.action==='readTeamWorkspace')return oldRead.promise;
+  if(call.action==='saveTeamComment')return call.options.operationId==='old-team-save'?oldWrite.promise:newWrite.promise;
+  throw new Error('Unexpected action '+call.action);
+ },{storedToken:token});await flush();
+ const read=h.render().readTeamWorkspace().catch(error=>error),old=h.render().mutateTeam('saveTeamComment',{body:'old input'},'old-team-save').catch(error=>error);
+ oldRead.reject(new SheetApiError('UNAUTHENTICATED','Old team session expired'));await read;await flush();assert.equal(h.render().authenticated,false);
+ await h.render().login('ND-001','test-new-login-password');const current=h.render().mutateTeam('saveTeamComment',{body:'new input'},'new-team-save');
+ try{
+  oldWrite.resolve({committed:true,operationId:'old-team-save'});const stale=await old;await flush();assert.equal(stale.code,'STALE_SESSION');
+  assert.equal(h.render().busy,true);await assert.rejects(h.render().mutateTeam('saveTeamComment',{body:'third input'},'third-team-save'),{code:'MUTATION_PENDING'});
+  assert.equal(h.calls.filter(call=>call.options.operationId==='third-team-save').length,0);
+ }finally{newWrite.resolve({committed:true,operationId:'new-team-save'});await current;h.unmount();}
+});
