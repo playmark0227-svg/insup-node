@@ -5,6 +5,7 @@ import vm from 'node:vm';
 import ts from 'typescript';
 import * as groups from '../lib/candidate-groups.ts';
 import * as intake from '../lib/candidate-intake.ts';
+import * as conditions from '../lib/candidate-conditions.ts';
 const source=ts.transpileModule(fs.readFileSync(new URL('../components/candidate-list-controls.tsx',import.meta.url),'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,jsx:ts.JsxEmit.ReactJSX}}).outputText;
 const nodes=tree=>!tree||typeof tree!=='object'?[]:Array.isArray(tree)?tree.flatMap(nodes):[tree,...nodes(tree.props?.children)];
 const text=tree=>tree==null||typeof tree==='boolean'?'':typeof tree==='string'||typeof tree==='number'?String(tree):Array.isArray(tree)?tree.map(text).join(''):text(tree.props?.children);
@@ -13,7 +14,7 @@ function harness(overrides={}){
  const props={filter:{owner:'all',status:'all',statuses:[],search:'検索は保持',appointment:'all',profile:'all'},onFilterChange:value=>{changes.push(value);props.filter=value;},sort:{field:'interview',direction:'desc'},onSortChange:value=>{sorts.push(value);props.sort=value;},players:[{id:'ND-001',name:'利用中の担当'},{id:'ND-002',name:'停止した担当',active:false}],statuses:['提案候補','提案完了',''],companies:['架空会社A','架空会社B','all','none',''],admin:true,intakeEnabled:true,...overrides};
  const react={useState(initial){const i=cursor++;const slot=slots[i]||={value:typeof initial==='function'?initial():initial};return [slot.value,value=>slot.value=typeof value==='function'?value(slot.value):value];},useId(){return 'controls-test';},useRef(initial){return slots[cursor++]||={current:initial};}};
  const jsx=(type,props,key)=>{if(type==='button'&&props?.ref)props.ref.current={focus:()=>focus.push(props['aria-label'])};return {type,props:props||{},key};},exports={};
- vm.runInNewContext(source,{exports,module:{exports},require:name=>name==='react'?react:name==='react/jsx-runtime'?{jsx,jsxs:jsx}:name.includes('candidate-groups')?groups:name.includes('candidate-intake')?intake:name.endsWith('.css')?{}:new Proxy({},{get:(_,key)=>key})});
+ vm.runInNewContext(source,{exports,module:{exports},require:name=>name==='react'?react:name==='react/jsx-runtime'?{jsx,jsxs:jsx}:name.includes('candidate-groups')?groups:name.includes('candidate-intake')?intake:name.includes('candidate-conditions')?conditions:name.endsWith('.css')?{}:new Proxy({},{get:(_,key)=>key})});
  const render=next=>{Object.assign(props,next);cursor=0;return exports.CandidateListControls(props);};
  const find=(type,label)=>nodes(render()).find(n=>n.type===type&&(n.props['aria-label']===label||text(n)===label));
  const click=label=>{const node=find('button',label);assert.ok(node,label);assert.ok(!node.props.disabled,`${label} enabled`);node.props.onClick();};
@@ -68,4 +69,27 @@ test('recorded PC, CRM, experience and availability controls are optional, immed
 test('tomorrow is a separate visible appointment choice and profile controls stay hidden when unavailable',()=>{
  const h=harness();h.click('候補者のフィルター');assert.match(text(h.find('select','候補者の予定で絞り込み')),/明日の予定・前日準備/);h.select('候補者の予定で絞り込み','tomorrow');assert.equal(h.props.filter.appointment,'tomorrow');
  const unavailable=harness({intakeEnabled:false});unavailable.click('候補者のフィルター');for(const label of ['候補者のPC環境で絞り込み','候補者の登録CRMで絞り込み'])assert.equal(unavailable.find('select',label),undefined);for(const label of ['候補者の経験・強みの記載で絞り込み','候補者の稼働条件の記載で絞り込み'])assert.equal(unavailable.find('input',label),undefined);
+});
+
+
+test('numeric conditions combine without changing query, reject unknown units, and reset together',()=>{
+ const h=harness();h.click('候補者のフィルター');
+ h.find('input','週の稼働日数の下限').props.onChange({target:{value:'3'}});
+ h.find('input','週の稼働日数の上限').props.onChange({target:{value:'5'}});
+ h.find('input','月の稼働時間の下限').props.onChange({target:{value:'80'}});
+ h.find('input','希望時給の上限').props.onChange({target:{value:'2500'}});
+ h.find('input','候補者の開始可能日の上限').props.onChange({target:{value:'2026-11-20'}});
+ h.select('候補者の条件の確認状態','rate:ambiguous');
+ assert.equal(h.props.filter.daysMin,3);assert.equal(h.props.filter.daysMax,5);assert.equal(h.props.filter.hoursMin,80);assert.equal(h.props.filter.rateMax,2500);assert.equal(h.props.filter.availableBy,'2026-11-20');assert.equal(h.props.filter.conditionCheck,'rate:ambiguous');
+ assert.equal(groups.candidateFilterCount(h.props.filter),5);assert.equal(h.props.filter.search,'検索は保持');
+ const count=h.changes.length;h.select('候補者の条件の確認状態','secret:known');h.find('input','週の稼働日数の上限').props.onChange({target:{value:'100'}});h.find('input','候補者の開始可能日の上限').props.onChange({target:{value:'2026-02-30'}});assert.equal(h.changes.length,count);
+ h.find('input','週の稼働日数の上限').props.onChange({target:{value:'2'}});assert.match(text(h.render()),/下限を上限以下/);
+ assert.match(text(h.render()),/基本情報・紹介文/);assert.match(text(h.render()),/月額から換算しません/);
+ h.click('フィルターを解除');assert.equal(groups.candidateFilterCount(h.props.filter),0);assert.equal(h.props.filter.daysMin,undefined);assert.equal(h.props.filter.conditionCheck,undefined);
+});
+
+test('a needs-confirmation selection can clear just its conflicting numeric bounds',()=>{
+ const h=harness();h.click('候補者のフィルター');h.find('input','希望時給の上限').props.onChange({target:{value:'2500'}});h.find('input','週の稼働日数の下限').props.onChange({target:{value:'3'}});h.select('候補者の条件の確認状態','rate:ambiguous');
+ assert.match(text(h.render()),/同じ項目の範囲条件を同時に適用できません/);h.click('その項目の範囲だけ解除');assert.equal(h.props.filter.rateMax,undefined);assert.equal(h.props.filter.daysMin,3);assert.equal(h.props.filter.conditionCheck,'rate:ambiguous');
+ h.find('input','週の稼働日数の下限').props.onChange({target:{value:'3.5'}});assert.match(text(h.render()),/0〜7の整数/);
 });

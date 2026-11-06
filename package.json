@@ -7,10 +7,10 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "pretest": "node scripts/generate-workspace-rules.mjs",
+    "pretest": "node scripts/generate-workflow-features.mjs && node scripts/generate-workspace-rules.mjs",
     "test": "node --experimental-strip-types --test tests/*.test.mjs tests/*.test.ts",
     "dev": "vite --host 127.0.0.1 --port 5173",
-    "build": "node scripts/generate-workspace-rules.mjs && tsc --noEmit && vite build && node scripts/finalize-pages.mjs",
+    "build": "node scripts/generate-workflow-features.mjs && node scripts/generate-workspace-rules.mjs && tsc --noEmit && vite build && node scripts/finalize-pages.mjs",
     "security:artifacts": "node scripts/security-artifacts.mjs",
     "security:dependencies": "npm audit --package-lock-only --audit-level=moderate",
     "preview": "vite preview --host 127.0.0.1 --port 4173"

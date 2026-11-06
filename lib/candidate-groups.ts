@@ -1,6 +1,7 @@
 import { sortCandidateRecords, statusTone, valueAt, type CandidateSort } from "./management-data.ts";
 import type { CandidateRecord } from "./sheets-client.ts";
 import { linkedCandidateProfile, type CandidateProfile, type InterviewFields } from "./candidate-intake.ts";
+import { candidateConditionFilterCount, matchesCandidateConditions, matchesCandidateWords, type CandidateConditionFilter } from "./candidate-conditions.ts";
 
 export type CandidateGroup = {
   key: string;
@@ -11,7 +12,7 @@ export type CandidateGroup = {
 
 export type CandidateAppointmentFilter = "all" | "overdue" | "today" | "tomorrow" | "future" | "none";
 export type CandidateProfileFilter = "all" | "with" | "without";
-export type CandidateGroupFilter = {
+export type CandidateGroupFilter = CandidateConditionFilter & {
   owner: string; status: string; search: string;
   statuses?: string[]; company?: string | null;
   appointment?: CandidateAppointmentFilter; profile?: CandidateProfileFilter;
@@ -61,7 +62,7 @@ export function candidateFilterCount(filter: CandidateGroupFilter): number {
     + Number(filter.company !== undefined) + Number(!!filter.appointment && filter.appointment !== "all")
     + Number(!!filter.profile && filter.profile !== "all")
     + Number(filter.pcEnvironment !== undefined) + Number(filter.crmTool !== undefined)
-    + Number(!!filter.experienceKeyword?.trim()) + Number(!!filter.availabilityKeyword?.trim());
+    + Number(!!filter.experienceKeyword?.trim()) + Number(!!filter.availabilityKeyword?.trim()) + candidateConditionFilterCount(filter);
 }
 
 const availabilityFields = ["availableFrom", "timeWindow", "daysPerWeek", "monthlyHours", "workStyle", "sideJob", "desiredHourlyRate", "interviewAvailability"] as const;
@@ -69,11 +70,6 @@ const experienceFields = ["workHistory", "achievements", "strengths", "pcSkills"
 /** Search only explicitly linked, recorded professional fields. Dedicated
  * attendance concerns, internal notes and protected-attribute fields are excluded. */
 const searchableProfileFields = [...experienceFields, ...availabilityFields, "pcEnvironment", "networkEnvironment", "crmOther", "chatOther"] as const;
-const normalizedSearch = (value:string) => value.normalize("NFKC").toLocaleLowerCase("ja");
-const matchesWords = (value:string, query:string) => {
-  const recorded=normalizedSearch(value);
-  return normalizedSearch(query).trim().split(/\s+/).filter(Boolean).every(word=>recorded.includes(word));
-};
 const profileText = (fields:InterviewFields|undefined, keys:readonly (keyof InterviewFields)[]) => fields ? keys.flatMap(key=>fields[key]).join(" ") : "";
 
 /** Optional dates/names stay at the end in both directions; equal values use a stable identity order. */
@@ -136,8 +132,9 @@ export function filterCandidateGroups(groups: CandidateGroup[], filter: Candidat
     // A dropdown selection is recorded tool experience. Free text such as
     // "Salesforce未経験" must not become an inferred positive tool selection.
     if(filter.crmTool!==undefined&&(filter.crmTool===null ? !!fields&&(fields.crmTools.length>0||!!fields.crmOther.trim()) : !fields?.crmTools.includes(filter.crmTool)))return false;
-    return (!filter.experienceKeyword?.trim()||matchesWords(profileText(fields,experienceFields),filter.experienceKeyword))
-      &&(!filter.availabilityKeyword?.trim()||matchesWords(profileText(fields,availabilityFields),filter.availabilityKeyword));
+    return (!filter.experienceKeyword?.trim()||matchesCandidateWords(profileText(fields,experienceFields),filter.experienceKeyword,true))
+      &&(!filter.availabilityKeyword?.trim()||matchesCandidateWords(profileText(fields,availabilityFields),filter.availabilityKeyword))
+      &&matchesCandidateConditions(fields,filter);
   }
   return groups.filter(group =>
     (filter.owner === "all" || (filter.owner === "unassigned" ? !group.playerId : group.playerId === filter.owner)) &&
@@ -149,7 +146,7 @@ export function filterCandidateGroups(groups: CandidateGroup[], filter: Candidat
       (filter.profile === undefined || filter.profile === "all" || (filter.profile === "with" ? !!record.profileId : !record.profileId)) &&
       appointmentMatches(record) &&
       profileMatches(fields) &&
-      (!search || matchesWords(`${record.candidateName} ${group.name} ${record.values.join(" ")} ${profileText(fields,searchableProfileFields)} ${fields?.crmTools.join(" ")||""} ${fields?.chatTools.join(" ")||""}`,search))
+      (!search || matchesCandidateWords(`${record.candidateName} ${group.name} ${record.values.join(" ")} ${profileText(fields,searchableProfileFields)} ${fields?.crmTools.join(" ")||""} ${fields?.chatTools.join(" ")||""}`,search))
     );})
   );
 }

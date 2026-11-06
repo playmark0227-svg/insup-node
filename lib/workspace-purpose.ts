@@ -1,6 +1,8 @@
-export type WorkspaceView = "home" | "ranking" | "records" | "profile" | "players" | "connection" | "workbook" | "reviews" | "insights" | "security" | "team";
+export type WorkspaceView = "home" | "ranking" | "records" | "profile" | "players" | "connection" | "workbook" | "reviews" | "insights" | "security" | "team" | "reminders" | "migration";
 export type WorkspacePurpose = { title: string; goal: string; steps: string[]; links: { view: WorkspaceView; label: string }[] };
 const purposes: Record<WorkspaceView, WorkspacePurpose> = {
+  reminders:{title:"通知・前日確認",goal:"明日のC面談と稼働予定を確認し、アプリ内・PC通知で確認漏れを減らします。",steps:["未完了の予定を確認して、対象の提案を開きます。","PC通知は自分で許可した場合だけ有効です。通知本文に候補者名や会社名は表示しません。","アプリを開き、ログインが有効な間に通知します。閉じている間の通知は行いません。"],links:[{view:"records",label:"候補者・提案を確認"}]},
+  migration:{title:"過去データの移行",goal:"Slackの原文を保管し、担当者と内容を確認して候補者・案件へ登録します。",steps:["Slack JSONまたはコピーした本文を読み込み、原文を管理者限定で保管します。","同じ投稿は重複登録せず、原文の変更は自動上書きしません。","担当者・内容・共有先を確認してから業務データへ登録します。"],links:[{view:"records",label:"登録済み候補者を確認"},{view:"team",label:"共有した案件を確認"}]},
   team:{title:"社内共有・案件",goal:"共有した候補者の紹介文、社内の相談、募集案件を一か所で確認します。",steps:["面談情報と紹介文は候補者・提案で保存してから、公開する氏名・紹介文を確認します。","社内共有した候補者へコメント・返信・担当者への言及を残せます。","案件の条件を確認して、本人が担当する候補者への提案を登録します。","候補者の内部メモや元の記録は、社内共有へ自動で公開されません。"],links:[{view:"records",label:"自分の候補者を確認"}]},
   home: { title: "ホーム", goal: "今日確認する提案と、今月の成果をひとつの場所で確認します。", steps: ["「今日の確認」から対象の会社・提案を開きます。", "実施した工程の日付を記録すると、成果とランキングに反映されます。", "保存状況は右上で確認できます。同期中も別の作業を続けられます。"], links: [{view:"records",label:"候補者・提案を開く"},{view:"insights",label:"確認対象をすべて見る"}] },
   records: { title: "候補者・提案", goal: "候補者の基本情報と、会社ごとの提案・進捗・実績を管理します。", steps: ["初めての人は「候補者を登録」から追加します。", "基本情報・紹介文はその人の条件や職歴、提案の履歴は会社ごとの状況を確認する場所です。", "面談・提案・合格・承諾・稼働開始は、実際に進んだ工程の日付を記録します。予定日と実績日は分けます。", "同じ人を複数社へ提案しても、候補者リストは一人ひとつ。会社ごとの履歴から対象を選んで編集します。"], links: [{view:"reviews",label:"不成立の理由を振り返る"},{view:"ranking",label:"登録した成果を見る"}] },
@@ -14,7 +16,7 @@ const purposes: Record<WorkspaceView, WorkspacePurpose> = {
   security: { title: "アカウント・安全設定", goal: "自分のパスワードと、利用できるアクセスの状態を確認します。", steps: ["パスワード変更は本人のアカウントに適用されます。", "変更後は他の端末もログアウトされるため、新しいパスワードで再ログインします。", "未同期の入力がある場合は、右上の保存状況を確認してからログアウトします。"], links: [{view:"home",label:"ホームに戻る"}] },
 };
 export function allowedWorkspaceViews(admin: boolean): WorkspaceView[] {
-  return admin ? ["home","ranking","records","team","reviews","insights","players","workbook","connection","security"] : ["home","ranking","records","team","reviews","insights","profile","security"];
+  return admin ? ["home","ranking","records","team","reviews","insights","reminders","migration","players","workbook","connection","security"] : ["home","ranking","records","team","reviews","insights","reminders","profile","security"];
 }
 export function workspacePurpose(view: WorkspaceView, admin: boolean): WorkspacePurpose {
   const selected = allowedWorkspaceViews(admin).includes(view) ? view : "home";
@@ -24,6 +26,6 @@ export function workspacePurpose(view: WorkspaceView, admin: boolean): Workspace
 }
 export const workspaceNavigationGroups = [
   { label: "成果の確認", views: ["home","ranking"] },
-  { label: "日々の営業", views: ["records","team","reviews","insights"] },
-  { label: "管理・設定", views: ["profile","players","workbook","connection","security"] },
+  { label: "日々の営業", views: ["records","team","reviews","insights","reminders"] },
+  { label: "管理・設定", views: ["profile","players","workbook","migration","connection","security"] },
 ] as const;

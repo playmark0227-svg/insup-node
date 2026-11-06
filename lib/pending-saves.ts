@@ -196,7 +196,8 @@ export async function replacePendingSave(endpoint:string,account:string,operatio
 /** Block overlapping edits until their server revisions arrive. Never silently rebase a draft. */
 export function pendingSaveResources(action: string, payload: unknown, snapshot: SheetSnapshot): string[] {
   const data = payload as Record<string, unknown>;
-  if (action === "restoreChange") return ["*"];
+  if (["restoreChange","stageMigrationBatch","applyMigrationItem"].includes(action)) return ["*"];
+  if(action==="mutateRewards")return ["rewards:ledger"];
   if (action === "saveManagementRow") return [`management:${data.sheetId}:${data.row}`];
   if (action === "saveClient") return [`client:${data.id || String(data.name || "").trim().toLocaleLowerCase()}`];
   const body = (action === "saveActivity" ? data.activity : action === "updateProfile" ? data.player : data) as Record<string, unknown>;

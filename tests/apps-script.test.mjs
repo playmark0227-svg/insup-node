@@ -1155,6 +1155,47 @@ test("failed player creation cannot grant login and a retry commits one active a
   assert.equal(harness.spreadsheet.getSheetByName("_NODE_players").values.filter(row => row[0] === "ND-003").length, 1);
 });
 
+for (const action of ["updateProfile", "createPlayer"]) {
+  for (const failureAt of ["freshStore", "mutationResponse"]) {
+    test(`${action} preserves a committed full snapshot outcome after ${failureAt} fails`, () => {
+      const {harness, admin, player}=signedInFixture();
+      const token=action==="createPlayer"?admin.token:player.token;
+      const profile=player.snapshot.players.find(person=>person.id==="ND-001");
+      const payload=action==="createPlayer"?{name:"受領障害担当",team:"NODE",target:10,sheetNames:["受領障害担当"]}:{player:{...profile,bio:"保存済みの受領確認"}};
+      const operationId=randomUUID(),operations=harness.spreadsheet.getSheetByName("_NODE_operations"),before=operations.getLastRow();
+      const method=failureAt==="freshStore"?"readStore_":"mutationResponse_",original=harness.context[method];
+      harness.context[method]=function(...args){
+        if(operations.getLastRow()>before)harness.context.fail_("SCHEMA_MISMATCH","Injected post-commit snapshot failure");
+        return original(...args);
+      };
+      const failure=assertFailure(mutate(harness,token,action,payload,operationId));
+      assert.equal(failure.code,"INTERNAL");
+      assert.equal(operations.getLastRow(),before+1);
+      harness.context[method]=original;
+      const writes=harness.apiCalls.length,replay=assertSuccess(mutate(harness,token,action,payload,operationId));
+      assert.equal(harness.apiCalls.length,writes);
+      assert.equal(operations.getLastRow(),before+1);
+      if(action==="createPlayer"){
+        assert.equal(harness.spreadsheet.getSheetByName("_NODE_players").values.filter(row=>row[0]==="ND-003").length,1);
+        assert.equal(replay.credentials,undefined);
+        assert.equal(replay.credentialsUnavailable,true,"Replaying a creation must not recover or issue a new one-time password");
+      } else assert.equal(replay.snapshot.players.find(person=>person.id==="ND-001").bio,payload.player.bio);
+    });
+  }
+}
+
+test("a full snapshot save preserves post-commit session expiry and confirms only after logging in again",()=>{
+  const {harness,player}=signedInFixture(),profile=player.snapshot.players.find(person=>person.id==="ND-001");
+  const payload={player:{...profile,bio:"認証失効前に保存"}},operationId=randomUUID(),original=harness.context.mutationResponse_;
+  harness.context.mutationResponse_=function(...args){delete harness.properties[harness.context.sessionKey_(player.token)];return original(...args);};
+  assert.equal(assertFailure(mutate(harness,player.token,"updateProfile",payload,operationId)).code,"UNAUTHENTICATED");
+  harness.context.mutationResponse_=original;
+  const renewed=authenticate(harness,"ND-001"),writes=harness.apiCalls.length;
+  const replay=assertSuccess(mutate(harness,renewed.token,"updateProfile",payload,operationId));
+  assert.equal(harness.apiCalls.length,writes);
+  assert.equal(replay.snapshot.players.find(person=>person.id==="ND-001").bio,payload.player.bio);
+});
+
 test("shared sheet-name aliases are rejected to prevent ambiguous ownership", () => {
   const { harness, admin } = signedInFixture();
   assertFailure(mutate(harness, admin.token, "createPlayer", { name: "重複担当", team: "NODE", target: 20, sheetNames: ["担 当 一"] }));

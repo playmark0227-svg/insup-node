@@ -66,3 +66,11 @@ test('cached accounts are bounded and purging preserves only encrypted valid ent
  for(let i=0;i<23;i++){const access=grant();await persistSnapshotCache(endpoint,access,fixture(access));}
  await purgeSnapshotCache();const rows=await stored();assert.ok(rows.length<=20);assert.ok(rows.every(row=>row.expiresAt>Date.now()&&row.ciphertext.byteLength<=SNAPSHOT_CACHE_MAX_BYTES+32));
 });
+
+test('new private migration archives and rewards never enter the encrypted ranking projection',()=>{
+ const access={...grant(),self:{playerId:'ADMIN',role:'admin' as const}},snapshot=Object.assign(fixture(access),{migrationFeature:true,rewardsFeature:true,migrationArchive:[{body:'原文保管の非公開情報',author:'Slackの個別投稿者',sourceId:'Slackの個別投稿ID'}],rewards:{balances:[{playerId:'ND-001',balance:987654}],requests:[{decisionNote:'特典交換の非公開判断'}]}});
+ const projected=projectSnapshotForCache(snapshot),raw=JSON.stringify(projected);
+ assert.notEqual(projected.migrationFeature,true);assert.notEqual(projected.rewardsFeature,true);
+ for(const word of ['migrationArchive','原文保管の非公開情報','Slackの個別投稿者','Slackの個別投稿ID','rewards','987654','特典交換の非公開判断'])assert.equal(raw.includes(word),false,word);
+ assert.equal(projected.writesEnabled,false);assert.equal(projected.records?.length,0);
+});

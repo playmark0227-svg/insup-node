@@ -102,6 +102,27 @@ export function buildIntroductionPlan(name: string, preparedFields: InterviewFie
   return { fixed, narrativeSections, narrativeFacts, attributionNotes, rankQualifications, sectionOrder, tone: settings.tone, limit, budget, overflow: budget < 0 };
 }
 
+/** A bounded editorial brief varies with the supplied facts, without adding a
+ * target claim, a new factual source or a fixed minimum character count. */
+export function introductionEditorialInstructions(plan:IntroductionPlan):string {
+  const source=Object.values(plan.narrativeFacts).join("\n");
+  const facts=source.split(/[。\n;；]/).map(value=>value.trim()).filter(Boolean);
+  const sparse=unicodeLength(source)<45&&facts.length<3;
+  return [
+    plan.tone==="formal"
+      ? "文末は『担当していました』『経験があります』『取り組んでいます』など、事実に合う自然な丁寧語にします。単語・体言止めを並べるだけで終わらせません。"
+      : "簡潔な常体で、対象・担当業務・実績の関係が読める文にします。単語を並べるだけで終わらせません。",
+    sparse
+      ? "材料が少ない場合は、分かる業務を一つの完全文で説明します。事実が一つしかないときは一文で十分です。文字数を埋める目的で同じ説明を言い換えたり、強み・総評を水増ししません。"
+      : "職歴では対象・商材・手法・担当業務の関係を整理し、複数の事実を読みやすい数文へつなぎます。会社や期間が変わる場所では段落を分け、実績と具体的な工夫も読み落とさず残します。",
+    plan.narrativeSections.includes("results")
+      ? "強みの欄は『実際にどのように仕事を進めたか』が伝わるよう、原文にある行動を説明します。実績の数値を使うときは期間・最大・平均・目標・本人申告などの限定と一緒に書きます。" : "",
+    plan.narrativeSections.includes("summary")
+      ? "総評は経験と担当業務がひと目で分かる短い紹介にします。前の節と同じ文の貼り直し、人物の採点、将来の活躍予想、クライアントへの推薦は加えません。" : "",
+    "最終確認：原文の業務・否定・条件・実績の限定が抜けていないかを読み直し、会社ごとの事実を混ぜず、同じ文の反復と入力ラベルの羅列を取り除いてから返してください。",
+  ].filter(Boolean).join("\n");
+}
+
 function narrativeSection(plan:IntroductionPlan,key:IntroductionNarrativeSection,value:string|undefined):string|null {
  if(!plan.narrativeSections.includes(key)||!value?.trim())return null;
  const body=value.trim(),note=plan.attributionNotes[key];

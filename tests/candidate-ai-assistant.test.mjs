@@ -383,3 +383,11 @@ test('editing a valid candidate cannot copy or adopt private details assessment 
   assert.ok(h.text().includes(label));assert.equal(h.button('コピー').props.disabled,true);assert.equal(h.button('この文章を使う').props.disabled,true);assert.equal(h.calls.applied.length,0);h.unmount();
  }
 });
+
+test('editorial feedback identifies omitted material and updates as the proposed prose is edited without overwriting the original',async()=>{
+ const h=harness({deviceIntroduction:async()=>({draft:'【基本情報】\n氏名：架空の候補者\n【営業経験・職務経歴】\n営業を担当していました。'})});await flush();
+ h.render({fields:{...blankInterviewFields(),workHistory:'法人向けSaaSのテレアポを2年。リスト作成とヒアリング。'}});
+ h.click('文章をAIで整理・仕上げる');await flush();assert.match(h.text(),/職歴から抜けた説明がないか確認/);assert.match(h.text(),/総評の材料を確認/);assert.equal(h.calls.applied.length,0);
+ h.click('候補文をその場で修正');h.change('-draft-editor','【基本情報】\n氏名：架空の候補者\n【営業経験・職務経歴】\n法人向けSaaSのテレアポを2年間担当していました。リスト作成とヒアリングを行っています。\n【総評】\n法人向けSaaSの電話営業で、リストの準備から聞き取りまでを経験しています。');
+ assert.doesNotMatch(h.text(),/職歴から抜けた説明がないか確認|総評の材料を確認/);assert.match(h.text(),/文章の仕上がりを確認/);assert.equal(h.calls.applied.length,0);h.unmount();
+});

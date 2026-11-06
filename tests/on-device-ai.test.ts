@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { blankInterviewFields, unicodeLength } from "../lib/candidate-intake.ts";
 import { buildIntroductionPlan } from "../lib/introduction-plan.ts";
-import { reviewIntroductionSource, introductionEvidenceIssues } from "../lib/introduction-review.ts";
+import { reviewIntroductionSource, introductionEvidenceIssues, reviewIntroductionQuality } from "../lib/introduction-review.ts";
 import { resolveCandidateChatQuestion } from "../lib/candidate-chat-guidance.ts";
 import { selectCandidateChatContext } from "../lib/candidate-chat.ts";
 import { defaultWritingPreferences, validateWritingPreferences, getOnDeviceAiAvailability,
@@ -895,7 +895,7 @@ test('native objective copyediting keeps qualified facts while source attributio
  assert.match(result.draft,/3年間担当/);assert.match(result.draft,/期間と比較人数は未確認/);
  assert.doesNotMatch(result.draft,/実績には本人申告の内容を含みます|長け|顧客満足|課題解決|〇〇/);
  assert.match(result.draft,/職歴には本人申告/);assert.match(result.draft,/総評の職歴・実績に関する記載には本人申告/);
- assert.match(calls.prompt[0].text,/文章の校正/);assert.match(calls.prompt[0].text,/原文が短ければ出力も短いまま/);
+ assert.match(calls.prompt[0].text,/文章の校正/);assert.match(calls.prompt[0].text,/文字数を埋めるための反復/);assert.match(calls.prompt[0].text,/自然な丁寧語/);assert.doesNotMatch(calls.prompt[0].text,/助詞・句読点・改行・明確な業務用語の表記だけ/);
  assert.match(calls.prompt[0].text,/各文・各箇条書きへ本人申告を繰り返さず/);
  assert.equal(calls.create.length,1);assert.deepEqual(source,before);
 });
@@ -907,4 +907,19 @@ test('a native rank summary cannot lose source uncertainty when the model return
  assert.equal((result.draft.match(/順位の確認範囲：期間と比較した人数は未確認。/g)||[]).length,2);
  assert.ok(!introductionEvidenceIssues(result.draft,source.candidateName,reviewIntroductionSource(source.profile).fields).includes('rank-scope-removed'));
  assert.deepEqual(source,before);
+});
+
+
+test('five fictional editorial acceptance cases pass the actual introduction pipeline and keep fixed fields out of inference',async t=>{
+ const fixtures=JSON.parse(readFileSync(new URL('./fixtures/introduction-quality-cases.json',import.meta.url),'utf8'));
+ for(const item of fixtures){
+  const profile={...blankInterviewFields(),...item.profile},before=structuredClone(profile),preferences={...defaultWritingPreferences(),includeSummary:item.includeSummary!==false};
+  const calls=fake(t,{response:item.modelOutput}),value=await generateCandidateIntroduction({candidateName:item.candidateName,profile,preferences});
+  assert.equal(value.method,'device',item.id);assert.deepEqual(reviewIntroductionQuality(value.draft,reviewIntroductionSource(profile,[item.candidateName]).fields,preferences).issues,[],item.id);
+  for(const needle of item.mustRetain)assert.ok(value.draft.includes(needle),`${item.id}: ${needle}`);
+  for(const needle of item.mustNotContain)assert.ok(!value.draft.includes(needle),`${item.id}: ${needle}`);
+  assert.ok(!calls.prompt[0].text.includes(item.candidateName),item.id);
+  for(const field of ['desiredHourlyRate','pcEnvironment','availableFrom'])if(profile[field])assert.ok(!calls.prompt[0].text.includes(profile[field]),`${item.id}: ${field}`);
+  assert.deepEqual(profile,before);assert.equal(calls.create.length,1);assert.equal(calls.destroyed,1);
+ }
 });

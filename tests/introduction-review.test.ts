@@ -225,3 +225,23 @@ test('rank uncertainty must remain with each ranking claim rather than an unrela
  for(const draft of ['本人申告：営業会社で1位の実績があります。','本人申告：営業会社でNo.1です。','【営業における強み】\n本人申告：1位の実績。期間と比較人数は未確認。\n【総評】\n営業会社で1位の実績があります。','### 営業における強み\n本人申告：1位の実績。期間と比較人数は未確認。\n### 総評\n営業会社で1位の実績があります。','本人申告：営業会社で1位の実績。使用ツールは未確認です。'])assert.ok(introductionEvidenceIssues(draft,'架空検証',fields).includes('rank-scope-removed'),draft);
  assert.deepEqual(introductionEvidenceIssues('本人申告：営業会社で1位の実績があるとのことです。期間と比較した人数は未確認です。','架空検証',fields),[]);
 });
+
+test('experience durations cannot change months to years, lose half years or borrow another company period',()=>{
+ const fields={...blankInterviewFields(),workHistory:'検証A社で法人営業を2か月担当。検証B社で個人営業を2年半担当。'};
+ for(const draft of ['検証A社で法人営業を2年担当しました。','検証B社で個人営業を2年間担当しました。','検証A社で法人営業を2年半担当しました。','検証B社で個人営業を2か月担当しました。'])assert.ok(introductionEvidenceIssues(draft,'架空',fields).includes('experience-period-changed'),draft);
+ assert.deepEqual(introductionEvidenceIssues('検証A社で法人営業を2ヶ月担当しました。検証B社で個人営業を2年半担当しました。','架空',fields),[]);
+ const dated={...blankInterviewFields(),workHistory:'2024年4月から2025年3月まで検証A社で架電を担当。',availableFrom:'2026年12月以降（希望）'};
+ assert.deepEqual(introductionEvidenceIssues('2024年4月から2025年3月まで検証A社で架電を担当していました。稼働開始可能日は2026年12月以降です。','架空',dated),[]);
+ assert.ok(introductionEvidenceIssues('検証A社で3年間担当していました。','架空',dated).includes('experience-period-changed'));
+ const quantified={...blankInterviewFields(),achievements:'営業で2件の成約実績。'};
+ assert.ok(introductionEvidenceIssues('営業を2年間経験しています。','架空',quantified).includes('experience-period-changed'));
+});
+
+test('experience periods keep approximation and bounds while normal paraphrases remain valid',()=>{
+ for(const [source,good,bad] of [
+  ['法人営業を約2年担当。','法人営業を2年ほど担当していました。','法人営業を2年担当していました。'],
+  ['法人営業を2年程度担当。','法人営業をおよそ2年間担当していました。','法人営業を2年間担当していました。'],
+  ['法人営業を2年以上担当。','法人営業を2年以上担当していました。','法人営業を2年間担当していました。'],
+  ['法人営業を最長2年担当。','法人営業を最長2年間担当していました。','法人営業を2年間担当していました。'],
+ ] as const){const fields={...blankInterviewFields(),workHistory:source};assert.deepEqual(introductionEvidenceIssues(good,'架空',fields),[],good);assert.ok(introductionEvidenceIssues(bad,'架空',fields).includes('experience-period-changed'),bad);}
+});
