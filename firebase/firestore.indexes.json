@@ -1,0 +1,15 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "rows",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "hasMetadata", "order": "ASCENDING"},
+        {"fieldPath": "row", "order": "ASCENDING"}
+      ]
+    }
+  ],
+  "fieldOverrides": [
+    {"collectionGroup": "rows", "fieldPath": "payload", "indexes": []}
+  ]
+}

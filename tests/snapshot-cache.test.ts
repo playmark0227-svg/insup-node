@@ -74,3 +74,11 @@ test('new private migration archives and rewards never enter the encrypted ranki
  for(const word of ['migrationArchive','原文保管の非公開情報','Slackの個別投稿者','Slackの個別投稿ID','rewards','987654','特典交換の非公開判断'])assert.equal(raw.includes(word),false,word);
  assert.equal(projected.writesEnabled,false);assert.equal(projected.records?.length,0);
 });
+
+
+test('Firestore cache metadata keeps the verified provider without caching private Firebase configuration',()=>{
+ const access=grant(),snapshot=Object.assign(fixture(access),{storageBackend:{kind:'firestore' as const,projectId:'insup-node-test',migratedAt:'2026-11-06T00:00:00.000Z'},firebaseConfig:{apiKey:'do-not-persist'},migrationSource:{body:'private migration data'}});
+ const projected=projectSnapshotForCache(snapshot);
+ assert.deepEqual(projected.storageBackend,snapshot.storageBackend);assert.notEqual(projected.storageBackend,snapshot.storageBackend);
+ assert.equal(projected.writesEnabled,false);assert.equal(JSON.stringify(projected).includes('do-not-persist'),false);assert.equal(JSON.stringify(projected).includes('private migration data'),false);
+});

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { validateEndpoint, sheetRequest, assertSnapshot, liveCount, businessToday, isUncertainWrite, SheetApiError } from "../lib/sheets-client.ts";
+import { validateEndpoint, sheetRequest, assertSnapshot, liveCount, businessToday, isUncertainWrite, SheetApiError, sheetExtensionMutationEnabled, isSheetExtensionReadAction } from "../lib/sheets-client.ts";
 import type { SheetSnapshot } from "../lib/sheets-client.ts";
 import { defaultWritingPreferences } from "../lib/on-device-ai.ts";
 import { blankInterviewFields } from "../lib/candidate-intake.ts";
@@ -17,6 +17,32 @@ function intakeSnapshot():SheetSnapshot {
   candidateProfiles:[{profileId,playerId:player.id,recordIds:[recordId],version:"profile-version",updatedAt:"2026-10-20T01:00:00Z",fields:blankInterviewFields(),introduction:"本人が確認した入力のみ。"}],
   clients:[{id:"fictional-client-id",name:"架空の提案先",version:"client-version",active:true}]};
 }
+
+test("versioned extension capabilities accept only explicit true and remain optional for older servers", () => {
+ assert.doesNotThrow(() => assertSnapshot(snapshot));
+ for (const feature of ["metricGoalsFeature", "salesWorkflowFeature", "introductionV2Feature", "storageEvidenceFeature"]) {
+  assert.doesNotThrow(() => assertSnapshot({ ...snapshot, [feature]: true }));
+  for (const invalid of [false, "true", 1, null, {}]) assert.throws(() => assertSnapshot({ ...snapshot, [feature]: invalid }), {code:"INVALID_RESPONSE"});
+ }
+});
+
+test("extension capability gates cannot borrow a different feature or bypass read-only mode", () => {
+ const actions = {
+  saveMetricGoals: "metricGoalsFeature", saveWorkJob: "salesWorkflowFeature", saveProposalPlan: "salesWorkflowFeature", recordProposalSent: "salesWorkflowFeature", saveMatchReport: "salesWorkflowFeature",
+  saveIntroductionV2: "introductionV2Feature", saveIntroductionSettings: "introductionV2Feature", publishIntroductionV2:"introductionV2Feature", completeMatchEvidence: "storageEvidenceFeature",
+ };
+ for (const [action, feature] of Object.entries(actions)) {
+  const base = { ...snapshot, self:{playerId:player.id,role:"player" as const} };
+  assert.equal(sheetExtensionMutationEnabled(action, base), false);
+  assert.equal(sheetExtensionMutationEnabled(action, { ...base, migrationFeature: true, rewardsFeature: true }), false);
+  assert.equal(sheetExtensionMutationEnabled(action, { ...base, [feature]: true }), true);
+  assert.equal(sheetExtensionMutationEnabled(action, { ...base, [feature]: true, writesEnabled: false }), false);
+ }
+ assert.equal(sheetExtensionMutationEnabled("__proto__", snapshot as SheetSnapshot), false);
+ assert.equal(sheetExtensionMutationEnabled("changePassword", snapshot as SheetSnapshot), false);
+ for (const action of ["readMetricGoals", "readSalesWorkflow", "readIntroductionV2", "readMatchEvidence", "beginMatchEvidence"]) assert.equal(isSheetExtensionReadAction(action), true);
+ assert.equal(isSheetExtensionReadAction("completeMatchEvidence"), false);
+});
 
 test("intake snapshots accept linked profiles, Unicode introductions, inactive clients and old backends",()=>{
  assert.doesNotThrow(()=>assertSnapshot(snapshot));
@@ -218,7 +244,7 @@ test("cancellation and the original 45-second deadline stop delayed recovery bef
 test("an initial login or write network failure never retries its POST", async t => {
   let calls = 0;
   t.mock.method(globalThis,"fetch",async () => { calls++; throw new TypeError("offline"); });
-  for (const action of ["login","saveActivity","updateStatus","resetPassword","logout","analyzeInterviewReviews","generateWritingKit","saveWritingPreferences","unknown-action"]) {
+  for (const action of ["login","saveActivity","updateStatus","resetPassword","logout","analyzeInterviewReviews","generateWritingKit","saveWritingPreferences","beginMatchEvidence","completeMatchEvidence","saveIntroductionV2","saveMetricGoals","unknown-action"]) {
     const before = calls;
     await assert.rejects(() => sheetRequest(endpoint,action,{},{token:"test-token",operationId:"same-operation"}),{code:"NETWORK"});
     assert.equal(calls,before + 1);
@@ -228,7 +254,7 @@ test("an initial login or write network failure never retries its POST", async t
 test("temporary HTTP failures cannot replay a login or write", async t => {
   let calls = 0;
   t.mock.method(globalThis,"fetch",async () => { calls++; return new Response("temporarily unavailable",{status:503}); });
-  for (const action of ["login","saveActivity","updateStatus","resetPassword","logout","analyzeInterviewReviews"]) {
+  for (const action of ["login","saveActivity","updateStatus","resetPassword","logout","analyzeInterviewReviews","beginMatchEvidence","completeMatchEvidence","saveIntroductionV2","saveMetricGoals"]) {
     const before = calls;
     await assert.rejects(() => sheetRequest(endpoint,action),{code:"HTTP"});
     assert.equal(calls,before + 1);

@@ -9,7 +9,7 @@
 .meeting-button{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:38px;padding:8px 12px;border:1px solid var(--meeting-border);border-radius:8px;background:#fff;color:#34638f;font-size:12px;font-weight:600;white-space:nowrap;transition:background .15s,border-color .15s}
 .meeting-button:hover{background:#edf7ff;border-color:#a4cef7}
 .meeting-button.selected{background:var(--meeting-blue);border-color:var(--meeting-blue);color:#fff}
-.meeting-totals{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px}
+.meeting-totals{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:12px}
 .meeting-total{position:relative;min-width:0;padding:19px 17px 16px;border:1px solid var(--meeting-border);border-radius:12px;background:#fff;overflow:hidden}
 .meeting-total::before{content:"";position:absolute;left:0;right:0;top:0;height:3px;background:linear-gradient(90deg,#0872dd,#27cdea)}
 .meeting-total-label{font-size:13px;font-weight:600;color:#476684;white-space:nowrap}
@@ -74,7 +74,7 @@
 .meeting-speaker-heading p{font-size:12px;color:#57718f;margin-top:9px;display:flex;gap:15px}
 .meeting-speaker-heading p>span{color:#397fbb}
 .meeting-presentation-nav{display:flex;align-items:center;gap:8px}
-.meeting-person-metrics{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:11px}
+.meeting-person-metrics{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:11px}
 .meeting-person-metric{padding:17px 14px;background:#f4faff;border:1px solid #e0effb;border-radius:10px}
 .meeting-person-metric>div{display:flex;align-items:center;justify-content:space-between;gap:4px;font-size:12px;color:#587391;font-weight:600;white-space:nowrap}
 .meeting-person-metric>strong{display:block;font-size:38px;font-weight:700;color:#0b4b88;margin:10px 0 7px;letter-spacing:-.5px}
@@ -141,7 +141,7 @@
 .meeting-board-purpose>span{font-size:10px;white-space:nowrap}
 .meeting-board-purpose .meeting-scroll-hint{display:none}
 .meeting-column-unit{display:block;font-size:10px;font-weight:400;color:var(--meeting-muted);margin-top:6px}
-.meeting-table{min-width:1050px}
+.meeting-table{min-width:1180px}
 .meeting-table tbody td{min-width:105px}
 .meeting-table thead .meeting-player-heading,.meeting-table tbody th{position:sticky;left:0;z-index:1}
 .meeting-table thead .meeting-player-heading{background:#f7fbff}
@@ -179,6 +179,8 @@
 .meeting-dashboard.is-presenting .meeting-target-remainder{font-size:11px}
 .meeting-dashboard.is-presenting .meeting-table .meeting-difference{font-size:12px}
 .meeting-dashboard.is-presenting .meeting-period-summary>div>strong{font-size:22px}
-@media(max-width:1440px){.meeting-person-metrics{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:1440px){.meeting-person-metrics{grid-template-columns:repeat(4,minmax(0,1fr))}}
 @media(max-width:1250px){.meeting-period-summary{flex-wrap:wrap;gap:12px 25px}.meeting-mode-hint{margin-left:0}.meeting-board-purpose .meeting-scroll-hint{display:inline}.meeting-team-goal{flex-wrap:wrap}.meeting-goal-remainder{font-size:11px}.meeting-dashboard .meeting-person-metric{min-width:0}}
-@media(max-width:767px){.meeting-period-summary{align-items:flex-start;gap:11px;padding:15px 16px}.meeting-period-summary>div{width:100%;gap:10px}.meeting-period-summary>div>strong{font-size:18px}.meeting-period-summary>p{font-size:10px}.meeting-mode-hint{font-size:10px}.meeting-goal-caption{align-items:flex-start;flex-direction:column;gap:3px}.meeting-goal-remainder{width:100%;text-align:right}.meeting-board-purpose{align-items:flex-start;flex-direction:column;gap:6px;padding:11px 16px}.meeting-table tbody th{min-width:145px;padding-left:14px}.meeting-table .meeting-person-cell{gap:7px}.meeting-table .meeting-person-cell strong{max-width:130px;white-space:normal;line-height:1.5;overflow-wrap:anywhere}.meeting-dashboard .meeting-correct-icon,.meeting-dashboard .meeting-register-icon{width:30px;height:32px}.meeting-table tbody td{min-width:117px}.meeting-person-metric>div{flex-wrap:wrap;white-space:normal}.meeting-person-metric>div>span:first-child{width:100%;line-height:1.5}.meeting-person-metric .meeting-metric-actions{margin-left:0}.meeting-person-metric>strong{margin-top:8px}.meeting-empty-period{align-items:flex-start;flex-direction:column;gap:12px;padding:16px}.meeting-scope-note{font-size:10px}.meeting-scope-note button{margin-left:0;display:flex}.meeting-report-end{align-items:flex-start;flex-direction:column;gap:12px}}
+@media(max-width:767px){.meeting-totals,.meeting-person-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.meeting-period-summary{align-items:flex-start;gap:11px;padding:15px 16px}.meeting-period-summary>div{width:100%;gap:10px}.meeting-period-summary>div>strong{font-size:18px}.meeting-period-summary>p{font-size:10px}.meeting-mode-hint{font-size:10px}.meeting-goal-caption{align-items:flex-start;flex-direction:column;gap:3px}.meeting-goal-remainder{width:100%;text-align:right}.meeting-board-purpose{align-items:flex-start;flex-direction:column;gap:6px;padding:11px 16px}.meeting-table tbody th{min-width:145px;padding-left:14px}.meeting-table .meeting-person-cell{gap:7px}.meeting-table .meeting-person-cell strong{max-width:130px;white-space:normal;line-height:1.5;overflow-wrap:anywhere}.meeting-dashboard .meeting-correct-icon,.meeting-dashboard .meeting-register-icon{width:30px;height:32px}.meeting-table tbody td{min-width:117px}.meeting-person-metric>div{flex-wrap:wrap;white-space:normal}.meeting-person-metric>div>span:first-child{width:100%;line-height:1.5}.meeting-person-metric .meeting-metric-actions{margin-left:0}.meeting-person-metric>strong{margin-top:8px}.meeting-empty-period{align-items:flex-start;flex-direction:column;gap:12px;padding:16px}.meeting-scope-note{font-size:10px}.meeting-scope-note button{margin-left:0;display:flex}.meeting-report-end{align-items:flex-start;flex-direction:column;gap:12px}}
+
+.meeting-coaching-note{margin-top:18px;padding:14px 16px;border:1px solid #d7e7f7;border-radius:8px;background:#f7fbff;font-size:12px;line-height:1.8}.meeting-coaching-note>strong{font-size:13px}.meeting-coaching-note p{margin-top:5px;color:var(--meeting-muted)}.meeting-coaching-note summary{cursor:pointer;font-weight:600;margin-top:8px}.meeting-coaching-note ul{margin:6px 0 0;padding-left:20px;color:var(--meeting-muted)}

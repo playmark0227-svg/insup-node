@@ -55,21 +55,51 @@ var NODE = Object.freeze({
   seedPlayersKey: 'NODE_SEED_PLAYERS'
 });
 
-function doGet() { return output_({ ok: true, data: health_() }); }
+function doGet() { return doPost({postData:{contents:JSON.stringify({version:1,action:'health'})}}); }
 function doPost(e) {
+  var responseAfterMutation=false;
   try {
     var text = e && e.postData && e.postData.contents;
-    if (typeof text !== 'string' || text.length > 32768) fail_('BAD_REQUEST', 'リクエストを確認してください。');
+    if (typeof text !== 'string' || text.length > 400000) fail_('BAD_REQUEST', 'リクエストを確認してください。');
     var request;
     try { request = JSON.parse(text); } catch (_) { fail_('BAD_REQUEST', 'JSON形式を確認してください。'); }
-    return output_({ ok: true, data: nodeHandle_(request) });
+    if(text.length>32768&&(!request||request.action!=='saveIntroductionV2'))fail_('BAD_REQUEST','リクエストを確認してください。');
+    firestoreReset_(nodeStorageMutation_(request&&request.action));
+    var data=nodeHandle_(request);
+    responseAfterMutation=nodeStorageMutation_(request.action);
+    if(nodeUsesFirestore_())firestoreAssertSnapshot_();
+    return output_({ ok: true, data: data });
   } catch (error) {
+    if((responseAfterMutation||firestoreCommitted_())&&['AUTH_REQUIRED','UNAUTHENTICATED','UNAUTHORIZED','SESSION_EXPIRED'].indexOf(error.nodeCode)<0){error=new Error('保存結果を再確認してください。入力は保持しています。同じ内容で再試行できます。');error.nodeCode='INTERNAL';}
     return output_({ ok: false, error: { code: error.nodeCode || 'INTERNAL', message: error.nodeCode ? error.message : '処理を完了できませんでした。入力を残したまま再試行してください。' } });
-  }
+  } finally { try{firestoreClose_();}catch(_){} }
 }
 function output_(body) { return ContentService.createTextOutput(JSON.stringify(body)).setMimeType(ContentService.MimeType.JSON); }
 function fail_(code, message) { var error = new Error(message); error.nodeCode = code; throw error; }
 function props_() { return PropertiesService.getScriptProperties(); }
+// The endpoint and credential authority stay stable across a storage cutover.
+// An invalid provider must never fall back to the old spreadsheet.
+function nodeStorageProvider_() {
+  var provider=props_().getProperty('NODE_STORAGE_PROVIDER'),migration=firestoreMigrationState_();
+  if(migration&&migration.phase==='active'&&provider!=='firestore')fail_('NOT_CONFIGURED','Firebaseへの切替設定を確認してください。旧保存先への書き込みは停止しています。');
+  if(provider===null||provider===undefined||provider===''||provider==='sheets')return 'sheets';
+  if(provider==='firestore')return provider;
+  fail_('NOT_CONFIGURED','保存先の設定を確認してください。');
+}
+function nodeUsesFirestore_(){return nodeStorageProvider_()==='firestore';}
+/* New workflows only use the signed, active Firebase destination. An explicit
+ * separately registered verification copy remains usable for bounded tests;
+ * deploying compatible code never initializes new tables on production Sheets. */
+var NODE_WORKFLOW_V2_ACTIONS=['readMetricGoals','saveMetricGoals','readSalesWorkflow','saveWorkJob','saveProposalPlan','recordProposalSent','saveMatchReport','readIntroductionV2','saveIntroductionV2','saveIntroductionSettings','publishIntroductionV2','beginMatchEvidence','completeMatchEvidence','readMatchEvidence'];
+function nodeWorkflowV2Verification_(config){var verification=props_().getProperty(NODE.verificationKey),destination=props_().getProperty(NODE.destinationKey);return !!(config.purpose==='verification'&&verification&&destination&&config.spreadsheetId===verification&&verification!==destination&&verification!==NODE.originalId&&destination!==NODE.originalId);}
+function nodeWorkflowV2Available_(config){
+  config=config||config_();if(nodeWorkflowV2Verification_(config))return true;
+  if(!nodeUsesFirestore_())return false;
+  return firestoreMigrationReady_(config)===true;
+}
+function nodeStorageMutation_(action){return ['manageAccount','saveMonthlyTarget','saveActivity','updateStatus','updateProfile','createPlayer','updateRecord','deleteCandidate','cancelAchievement','restoreChange','saveManagementRow','createCandidate','saveInterviewReview','saveCandidateProfile','saveClient','saveWritingPreferences','publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards','saveMetricGoals','saveWorkJob','saveProposalPlan','recordProposalSent','saveMatchReport','saveIntroductionV2','saveIntroductionSettings','publishIntroductionV2','beginMatchEvidence','completeMatchEvidence'].indexOf(action)>=0;}
+function nodeOpenBook_(config){if(!nodeUsesFirestore_())return SpreadsheetApp.openById(config.spreadsheetId);var book=firestoreOpenBook_(config);if(!firestoreMigrationReady_(config))fail_('NOT_CONFIGURED','Firebaseへの移行確認が完了していません。管理者が保存先を確認してください。');return book;}
+function nodeFlush_(){if(!nodeUsesFirestore_())SpreadsheetApp.flush();}
 function config_() {
   var raw = props_().getProperty(NODE.configKey);
   if (!raw) fail_('NOT_CONFIGURED', '管理者による連携設定が必要です。');
@@ -78,6 +108,8 @@ function config_() {
   return config;
 }
 function writesEnabled_(config) {
+  if(firestoreMigrationFrozen_())return false;
+  if(nodeUsesFirestore_()&&!firestoreMigrationReady_(config))return false;
   var destinationId=props_().getProperty(NODE.destinationKey),verificationId=props_().getProperty(NODE.verificationKey);
   if (config.writesEnabled !== true || config.spreadsheetId === NODE.originalId || !destinationId || destinationId===NODE.originalId) return false;
   if (config.purpose==='verification') return config.spreadsheetId===verificationId && verificationId!==destinationId;
@@ -128,7 +160,23 @@ function resolveBusinessTabs_(book) {
 function health_() {
   var config;
   try { config = config_(); } catch (_) { return { configured: false, writesEnabled: false, protocol: NODE.protocol }; }
-  return { configured: true, writesEnabled: writesEnabled_(config), protocol: NODE.protocol };
+  // Public setup status is advisory and Properties-only. Never let anonymous
+  // probes spend Firestore reads. Authenticated reads and writes still validate
+  // the live migration manifest, proof, roster and document versions.
+  return { configured: true, writesEnabled: healthWritesEnabled_(config), protocol: NODE.protocol };
+}
+function healthWritesEnabled_(config) {
+  if(firestoreMigrationFrozen_())return false;
+  if(nodeStorageProvider_()!=='firestore')return writesEnabled_(config);
+  var state=firestoreMigrationState_(),target=firestoreConfig_();
+  if(!state||state.phase!=='active'||state.sourceSpreadsheetId!==config.spreadsheetId||state.sourceSpreadsheetId===NODE.originalId||state.runtimeConfigHash!==firestoreRuntimeConfigHash_(config)||stableJson_(target)!==stableJson_(state.target))return false;
+  var destinationId=props_().getProperty(NODE.destinationKey),verificationId=props_().getProperty(NODE.verificationKey);
+  if(config.writesEnabled!==true||config.spreadsheetId===NODE.originalId||!destinationId||destinationId===NODE.originalId)return false;
+  if(config.purpose==='verification')return config.spreadsheetId===verificationId&&verificationId!==destinationId;
+  if(config.purpose!=='production'||config.spreadsheetId!==destinationId)return false;
+  var proof=copyProof_();
+  if(!config.destinationAuthorizedAt||!proof||config.verifiedCopyId!==proof.copyId||!validCopyProof_(proof,config.ownerEmail,Date.parse(config.destinationAuthorizedAt)))return false;
+  return constantEqual_(config.destinationAuthorizationSeal,destinationAuthorization_(proof,config.ownerEmail,config.destinationAuthorizedAt));
 }
 /* touchSession_ reuses a held lock instead of taking it again: re-entrancy is undocumented, and
  * releasing an inner lock could release the mutation's own lock mid-write. */
@@ -145,8 +193,8 @@ function withLock_(fn, waitMs) {
  * read, and rejected requests do not count. NODE_AI_QUOTA still governs Gemini.
  * Writes are not budgeted here; their reads are serialized by the script lock. A replayed operation
  * that answers with a snapshot writes nothing, so it is charged to the snapshot budget. */
-var NODE_READ_BUCKETS = Object.freeze({ readRewards: 'table', readMigrationArchive:'table', readTeamWorkspace: 'table', snapshot: 'snapshot', resumeSession: 'snapshot', readInterviewAdvice: 'report', readWorkspaceInsights: 'report', analyzeInterviewReviews: 'report', analyzeWorkspaceInsights: 'report', auditSecurity: 'report', readAccountManagement:'report', readOperationHistory:'report', readDataExport:'export', managementTables: 'table', managementTable: 'table', readWritingKit: 'kit', readWritingPreferences: 'kit', generateWritingKit: 'kit' });
-var NODE_READ_LIMITS = Object.freeze({ snapshot: [40, 900], report: [20, 300], table: [40, 600], kit: [60, 1200], export:[2,10] });
+var NODE_READ_BUCKETS = Object.freeze({ readMetricGoals:'table',readSalesWorkflow:'table',readIntroductionV2:'table',readMatchEvidence:'table',beginMatchEvidence:'upload',readRewards: 'table', readMigrationArchive:'table', readTeamWorkspace: 'table', snapshot: 'snapshot', resumeSession: 'snapshot', readInterviewAdvice: 'report', readWorkspaceInsights: 'report', analyzeInterviewReviews: 'report', analyzeWorkspaceInsights: 'report', auditSecurity: 'report', readAccountManagement:'report', readOperationHistory:'report', readDataExport:'export', managementTables: 'table', managementTable: 'table', readWritingKit: 'kit', readWritingPreferences: 'kit', generateWritingKit: 'kit' });
+var NODE_READ_LIMITS = Object.freeze({ upload:[8,60], snapshot: [40, 900], report: [20, 300], table: [40, 600], kit: [60, 1200], export:[2,10] });
 function readBudget_(id, action) {
   // id is always an ID the server already normalized (a session record or issueSession_), never request input.
   var bucket = NODE_READ_BUCKETS[action], limits = NODE_READ_LIMITS[bucket], now = Date.now(), minute = Math.floor(now / 60000), hour = Math.floor(now / 3600000), key = 'NODE_READ_' + bucket + '_' + id, cache, raw, state;
@@ -173,10 +221,18 @@ function nodeHandle_(request) {
   if (action === 'health') return health_();
   if (action === 'login') return login_(request.payload || {});
   if (action === 'changePassword') return changePassword_(request);
+  // Existing browser versions already retain INTERNAL results under the same
+  // encrypted operation ID. A temporary migration freeze must not discard input.
+  if(nodeStorageMutation_(action)&&firestoreMigrationFrozen_()){authenticate_(request.token);fail_('INTERNAL','保存先を切り替えています。入力を保持したまま、同じ保存IDで後ほど再試行してください。');}
   // Budget expensive reads per account after authentication and before any sheet, AI or audit read.
   // hasOwnProperty keeps inherited names such as 'constructor' answering BAD_REQUEST below.
+  // Upload initialization owns its rate budget; its subsequent readStore_ verifies
+  // the live signed Firebase proof. Keep this precheck Properties-only so rejected
+  // quota calls cannot start a Firestore transaction or spend the budget twice.
+  if(action==='beginMatchEvidence'){authenticate_(request.token,false,passive);if(!nodeWorkflowV2Verification_(config_())&&!nodeUsesFirestore_())fail_('NOT_CONFIGURED','この機能はFirebaseへの移行が完了すると利用できます。現在のデータは変更していません。');return beginMatchEvidence_(request);}
   var budgeted = null;
   if (Object.prototype.hasOwnProperty.call(NODE_READ_BUCKETS, action)) { budgeted = authenticate_(request.token, false, passive); readBudget_(budgeted.id, action); }
+  if(NODE_WORKFLOW_V2_ACTIONS.indexOf(action)>=0){authenticate_(request.token,false,passive);if(!nodeWorkflowV2Available_(config_()))fail_('NOT_CONFIGURED','この機能はFirebaseへの移行が完了すると利用できます。現在のデータは変更していません。');}
   if (action === 'resumeSession') {var accounts=readAccountStore_(),actor=activeActor_(accounts,budgeted);var access=snapshotCacheAccess_(accounts,actor);snapshotActor_(accounts,request.token);return {cacheAccess:access};}
   if (action === 'auditSecurity') return auditSecurity_(request);
   if (action === 'readAccountManagement') return readAccountManagement_(request);
@@ -187,11 +243,19 @@ function nodeHandle_(request) {
   if (action === 'readTeamWorkspace') return readTeamWorkspace_(request);
   if (action === 'readMigrationArchive') return readMigrationArchive_(request);
   if (action === 'readRewards') return readRewards_(request);
+  if(action==='readMetricGoals')return readMetricGoals_(request);
+  if(action==='saveMetricGoals')return saveMetricGoals_(request);
+  if(action==='readSalesWorkflow')return readSalesWorkflow_(request);
+  if(action==='readIntroductionV2')return readIntroductionV2_(request);
+  if(action==='saveIntroductionV2')return saveIntroductionV2_(request);
+  if(action==='saveIntroductionSettings')return saveIntroductionSettings_(request);
+  if(action==='publishIntroductionV2')return publishIntroductionV2_(request);
+  if(action==='readMatchEvidence')return readMatchEvidence_(request);
   // Real input while an editor is open: records activity without reading the business table. A background
   // touch only checks the session (idle and absolute limits) while a pending save pauses the polls.
   // deferred: the due refresh was not written (busy lock), so the client keeps the input to report again.
   if (action === 'touch') { var touched = authenticate_(request.token, false, passive); return passive ? { touched: false } : touched.touchDeferred ? { touched: false, deferred: true } : { touched: true }; }
-  if (['snapshot','logout','saveActivity','updateStatus','updateProfile','createPlayer','updateRecord','deleteCandidate','cancelAchievement','restoreChange','managementTables','managementTable','saveManagementRow','createCandidate','saveInterviewReview','saveCandidateProfile','saveClient','analyzeInterviewReviews','readInterviewAdvice','readWorkspaceInsights','analyzeWorkspaceInsights','readWritingKit','generateWritingKit','readWritingPreferences','saveWritingPreferences','publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards'].indexOf(action) < 0) fail_('BAD_REQUEST', '対応していない操作です。');
+  if (['snapshot','logout','saveActivity','updateStatus','updateProfile','createPlayer','updateRecord','deleteCandidate','cancelAchievement','restoreChange','managementTables','managementTable','saveManagementRow','createCandidate','saveInterviewReview','saveCandidateProfile','saveClient','analyzeInterviewReviews','readInterviewAdvice','readWorkspaceInsights','analyzeWorkspaceInsights','readWritingKit','generateWritingKit','readWritingPreferences','saveWritingPreferences','publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards','saveWorkJob','saveProposalPlan','recordProposalSent','saveMatchReport','completeMatchEvidence'].indexOf(action) < 0) fail_('BAD_REQUEST', '対応していない操作です。');
   if (action === 'readWritingKit') return readWritingKit_(request);
   if (action === 'generateWritingKit') return generateWritingKit_(request);
   if (action === 'readWritingPreferences') return readWritingPreferences_(request);
@@ -208,6 +272,8 @@ function nodeHandle_(request) {
   }
   if (action === 'snapshot') {
     // The read budget above has already authenticated this token before any sheet read.
+    var unchanged = firestoreUnchangedSnapshot_(request, budgeted);
+    if (unchanged) return unchanged;
     var snapshotStore = readStore_({ readOnly: true }), snapshot = authenticatedSnapshot_(snapshotStore, request.token);
     // Older frontends ignore this field; the current one reports the input again on the next poll.
     if (budgeted && budgeted.touchDeferred) snapshot.activityDeferred = true;
@@ -218,7 +284,7 @@ function nodeHandle_(request) {
     var user = authenticate_(request.token, action === 'logout', action === 'logout');
     if (action === 'logout') { props_().deleteProperty(sessionKey_(request.token)); return { loggedOut: true }; }
     var activity = request.payload && request.payload.activity;
-    var existingRow = ['publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards','saveInterviewReview','saveCandidateProfile','saveClient','updateStatus','updateRecord','deleteCandidate','cancelAchievement'].indexOf(action) >= 0 || action === 'saveActivity' && activity && activity.recordId;
+    var existingRow = ['saveWorkJob','saveProposalPlan','saveMatchReport','completeMatchEvidence','publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards','saveInterviewReview','saveCandidateProfile','saveClient','updateStatus','updateRecord','deleteCandidate','cancelAchievement'].indexOf(action) >= 0 || action === 'saveActivity' && activity && activity.recordId;
     // Existing-row edits only need named candidate rows. New rows still inspect
     // the entire template, preserving blank-row and formula protection.
     if(action==='applyMigrationItem'&&request.payload&&request.payload.mode==='candidate')existingRow=false;
@@ -243,6 +309,11 @@ function nodeHandle_(request) {
     if (action === 'stageMigrationBatch') plan = planMigrationBatch_(store,user,payload);
     if (action === 'applyMigrationItem') plan = planApplyMigration_(store,user,payload);
     if (action === 'mutateRewards') plan = planRewards_(store,user,payload);
+    if(action==='saveWorkJob')plan=planWorkJob_(store,user,payload);
+    if(action==='saveProposalPlan')plan=planProposalPlan_(store,user,payload);
+    if(action==='recordProposalSent')plan=planProposalSent_(store,user,payload);
+    if(action==='saveMatchReport')plan=planMatchReport_(store,user,payload);
+    if(action==='completeMatchEvidence')plan=planCompleteMatchEvidence_(store,user,payload);
     if (action === 'saveInterviewReview') plan = planInterviewReview_(store,user,payload);
     if (action === 'saveActivity') plan = planActivity_(store, user, payload.activity);
     if (action === 'updateStatus') plan = planStatus_(store, user, payload);
@@ -685,7 +756,7 @@ function manageAccount_(request) {
   });
 }
 function rowUpdateAccountActive_(sheetId,row,active){return {updateCells:{range:{sheetId:sheetId,startRowIndex:row-1,endRowIndex:row,startColumnIndex:8,endColumnIndex:9},rows:[{values:[cell_(active)]}],fields:'userEnteredValue'}};}
-var NODE_OPERATION_SUMMARIES=Object.freeze({stageMigrationBatch:'過去データの原文を保管',applyMigrationItem:'過去データを業務データへ登録',mutateRewards:'ポイント・特典を更新',publishTeamCandidate:'候補者紹介文を社内共有',unpublishTeamCandidate:'候補者の社内共有を停止',saveTeamComment:'社内コメントを更新',saveTeamJob:'募集案件を更新',saveActivity:'実績日を登録',updateStatus:'進捗を更新',updateProfile:'プロフィール・目標を更新',createPlayer:'プレイヤーIDを発行',createCandidate:'候補者を登録',saveCandidateProfile:'候補者の基本情報を更新',saveClient:'取引先を更新',updateRecord:'候補者の進捗・実績を更新',deleteCandidate:'候補者・提案を削除',cancelAchievement:'実績を取り消し',restoreChange:'変更を復元',saveManagementRow:'管理表を更新',saveInterviewReview:'面談の振り返りを保存',manageAccount:'アカウントの利用状態を管理',saveMonthlyTarget:'月別目標を更新'});
+var NODE_OPERATION_SUMMARIES=Object.freeze({publishIntroductionV2:'保存した紹介文を社内共有',saveMetricGoals:'7工程の月別目標を更新',saveWorkJob:'案件条件を更新',saveProposalPlan:'提案先の検討を保存',recordProposalSent:'会社への提案実績を記録',saveMatchReport:'マッチ報告を更新',saveIntroductionV2:'紹介文の基本情報・職歴を保存',saveIntroductionSettings:'紹介文の共通設定を更新',beginMatchEvidence:'合意資料の添付を開始',completeMatchEvidence:'合意資料を非公開保存',stageMigrationBatch:'過去データの原文を保管',applyMigrationItem:'過去データを業務データへ登録',mutateRewards:'ポイント・特典を更新',publishTeamCandidate:'候補者紹介文を社内共有',unpublishTeamCandidate:'候補者の社内共有を停止',saveTeamComment:'社内コメントを更新',saveTeamJob:'募集案件を更新',saveActivity:'実績日を登録',updateStatus:'進捗を更新',updateProfile:'プロフィール・目標を更新',createPlayer:'プレイヤーIDを発行',createCandidate:'候補者を登録',saveCandidateProfile:'候補者の基本情報を更新',saveClient:'取引先を更新',updateRecord:'候補者の進捗・実績を更新',deleteCandidate:'候補者・提案を削除',cancelAchievement:'実績を取り消し',restoreChange:'変更を復元',saveManagementRow:'管理表を更新',saveInterviewReview:'面談の振り返りを保存',manageAccount:'アカウントの利用状態を管理',saveMonthlyTarget:'月別目標を更新'});
 function readOperationHistory_(request) {
   var access=accountManagementStore_(request.token),store=access.store,payload=request.payload||{},limit=payload.limit===undefined?25:payload.limit,cursor=payload.cursor;
   if(!Number.isInteger(limit)||limit<1||limit>50||cursor!==undefined&&(!Number.isInteger(cursor)||cursor<2))fail_('VALIDATION','履歴の表示範囲を確認してください。');
@@ -700,7 +771,8 @@ function readDataExport_(request) {
   if(total>maxCells)fail_('EXPORT_LIMIT','アプリデータの書き出し上限です。');
   var snapshot=buildSnapshot_(store,access.actor);delete snapshot.outboxKey;delete snapshot.cacheAccess;delete snapshot.destination;
   var teamExport=teamWorkspaceExport_(store,access.actor),rewardsState=rewardState_(store.book),migrationState=migrationTable_(store.book);
-  var extraChecks=[];[[REWARD_SETTINGS_TAB,REWARD_SETTINGS_HEADERS,rewardsState.settings],[REWARD_LEDGER_TAB,REWARD_LEDGER_HEADERS,rewardsState.ledger],[REWARD_REQUESTS_TAB,REWARD_REQUESTS_HEADERS,rewardsState.requests],[MIGRATION_TAB,MIGRATION_HEADERS,migrationState]].forEach(function(v){total+=(v[2].rows.length+(v[2].sheet?1:0))*v[1].length;extraChecks.push({title:v[0],headers:v[1],fingerprint:v[2].fingerprint,sheetId:v[2].sheet?v[2].sheet.getSheetId():null});});
+  var workflowExport=workflowDataExport_(store,access.actor);total+=workflowExport.cells;
+  var extraChecks=workflowExport.checks.slice();[[REWARD_SETTINGS_TAB,REWARD_SETTINGS_HEADERS,rewardsState.settings],[REWARD_LEDGER_TAB,REWARD_LEDGER_HEADERS,rewardsState.ledger],[REWARD_REQUESTS_TAB,REWARD_REQUESTS_HEADERS,rewardsState.requests],[MIGRATION_TAB,MIGRATION_HEADERS,migrationState]].forEach(function(v){total+=(v[2].rows.length+(v[2].sheet?1:0))*v[1].length;extraChecks.push({title:v[0],headers:v[1],fingerprint:v[2].fingerprint,sheetId:v[2].sheet?v[2].sheet.getSheetId():null});});
   total+=teamExport.cells;if(total>maxCells)fail_('EXPORT_LIMIT','社内共有を含むアプリデータの書き出し上限です。');
   store.book.getSheets().filter(function(sheet){return managementTabAllowed_(sheet.getName());}).forEach(function(sheet){
     var rowCount=sheet.getLastRow(),columnCount=Math.min(100,sheet.getLastColumn()),rows=[];
@@ -710,7 +782,7 @@ function readDataExport_(request) {
     tables.push({sheetId:sheet.getSheetId(),title:sheet.getName(),rowCount:rowCount,columnCount:columnCount,rows:rows});
   });
   if(total>maxCells)fail_('EXPORT_LIMIT','アプリデータの書き出し上限です。');
-  var result={schemaVersion:1,exportedAt:new Date().toISOString(),scope:'application-data',snapshot:snapshot,managementTables:tables,teamWorkspace:teamExport.data,rewards:rewardPublic_(rewardsState,access.actor,store.players),migrationArchive:migrationState.entries.map(function(e){var item=Object.assign({},e);delete item.row;return item;}),limits:{maxCells:maxCells,maxCharacters:maxCharacters}};
+  var result={schemaVersion:1,exportedAt:new Date().toISOString(),scope:'application-data',snapshot:snapshot,managementTables:tables,teamWorkspace:teamExport.data,rewards:rewardPublic_(rewardsState,access.actor,store.players),workflow:workflowExport.data,migrationArchive:migrationState.entries.map(function(e){var item=Object.assign({},e);delete item.row;return item;}),limits:{maxCells:maxCells,maxCharacters:maxCharacters}};
   if(JSON.stringify(result).length>maxCharacters)fail_('EXPORT_LIMIT','アプリデータが書き出し上限を超えています。');
   revalidateIntakePlan_(store,access.actor,{intakeTableChecks:teamExport.checks.concat(extraChecks)});requireAdmin_(snapshotActor_(store,request.token));return result;
 }
@@ -808,6 +880,7 @@ function metadataMap_(sheet, key) {
   return metadataMaps_(sheet, [key])[key];
 }
 function metadataMaps_(sheet, keys) {
+  if(nodeUsesFirestore_())return firestoreMetadataMaps_(sheet,keys);
   var maps = {}, response, sheetId = sheet.getSheetId();
   keys.forEach(function (key) { maps[key] = {}; });
   // A single Sheets API read avoids remote getters for every metadata entry.
@@ -827,6 +900,7 @@ function metadataMaps_(sheet, keys) {
   return maps;
 }
 function sheetRowCount_(sheet) {
+  if(nodeUsesFirestore_())return firestoreRowCount_(sheet);
   var response;
   // REST writes can leave SpreadsheetApp.getMaxRows() stale during this execution.
   try { response = Sheets.Spreadsheets.get(sheet.getParent().getId(), { fields: 'sheets(properties(sheetId,gridProperties(rowCount)))' }); }
@@ -848,7 +922,7 @@ function readPlayers_(playerSheet) {
 }
 function readAccountStore_(config) {
   config = config || config_();
-  var book = SpreadsheetApp.openById(config.spreadsheetId), playerSheet = book.getSheetByName(NODE.playersTab);
+  var book = nodeOpenBook_(config), playerSheet = book.getSheetByName(NODE.playersTab);
   return { config: config, book: book, playerSheet: playerSheet, players: readPlayers_(playerSheet) };
 }
 function readStore_(options, accountStore) {
@@ -870,7 +944,7 @@ function readStore_(options, accountStore) {
   try { fullGridCache = CacheService.getScriptCache(); useFullGrid = fullGridCache.get(fullGridKey) === '1'; } catch (_) { /* Cache is optional. */ }
   // This caches only a choice to read the entire grid, never a data snapshot or
   // a shortened boundary. Edits cannot be omitted by an outdated cache entry.
-  if (options && options.readOnly && !useFullGrid) {
+  if (options && options.readOnly && (nodeUsesFirestore_() || !useFullGrid)) {
     // Formula-filled template rows make getLastRow much larger than the actual
     // candidate table. A:D is enough to retain every named/unknown-owner row.
     // Mutations still load the full grid for blank-row and formula protection.
@@ -971,15 +1045,41 @@ function countActivities_(activities, players) {
  * roster/alias or credential-version changes. It grants no API capability on its own. */
 function snapshotCacheAccess_(store,user) {
   var auth=authRecord_(user.id),pepper=props_().getProperty(NODE.pepperKey);if(!auth||!pepper)fail_('UNAUTHENTICATED','ログイン状態を確認してください。');
-  var scope=hmac_('display-cache-scope-v1|'+stableJson_({version:1,config:store.config,self:user,roster:store.players,authVersion:auth.version||null}),pepper);
+  var scope=hmac_('display-cache-scope-v1|'+stableJson_({version:1,config:store.config,self:user,roster:store.players,authVersion:auth.version||null,storageProvider:nodeStorageProvider_(),storageBinding:nodeUsesFirestore_()?firestoreConfig_():null}),pepper);
   return {version:1,self:{playerId:user.id,role:user.role},scope:scope,secret:hmac_('display-cache-encryption-v1|'+scope,pepper),expiresAt:Date.now()+3600000};
+}
+/* A stamp is only an authenticated cache validator, never a credential. Bump
+ * this backend stamp when the full snapshot projection/meaning changes. */
+var NODE_FIRESTORE_SNAPSHOT_STAMP='node-firestore-snapshot-v1-20261106';
+function firestoreSnapshotVersion_(store,user,cacheAccess,preferences,evidenceEnabled,canWrite){
+  if(!nodeUsesFirestore_())return '';
+  var book=store.book,manifest=book&&book.manifest,pepper=props_().getProperty(NODE.pepperKey);
+  if(!book||!book.transaction||!manifest||!Number.isSafeInteger(manifest.revision)||manifest.revision<0||!cacheAccess||!(/^[A-Za-z0-9_-]{43}$/).test(cacheAccess.scope)||cacheAccess.self.playerId!==user.id||cacheAccess.self.role!==user.role||!pepper)fail_('FIRESTORE_READ_FAILED','表示データの確認位置を検証できません。');
+  return hmac_('authenticated-firestore-snapshot-v1|'+stableJson_({backend:NODE_FIRESTORE_SNAPSHOT_STAMP,revision:manifest.revision,scope:cacheAccess.scope,writingPreferences:preferences,evidenceEnabled:evidenceEnabled===true,writesEnabled:canWrite===true,refreshWindow:Math.floor(Date.now()/300000)}),pepper);
+}
+function firestoreSnapshotRequestVersion_(request){
+  var payload=request.payload;
+  // Older callers may send ignored role/player hints. They grant no authority;
+  // preserve that behavior and interpret only the new explicit validator.
+  if(!payload||typeof payload!=='object'||!Object.prototype.hasOwnProperty.call(payload,'ifSnapshotVersion'))return '';
+  var value=payload.ifSnapshotVersion;if(typeof value!=='string'||!(/^[A-Za-z0-9_-]{43}$/).test(value))fail_('BAD_REQUEST','表示データの確認値を確認してください。');return value;
+}
+function firestoreUnchangedSnapshot_(request,session){
+  var expected=firestoreSnapshotRequestVersion_(request);
+  if(!expected||request.background!==true||!nodeUsesFirestore_())return null;
+  // Only the current roster is read. Every response still passes the existing
+  // outside-transaction roster/manifest proof in doPost before it is sent.
+  var accounts=readAccountStore_(),actor=activeActor_(accounts,session||authenticate_(request.token,false,true)),access=snapshotCacheAccess_(accounts,actor),preferences=writingPreferences_(),evidence=matchEvidenceFeature_(),canWrite=writesEnabled_(accounts.config),version=firestoreSnapshotVersion_(accounts,actor,access,preferences,evidence,canWrite);
+  if(!constantEqual_(expected,version))return null;
+  snapshotActor_(accounts,request.token);
+  var result={snapshotUnchanged:true,snapshotVersion:version,self:{playerId:actor.id,role:actor.role},syncedAt:new Date().toISOString(),cacheAccess:access};if(session&&session.touchDeferred)result.activityDeferred=true;return result;
 }
 function publicPlayer_(player,user) { var own=user.role==='admin'||user.id===player.id;return { id: player.id, name: player.name, team: player.team, color: player.color, target: player.target, bio: own?player.bio:'', sheetNames: own?player.sheetNames.slice():[], active:player.active }; }
 function buildSnapshot_(store, user) {
   var all = activities_(store);
   var snapshot={ self: { playerId: user.id, role: user.role }, players: store.players.filter(function (p) { return p.role === 'player' && (user.role==='admin'||p.active); }).map(function(player){return publicPlayer_(player,user);}), activities: all.filter(function (a) { return user.role === 'admin' || a.playerId === user.id; }), counts: countActivities_(all, store.players.filter(function(p){return user.role==='admin'||p.active;})), syncedAt: new Date().toISOString(), warnings: store.warnings.slice(), writesEnabled: store.schemaCompatible&&writesEnabled_(store.config) && store.book.getSpreadsheetTimeZone() === 'Asia/Tokyo' };
   snapshot.interviewReviews=readInterviewReviews_(store,user);
-  snapshot.migrationFeature=true; snapshot.rewardsFeature=true; snapshot.candidateRegistrationFeature=true; snapshot.teamWorkspaceFeature=true; snapshot.intakeFeature=true; snapshot.candidateProfiles=readCandidateProfiles_(store,user); snapshot.clients=clientEntries_(store.book);
+  var workflowV2=nodeWorkflowV2Available_(store.config);if(workflowV2){snapshot.metricGoalsFeature=true;snapshot.salesWorkflowFeature=true;snapshot.introductionV2Feature=true;snapshot.candidateIntroductionV2=readIntroductionV2Profiles_(store,user);}snapshot.storageEvidenceFeature=workflowV2&&matchEvidenceFeature_()?true:undefined; snapshot.migrationFeature=true; snapshot.rewardsFeature=true; snapshot.candidateRegistrationFeature=true; snapshot.teamWorkspaceFeature=true; snapshot.intakeFeature=true; snapshot.candidateProfiles=readCandidateProfiles_(store,user); snapshot.clients=clientEntries_(store.book);
   snapshot.deletionFeature=true; snapshot.deletedCandidates=deletedCandidates_(store,user);
   snapshot.writingFeature=true; snapshot.writingPreferences=writingPreferences_();
   snapshot.reviewFeature=true; snapshot.monthlyGoalsFeature=true; snapshot.monthlyGoals=readMonthlyGoals_(store,user);
@@ -990,7 +1090,8 @@ function buildSnapshot_(store, user) {
   if(pepper)snapshot.cacheAccess=snapshotCacheAccess_(store,user);
   if(pepper)snapshot.outboxKey=hmac_('outbox-v2|'+store.config.spreadsheetId+'|'+user.role+'|'+user.id,pepper);
   snapshot.records=store.schemaCompatible ? store.records.filter(function(r){return user.role==='admin'||r.playerId===user.id;}).map(publicRecord_) : [];
-  if(user.role==='admin'){
+  if(nodeUsesFirestore_()){snapshot.storageBackend=firestoreStorageInfo_();snapshot.snapshotVersion=firestoreSnapshotVersion_(store,user,snapshot.cacheAccess,snapshot.writingPreferences,snapshot.storageEvidenceFeature===true,snapshot.writesEnabled);}
+  if(user.role==='admin'&&!nodeUsesFirestore_()){
     var prefix='https://docs.google.com/spreadsheets/d/'+encodeURIComponent(store.config.spreadsheetId)+'/edit#gid=';
     snapshot.destination={title:store.book.getName(),matchingUrl:prefix+Number(store.config.matchingSheetId),kpiUrl:prefix+Number(store.config.kpiSheetId)};
   }
@@ -1195,19 +1296,22 @@ function commit_(store, user, action, operationId, payloadHash, plan, token) {
   revalidateIntakePlan_(store,user,plan);
   revalidateTeamPlan_(store,user,plan);
   revalidateRewardsPlan_(store,user,plan);
+  revalidateSalesPlan_(store,user,plan);
+  revalidateMatchEvidencePlan_(store,user,plan);
   if(token)snapshotActor_(store,token);
   Array.prototype.push.apply(requests, plan.requests || []);
   if(JSON.stringify(plan.result||{}).length>48000)fail_('VALIDATION','変更履歴が大きすぎます。長いメモは項目を分けて保存してください。');
   requests.push({ appendCells: { sheetId: store.operationSheet.getSheetId(), rows: [{ values: [operationId,user.id,action,payloadHash,JSON.stringify(plan.result || {}),new Date().toISOString()].map(cell_) }], fields: 'userEnteredValue' } });
   sheetsBatch_(store.config.spreadsheetId, requests);
-  SpreadsheetApp.flush();
+  nodeFlush_();
 }
 function sheetsBatch_(spreadsheetId, requests) {
   assertManagedBook_(spreadsheetId);
+  if(nodeUsesFirestore_())return firestoreBatch_(spreadsheetId,requests);
   if (!requests.length) return;
   var response = UrlFetchApp.fetch('https://sheets.googleapis.com/v4/spreadsheets/' + encodeURIComponent(spreadsheetId) + ':batchUpdate', { method: 'post', contentType: 'application/json', headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, payload: JSON.stringify({ requests: requests }), muteHttpExceptions: true });
   if (response.getResponseCode() < 200 || response.getResponseCode() >= 300) fail_('SHEET_WRITE_FAILED', 'シートへの保存を完了できませんでした。同じ操作IDのまま再試行してください。');
-  SpreadsheetApp.flush();
+  nodeFlush_();
 }
 
 /* Owner-only editor/menu setup. Never reachable through the web-app action dispatch. */
@@ -1326,8 +1430,8 @@ function probeReservation_(store,actorId,allowExpired) {
   return probe;
 }
 function guardProbeBusinessMutation_(store,user,action,payload) {
-  if(['publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards','saveActivity','updateStatus','updateRecord','deleteCandidate','cancelAchievement','restoreChange','saveManagementRow','createCandidate','saveCandidateProfile','saveClient'].indexOf(action)<0)return;
-  if((['publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards'].indexOf(action)>=0||action==='restoreChange'||action==='saveManagementRow'||action==='createCandidate'||action==='saveCandidateProfile'||action==='saveClient')&&probeReservation_(store,user.id,false))fail_('FORBIDDEN','検証専用アカウントにはこの操作は許可されていません。');
+  if(['saveMetricGoals','saveWorkJob','saveProposalPlan','recordProposalSent','saveMatchReport','saveIntroductionV2','saveIntroductionSettings','publishIntroductionV2','beginMatchEvidence','completeMatchEvidence','publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards','saveActivity','updateStatus','updateRecord','deleteCandidate','cancelAchievement','restoreChange','saveManagementRow','createCandidate','saveCandidateProfile','saveClient'].indexOf(action)<0)return;
+  if((['saveMetricGoals','saveWorkJob','saveProposalPlan','recordProposalSent','saveMatchReport','saveIntroductionV2','saveIntroductionSettings','publishIntroductionV2','beginMatchEvidence','completeMatchEvidence','publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards'].indexOf(action)>=0||action==='restoreChange'||action==='saveManagementRow'||action==='createCandidate'||action==='saveCandidateProfile'||action==='saveClient')&&probeReservation_(store,user.id,false))fail_('FORBIDDEN','検証専用アカウントにはこの操作は許可されていません。');
   var activity=payload.activity||{},recordId=action==='saveActivity'?activity.recordId:payload.recordId,record=recordId?findRecord_(store,recordId):null;
   var targetId=record?record.playerId:action==='saveActivity'?activity.playerId:null;
   var probe=probeReservation_(store,user.id,false),targetProbe=targetId&&targetId!==user.id?probeReservation_(store,targetId,false):null;
@@ -1443,7 +1547,7 @@ function cleanupCopyProbe_(testId) {
   [NODE.recordKey,NODE.sourceKey].forEach(function(key){var metadata=metadataMap_(store.matching,key);rows.forEach(function(row){if(metadata[row])requests.push({deleteDeveloperMetadata:{dataFilter:{developerMetadataLookup:{metadataId:metadata[row].metadataId}}}});});});
   var player=store.players.find(function(p){return p.id===testId;});
   if(player)requests.push(rowUpdateRequest_(store.playerSheet.getSheetId(),player.row,[player.id,player.name,player.team,player.color,player.target,player.bio,JSON.stringify(player.sheetNames),player.role,false]));
-  sheetsBatch_(store.config.spreadsheetId,requests);SpreadsheetApp.flush();
+  sheetsBatch_(store.config.spreadsheetId,requests);nodeFlush_();
   if(probe){
     // Check raw cells and metadata: inactive actors are intentionally absent from readStore().records.
     var remainingIds=metadataMap_(store.matching,NODE.recordKey),remainingSources=metadataMap_(store.matching,NODE.sourceKey),maxRows=sheetRowCount_(store.matching),expectedIds=Object.keys(probe.recordIds).map(function(row){return probe.recordIds[row];});
@@ -1559,6 +1663,7 @@ function managementSheet_(book,id) {
 }
 function columnName_(n) { var text='';while(n>0){n--;text=String.fromCharCode(65+n%26)+text;n=Math.floor(n/26);}return text; }
 function gridRead_(book,sheet,start,count) {
+  if(nodeUsesFirestore_())return firestoreGridRead_(book,sheet,start,count);
   if(!Number.isInteger(start)||start<1||start>sheet.getMaxRows()||!Number.isInteger(count)||count<1||count>100)fail_('VALIDATION','表示する行を確認してください。');
   var end=Math.min(start+count-1,sheet.getMaxRows()),cols=Math.min(100,sheet.getMaxColumns());
   var ranges=["'"+sheet.getName().replace(/'/g,"''")+"'!A"+start+':'+columnName_(cols)+end];
@@ -1584,12 +1689,13 @@ function publicCell_(c,column) {
   var options=c.dataValidation&&c.dataValidation.condition&&c.dataValidation.condition.type==='ONE_OF_LIST'?(c.dataValidation.condition.values||[]).map(function(v){return v.userEnteredValue;}):[];
   return {column:column,value:value,display:c.formattedValue||String(value),kind:kind,options:options,readonly:!!raw.formulaValue||!Object.keys(raw).length&&!!Object.keys(effective).length||!!(c.chipRuns&&c.chipRuns.length),note:c.note||''};
 }
+function nodeFirebaseReferenceTable_(sheet){return nodeUsesFirestore_()&&(sheet.getName()===NODE.kpiTab||/^マッチ計上/.test(sheet.getName()));}
 function managementTable_(book,payload) {
   var sheet=managementSheet_(book,payload.sheetId),start=payload.startRow===undefined?1:payload.startRow,rows=gridRead_(book,sheet,start,50);
-  var imported=sheet.getName()==='稼働者管理表';
+  var imported=sheet.getName()==='稼働者管理表'||nodeFirebaseReferenceTable_(sheet);
   var header=sheet.getName()==='目標'?0:/^マッチ計上/.test(sheet.getName())?4:sheet.getName()==='1期目マッチングDB'||imported?1:2,headers=header?(start<=header&&header<start+rows.length?rows[header-start]:gridRead_(book,sheet,header,1)[0]).map(function(c){return c.formattedValue||'';}):[];
   return {sheetId:sheet.getSheetId(),title:sheet.getName(),startRow:start,rowCount:sheet.getMaxRows(),columnCount:Math.min(100,sheet.getMaxColumns()),readonly:imported,
-    headers:headers,rows:rows.map(function(cells,i){return {row:start+i,version:gridFingerprint_(cells),cells:cells.map(function(c,j){return publicCell_(c,j+1);})};})};
+    calculationReference:nodeUsesFirestore_()&&rows.some(function(row){return row.some(function(cell){return !!(cell.userEnteredValue&&cell.userEnteredValue.formulaValue);});}),headers:headers,rows:rows.map(function(cells,i){return {row:start+i,version:gridFingerprint_(cells),cells:cells.map(function(c,j){return publicCell_(c,j+1);})};})};
 }
 function primitiveInput_(cell,value) {
   if(value===null)value='';
@@ -1694,6 +1800,7 @@ function planCancelAchievement_(store,user,payload) {
 }
 function planManagementRow_(store,user,payload) {
   requireAdmin_(user);var sheet=managementSheet_(store.book,payload.sheetId);
+  if(nodeFirebaseReferenceTable_(sheet))fail_('FORMULA_PROTECTED','この旧集計表は移行時の参照用です。成果の修正は候補者・提案から行ってください。');
   if(sheet.getName()==='稼働者管理表')fail_('FORMULA_PROTECTED','稼働者管理表は外部シートの集計結果です。元データを更新してください。');
   if(typeof payload.rowVersion!=='string')fail_('CONFLICT','行の最新情報を取得してください。');
   var header=sheet.getName()==='目標'?0:/^マッチ計上/.test(sheet.getName())?4:sheet.getName()==='1期目マッチングDB'?1:2;
@@ -1706,7 +1813,7 @@ function planRestoreChange_(store,user,payload) {
   if(probeReservation_(store,original.actorId,false))fail_('FORBIDDEN','検証用の変更はこの操作で復元できません。');
   if(original.actorId!==user.id&&user.role!=='admin'&&!(original.action==='deleteCandidate'&&original.result.undo.every(function(item){return item.ownerId===user.id;})))fail_('FORBIDDEN','他の人の変更は元に戻せません。');
   var changes=original.result.undo.map(function(item){
-    var sheet=item.recordId?store.matching:managementSheet_(store.book,item.sheetId);if(!item.recordId)requireAdmin_(user);
+    var sheet=item.recordId?store.matching:managementSheet_(store.book,item.sheetId);if(!item.recordId){requireAdmin_(user);if(nodeFirebaseReferenceTable_(sheet))fail_('FORMULA_PROTECTED','旧集計表は参照専用のため、この変更は復元できません。');}
     var record=item.recordId?findRecord_(store,item.recordId):null,archived=null;
     if(item.recordId&&original.action==='deleteCandidate'){
       var ids=metadataMap_(sheet,NODE.recordKey),markers=metadataMap_(sheet,NODE.deletedKey);archived=markers[item.row];var marker=archived&&deletedMarker_(archived);
@@ -1725,7 +1832,7 @@ function revalidateManagementPlan_(store,user,plan) {
   var latest=plan.candidateDeleteCheck||plan.recordChecks&&plan.recordChecks.length?readStore_({readOnly:true},accountStore):null;
   if(plan.candidateDeleteCheck){var group=plan.candidateDeleteCheck,ids=latest.records.filter(function(r){return r.playerId===group.playerId&&r.candidateId===group.candidateId;}).map(function(r){return r.recordId;}).sort();if(stableJson_(ids)!==stableJson_(group.ids))fail_('CONFLICT','削除対象の提案が増減しています。範囲を確認してください。');}
   (plan.recordChecks||[]).forEach(function(c){var fresh=findRecord_(latest,c.recordId);actorOwns_(user,fresh);if(fresh.row!==c.row||fresh.version!==c.version||c.profileId!==undefined&&(fresh.profileId||'')!==c.profileId||c.playerId!==undefined&&fresh.playerId!==c.playerId)fail_('CONFLICT','対象行が更新されました。再取得してください。');});
-  (plan.checks||[]).forEach(function(c){var sheet=c.recordId?store.matching:managementSheet_(store.book,c.sheetId);if(!c.recordId)requireAdmin_(user);
+  (plan.checks||[]).forEach(function(c){var sheet=c.recordId?store.matching:managementSheet_(store.book,c.sheetId);if(!c.recordId){requireAdmin_(user);if(nodeFirebaseReferenceTable_(sheet))fail_('FORMULA_PROTECTED','旧集計表は参照専用のため、この変更は復元できません。');}
     if(gridFingerprint_(gridRead_(store.book,sheet,c.row,1)[0])!==c.before)fail_('CONFLICT','保存前に行が更新されました。再取得してください。');
     if(c.archiveChangeId){var archived=metadataMap_(sheet,NODE.deletedKey)[c.row],marker=archived&&deletedMarker_(archived);if(!marker||marker.changeId!==c.archiveChangeId||marker.playerId!==c.archiveOwnerId||marker.recordId!==c.recordId)fail_('CONFLICT','削除済みの情報が変更されています。');if(user.role!=='admin'&&marker.playerId!==user.id)fail_('FORBIDDEN','本人の候補者だけ復元できます。');}
     if(c.recordId){var ids=metadataMap_(sheet,NODE.recordKey);if(!ids[c.row]||ids[c.row].value!==c.recordId)fail_('CONFLICT','対象の行が移動しました。再取得してください。');}
@@ -3501,7 +3608,7 @@ function teamCandidateTable_(book){
  var state=intakeTable_(book,TEAM_CANDIDATE_TAB,TEAM_CANDIDATE_HEADERS),seen=Object.create(null);
  state.entries=state.rows.map(function(row,index){return teamSchema_(function(){
   var id=teamId_(row[0]);if(seen[id]||typeof row[8]!=='boolean')fail_('SCHEMA_MISMATCH','共有候補者の管理IDまたは状態を確認してください。');seen[id]=true;
-  return {publicationId:id,ownerId:teamAccount_(row[1]),sourceRecordId:teamId_(row[2]),sourceProfileId:teamId_(row[3]),sourceRowVersion:shortText_(row[4],128,true),sourceProfileVersion:teamId_(row[5]),candidateName:teamText_(row[6],60,true),introduction:teamText_(row[7],1000,true),published:row[8],version:teamId_(row[9]),createdAt:teamTime_(row[10]),updatedAt:teamTime_(row[11]),publishedAt:teamTime_(row[12],true),row:index+2};
+  return {publicationId:id,ownerId:teamAccount_(row[1]),sourceRecordId:teamId_(row[2]),sourceProfileId:teamId_(row[3]),sourceRowVersion:shortText_(row[4],128,true),sourceProfileVersion:teamId_(row[5]),candidateName:teamText_(row[6],60,true),introduction:teamIntroductionText_(row[7],row[3]),published:row[8],version:teamId_(row[9]),createdAt:teamTime_(row[10]),updatedAt:teamTime_(row[11]),publishedAt:teamTime_(row[12],true),row:index+2};
  });});return state;
 }
 function teamMentions_(value,players,stored){
@@ -3727,4 +3834,1638 @@ function planRewards_(store,user,payload){
 }
 function revalidateRewardsPlan_(store,user,plan){if(plan.rewardSettlementCheck){requireAdmin_(user);var latest=readStore_({readOnly:true},{config:store.config,book:store.book,playerSheet:store.playerSheet,players:readPlayers_(store.playerSheet)}),state=rewardState_(latest.book);if(rewardPreview_(latest,state,plan.rewardSettlementCheck.month).fingerprint!==plan.rewardSettlementCheck.fingerprint)fail_('CONFLICT','保存前に月の実績が変わりました。最新のプレビューで確認してください。');}}
 /* END REWARDS WORKSPACE */
+
+/* Firestore persistence facade. Authentication and business validation remain in Code.gs.
+ * No Sheets fallback: every app write and its operation receipt share one Firestore transaction.
+ * Schema v1: nodeWorkbooks/{namespace}, tables/{sheetId}, rows/{8-digit row}; row payloads
+ * are JSON strings to preserve Sheets cell metadata and nested arrays without executable code. */
+var NODE_FIRESTORE_REQUEST_=null;
+function firestoreReset_(write){firestoreClose_();NODE_FIRESTORE_REQUEST_={write:write===true,book:null};}
+function firestoreResetRequest_(write){firestoreReset_(write);}
+function firestoreEnabled_(){var value=props_().getProperty('NODE_STORAGE_PROVIDER');if(value&&value!=='sheets'&&value!=='firestore')fail_('NOT_CONFIGURED','保存先の設定を確認してください。');return value==='firestore';}
+function firestoreConfig_(){var raw=props_().getProperty('NODE_FIRESTORE_CONFIG'),value;try{value=JSON.parse(raw||'null');}catch(_){fail_('NOT_CONFIGURED','Firebaseの接続設定を確認してください。');}return firestoreValidateConfig_(value);}
+function firestoreValidateConfig_(value){if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(function(k){return ['projectId','databaseId','workbookId'].indexOf(k)<0;})||typeof value.projectId!=='string'||!(/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/).test(value.projectId)||typeof value.databaseId!=='string'||!(value.databaseId==='(default)'||/^[a-z][a-z0-9-]{2,61}[a-z0-9]$/.test(value.databaseId))||typeof value.workbookId!=='string'||!/^[A-Za-z0-9_-]{1,100}$/.test(value.workbookId))fail_('NOT_CONFIGURED','Firebaseのプロジェクト・データベース・移行先IDを確認してください。');return {projectId:value.projectId,databaseId:value.databaseId,workbookId:value.workbookId};}
+function firestoreDocumentName_(config,path){config=firestoreValidateConfig_(config);if(typeof path!=='string'||!path||path.length>1500||!/^[-A-Za-z0-9_/]+$/.test(path)||path.split('/').some(function(p){return !p||p==='.'||p==='..';}))fail_('VALIDATION','Firebaseの保存位置を確認してください。');return 'projects/'+config.projectId+'/databases/'+config.databaseId+'/documents/'+path;}
+function firestoreRequest_(method,path,payload,override){var config=firestoreValidateConfig_(override||firestoreConfig_());if(['get','post','patch','delete'].indexOf(String(method).toLowerCase())<0||typeof path!=='string'||path.length>5000||/[\s\u0000-\u001f\u007f#]/.test(path)||path.indexOf('..')>=0||path.indexOf('://')>=0||!/^[-A-Za-z0-9_/:?=&%().]+$/.test(path))fail_('VALIDATION','Firebaseへの操作を確認してください。');var url='https://firestore.googleapis.com/v1/projects/'+config.projectId+'/databases/'+encodeURIComponent(config.databaseId)+'/documents'+(path.charAt(0)===':'?path:'/'+path),options={method:String(method).toLowerCase(),headers:{Authorization:'Bearer '+ScriptApp.getOAuthToken()},muteHttpExceptions:true};if(payload!==undefined){options.contentType='application/json';options.payload=JSON.stringify(payload);if(firestoreBytes_(options.payload)>9500000)fail_('DATA_LIMIT','一度に保存するデータが大きすぎます。');}var response,text,status;try{response=UrlFetchApp.fetch(url,options);status=response.getResponseCode();text=response.getContentText();}catch(_){fail_('INTERNAL','Firebaseからの応答を確認できませんでした。同じ保存IDで確認してください。');}if(typeof text!=='string'||firestoreBytes_(text)>12000000)fail_('INTERNAL','Firebaseの応答を確認できませんでした。入力は保持しています。');if(status===404)return null;if(status<200||status>=300){if(status===409||status===412)fail_('CONFLICT','データが更新されています。再取得してから確認してください。');if(status===401||status===403)fail_('FIRESTORE_ACCESS_DENIED','Firebaseへのアクセス権を確認してください。');if(status===429)fail_('RATE_LIMITED','Firebaseの利用上限に達しました。時間をおいて同じ保存IDで確認してください。');if(status>=500||status===408)fail_('INTERNAL','Firebaseの保存結果を確認できませんでした。同じ保存IDで確認してください。');fail_('FIRESTORE_REQUEST_FAILED','Firebaseへの操作を完了できませんでした。管理者に連絡してください。');}if(!text)return {};try{return JSON.parse(text);}catch(_){fail_('INTERNAL','Firebaseから正しい応答が返りませんでした。同じ保存IDで確認してください。');}}
+function firestoreBytes_(text){var n=0;for(var i=0;i<text.length;i++){var c=text.charCodeAt(i);n+=c<128?1:c<2048?2:c>=55296&&c<=56319&&i+1<text.length&&text.charCodeAt(i+1)>=56320&&text.charCodeAt(i+1)<=57343?(i++,4):3;}return n;}
+function firestoreEncodeFields_(object){if(!object||typeof object!=='object'||Array.isArray(object))fail_('VALIDATION','Firebaseの保存形式を確認してください。');var out={};Object.keys(object).forEach(function(k){if(k==='__proto__'||k==='constructor'||k==='prototype')fail_('VALIDATION','Firebaseの項目名を確認してください。');out[k]=firestoreEncodeValue_(object[k]);});return out;}
+function firestoreEncodeValue_(value){if(value===null)return {nullValue:null};if(typeof value==='string')return {stringValue:value};if(typeof value==='boolean')return {booleanValue:value};if(typeof value==='number'&&isFinite(value))return Number.isSafeInteger(value)?{integerValue:String(value)}:{doubleValue:value};if(Array.isArray(value))return {arrayValue:{values:value.map(firestoreEncodeValue_)}};if(value&&typeof value==='object'&&Object.prototype.toString.call(value)==='[object Object]')return {mapValue:{fields:firestoreEncodeFields_(value)}};fail_('VALIDATION','Firebaseに保存できない値です。');}
+function firestoreDecodeFields_(fields){if(!fields||typeof fields!=='object'||Array.isArray(fields))fail_('SCHEMA_MISMATCH','Firebaseの保存形式を確認してください。');var out={};Object.keys(fields).forEach(function(k){if(k==='__proto__'||k==='constructor'||k==='prototype')fail_('SCHEMA_MISMATCH','Firebaseの保存項目を確認してください。');out[k]=firestoreDecodeValue_(fields[k]);});return out;}
+function firestoreDecodeValue_(value){if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).length!==1)fail_('SCHEMA_MISMATCH','Firebaseの保存値を確認してください。');if(Object.prototype.hasOwnProperty.call(value,'nullValue'))return null;if(typeof value.stringValue==='string')return value.stringValue;if(typeof value.booleanValue==='boolean')return value.booleanValue;if(Object.prototype.hasOwnProperty.call(value,'integerValue')){var n=Number(value.integerValue);if(Number.isSafeInteger(n))return n;}if(typeof value.doubleValue==='number'&&isFinite(value.doubleValue))return value.doubleValue;if(value.arrayValue&&typeof value.arrayValue==='object')return (value.arrayValue.values||[]).map(firestoreDecodeValue_);if(value.mapValue&&typeof value.mapValue==='object')return firestoreDecodeFields_(value.mapValue.fields||{});fail_('SCHEMA_MISMATCH','Firebaseの保存値の種類を確認してください。');}
+function firestoreClone_(v){return JSON.parse(JSON.stringify(v));}
+function firestorePath_(book,tail){return 'nodeWorkbooks/'+book.storage.workbookId+(tail?'/'+tail:'');}
+function firestoreTime_(document){if(!document||typeof document.updateTime!=='string'||!/^\d{4}-\d\d-\d\dT/.test(document.updateTime)||!isFinite(Date.parse(document.updateTime)))fail_('SCHEMA_MISMATCH','Firebaseの更新時刻を確認してください。');return document.updateTime;}
+function firestoreReadDocument_(book,path,outside){var name=firestoreDocumentName_(book.storage,path),d;if(outside)return firestoreRequest_('get',path,undefined,book.storage);var result=firestoreRequest_('post',':batchGet',{documents:[name],transaction:book.transaction},book.storage);if(!Array.isArray(result)||result.length!==1||!result[0]||result[0].found&&result[0].missing||!result[0].found&&!result[0].missing||(result[0].found?result[0].found.name:result[0].missing)!==name)fail_('FIRESTORE_READ_FAILED','Firebaseの文書を確認できませんでした。');d=result[0].found||null;book.proofs[name]=d?firestoreTime_(d):null;return d;}
+function firestoreLoadedBook_(){return NODE_FIRESTORE_REQUEST_&&NODE_FIRESTORE_REQUEST_.book||null;}
+function firestoreCommitted_(){return !!(NODE_FIRESTORE_REQUEST_&&NODE_FIRESTORE_REQUEST_.committed);}
+function firestoreOpenBook_(config){if(!firestoreEnabled_())fail_('NOT_CONFIGURED','Firebase保存が有効ではありません。');if(!NODE_FIRESTORE_REQUEST_)firestoreReset_(false);var storage=firestoreConfig_(),cached=firestoreLoadedBook_();if(cached){if(stableJson_(cached.storage)!==stableJson_(storage)||cached.sourceId!==config.spreadsheetId)fail_('BUSY','保存先の設定が変更されました。');return cached;}var begin=firestoreRequest_('post',':beginTransaction',{options:NODE_FIRESTORE_REQUEST_.write?{readWrite:{}}:{readOnly:{}}},storage);if(!begin||typeof begin.transaction!=='string'||!begin.transaction||begin.transaction.length>4000)fail_('FIRESTORE_READ_FAILED','Firebaseの読込を開始できませんでした。');var book={storage:storage,transaction:begin.transaction,write:NODE_FIRESTORE_REQUEST_.write,sourceId:config.spreadsheetId,tables:{},rows:{},intervals:{},metadataLoaded:{},proofs:{}};NODE_FIRESTORE_REQUEST_.book=book;var document=firestoreReadDocument_(book,firestorePath_(book));if(!document)fail_('NOT_CONFIGURED','Firebaseへの移行が完了していません。');book.updateTime=firestoreTime_(document);book.manifest=firestoreDecodeFields_(document.fields||{});book._firestoreManifest=book.manifest;book._firestoreUpdateTime=book.updateTime;var m=book.manifest;if(m.schemaVersion!==1||!Number.isSafeInteger(m.revision)||m.revision<0||m.sourceSpreadsheetId!==config.spreadsheetId||typeof m.sourceConfigHash!=='string'||!m.sourceConfigHash||typeof m.title!=='string'||m.timeZone!=='Asia/Tokyo'||!m.migrationProof||m.migrationProof.state!=='active'||!Number.isSafeInteger(m.nextMetadataId)||m.nextMetadataId<1||!Array.isArray(m.tables)||m.tables.length>1000)fail_('SCHEMA_MISMATCH','Firebaseの移行証明または管理情報を確認してください。');var ids={},titles={};m.tables.forEach(function(t){if(!t||!Number.isSafeInteger(t.sheetId)||t.sheetId<0||typeof t.title!=='string'||!t.title||ids[t.sheetId]||titles[t.title])fail_('SCHEMA_MISMATCH','Firebaseの管理表IDが重複しています。');ids[t.sheetId]=true;titles[t.title]=true;});book.getId=function(){return book.sourceId;};book.getName=function(){return book.manifest.title;};book.getSpreadsheetTimeZone=function(){return book.manifest.timeZone;};book.getSheets=function(){return book.manifest.tables.map(function(t){return firestoreSheet_(book,t.sheetId);});};book.getSheetByName=function(title){var t=book.manifest.tables.find(function(t){return t.title===title;});return t?firestoreSheet_(book,t.sheetId):null;};return book;}
+function firestoreSheet_(book,id){var existing=book.tables[id];if(existing)return existing;var descriptor=book.manifest.tables.find(function(t){return t.sheetId===id;});if(!descriptor)fail_('PROTECTED_SHEET','Firebaseの管理表が見つかりません。');var document=firestoreReadDocument_(book,firestorePath_(book,'tables/'+id));if(!document)fail_('SCHEMA_MISMATCH','Firebaseの管理表情報がありません。');var data=firestoreDecodeFields_(document.fields||{});firestoreTableShape_(data);if(data.sheetId!==id||data.title!==descriptor.title)fail_('SCHEMA_MISMATCH','Firebaseの管理表IDが一致しません。');var sheet={book:book,data:data,updateTime:firestoreTime_(document)};sheet.getSheetId=function(){return sheet.data.sheetId;};sheet.getName=function(){return sheet.data.title;};sheet.getParent=function(){return sheet.book;};sheet.getLastRow=function(){return sheet.data.lastRow;};sheet.getLastColumn=function(){return sheet.data.lastColumn;};sheet.getMaxRows=function(){return sheet.data.rowCount;};sheet.getMaxColumns=function(){return sheet.data.columnCount;};sheet.getRange=function(row,column,numRows,numColumns){return firestoreRange_(sheet,row,column,numRows===undefined?1:numRows,numColumns===undefined?1:numColumns);};book.tables[id]=sheet;return sheet;}
+function firestoreTableShape_(d){if(!d||!Number.isSafeInteger(d.sheetId)||d.sheetId<0||typeof d.title!=='string'||!d.title||!Number.isSafeInteger(d.rowCount)||d.rowCount<1||d.rowCount>50000||!Number.isSafeInteger(d.columnCount)||d.columnCount<1||d.columnCount>1000||!Number.isSafeInteger(d.lastRow)||d.lastRow<0||d.lastRow>d.rowCount||!Number.isSafeInteger(d.lastColumn)||d.lastColumn<0||d.lastColumn>d.columnCount||d.identityReadBound!==undefined&&(!Number.isSafeInteger(d.identityReadBound)||d.identityReadBound<Math.min(40,d.rowCount)||d.identityReadBound>d.rowCount))fail_('SCHEMA_MISMATCH','Firebaseの行・列の範囲を確認してください。');}
+function firestoreRowId_(row){if(!Number.isSafeInteger(row)||row<1||row>50000)fail_('VALIDATION','Firebaseの行番号を確認してください。');return ('00000000'+row).slice(-8);}
+function firestoreEmptyRow_(){return {values:[],formulas:[],cells:[],metadata:{}};}
+function firestoreDecodeRow_(document,row){if(!document)return firestoreEmptyRow_();var d=firestoreDecodeFields_(document.fields||{});if(d.row!==row||typeof d.hasMetadata!=='boolean'||typeof d.payload!=='string'||firestoreBytes_(d.payload)>900000)fail_('SCHEMA_MISMATCH','Firebaseの行データを確認してください。');var body;try{body=JSON.parse(d.payload);}catch(_){fail_('SCHEMA_MISMATCH','Firebaseの行データを読み取れません。');}if(!body||typeof body!=='object'||Array.isArray(body)||Object.keys(body).some(function(k){return ['values','formulas','cells','metadata'].indexOf(k)<0;})||!Array.isArray(body.values)||body.values.length>1000||!Array.isArray(body.formulas)||body.formulas.length>1000||body.formulas.some(function(v){return typeof v!=='string';})||!Array.isArray(body.cells)||body.cells.length>1000||!body.metadata||typeof body.metadata!=='object'||Array.isArray(body.metadata)||d.hasMetadata!==(Object.keys(body.metadata).length>0))fail_('SCHEMA_MISMATCH','Firebaseの行データの項目を確認してください。');body.values.forEach(firestoreStoredValue_);Object.keys(body.metadata).forEach(function(k){var m=body.metadata[k];if(['__proto__','constructor','prototype'].indexOf(k)>=0||!m||typeof m!=='object'||!Number.isSafeInteger(m.metadataId)||m.metadataId<1||m.value!==null&&typeof m.value!=='string')fail_('SCHEMA_MISMATCH','Firebaseの行メタデータを確認してください。');});return body;}
+function firestoreStoredValue_(value){if(typeof value==='string'||typeof value==='boolean'||typeof value==='number'&&isFinite(value))return value;if(value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).length===1&&typeof value.$nodeDate==='string'&&/^\d{4}-\d\d-\d\dT/.test(value.$nodeDate)&&isFinite(Date.parse(value.$nodeDate))&&new Date(value.$nodeDate).toISOString()===value.$nodeDate)return new Date(value.$nodeDate);fail_('SCHEMA_MISMATCH','Firebaseの日付または入力値を確認してください。');}
+function firestoreQueryRows_(sheet,filter,after){var q={from:[{collectionId:'rows'}],where:filter,orderBy:[{field:{fieldPath:filter.fieldFilter?'__name__':'row'},direction:'ASCENDING'}],limit:200};if(after!==undefined)q.startAt={values:[filter.fieldFilter?{referenceValue:firestoreDocumentName_(sheet.book.storage,firestorePath_(sheet.book,'tables/'+sheet.getSheetId()+'/rows/'+('00000000'+after).slice(-8)))}:{integerValue:String(after)}],before:false};var result=firestoreRequest_('post',firestorePath_(sheet.book,'tables/'+sheet.getSheetId())+':runQuery',{structuredQuery:q,transaction:sheet.book.transaction},sheet.book.storage);if(!Array.isArray(result))fail_('FIRESTORE_READ_FAILED','Firebaseの行データを取得できませんでした。');return result.filter(function(item){return !!item.document;}).map(function(item){var fields=firestoreDecodeFields_(item.document.fields||{}),row=fields.row;if(!Number.isSafeInteger(row)||row<1||row>sheet.data.rowCount||!item.document.name||item.document.name!==firestoreDocumentName_(sheet.book.storage,firestorePath_(sheet.book,'tables/'+sheet.getSheetId()+'/rows/'+firestoreRowId_(row))))fail_('SCHEMA_MISMATCH','Firebaseの行の保存位置が一致しません。');var payload=firestoreDecodeRow_(item.document,row);sheet.book.rows[sheet.getSheetId()+':'+row]={body:payload,updateTime:firestoreTime_(item.document)};sheet.book.proofs[item.document.name]=firestoreTime_(item.document);return row;});}
+function firestoreLoadRows_(sheet,start,count){var end=start+count-1,key=sheet.getSheetId(),ranges=sheet.book.intervals[key]||(sheet.book.intervals[key]=[]);if(ranges.some(function(v){return v[0]<=start&&v[1]>=end;}))return;var lower=start-1,filter={compositeFilter:{op:'AND',filters:[{fieldFilter:{field:{fieldPath:'row'},op:'GREATER_THAN_OR_EQUAL',value:{integerValue:String(start)}}},{fieldFilter:{field:{fieldPath:'row'},op:'LESS_THAN_OR_EQUAL',value:{integerValue:String(end)}}}]}},pages=0;while(true){var rows=firestoreQueryRows_(sheet,filter,lower);if(++pages>251)fail_('DATA_LIMIT','Firebaseの読込範囲が上限を超えました。');if(!rows.length)break;var last=rows[rows.length-1];if(last<=lower||rows.some(function(row){return row<start||row>end;}))fail_('SCHEMA_MISMATCH','Firebaseの行データが重複しています。');lower=last;if(rows.length<200)break;}ranges.push([start,end]);}
+function firestoreBody_(sheet,row){firestoreLoadRows_(sheet,row,1);var key=sheet.getSheetId()+':'+row,cached=sheet.book.rows[key];if(cached)return cached.body;var document=firestoreReadDocument_(sheet.book,firestorePath_(sheet.book,'tables/'+sheet.getSheetId()+'/rows/'+firestoreRowId_(row)));if(document)fail_('BUSY','読込中にFirebaseの行が変更されました。再取得してください。');sheet.book.rows[key]={body:firestoreEmptyRow_(),updateTime:null};return sheet.book.rows[key].body;}
+function firestoreRange_(sheet,row,column,count,columns){if(![row,column,count,columns].every(Number.isSafeInteger)||row<1||column<1||count<1||columns<1||row+count-1>sheet.data.rowCount||column+columns-1>sheet.data.columnCount)fail_('VALIDATION','Firebaseの入力範囲を確認してください。');var range={sheet:sheet,start:row,column:column,count:count,columns:columns};function matrix(kind){var identity=kind==='values'&&row===1&&column===1&&columns===4&&sheet.data.title===(typeof NODE==='object'&&NODE.matchingTab||'2期目マッチングDB')&&sheet.data.identityReadBound!==undefined,readCount=identity?Math.min(count,sheet.data.identityReadBound):count;firestoreLoadRows_(sheet,row,readCount);return Array.from({length:count},function(_,i){var body=(sheet.book.rows[sheet.getSheetId()+':'+(row+i)]||{body:firestoreEmptyRow_()}).body;return Array.from({length:columns},function(_,j){var value=body[kind][column+j-1];return kind==='values'?value===undefined?'':firestoreStoredValue_(value):value===undefined?'':value;});});}range.getValues=function(){return matrix('values');};range.getFormulas=function(){return matrix('formulas');};range.getValue=function(){return matrix('values')[0][0];};range.getFormula=function(){return matrix('formulas')[0][0];};range.getRow=function(){return row;};range.getColumn=function(){return column;};range.createTextFinder=function(text){var settings={text:String(text),caseSensitive:false,whole:false,regex:false,formula:false},finder={};finder.matchCase=function(v){settings.caseSensitive=v===true;return finder;};finder.matchEntireCell=function(v){settings.whole=v===true;return finder;};finder.useRegularExpression=function(v){if(v===true)fail_('VALIDATION','正規表現の検索は利用できません。');return finder;};finder.matchFormulaText=function(v){settings.formula=v===true;return finder;};finder.findAll=function(){var data=matrix(settings.formula?'formulas':'values'),needle=settings.caseSensitive?settings.text:settings.text.toLowerCase(),found=[];data.forEach(function(line,i){line.forEach(function(value,j){var hay=String(value);if(!settings.caseSensitive)hay=hay.toLowerCase();if(settings.whole?hay===needle:hay.indexOf(needle)>=0)found.push(firestoreRange_(sheet,row+i,column+j,1,1));});});return found;};return finder;};return range;}
+function firestoreMetadataMaps_(sheet,keys){var book=sheet.book,id=sheet.getSheetId();if(!book.metadataLoaded[id]){var lower=0,pages=0;while(true){var filter={fieldFilter:{field:{fieldPath:'hasMetadata'},op:'EQUAL',value:{booleanValue:true}}},rows=firestoreQueryRows_(sheet,filter,lower);if(++pages>251)fail_('DATA_LIMIT','Firebaseの管理IDが上限を超えました。');if(!rows.length)break;var last=rows[rows.length-1];if(last<=lower)fail_('SCHEMA_MISMATCH','Firebaseの管理IDが重複しています。');lower=last;if(rows.length<200)break;}book.metadataLoaded[id]=true;}var maps={};keys.forEach(function(key){maps[key]={};});Object.keys(book.rows).forEach(function(key){if(key.indexOf(id+':')!==0)return;var row=Number(key.slice(String(id).length+1)),m=book.rows[key].body.metadata;keys.forEach(function(k){if(m[k])maps[k][row]=firestoreClone_(m[k]);});});return maps;}
+function firestoreRowCount_(sheet){return sheet.getMaxRows();}
+function firestoreGridRead_(book,sheet,start,count){if(book!==sheet.book||!Number.isSafeInteger(start)||start<1||!Number.isSafeInteger(count)||count<1||count>100||start>sheet.data.rowCount)fail_('VALIDATION','Firebaseの表示範囲を確認してください。');var end=Math.min(start+count-1,sheet.data.rowCount),columns=Math.min(100,sheet.data.columnCount);firestoreLoadRows_(sheet,start,end-start+1);return Array.from({length:end-start+1},function(_,i){var body=(book.rows[sheet.getSheetId()+':'+(start+i)]||{body:firestoreEmptyRow_()}).body;return Array.from({length:columns},function(_,j){return firestoreClone_(body.cells[j]||{});});});}
+function firestoreVerifyBook_(book){if(!book||!book.transaction)return;function manifest(){var current=firestoreReadDocument_(book,firestorePath_(book),true);if(!current||firestoreTime_(current)!==book.updateTime)fail_('BUSY','確認中にFirebaseのデータが更新されました。再取得してください。');}manifest();var accounts=book.manifest.tables.find(function(t){return t.title===(typeof NODE==='object'&&NODE.playersTab||'_NODE_players');});if(accounts){var prefix=firestoreDocumentName_(book.storage,firestorePath_(book,'tables/'+accounts.sheetId)),names=Object.keys(book.proofs).filter(function(name){return name===prefix||name.indexOf(prefix+'/rows/')===0;});for(var start=0;start<names.length;start+=100){var expected=names.slice(start,start+100),seen={},results=firestoreRequest_('post',':batchGet',{documents:expected,mask:{fieldPaths:['__nodeProofAbsent']}},book.storage);if(!Array.isArray(results))fail_('FIRESTORE_READ_FAILED','Firebaseの利用権限を再確認できませんでした。');results.forEach(function(item){var name=item.found&&item.found.name||item.missing;if(typeof name!=='string'||expected.indexOf(name)<0||seen[name])fail_('FIRESTORE_READ_FAILED','Firebaseの利用権限の応答を確認できませんでした。');seen[name]=true;var actual=item.found?firestoreTime_(item.found):null;if(actual!==book.proofs[name])fail_('BUSY','確認中にアカウントの利用権限が更新されました。再ログインしてください。');});if(expected.some(function(name){return !seen[name];}))fail_('FIRESTORE_READ_FAILED','Firebaseの利用権限を確認できませんでした。');}manifest();}}
+function firestoreAssertSnapshot_(){firestoreVerifyBook_(firestoreLoadedBook_());}
+function firestoreStorageInfo_(){var book=firestoreLoadedBook_();if(!book)return {kind:'firestore',projectId:firestoreConfig_().projectId,migratedAt:''};return {kind:'firestore',projectId:book.storage.projectId,migratedAt:(typeof firestoreMigrationState_==='function'&&firestoreMigrationState_()||{}).activatedAt||book.manifest.migrationProof.verifiedAt||book.manifest.migrationProof.preparedAt||''};}
+function firestoreClose_(){var book=firestoreLoadedBook_();if(book&&book.transaction){try{firestoreRequest_('post',':rollback',{transaction:book.transaction},book.storage);}catch(_){}book.transaction=null;}NODE_FIRESTORE_REQUEST_=null;}
+function firestoreBatch_(bookId,requests){var book=firestoreLoadedBook_();if(!book||book.sourceId!==bookId||!book.write||!book.transaction)fail_('WRITES_DISABLED','Firebaseへの保存処理が開始されていません。');if(!Array.isArray(requests)||requests.length>2000)fail_('DATA_LIMIT','一度の保存件数が上限を超えています。');if(!requests.length)return;var stage={manifest:firestoreClone_(book.manifest),tables:{},rows:{},dirtyRows:{},dirtyTables:{}};Object.keys(book.tables).forEach(function(k){stage.tables[k]=firestoreClone_(book.tables[k].data);});function table(id){if(!Number.isSafeInteger(id)||id<0)fail_('VALIDATION','Firebaseの管理表IDを確認してください。');if(!stage.tables[id])stage.tables[id]=firestoreClone_(firestoreSheet_(book,id).data);return stage.tables[id];}function row(id,n){var k=id+':'+n;if(!stage.rows[k]){var original=stage.manifest.tables.some(function(t){return t.sheetId===id;})&&book.manifest.tables.some(function(t){return t.sheetId===id;})?firestoreBody_(firestoreSheet_(book,id),n):firestoreEmptyRow_();if(!book.manifest.tables.some(function(t){return t.sheetId===id;})&&firestoreReadDocument_(book,firestorePath_(book,'tables/'+id+'/rows/'+firestoreRowId_(n))))fail_('CONFLICT','作成先に別の行データがあります。');stage.rows[k]=firestoreClone_(original);}stage.dirtyRows[k]=true;return stage.rows[k];}function touched(id){stage.dirtyTables[id]=true;}function applyCells(id,startRow,startCol,rows,fieldMask){var t=table(id),fields=String(fieldMask).split(',');if(fields.some(function(f){return ['userEnteredValue','userEnteredFormat.numberFormat'].indexOf(f)<0;}))fail_('VALIDATION','このセル更新形式は利用できません。');if(!Number.isSafeInteger(startRow)||startRow<0||!Number.isSafeInteger(startCol)||startCol<0||!Array.isArray(rows)||!rows.length||startRow+rows.length>t.rowCount)fail_('VALIDATION','セル更新の範囲を確認してください。');rows.forEach(function(r,i){if(!r||!Array.isArray(r.values)||startCol+r.values.length>t.columnCount)fail_('VALIDATION','セル更新の列を確認してください。');var body=row(id,startRow+i+1);r.values.forEach(function(c,j){if(!c||typeof c!=='object'||Array.isArray(c))fail_('VALIDATION','セルの保存値を確認してください。');var index=startCol+j;while(body.values.length<=index)body.values.push('');while(body.formulas.length<=index)body.formulas.push('');while(body.cells.length<=index)body.cells.push({});var previousValue=firestoreClone_(body.values[index]),prior=body.cells[index]||{},next=firestoreClone_(prior);if(fields.indexOf('userEnteredValue')>=0){var v=c.userEnteredValue||{};if(Object.keys(v).some(function(k){return ['stringValue','numberValue','boolValue','formulaValue'].indexOf(k)<0;})||Object.keys(v).length>1)fail_('VALIDATION','セルの入力値を確認してください。');next.userEnteredValue=firestoreClone_(v);delete next.effectiveValue;delete next.formattedValue;body.formulas[index]=typeof v.formulaValue==='string'?v.formulaValue:'';body.values[index]=typeof v.stringValue==='string'?v.stringValue:typeof v.numberValue==='number'&&isFinite(v.numberValue)?v.numberValue:typeof v.boolValue==='boolean'?v.boolValue:'';if(Object.keys(v).length&&body.values[index]===''&&!body.formulas[index]&&v.stringValue!=='')fail_('VALIDATION','セルの型を確認してください。');if(body.formulas[index]){if(prior.userEnteredValue&&prior.userEnteredValue.formulaValue===body.formulas[index]){body.values[index]=previousValue;next.effectiveValue=prior.effectiveValue||{};next.formattedValue=prior.formattedValue||'';}else{body.values[index]='';next.formattedValue='';}}else if(Object.keys(v).length){next.effectiveValue=firestoreClone_(v);next.formattedValue=String(body.values[index]);}}if(fields.indexOf('userEnteredFormat.numberFormat')>=0){next.userEnteredFormat=next.userEnteredFormat||{};next.userEnteredFormat.numberFormat=firestoreClone_(c.userEnteredFormat&&c.userEnteredFormat.numberFormat||{});}var fmt=next.userEnteredFormat&&next.userEnteredFormat.numberFormat;if(!body.formulas[index]&&typeof body.values[index]==='number'&&fmt&&['DATE','DATE_TIME'].indexOf(fmt.type)>=0){var date=new Date((body.values[index]-25569)*86400000);if(!isFinite(date.getTime()))fail_('VALIDATION','日付を確認してください。');body.values[index]={$nodeDate:date.toISOString()};next.formattedValue=date.toISOString().slice(0,10);}if(index===2&&t.title===(typeof NODE==='object'&&NODE.matchingTab||'2期目マッチングDB')&&typeof body.values[index]==='string'&&body.values[index].replace(/[\s\u3000]/g,'')){t.identityReadBound=Math.max(t.identityReadBound===undefined?t.lastRow:t.identityReadBound,Math.min(40,t.rowCount),startRow+i+1);}body.cells[index]=next;});t.lastRow=Math.max(t.lastRow,startRow+i+1);t.lastColumn=Math.max(t.lastColumn,startCol+r.values.length);});touched(id);}
+ requests.forEach(function(request){if(!request||typeof request!=='object'||Array.isArray(request)||Object.keys(request).length!==1)fail_('VALIDATION','保存操作の形式を確認してください。');var kind=Object.keys(request)[0],v=request[kind];if(kind==='addSheet'){var p=v&&v.properties;if(!p||!p.gridProperties||stage.manifest.tables.some(function(t){return t.sheetId===p.sheetId||t.title===p.title;}))fail_('CONFLICT','作成する管理表が既に存在します。');var t={sheetId:p.sheetId,title:p.title,rowCount:p.gridProperties.rowCount,columnCount:p.gridProperties.columnCount,lastRow:0,lastColumn:0};firestoreTableShape_(t);if(firestoreReadDocument_(book,firestorePath_(book,'tables/'+t.sheetId)))fail_('CONFLICT','作成先に別の管理表情報があります。');stage.tables[t.sheetId]=t;stage.manifest.tables.push({sheetId:t.sheetId,title:t.title});touched(t.sheetId);return;}
+ if(kind==='appendDimension'){var t=table(v.sheetId);if(v.dimension!=='ROWS'||!Number.isSafeInteger(v.length)||v.length<1||t.rowCount+v.length>50000)fail_('VALIDATION','追加する行数を確認してください。');t.rowCount+=v.length;touched(v.sheetId);return;}
+ if(kind==='updateCells'){var range=v&&v.range;if(!range||!Number.isSafeInteger(range.endRowIndex)||!Number.isSafeInteger(range.endColumnIndex)||range.endRowIndex-range.startRowIndex!==(v.rows||[]).length||(v.rows||[]).some(function(r){return !r.values||r.values.length!==range.endColumnIndex-range.startColumnIndex;}))fail_('VALIDATION','更新するセルの範囲を確認してください。');applyCells(range.sheetId,range.startRowIndex,range.startColumnIndex,v.rows,v.fields);return;}
+ if(kind==='appendCells'){var t=table(v.sheetId),needed=t.lastRow+(v.rows||[]).length;if(needed>50000)fail_('DATA_LIMIT','管理表の保存上限に達しました。');if(needed>t.rowCount)t.rowCount=needed;applyCells(v.sheetId,t.lastRow,0,v.rows,v.fields);return;}
+ if(kind==='createDeveloperMetadata'){var m=v&&v.developerMetadata,d=m&&m.location&&m.location.dimensionRange;if(!m||m.visibility!=='DOCUMENT'||typeof m.metadataKey!=='string'||!m.metadataKey||['__proto__','constructor','prototype'].indexOf(m.metadataKey)>=0||typeof m.metadataValue!=='string'||!d||d.dimension!=='ROWS'||!Number.isSafeInteger(d.startIndex)||d.endIndex!==d.startIndex+1||d.startIndex<0||d.endIndex>table(d.sheetId).rowCount)fail_('VALIDATION','行の管理IDを確認してください。');var b=row(d.sheetId,d.startIndex+1);if(b.metadata[m.metadataKey])fail_('METADATA_CONFLICT','同じ行の管理IDが重複しています。');b.metadata[m.metadataKey]={metadataId:stage.manifest.nextMetadataId++,value:m.metadataValue};return;}
+ if(kind==='updateDeveloperMetadata'||kind==='deleteDeveloperMetadata'){var filter=kind==='updateDeveloperMetadata'?v&&v.dataFilters:v&&v.dataFilter?[v.dataFilter]:null;if(!Array.isArray(filter)||filter.length!==1||!filter[0].developerMetadataLookup||Object.keys(filter[0].developerMetadataLookup).length!==1||!Number.isSafeInteger(filter[0].developerMetadataLookup.metadataId))fail_('VALIDATION','管理IDの更新条件を確認してください。');var wanted=filter[0].developerMetadataLookup.metadataId,found=[];book.getSheets().forEach(function(s){firestoreMetadataMaps_(s,[]);});Object.keys(book.rows).forEach(function(k){var body=stage.rows[k]||book.rows[k].body;Object.keys(body.metadata).forEach(function(key){if(body.metadata[key].metadataId===wanted)found.push({key:key,id:Number(k.split(':')[0]),row:Number(k.split(':')[1])});});});if(found.length!==1)fail_('METADATA_CONFLICT','更新する管理IDが重複、または存在しません。');var f=found[0],b=row(f.id,f.row);if(kind==='deleteDeveloperMetadata')delete b.metadata[f.key];else{if(v.fields!=='metadataValue'||!v.developerMetadata||typeof v.developerMetadata.metadataValue!=='string')fail_('VALIDATION','管理IDの保存内容を確認してください。');b.metadata[f.key].value=v.developerMetadata.metadataValue;}return;}
+ fail_('VALIDATION','Firebaseでは未対応の保存形式です。元のスプレッドシートへは保存していません。');});
+ stage.manifest.revision++;var writes=[];Object.keys(stage.dirtyTables).forEach(function(id){var path=firestorePath_(book,'tables/'+id);writes.push({update:{name:firestoreDocumentName_(book.storage,path),fields:firestoreEncodeFields_(stage.tables[id])}});});Object.keys(stage.dirtyRows).forEach(function(k){var body=stage.rows[k],payload=JSON.stringify(body);if(firestoreBytes_(payload)>900000)fail_('DATA_LIMIT','一行の保存量が上限を超えています。');var parts=k.split(':'),n=Number(parts[1]);writes.push({update:{name:firestoreDocumentName_(book.storage,firestorePath_(book,'tables/'+parts[0]+'/rows/'+firestoreRowId_(n))),fields:firestoreEncodeFields_({row:n,hasMetadata:Object.keys(body.metadata).length>0,payload:payload})}});});writes.push({update:{name:firestoreDocumentName_(book.storage,firestorePath_(book)),fields:firestoreEncodeFields_(stage.manifest)},currentDocument:{updateTime:book.updateTime}});if(writes.length>450)fail_('DATA_LIMIT','一度の保存が大きすぎます。入力は保持しています。');var committed=firestoreRequest_('post',':commit',{writes:writes,transaction:book.transaction},book.storage);if(!committed||!Array.isArray(committed.writeResults)||committed.writeResults.length!==writes.length)fail_('INTERNAL','Firebaseの保存結果を確認できません。同じ保存IDで確認してください。');book.transaction=null;NODE_FIRESTORE_REQUEST_={write:false,book:null,committed:true};
+}
+
+/* Owner-only, resumable migration. The original workbook is read, never changed.
+ * Normal app requests cannot call these editor functions. Authentication stays in
+ * Script Properties; neither password hashes nor secrets enter the import. */
+var FIRESTORE_MIGRATION_KEY='NODE_FIRESTORE_MIGRATION_STATE';
+var FIRESTORE_MIGRATION_TARGET_KEY='NODE_FIRESTORE_MIGRATION_TARGET';
+var FIRESTORE_MIGRATION_CONFIRM_KEY='NODE_FIRESTORE_MIGRATION_CONFIRM';
+var FIRESTORE_MIGRATION_PREVIEW_KEY='NODE_FIRESTORE_PREVIEW_V2';
+var FIRESTORE_MIGRATION_PAGE_ROWS=64;
+var FIRESTORE_MIGRATION_PAGE_BYTES=4*1024*1024;
+
+function firestoreMigrationState_(){
+  var raw=props_().getProperty(FIRESTORE_MIGRATION_KEY);if(!raw)return null;
+  try{var state=JSON.parse(raw);if(!state||['prepared','importing','ready','verified','active','abandoned'].indexOf(state.phase)<0)throw new Error('state');if(state.rootHashVersion===2)firestoreMigrationCheckpointValidate_(state);return state;}
+  catch(error){fail_('MIGRATION_STATE','Firebase移行状態を確認してください。安全のため保存を停止しています。');}
+}
+function firestoreMigrationFrozen_(){var state=firestoreMigrationState_();return !!state&&(['prepared','importing','ready','verified'].indexOf(state.phase)>=0||state.phase==='active'&&props_().getProperty('NODE_STORAGE_PROVIDER')!=='firestore');}
+function firestoreMigrationTarget_(){
+  var raw=props_().getProperty(FIRESTORE_MIGRATION_TARGET_KEY),target;
+  try{target=JSON.parse(raw||'null');}catch(error){target=null;}
+  if(!target||Object.keys(target).some(function(key){return ['projectId','databaseId'].indexOf(key)<0;})||typeof target.projectId!=='string'||!/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(target.projectId)||target.databaseId!==undefined&&target.databaseId!=='(default)'&&!/^[a-z][a-z0-9-]{2,61}[a-z0-9]$/.test(target.databaseId))fail_('FIRESTORE_NOT_CONFIGURED','移行先プロジェクトを NODE_FIRESTORE_MIGRATION_TARGET に設定してください。');
+  return {projectId:target.projectId,databaseId:target.databaseId||'(default)'};
+}
+function firestoreMigrationReset_(){if(typeof firestoreClose_==='function')firestoreClose_();if(typeof firestoreReset_==='function')firestoreReset_();}
+function firestoreMigrationPlain_(value){
+  if(value instanceof Date){if(!isFinite(value.getTime()))fail_('MIGRATION_SOURCE','無効な日付があるため移行を停止しました。');return {$nodeDate:value.toISOString()};}
+  if(value===undefined||value===null)return '';
+  if(typeof value==='string'||typeof value==='boolean'||typeof value==='number'&&isFinite(value))return value;
+  fail_('MIGRATION_SOURCE','移行元に対応していないセル値があります。');
+}
+/* All migration callers pass JSON-compatible objects. Count their serialized
+ * UTF-8 bytes locally instead of creating a service Blob for every source row.
+ * Preserve the previous service behavior for a raw unpaired surrogate; normal
+ * JSON.stringify escapes it and never needs this compatibility fallback. */
+function firestoreMigrationUtf8Length_(value){
+  var text=typeof value==='string'?value:JSON.stringify(value),bytes=0;
+  if(typeof text!=='string')fail_('MIGRATION_SOURCE','移行元の保存サイズを確認できませんでした。');
+  for(var i=0;i<text.length;i++){
+    var code=text.charCodeAt(i);
+    if(code<128)bytes++;
+    else if(code<2048)bytes+=2;
+    else if(code>=55296&&code<=56319){var next=i+1<text.length?text.charCodeAt(i+1):0;if(next>=56320&&next<=57343){bytes+=4;i++;}else return Utilities.newBlob(text).getBytes().length;}
+    else if(code>=56320&&code<=57343)return Utilities.newBlob(text).getBytes().length;
+    else bytes+=3;
+  }
+  return bytes;
+}
+function firestoreMigrationSummary_(state,extra){
+  var result={phase:state.phase,sourceHash:state.sourceHash,tableCount:state.counts.tableCount,rowDocumentCount:state.counts.rowDocumentCount,recordIdCount:state.counts.recordIdCount,operationCount:state.counts.operationCount};
+  if(state.cursor!==undefined)result.documentsImported=state.cursor;
+  Object.keys(extra||{}).forEach(function(key){result[key]=extra[key];});Logger.log(JSON.stringify(result));return result;
+}
+function firestoreMigrationConfirm_(expected){if(props_().getProperty(FIRESTORE_MIGRATION_CONFIRM_KEY)!==expected)fail_('MIGRATION_CONFIRM_REQUIRED','確認したハッシュに対応する移行確認値を設定してください。');}
+/* Stopping writes is an operational switch, not a new data destination. All
+ * other source/owner/authorization fields stay bound to the migration seal. */
+function firestoreRuntimeConfigHash_(config){var binding={};Object.keys(config).forEach(function(key){if(key!=='writesEnabled')binding[key]=config[key];});return hash_(stableJson_(binding));}
+/* Metadata is one Advanced Sheets RPC, not a chain of remote getter calls per entry.
+ * Search visibility/location are intentionally not restricted: preserve DOCUMENT and
+ * all PROJECT metadata visible to this Apps Script project. No partial fallback. */
+function firestoreMigrationMetadata_(bookId,catalog){
+  var response;try{response=Sheets.Spreadsheets.DeveloperMetadata.search({dataFilters:[{developerMetadataLookup:{}}]},bookId);}catch(_){fail_('SHEET_READ_FAILED','移行元の管理IDを一括取得できませんでした。権限とSheets APIを確認してください。元データは変更していません。');}
+  function object(value,keys){return !!value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).every(function(key){return keys.indexOf(key)>=0;});}
+  if(!object(response,['matchedDeveloperMetadata'])||response.matchedDeveloperMetadata!==undefined&&!Array.isArray(response.matchedDeveloperMetadata))fail_('METADATA_CONFLICT','管理IDの一括応答を確認できませんでした。');
+  var items=response.matchedDeveloperMetadata||[],rowMetadata=Object.create(null),tableMetadata=Object.create(null),legacyMetadata=[],ids=Object.create(null),maxId=0;
+  var entries=items.map(function(item){
+    if(!object(item,['developerMetadata','dataFilters'])||!object(item.developerMetadata,['metadataId','metadataKey','metadataValue','visibility','location']))fail_('METADATA_CONFLICT','対応していない管理IDの保存形式があります。');
+    var raw=item.developerMetadata,id=raw.metadataId,key=raw.metadataKey,hasValue=Object.prototype.hasOwnProperty.call(raw,'metadataValue'),value=hasValue?raw.metadataValue:null,location=raw.location;
+    if(!Number.isSafeInteger(id)||id<1||id>2147483647||ids[id]||typeof key!=='string'||!key||hasValue&&typeof value!=='string'||['DOCUMENT','PROJECT'].indexOf(raw.visibility)<0)fail_('METADATA_CONFLICT','管理IDの形式・重複・公開範囲を確認してください。');ids[id]=true;maxId=Math.max(maxId,id);
+    if(!object(location,['locationType','dimensionRange','sheetId','spreadsheet']))fail_('METADATA_CONFLICT','管理IDの位置情報を確認してください。');
+    var locations=['dimensionRange','sheetId','spreadsheet'].filter(function(k){return Object.prototype.hasOwnProperty.call(location,k);});if(locations.length!==1)fail_('METADATA_CONFLICT','管理IDの位置が一つに特定できません。');
+    var type,sheetId,row;
+    if(locations[0]==='dimensionRange'){
+      var range=location.dimensionRange;type='ROW';if(!object(range,['sheetId','dimension','startIndex','endIndex'])||range.dimension!=='ROWS')fail_('METADATA_CONFLICT','行以外の管理IDは移行前に確認が必要です。');
+      var start=range.startIndex===undefined?0:range.startIndex,end=range.endIndex;sheetId=range.sheetId;
+      if(!Number.isSafeInteger(sheetId)||sheetId<0||!Object.prototype.hasOwnProperty.call(catalog,sheetId)||!Number.isSafeInteger(start)||start<0||!Number.isSafeInteger(end)||end!==start+1||end>catalog[sheetId].rowCount)fail_('METADATA_CONFLICT','管理IDの行位置・行数・表を確認してください。');row=start+1;
+      if(['__proto__','constructor','prototype'].indexOf(key)>=0)fail_('METADATA_CONFLICT','対応していない管理IDのキーがあります。');
+    }else if(locations[0]==='sheetId'){
+      type='SHEET';sheetId=location.sheetId;if(!Number.isSafeInteger(sheetId)||sheetId<0||!Object.prototype.hasOwnProperty.call(catalog,sheetId))fail_('METADATA_CONFLICT','管理IDが関連する表を確認できません。');
+    }else {type='SPREADSHEET';if(location.spreadsheet!==true)fail_('METADATA_CONFLICT','管理IDのブック位置を確認できません。');}
+    if(location.locationType!==undefined&&location.locationType!==type)fail_('METADATA_CONFLICT','管理IDの位置と種類が一致しません。');
+    return {entry:{metadataId:id,key:key,value:value,visibility:raw.visibility},type:type,sheetId:sheetId,row:row};
+  });
+  // The API does not promise response order. Canonical IDs avoid false source
+  // changes between identical reads; row object ordering is already stableJson_.
+  entries.sort(function(a,b){return a.entry.metadataId-b.entry.metadataId;}).forEach(function(item){var entry=item.entry;
+    if(item.type==='ROW'){var key=item.sheetId+':'+item.row,map=rowMetadata[key]||(rowMetadata[key]=Object.create(null));if(Object.prototype.hasOwnProperty.call(map,entry.key))fail_('METADATA_CONFLICT','同じ行に同じキーの管理IDが複数あります。元データを変更せず停止しました。');map[entry.key]={value:entry.value,metadataId:entry.metadataId,visibility:entry.visibility};}
+    else if(item.type==='SHEET')(tableMetadata[item.sheetId]||(tableMetadata[item.sheetId]=[])).push(entry);else legacyMetadata.push(entry);
+  });
+  return {rowMetadata:rowMetadata,tableMetadata:tableMetadata,legacyMetadata:legacyMetadata,maxMetadataId:maxId,metadataCount:items.length};
+}
+/* Up to four bounded ranges per RPC, capped at 64k cells. The returned grid has
+ * exactly the same original row/column positions and raw cell JSON as before. */
+function firestoreMigrationGrid_(bookId,info,end,width,stats){
+  var grid=[],chunk=Math.min(200,Math.max(1,Math.floor(64000/width))),perCall=Math.max(1,Math.min(4,Math.floor(64000/(chunk*width))));
+  for(var start=1;start<=end;){var ranges=[],expected=Object.create(null),batchStart=start,batchEnd=start-1;
+    for(var n=0;n<perCall&&start<=end;n++){var finish=Math.min(end,start+chunk-1);expected[start-1]={end:finish,seen:false};ranges.push("'"+info.title.replace(/'/g,"''")+"'!A"+start+':'+columnName_(width)+finish);batchEnd=finish;start=finish+1;}
+    var response;if(stats)stats.gridRequests++;try{response=Sheets.Spreadsheets.get(bookId,{ranges:ranges,fields:'sheets(properties(sheetId),data(startRow,startColumn,rowData(values(userEnteredValue,effectiveValue,formattedValue,dataValidation,userEnteredFormat(numberFormat),chipRuns,note))))'});}catch(_){fail_('SHEET_READ_FAILED','移行元のセル情報を一括取得できませんでした。元データは変更していません。');}
+    if(!response||!Array.isArray(response.sheets)||response.sheets.length!==1||!response.sheets[0].properties||response.sheets[0].properties.sheetId!==info.id||!Array.isArray(response.sheets[0].data)||response.sheets[0].data.length!==ranges.length||firestoreMigrationUtf8Length_(response)>12000000)fail_('SHEET_READ_FAILED','移行元のセル情報・応答サイズを確認できませんでした。');
+    response.sheets[0].data.forEach(function(part){
+      if(!part||typeof part!=='object'||Array.isArray(part)||part.rowData!==undefined&&!Array.isArray(part.rowData))fail_('SHEET_READ_FAILED','移行元のセル情報の形式を確認できませんでした。');
+      var baseRow=part.startRow===undefined?0:part.startRow,baseColumn=part.startColumn===undefined?0:part.startColumn;
+      if(!Number.isSafeInteger(baseRow)||baseRow<0||!Number.isSafeInteger(baseColumn)||baseColumn!==0||!Object.prototype.hasOwnProperty.call(expected,baseRow)||expected[baseRow].seen)fail_('SHEET_READ_FAILED','要求した範囲のセル情報が欠落・重複しています。');var block=expected[baseRow];block.seen=true;
+      (part.rowData||[]).forEach(function(row,index){var target=baseRow+index;if(target<baseRow||target>=block.end||!row||typeof row!=='object'||Array.isArray(row)||row.values!==undefined&&!Array.isArray(row.values)||(row.values||[]).length+baseColumn>width)fail_('SHEET_READ_FAILED','移行元のセル範囲を確認できませんでした。');var cells=grid[target]||(grid[target]=[]);
+        (row.values||[]).forEach(function(cell,column){var c=baseColumn+column;if(!cell||typeof cell!=='object'||Array.isArray(cell)||cells[c]!==undefined)fail_('SHEET_READ_FAILED','移行元のセル情報が重複、または不正な形式です。');cells[c]=cell;});
+      });
+    });
+    if(Object.keys(expected).some(function(key){return !expected[key].seen;}))fail_('SHEET_READ_FAILED','要求した範囲のセル情報をすべて確認できませんでした。');
+  }
+  return grid;
+}
+function firestoreMigrationSource_(config){
+  var readStarted=Date.now();
+  if(config.spreadsheetId===NODE.originalId)fail_('PROTECTED_SOURCE','原本からの移行は実行しません。登録済みの管理コピーを使ってください。');
+  assertManagedBook_(config.spreadsheetId);
+  // This one-off migration deliberately addresses the old Sheets source even
+  // when recovering a partially applied provider switch. It has no write calls.
+  var book=SpreadsheetApp.openById(config.spreadsheetId);if(book.getSpreadsheetTimeZone()!=='Asia/Tokyo')fail_('TIMEZONE','移行元のタイムゾーンを確認してください。');
+  var tabs=resolveBusinessTabs_(book);if(tabs.matchingSheetId!==Number(config.matchingSheetId)||tabs.kpiSheetId!==Number(config.kpiSheetId))fail_('SCHEMA_MISMATCH','移行元の業務タブIDが設定と一致しません。');
+  var bookId=book.getId(),sheets=book.getSheets().slice().sort(function(a,b){return a.getSheetId()-b.getSheetId();}),catalog=Object.create(null);
+  sheets.forEach(function(sheet){var id=sheet.getSheetId(),info={id:id,sheet:sheet,title:sheet.getName(),lastRow:sheet.getLastRow(),lastColumn:sheet.getLastColumn(),rowCount:sheet.getMaxRows(),columnCount:sheet.getMaxColumns()};if(!Number.isSafeInteger(id)||id<0||Object.prototype.hasOwnProperty.call(catalog,id)||typeof info.title!=='string'||!info.title||!Number.isSafeInteger(info.rowCount)||info.rowCount<1||!Number.isSafeInteger(info.columnCount)||info.columnCount<1||!Number.isSafeInteger(info.lastRow)||info.lastRow<0||info.lastRow>info.rowCount||!Number.isSafeInteger(info.lastColumn)||info.lastColumn<0||info.lastColumn>info.columnCount)fail_('MIGRATION_SOURCE','移行元の表の範囲を確認してください。');catalog[id]=info;});
+  var metadata=firestoreMigrationMetadata_(bookId,catalog),rowMetadata=metadata.rowMetadata,tableMetadata=metadata.tableMetadata,legacyMetadata=metadata.legacyMetadata,maxMetadataId=metadata.maxMetadataId,readStats={metadataCount:metadata.metadataCount,gridRequests:0,elapsedMs:0};
+  var tables=[],documents=[],cellCount=0,counts={tableCount:0,rowDocumentCount:0,recordIdCount:0,operationCount:0};
+  sheets.forEach(function(sheet){
+    var id=sheet.getSheetId(),info=catalog[id],lastRow=info.lastRow,lastColumn=info.lastColumn,rowCount=info.rowCount,columnCount=info.columnCount,rowsWithMetadata=Object.keys(rowMetadata).filter(function(key){return key.indexOf(id+':')===0;}).map(function(key){return Number(key.slice(String(id).length+1));});
+    if(rowsWithMetadata.some(function(row){return row>rowCount;}))fail_('METADATA_CONFLICT','管理IDの行位置が元の表を超えています。');
+    var end=Math.max(lastRow,rowsWithMetadata.length?Math.max.apply(null,rowsWithMetadata):0),width=Math.max(1,lastColumn);
+    cellCount+=end*width;if(cellCount>2000000||end>50000||columnCount>1000||tables.length>=200)fail_('MIGRATION_LIMIT','元データが一度に検証できる上限を超えています。分割移行を確認してください。');
+    var table={sheetId:id,title:info.title,rowCount:rowCount,columnCount:columnCount,lastRow:lastRow,lastColumn:lastColumn,legacyMetadata:tableMetadata[id]||[]};
+    tables.push(table);documents.push({path:'tables/'+id,data:table});
+    var values=end?sheet.getRange(1,1,end,width).getValues():[],formulas=end?sheet.getRange(1,1,end,width).getFormulas():[],grid=[];
+    // Only this optional scan bound is derived. All rows, formulas and raw cells
+    // remain in the import and its hash; missing bounds still mean a full scan.
+    if(id===Number(config.matchingSheetId)){var identityBound=Math.min(40,rowCount);values.forEach(function(row,index){if(normalizeName_(row[2]))identityBound=Math.max(identityBound,index+1);});table.identityReadBound=Math.min(rowCount,identityBound);}
+    grid=firestoreMigrationGrid_(bookId,info,end,width,readStats);
+    for(var row=1;row<=end;row++){
+      var rowValues=(values[row-1]||[]).map(firestoreMigrationPlain_),rowFormulas=(formulas[row-1]||[]).map(function(value){return String(value||'');}),cells=Array.from({length:width},function(_,column){return grid[row-1]&&grid[row-1][column]||{};}),metadata=rowMetadata[id+':'+row]||{};
+      var payload={values:rowValues,formulas:rowFormulas,cells:cells,metadata:metadata};
+      if(!rowValues.some(function(value){return value!=='';})&&!rowFormulas.some(Boolean)&&!cells.some(function(cell){return Object.keys(cell).length>0;})&&!Object.keys(metadata).length)continue;
+      var data={row:row,hasMetadata:!!Object.keys(metadata).length,payload:stableJson_(payload)};
+      if(firestoreMigrationUtf8Length_(data)>880000)fail_('MIGRATION_LIMIT','1行の保存サイズが大きいため移行を停止しました。元データは変更していません。');
+      documents.push({path:'tables/'+id+'/rows/'+('00000000'+row).slice(-8),data:data});counts.rowDocumentCount++;
+      if(metadata[NODE.recordKey])counts.recordIdCount++;
+      if(info.title===NODE.operationsTab&&row>1&&rowValues[0]!==''&&!rowFormulas[0])counts.operationCount++;
+    }
+  });
+  counts.tableCount=tables.length;var sourceConfigHash=hash_(stableJson_(config)),runtimeConfigHash=firestoreRuntimeConfigHash_(config),sourceHash=hash_(stableJson_([book.getId(),book.getName(),book.getSpreadsheetTimeZone(),sourceConfigHash,runtimeConfigHash,tables,legacyMetadata,documents]));
+  var manifest={schemaVersion:1,revision:0,title:book.getName(),timeZone:book.getSpreadsheetTimeZone(),sourceSpreadsheetId:book.getId(),sourceConfigHash:sourceConfigHash,runtimeConfigHash:runtimeConfigHash,tables:tables.map(function(table){return {sheetId:table.sheetId,title:table.title};}),nextMetadataId:maxMetadataId+1,legacyMetadata:legacyMetadata};
+  if(firestoreMigrationUtf8Length_(manifest)>880000)fail_('MIGRATION_LIMIT','移行目録が保存上限を超えています。');
+  readStats.elapsedMs=Date.now()-readStarted;return {sourceHash:sourceHash,sourceConfigHash:sourceConfigHash,runtimeConfigHash:runtimeConfigHash,counts:counts,manifest:manifest,documents:documents,readStats:readStats};
+}
+/* Editor-only connectivity probe. The fixed metadata GET has no documents path,
+ * no transaction/import write, and never logs project names or provider bodies. */
+function verifyNodeFirestoreAccess(){
+  var owner=requireOwner_(),target=firestoreMigrationTarget_(),name='projects/'+target.projectId+'/databases/'+target.databaseId,url='https://firestore.googleapis.com/v1/projects/'+target.projectId+'/databases/'+encodeURIComponent(target.databaseId),response,status,text;
+  try{response=UrlFetchApp.fetch(url,{method:'get',headers:{Authorization:'Bearer '+ScriptApp.getOAuthToken()},muteHttpExceptions:true,followRedirects:false});status=response.getResponseCode();text=response.getContentText();}catch(_){fail_('FIRESTORE_ACCESS_FAILED','Firebaseの接続を確認できませんでした。元データは変更していません。');}
+  if(status===401||status===403)fail_('FIRESTORE_ACCESS_DENIED','Firebaseの読み取り権限、またはGoogleの再認証を確認してください。元データは変更していません。');
+  if(status===404)fail_('FIRESTORE_NOT_CONFIGURED','指定したFirebaseデータベースが見つかりません。設定を確認してください。');
+  if(status===429)fail_('RATE_LIMITED','Firebaseの接続確認が集中しています。時間をおいて再確認してください。');
+  if(status!==200||typeof text!=='string'||text.length>100000)fail_('FIRESTORE_ACCESS_FAILED','Firebaseの接続確認を完了できませんでした。元データは変更していません。');
+  var data;try{data=JSON.parse(text);}catch(_){fail_('FIRESTORE_ACCESS_FAILED','Firebaseの接続応答を確認できませんでした。');}
+  if(!data||typeof data!=='object'||Array.isArray(data)||data.name!==name||typeof data.locationId!=='string'||!/^[a-z][a-z0-9-]{1,40}$/.test(data.locationId)||data.type!=='FIRESTORE_NATIVE')fail_('FIRESTORE_ACCESS_FAILED','Firebaseのデータベース形式・地域を確認してください。');
+  if(requireOwner_()!==owner||stableJson_(firestoreMigrationTarget_())!==stableJson_(target))fail_('BUSY','接続確認中に設定が変わりました。もう一度確認してください。');
+  var result={verified:true,readOnly:true,locationId:data.locationId,type:data.type};Logger.log(JSON.stringify({locationId:result.locationId,type:result.type}));return result;
+}
+function firestoreMigrationBinding_(state){var binding={projectId:state.target.projectId,databaseId:state.target.databaseId,workbookId:state.target.workbookId,sourceSpreadsheetId:state.sourceSpreadsheetId,sourceConfigHash:state.sourceConfigHash,runtimeConfigHash:state.runtimeConfigHash,sourceHash:state.sourceHash,importId:state.importId};if(state.rootHashVersion===2)binding.rootHashVersion=2;return binding;}
+function firestoreMigrationSeal_(state){var pepper=props_().getProperty(NODE.pepperKey);if(!pepper)fail_('NOT_CONFIGURED','認証設定が未完了のため移行できません。');return hmac_(stableJson_(firestoreMigrationBinding_(state)),pepper);}
+function firestoreMigrationProof_(state,phase){return Object.assign({state:phase,preparedAt:state.preparedAt,verifiedAt:state.verifiedAt||'',seal:firestoreMigrationSeal_(state)},firestoreMigrationBinding_(state),state.counts);}
+function firestoreMigrationWrite_(target,writes){
+  if(!writes.length)return;var body={writes:writes};if(firestoreMigrationUtf8Length_(body)>8000000)fail_('MIGRATION_LIMIT','移行バッチが大きすぎます。');
+  var result=firestoreRequest_('post',':commit',body,target);if(!result||!Array.isArray(result.writeResults)||result.writeResults.length!==writes.length)fail_('INTERNAL','移行の保存結果を確認できません。入力を変えずに同じ移行を再実行してください。');return result;
+}
+function firestoreMigrationDocument_(target,path,data,precondition){var result={update:{name:firestoreDocumentName_(target,'nodeWorkbooks/'+target.workbookId+(path?'/'+path:'')),fields:firestoreEncodeFields_(data)}};if(precondition)result.currentDocument=precondition;return result;}
+function firestoreMigrationRead_(target,path){return firestoreRequest_('get','nodeWorkbooks/'+target.workbookId+(path?'/'+path:''),undefined,target);}
+/* Version 2 signs only a bounded cursor and hashes. Source prose, raw cells,
+ * OAuth credentials and document arrays never enter Script Properties. */
+function firestoreMigrationCheckpointPayload_(value){var out={};Object.keys(value).forEach(function(key){if(key!=='checkpointSeal')out[key]=value[key];});return out;}
+function firestoreMigrationCheckpointValidate_(value){
+  var pepper=props_().getProperty(NODE.pepperKey),body=firestoreMigrationCheckpointPayload_(value);
+  if(!pepper||value.rootHashVersion!==2||typeof value.checkpointSeal!=='string'||firestoreMigrationUtf8Length_(value)>8192||!constantEqual_(value.checkpointSeal,hmac_(stableJson_(body),pepper)))fail_('MIGRATION_CHECKPOINT','移行の確認位置を検証できません。保存先を切り替えず停止しました。');
+  return value;
+}
+function firestoreMigrationCheckpointSave_(key,value){var pepper=props_().getProperty(NODE.pepperKey);if(!pepper)fail_('NOT_CONFIGURED','認証設定が未完了です。');value.updatedAt=new Date().toISOString();value.checkpointSeal=hmac_(stableJson_(firestoreMigrationCheckpointPayload_(value)),pepper);var text=JSON.stringify(value);if(firestoreMigrationUtf8Length_(text)>8192)fail_('MIGRATION_LIMIT','移行の確認位置が保存上限を超えています。');props_().setProperty(key,text);return value;}
+function firestoreMigrationSaveState_(state){if(state.rootHashVersion===2)return firestoreMigrationCheckpointSave_(FIRESTORE_MIGRATION_KEY,state);props_().setProperty(FIRESTORE_MIGRATION_KEY,JSON.stringify(state));return state;}
+function firestoreMigrationPreview_(){var text=props_().getProperty(FIRESTORE_MIGRATION_PREVIEW_KEY);if(!text)return null;var result;try{result=JSON.parse(text);}catch(_){fail_('MIGRATION_CHECKPOINT','移行前確認の保存形式を確認してください。');}return firestoreMigrationCheckpointValidate_(result);}
+/* Catalog and visible metadata are small, independent of the row count. Each
+ * source page obtains only its own values/formulas/raw CellData. */
+function firestoreMigrationContext_(config){
+  var started=Date.now();if(config.spreadsheetId===NODE.originalId)fail_('PROTECTED_SOURCE','原本からの移行は実行しません。登録済みの管理コピーを使ってください。');assertManagedBook_(config.spreadsheetId);
+  var book=SpreadsheetApp.openById(config.spreadsheetId);if(book.getSpreadsheetTimeZone()!=='Asia/Tokyo')fail_('TIMEZONE','移行元のタイムゾーンを確認してください。');var tabs=resolveBusinessTabs_(book);if(tabs.matchingSheetId!==Number(config.matchingSheetId)||tabs.kpiSheetId!==Number(config.kpiSheetId))fail_('SCHEMA_MISMATCH','移行元の業務タブIDが設定と一致しません。');
+  var catalog=Object.create(null),tables=book.getSheets().slice().sort(function(a,b){return a.getSheetId()-b.getSheetId();}).map(function(sheet){var id=sheet.getSheetId(),info={id:id,sheet:sheet,title:sheet.getName(),lastRow:sheet.getLastRow(),lastColumn:sheet.getLastColumn(),rowCount:sheet.getMaxRows(),columnCount:sheet.getMaxColumns()};if(!Number.isSafeInteger(id)||id<0||Object.prototype.hasOwnProperty.call(catalog,id)||typeof info.title!=='string'||!info.title||!Number.isSafeInteger(info.rowCount)||info.rowCount<1||!Number.isSafeInteger(info.columnCount)||info.columnCount<1||!Number.isSafeInteger(info.lastRow)||info.lastRow<0||info.lastRow>info.rowCount||!Number.isSafeInteger(info.lastColumn)||info.lastColumn<0||info.lastColumn>info.columnCount)fail_('MIGRATION_SOURCE','移行元の表の範囲を確認してください。');catalog[id]=info;return info;});
+  var metadata=firestoreMigrationMetadata_(book.getId(),catalog),cellCount=0;
+  tables.forEach(function(info){var prefix=info.id+':',lastMetadataRow=0;Object.keys(metadata.rowMetadata).forEach(function(key){if(key.indexOf(prefix)===0)lastMetadataRow=Math.max(lastMetadataRow,Number(key.slice(prefix.length)));});info.end=Math.max(info.lastRow,lastMetadataRow);info.width=Math.max(1,info.lastColumn);cellCount+=info.end*info.width;if(cellCount>2000000||info.end>50000||info.columnCount>1000||tables.length>200)fail_('MIGRATION_LIMIT','移行元の表が検証できる上限を超えています。');});
+  var plainTables=tables.map(function(info){return {sheetId:info.id,title:info.title,rowCount:info.rowCount,columnCount:info.columnCount,lastRow:info.lastRow,lastColumn:info.lastColumn,end:info.end,width:info.width,legacyMetadata:metadata.tableMetadata[info.id]||[]};});
+  if(firestoreMigrationUtf8Length_([plainTables,metadata])>4000000)fail_('MIGRATION_LIMIT','管理IDの目録が安全な検証サイズを超えています。');
+  var context={startedAt:started,bookId:book.getId(),title:book.getName(),timeZone:book.getSpreadsheetTimeZone(),tables:tables,rowMetadata:metadata.rowMetadata,tableMetadata:metadata.tableMetadata,legacyMetadata:metadata.legacyMetadata,maxMetadataId:metadata.maxMetadataId,metadataCount:metadata.metadataCount,matchingSheetId:Number(config.matchingSheetId),sourceConfigHash:hash_(stableJson_(config)),runtimeConfigHash:firestoreRuntimeConfigHash_(config),catalogHash:hash_(stableJson_([book.getId(),book.getName(),book.getSpreadsheetTimeZone(),plainTables])),metadataHash:hash_(stableJson_([metadata.rowMetadata,metadata.tableMetadata,metadata.legacyMetadata,metadata.maxMetadataId])),readStats:{metadataCount:metadata.metadataCount,gridRequests:0,rowsRead:0,elapsedMs:Date.now()-started}};
+  return context;
+}
+function firestoreMigrationTableData_(context,info,bound){var data={sheetId:info.id,title:info.title,rowCount:info.rowCount,columnCount:info.columnCount,lastRow:info.lastRow,lastColumn:info.lastColumn,legacyMetadata:context.tableMetadata[info.id]||[]};if(info.id===context.matchingSheetId)data.identityReadBound=Math.min(info.rowCount,bound);return data;}
+function firestoreMigrationManifest_(context){var manifest={schemaVersion:1,revision:0,title:context.title,timeZone:context.timeZone,sourceSpreadsheetId:context.bookId,sourceConfigHash:context.sourceConfigHash,runtimeConfigHash:context.runtimeConfigHash,tables:context.tables.map(function(table){return {sheetId:table.id,title:table.title};}),nextMetadataId:context.maxMetadataId+1,legacyMetadata:context.legacyMetadata};if(firestoreMigrationUtf8Length_(manifest)>880000)fail_('MIGRATION_LIMIT','移行目録が保存上限を超えています。');return manifest;}
+function firestoreMigrationPageGrid_(context,info,start,end){
+  var response;context.readStats.gridRequests++;try{response=Sheets.Spreadsheets.get(context.bookId,{ranges:["'"+info.title.replace(/'/g,"''")+"'!A"+start+':'+columnName_(info.width)+end],fields:'sheets(properties(sheetId),data(startRow,startColumn,rowData(values(userEnteredValue,effectiveValue,formattedValue,dataValidation,userEnteredFormat(numberFormat),chipRuns,note))))'});}catch(_){fail_('SHEET_READ_FAILED','移行元のセル情報を取得できませんでした。元データは変更していません。');}
+  if(!response||!Array.isArray(response.sheets)||response.sheets.length!==1||!response.sheets[0].properties||response.sheets[0].properties.sheetId!==info.id||!Array.isArray(response.sheets[0].data)||response.sheets[0].data.length!==1)fail_('SHEET_READ_FAILED','要求した範囲のセル情報が欠落・重複しています。');var responseBytes=firestoreMigrationUtf8Length_(response);if(responseBytes>4*1024*1024){if(end>start)return null;fail_('MIGRATION_LIMIT','1行のセル情報が安全な読取サイズを超えています。');}context.readStats.maxRawResponseBytes=Math.max(context.readStats.maxRawResponseBytes||0,responseBytes);
+  var part=response.sheets[0].data[0],grid=[],rawRowByteHint=1;if(!part||typeof part!=='object'||Array.isArray(part)||(part.startRow===undefined?0:part.startRow)!==start-1||(part.startColumn===undefined?0:part.startColumn)!==0||part.rowData!==undefined&&!Array.isArray(part.rowData)||(part.rowData||[]).length>end-start+1)fail_('SHEET_READ_FAILED','要求した範囲のセル位置が一致しません。');
+  (part.rowData||[]).forEach(function(row,index){if(!row||typeof row!=='object'||Array.isArray(row)||row.values!==undefined&&!Array.isArray(row.values)||(row.values||[]).length>info.width)fail_('SHEET_READ_FAILED','移行元のセル範囲を確認できませんでした。');rawRowByteHint=Math.max(rawRowByteHint,firestoreMigrationUtf8Length_(row));grid[index]=(row.values||[]).map(function(cell){if(!cell||typeof cell!=='object'||Array.isArray(cell))fail_('SHEET_READ_FAILED','移行元のセル形式を確認できませんでした。');return cell;});});info.rawRowByteHint=rawRowByteHint;return grid;
+}
+function firestoreMigrationSourcePage_(context,cursor){
+  if(!cursor||!Number.isSafeInteger(cursor.tableIndex)||cursor.tableIndex<0||cursor.tableIndex>context.tables.length||!Number.isSafeInteger(cursor.row)||cursor.row<1)fail_('MIGRATION_CHECKPOINT','移行元の確認位置が不正です。');
+  var tableIndex=cursor.tableIndex,info=context.tables[tableIndex],documents=[],delta={rowDocumentCount:0,recordIdCount:0,operationCount:0},bound=0,bytes=2,nextCursor,range;
+  if(!info){if(cursor.row!==1)fail_('MIGRATION_CHECKPOINT','移行元の確認位置が不正です。');range={tableIndex:tableIndex,sheetId:null,startRow:1,endRow:0};return {documents:[],pageHash:hash_(stableJson_([range,[]])),range:range,nextCursor:{tableIndex:tableIndex,row:1},done:true,countsDelta:delta,matchingIdentityBound:0,readStats:{rowsRead:0,gridRequests:0,bytes:2}};}
+  if(cursor.row>Math.max(1,info.end))fail_('MIGRATION_CHECKPOINT','移行元の行位置が表の範囲を超えています。');var start=cursor.row,end=Math.min(info.end,start+FIRESTORE_MIGRATION_PAGE_ROWS-1),processed=start-1,requestsBefore=context.readStats.gridRequests;
+  /* Start each table with eight raw rows, then adapt up to 32 rows from
+   * observed raw row bytes (256 KiB target). Raw data is checked before values
+   * and formulas; an oversized response is discarded and retried at half size.
+   * The hint is ephemeral, so it never changes page boundaries or source hashes. */
+  pageBlocks:for(var blockStart=start;blockStart<=end;){var chunk=info.rawRowByteHint?Math.max(1,Math.min(32,Math.floor(262144/info.rawRowByteHint))):8,blockEnd=Math.min(end,blockStart+chunk-1),grid=firestoreMigrationPageGrid_(context,info,blockStart,blockEnd);while(grid===null){chunk=Math.max(1,Math.floor((blockEnd-blockStart+1)/2));blockEnd=blockStart+chunk-1;grid=firestoreMigrationPageGrid_(context,info,blockStart,blockEnd);}var values=info.sheet.getRange(blockStart,1,blockEnd-blockStart+1,info.width).getValues(),formulas=info.sheet.getRange(blockStart,1,blockEnd-blockStart+1,info.width).getFormulas();if(!Array.isArray(values)||!Array.isArray(formulas)||values.length!==blockEnd-blockStart+1||formulas.length!==blockEnd-blockStart+1||values.some(function(row){return !Array.isArray(row)||row.length!==info.width;})||formulas.some(function(row){return !Array.isArray(row)||row.length!==info.width;}))fail_('SHEET_READ_FAILED','移行元の値・数式の範囲が一致しません。');
+    for(var row=blockStart;row<=blockEnd;row++){
+      var index=row-blockStart,rowValues=values[index].map(firestoreMigrationPlain_),rowFormulas=formulas[index].map(function(value){return String(value||'');}),cells=Array.from({length:info.width},function(_,column){return grid[index]&&grid[index][column]||{};}),metadata=context.rowMetadata[info.id+':'+row]||{},hasMetadata=Object.keys(metadata).length>0;
+      if(rowValues.some(function(value){return value!=='';})||rowFormulas.some(Boolean)||cells.some(function(cell){return Object.keys(cell).length>0;})||hasMetadata){var data={row:row,hasMetadata:hasMetadata,payload:stableJson_({values:rowValues,formulas:rowFormulas,cells:cells,metadata:metadata})};if(firestoreMigrationUtf8Length_(data)>880000)fail_('MIGRATION_LIMIT','1行の保存サイズが大きいため移行を停止しました。元データは変更していません。');var item={path:'tables/'+info.id+'/rows/'+('00000000'+row).slice(-8),data:data},size=firestoreMigrationUtf8Length_(item)+(documents.length?1:0);if(bytes+size>FIRESTORE_MIGRATION_PAGE_BYTES){if(!documents.length)fail_('MIGRATION_LIMIT','移行ページの保存サイズが大きすぎます。');break pageBlocks;}bytes+=size;documents.push(item);delta.rowDocumentCount++;if(metadata[NODE.recordKey])delta.recordIdCount++;if(info.title===NODE.operationsTab&&row>1&&rowValues[0]!==''&&!rowFormulas[0])delta.operationCount++;}
+      if(info.id===context.matchingSheetId&&normalizeName_(rowValues[2]))bound=Math.max(bound,row);processed=row;
+    }
+    values=null;formulas=null;grid=null;blockStart=blockEnd+1;
+  }
+  if(!info.end)processed=0;var finished=processed>=info.end;nextCursor=finished?{tableIndex:tableIndex+1,row:1}:{tableIndex:tableIndex,row:processed+1};range={tableIndex:tableIndex,sheetId:info.id,startRow:start,endRow:processed};context.readStats.rowsRead+=Math.max(0,processed-start+1);
+  return {documents:documents,pageHash:hash_(stableJson_([range,documents])),range:range,nextCursor:nextCursor,done:nextCursor.tableIndex===context.tables.length,countsDelta:delta,matchingIdentityBound:bound,readStats:{rowsRead:Math.max(0,processed-start+1),gridRequests:context.readStats.gridRequests-requestsBefore,bytes:bytes}};
+}
+function firestoreMigrationRowsSeed_(){return hash_('NODE_FIRESTORE_ROWS_V2');}
+function firestoreMigrationRowsAdd_(root,item){return hash_(stableJson_(['NODE_FIRESTORE_ROW_V2',root,item.path,item.data]));}
+function firestoreMigrationScan_(context){var matching=context.tables.filter(function(t){return t.id===context.matchingSheetId;})[0];return {cursor:{tableIndex:0,row:1},rollingRoot:hash_(stableJson_(['NODE_FIRESTORE_SOURCE_V2',context.bookId,context.title,context.timeZone,context.sourceConfigHash,context.runtimeConfigHash,context.catalogHash,context.metadataHash])),rowsRoot:firestoreMigrationRowsSeed_(),counts:{tableCount:context.tables.length,rowDocumentCount:0,recordIdCount:0,operationCount:0},matchingIdentityBound:matching?Math.min(40,matching.rowCount):0,maxDocumentBytes:0,pageCount:0,done:false};}
+function firestoreMigrationScanPage_(context,scan){if(scan.done)fail_('MIGRATION_CHECKPOINT','確認済みの範囲を重ねて実行できません。');var page=firestoreMigrationSourcePage_(context,scan.cursor);scan.rollingRoot=hash_(stableJson_(['NODE_FIRESTORE_PAGE_V2',scan.rollingRoot,page.pageHash]));page.documents.forEach(function(item){scan.rowsRoot=firestoreMigrationRowsAdd_(scan.rowsRoot,item);scan.maxDocumentBytes=Math.max(scan.maxDocumentBytes,firestoreMigrationUtf8Length_(item));});Object.keys(page.countsDelta).forEach(function(key){scan.counts[key]+=page.countsDelta[key];});scan.matchingIdentityBound=Math.max(scan.matchingIdentityBound,page.matchingIdentityBound);scan.cursor=page.nextCursor;scan.pageCount++;scan.done=page.done;if(scan.done)scan.sourceHash=hash_(stableJson_(['NODE_FIRESTORE_ROOT_V2',scan.rollingRoot,scan.rowsRoot,scan.counts,scan.matchingIdentityBound,scan.maxDocumentBytes,scan.pageCount]));return page;}
+function firestoreMigrationContextBinding_(context){return {sourceSpreadsheetId:context.bookId,sourceConfigHash:context.sourceConfigHash,runtimeConfigHash:context.runtimeConfigHash,catalogHash:context.catalogHash,metadataHash:context.metadataHash};}
+function firestoreMigrationAssertContext_(state,context,owner){if(requireOwner_()!==owner||(state.ownerEmail!==undefined?state.ownerEmail!==owner:state.ownerHash!==hash_(owner)))fail_('FORBIDDEN','移行の実行者が変わりました。');var binding=firestoreMigrationContextBinding_(context);if(Object.keys(binding).some(function(key){return state[key]!==binding[key];})||hash_(stableJson_(config_()))!==context.sourceConfigHash)fail_('MIGRATION_SOURCE_CHANGED','移行元の目録・管理ID・接続設定が変わりました。元データへ書かずに停止しました。');if(state.target){var target=firestoreMigrationTarget_();if(target.projectId!==state.target.projectId||target.databaseId!==state.target.databaseId)fail_('MIGRATION_SOURCE_CHANGED','移行先設定が変わりました。');}}
+function firestoreMigrationAssertScan_(state,scan){if(!scan.done||scan.sourceHash!==state.sourceHash||stableJson_(scan.counts)!==stableJson_(state.counts)||scan.rowsRoot!==state.rowsRoot||scan.matchingIdentityBound!==state.matchingIdentityBound||scan.maxDocumentBytes!==state.maxDocumentBytes)fail_('MIGRATION_SOURCE_CHANGED','移行元の内容が確認した版から変わりました。保存先を切り替えず停止しました。');}
+function firestoreMigrationBudget_(context){return {remaining:16,deadline:context.startedAt+28000};}
+function firestoreMigrationBudgetNext_(budget){if(budget.remaining<1||Date.now()>budget.deadline)return false;budget.remaining--;return true;}
+function previewNodeFirestoreMigration(){firestoreMigrationReset_();return withLock_(function(){var owner=requireOwner_(),config=config_();if(props_().getProperty('NODE_STORAGE_PROVIDER')==='firestore')fail_('MIGRATION_ALREADY_ACTIVE','Firebaseへの切替は完了しています。');var context=firestoreMigrationContext_(config),preview=firestoreMigrationPreview_();if(preview&&preview.scan.done)preview=null;if(!preview)preview=Object.assign({rootHashVersion:2,ownerHash:hash_(owner),createdAt:new Date().toISOString(),scan:firestoreMigrationScan_(context)},firestoreMigrationContextBinding_(context));firestoreMigrationAssertContext_(preview,context,owner);var budget=firestoreMigrationBudget_(context);while(!preview.scan.done&&firestoreMigrationBudgetNext_(budget)){firestoreMigrationScanPage_(context,preview.scan);firestoreMigrationCheckpointSave_(FIRESTORE_MIGRATION_PREVIEW_KEY,preview);}firestoreMigrationAssertContext_(preview,context,owner);context.readStats.elapsedMs=Date.now()-context.startedAt;return firestoreMigrationSummary_({phase:'preview',sourceHash:preview.scan.sourceHash||'',counts:preview.scan.counts},{rootHashVersion:2,more:!preview.scan.done,readOnly:true,readStats:context.readStats,prepareConfirmation:preview.scan.done?'PREPARE:'+preview.scan.sourceHash:''});});}
+function prepareNodeFirestoreMigration(){firestoreMigrationReset_();return withLock_(function(){var owner=requireOwner_(),config=config_();if(props_().getProperty('NODE_STORAGE_PROVIDER')==='firestore')fail_('MIGRATION_ALREADY_ACTIVE','Firebaseへの切替は完了しています。');if(props_().getProperty(NODE.probeKey))fail_('COPY_PROBE_PENDING','保存確認の予約が残っています。先に確認を完了してください。');var context=firestoreMigrationContext_(config),target=firestoreMigrationTarget_(),state=firestoreMigrationState_();
+  if(!state||state.phase==='abandoned'){var preview=firestoreMigrationPreview_();if(!preview||!preview.scan.done)fail_('MIGRATION_CONFIRM_REQUIRED','移行前の分割確認を最後まで実行してください。');firestoreMigrationAssertContext_(preview,context,owner);firestoreMigrationConfirm_('PREPARE:'+preview.scan.sourceHash);var id=Utilities.getUuid().replace(/-/g,'');state=Object.assign({rootHashVersion:2,phase:'prepared',importId:id,target:Object.assign({},target,{workbookId:'migration-'+id}),ownerEmail:owner,sourceHash:preview.scan.sourceHash,counts:preview.scan.counts,rowsRoot:preview.scan.rowsRoot,matchingIdentityBound:preview.scan.matchingIdentityBound,maxDocumentBytes:preview.scan.maxDocumentBytes,cursor:0,preparedAt:new Date().toISOString(),preparedComplete:false,scan:firestoreMigrationScan_(context)},firestoreMigrationContextBinding_(context));firestoreMigrationSaveState_(state);}
+  if(state.rootHashVersion!==2)fail_('MIGRATION_STATE','旧形式の未完了移行は先に中止し、新しい確認からやり直してください。');firestoreMigrationAssertContext_(state,context,owner);firestoreMigrationConfirm_('PREPARE:'+state.sourceHash);if(state.phase!=='prepared')return firestoreMigrationSummary_(state,{more:false,frozen:true});var budget=firestoreMigrationBudget_(context);while(!state.preparedComplete&&firestoreMigrationBudgetNext_(budget)){firestoreMigrationScanPage_(context,state.scan);if(state.scan.done){firestoreMigrationAssertScan_(state,state.scan);state.preparedComplete=true;delete state.scan;}firestoreMigrationSaveState_(state);}return firestoreMigrationSummary_(state,{more:!state.preparedComplete,frozen:true});
+});}
+function firestoreMigrationBatchRead_(target,items){if(!items.length)return {};var names=items.map(function(item){return firestoreDocumentName_(target,'nodeWorkbooks/'+target.workbookId+'/'+item.path);});if(names.length>64)fail_('MIGRATION_LIMIT','検証ページの件数が多すぎます。');var response=firestoreRequest_('post',':batchGet',{documents:names},target),found=Object.create(null),seen=Object.create(null);if(!Array.isArray(response)||response.length!==names.length)fail_('MIGRATION_VERIFY_FAILED','Firebaseの確認応答が欠落しています。');response.forEach(function(entry){var name=entry&&entry.found&&entry.found.name||entry&&entry.missing;if(typeof name!=='string'||names.indexOf(name)<0||seen[name]||!!entry.found===!!entry.missing)fail_('MIGRATION_VERIFY_FAILED','Firebaseの確認位置が重複・不一致です。');seen[name]=true;if(entry.found)found[name]=entry.found;});return found;}
+function firestoreMigrationEnsureDocuments_(target,items){var found=firestoreMigrationBatchRead_(target,items),writes=[];items.forEach(function(item){var name=firestoreDocumentName_(target,'nodeWorkbooks/'+target.workbookId+'/'+item.path),existing=found[name];if(existing){if(stableJson_(firestoreDecodeFields_(existing.fields))!==stableJson_(item.data))fail_('MIGRATION_VERIFY_FAILED','移行先に異なる内容があります。上書きせず停止しました。');}else writes.push(firestoreMigrationDocument_(target,item.path,item.data,{exists:false}));});firestoreMigrationWrite_(target,writes);}
+function firestoreMigrationCheckDocuments_(target,items){var found=firestoreMigrationBatchRead_(target,items);items.forEach(function(item){var existing=found[firestoreDocumentName_(target,'nodeWorkbooks/'+target.workbookId+'/'+item.path)];if(!existing||stableJson_(firestoreDecodeFields_(existing.fields))!==stableJson_(item.data))fail_('MIGRATION_VERIFY_FAILED','Firebaseの行が不足・変更されています。保存先は切り替えていません。');});}
+function firestoreMigrationAcceptProof_(state,proof){if(stableJson_(proof)===stableJson_(firestoreMigrationProof_(state,proof.state)))return true;var task=state.task;if(task&&task.kind==='verify'&&proof.state==='verified'&&typeof task.proofVerifiedAt==='string'){var future=Object.assign({},state,{verifiedAt:task.proofVerifiedAt});return stableJson_(proof)===stableJson_(firestoreMigrationProof_(future,'verified'));}return false;}
+function firestoreMigrationCheckManifest_(state,context,allowed){var current=firestoreMigrationRead_(state.target,'');if(!current||typeof current.updateTime!=='string'||!current.updateTime)fail_('MIGRATION_VERIFY_FAILED','Firebaseの移行目録がありません。');var manifest=firestoreDecodeFields_(current.fields),proof=manifest.migrationProof,expected=Object.assign({},firestoreMigrationManifest_(context),{migrationProof:proof});if(!proof||allowed.indexOf(proof.state)<0||stableJson_(manifest)!==stableJson_(expected)||!firestoreMigrationAcceptProof_(state,proof))fail_('MIGRATION_VERIFY_FAILED','Firebaseの移行目録・証明が一致しません。');return {current:current,manifest:manifest};}
+function importNodeFirestoreMigration(){firestoreMigrationReset_();return withLock_(function(){var owner=requireOwner_(),state=firestoreMigrationState_(),config=config_();if(!state||state.rootHashVersion!==2||['prepared','importing','ready'].indexOf(state.phase)<0||!state.preparedComplete)fail_('MIGRATION_STATE','分割した移行準備を最後まで実行してください。');var context=firestoreMigrationContext_(config);firestoreMigrationAssertContext_(state,context,owner);if(state.phase==='ready')return firestoreMigrationSummary_(state,{more:false,frozen:true});
+  if(state.phase==='prepared'){var manifest=Object.assign({},firestoreMigrationManifest_(context),{migrationProof:firestoreMigrationProof_(state,'importing')}),existing=firestoreMigrationRead_(state.target,'');if(existing){if(stableJson_(firestoreDecodeFields_(existing.fields))!==stableJson_(manifest))fail_('MIGRATION_VERIFY_FAILED','移行先の目録が異なります。');}else firestoreMigrationWrite_(state.target,[firestoreMigrationDocument_(state.target,'',manifest,{exists:false})]);var tables=context.tables.map(function(info){return {path:'tables/'+info.id,data:firestoreMigrationTableData_(context,info,state.matchingIdentityBound)};});for(var offset=0;offset<tables.length;offset+=64)firestoreMigrationEnsureDocuments_(state.target,tables.slice(offset,offset+64));state.phase='importing';state.scan=firestoreMigrationScan_(context);firestoreMigrationSaveState_(state);}
+  var budget=firestoreMigrationBudget_(context);while(!state.scan.done&&firestoreMigrationBudgetNext_(budget)){var page=firestoreMigrationScanPage_(context,state.scan);firestoreMigrationEnsureDocuments_(state.target,page.documents);state.cursor=context.tables.length+state.scan.counts.rowDocumentCount;firestoreMigrationSaveState_(state);}if(state.scan.done){firestoreMigrationAssertScan_(state,state.scan);var checked=firestoreMigrationCheckManifest_(state,context,['importing','ready']);if(checked.manifest.migrationProof.state!=='ready'){checked.manifest.migrationProof=firestoreMigrationProof_(state,'ready');firestoreMigrationWrite_(state.target,[firestoreMigrationDocument_(state.target,'',checked.manifest,{updateTime:checked.current.updateTime})]);}state.phase='ready';delete state.scan;firestoreMigrationSaveState_(state);}return firestoreMigrationSummary_(state,{more:state.phase!=='ready',frozen:true});
+});}
+function firestoreMigrationTargetListPage_(state,context,task){var list=task.list,prefix='nodeWorkbooks/'+state.target.workbookId,root=firestoreDocumentName_(state.target,prefix),page;
+  if(!list.tablesDone){page=firestoreRequest_('get',prefix+'/tables?pageSize=64&showMissing=true'+(list.pageToken?'&pageToken='+encodeURIComponent(list.pageToken):''),undefined,state.target);firestoreMigrationListEnvelope_(page,list.pageToken);(page.documents||[]).forEach(function(document){var path=document&&document.name;if(typeof path!=='string'||path.indexOf(root+'/tables/')!==0||path.slice((root+'/tables/').length).indexOf('/')>=0||path<=list.lastName)fail_('MIGRATION_VERIFY_FAILED','Firebaseの表の一覧が重複・不一致です。');var idText=path.slice((root+'/tables/').length),info=context.tables.filter(function(t){return String(t.id)===idText;})[0];if(!info||!document.fields||stableJson_(firestoreDecodeFields_(document.fields))!==stableJson_(firestoreMigrationTableData_(context,info,state.matchingIdentityBound)))fail_('MIGRATION_VERIFY_FAILED','Firebaseに余分な表・変更された表があります。');list.lastName=path;list.tablesSeen++;});list.pageToken=page.nextPageToken||'';if(!list.pageToken){if(list.tablesSeen!==context.tables.length)fail_('MIGRATION_VERIFY_FAILED','Firebaseの表の件数が一致しません。');list.tablesDone=true;list.lastName='';}return;}
+  if(list.tableIndex>=context.tables.length){if(list.rowCount!==state.counts.rowDocumentCount||list.rowsRoot!==state.rowsRoot)fail_('MIGRATION_VERIFY_FAILED','Firebaseの行の内容・件数が元データと一致しません。');list.done=true;return;}
+  var info=context.tables[list.tableIndex],rowPrefix=root+'/tables/'+info.id+'/rows/';page=firestoreRequest_('get',prefix+'/tables/'+info.id+'/rows?pageSize='+Math.max(1,Math.min(64,Math.floor(3500000/Math.max(1,state.maxDocumentBytes))))+'&showMissing=true'+(list.pageToken?'&pageToken='+encodeURIComponent(list.pageToken):''),undefined,state.target);firestoreMigrationListEnvelope_(page,list.pageToken);(page.documents||[]).forEach(function(document){var path=document&&document.name,idText=typeof path==='string'&&path.slice(rowPrefix.length),row=Number(idText);if(typeof path!=='string'||path.indexOf(rowPrefix)!==0||!/^\d{8}$/.test(idText)||row<1||row>info.end||path<=list.lastName)fail_('MIGRATION_VERIFY_FAILED','Firebaseに余分な行・重複行・範囲外の行があります。');if(!document.fields)fail_('MIGRATION_VERIFY_FAILED','Firebaseに内容のない親行があります。');var data=firestoreDecodeFields_(document.fields);if(data.row!==row||typeof data.payload!=='string'||typeof data.hasMetadata!=='boolean'||firestoreMigrationUtf8Length_(data)>880000)fail_('MIGRATION_VERIFY_FAILED','Firebaseの行の保存形式が一致しません。');list.rowsRoot=firestoreMigrationRowsAdd_(list.rowsRoot,{path:'tables/'+info.id+'/rows/'+idText,data:data});list.rowCount++;if(list.rowCount>state.counts.rowDocumentCount)fail_('MIGRATION_VERIFY_FAILED','Firebaseに余分な行があります。');list.lastName=path;});list.pageToken=page.nextPageToken||'';if(!list.pageToken){list.tableIndex++;list.lastName='';}
+}
+function firestoreMigrationListEnvelope_(page,prior){if(!page||typeof page!=='object'||Array.isArray(page)||page.documents!==undefined&&!Array.isArray(page.documents)||(page.documents||[]).length>64||page.nextPageToken!==undefined&&(typeof page.nextPageToken!=='string'||page.nextPageToken.length>3000||page.nextPageToken&&page.nextPageToken===prior))fail_('MIGRATION_VERIFY_FAILED','Firebaseの一覧の確認位置が不正です。');}
+function firestoreMigrationRunVerification_(state,context,owner,kind){
+  firestoreMigrationAssertContext_(state,context,owner);if(!state.task||state.task.kind!==kind){if(state.task)fail_('MIGRATION_STATE','別の検証が途中です。同じ確認を続けてください。');var initial=firestoreMigrationCheckManifest_(state,context,kind==='activate'?['verified']:['ready','verified']);state.task={kind:kind,stage:'sourceBefore',manifestUpdateTime:initial.current.updateTime,proofVerifiedAt:kind==='verify'?new Date().toISOString():'',scan:firestoreMigrationScan_(context)};firestoreMigrationSaveState_(state);}
+  var task=state.task,budget=firestoreMigrationBudget_(context);/* A persisted finalize cursor may be a lost proof receipt. Recheck from a fresh pass instead of trusting a possibly old completed scan. */if(task.stage==='finalize'){var recovery=firestoreMigrationCheckManifest_(state,context,kind==='activate'?['verified','active']:['ready','verified']);task.stage='sourceBefore';task.manifestUpdateTime=recovery.current.updateTime;task.scan=firestoreMigrationScan_(context);delete task.finishedAt;firestoreMigrationSaveState_(state);}if(task.stage!=='finalize'){var current=firestoreMigrationCheckManifest_(state,context,kind==='activate'?['verified','active']:['ready','verified']);if(current.current.updateTime!==task.manifestUpdateTime)fail_('MIGRATION_VERIFY_FAILED','確認中にFirebaseの目録が変更されました。');}
+  while(task.stage!=='finalize'&&firestoreMigrationBudgetNext_(budget)){
+    if(task.stage==='targetList'){firestoreMigrationTargetListPage_(state,context,task);if(task.list.done){delete task.list;task.stage='sourceAfter';task.scan=firestoreMigrationScan_(context);}}
+    else {var page=firestoreMigrationScanPage_(context,task.scan);if(task.stage==='targetExact'||task.stage==='sourceAfter')firestoreMigrationCheckDocuments_(state.target,page.documents);if(task.scan.done){firestoreMigrationAssertScan_(state,task.scan);if(task.stage==='sourceBefore'){task.stage='targetExact';task.scan=firestoreMigrationScan_(context);var tables=context.tables.map(function(info){return {path:'tables/'+info.id,data:firestoreMigrationTableData_(context,info,state.matchingIdentityBound)};});for(var i=0;i<tables.length;i+=64)firestoreMigrationCheckDocuments_(state.target,tables.slice(i,i+64));}else if(task.stage==='targetExact'){delete task.scan;task.stage='targetList';task.list={tablesDone:false,tablesSeen:0,tableIndex:0,pageToken:'',lastName:'',rowCount:0,rowsRoot:firestoreMigrationRowsSeed_(),done:false};}else {delete task.scan;task.stage='finalize';task.finishedAt=new Date().toISOString();}}}
+    firestoreMigrationSaveState_(state);
+  }
+  if(task.stage!=='finalize')return firestoreMigrationSummary_(state,{rootHashVersion:2,more:true,frozen:true,verificationStage:task.stage});
+  firestoreMigrationAssertContext_(state,context,owner);var desiredState=Object.assign({},state);if(kind==='verify')desiredState.verifiedAt=task.proofVerifiedAt;var desiredPhase=kind==='activate'?'active':'verified',desiredProof=firestoreMigrationProof_(desiredState,desiredPhase),doc=firestoreMigrationRead_(state.target,''),manifest=doc&&firestoreDecodeFields_(doc.fields),expected=Object.assign({},firestoreMigrationManifest_(context),{migrationProof:manifest&&manifest.migrationProof});if(!manifest||stableJson_(manifest)!==stableJson_(expected))fail_('MIGRATION_VERIFY_FAILED','切替直前の移行目録が一致しません。');
+  if(stableJson_(manifest.migrationProof)!==stableJson_(desiredProof)){if(doc.updateTime!==task.manifestUpdateTime||stableJson_(manifest.migrationProof)!==stableJson_(firestoreMigrationProof_(state,manifest.migrationProof.state)))fail_('MIGRATION_VERIFY_FAILED','検証中に移行証明が変わりました。');manifest.migrationProof=desiredProof;firestoreMigrationWrite_(state.target,[firestoreMigrationDocument_(state.target,'',manifest,{updateTime:doc.updateTime})]);}
+  state.phase=desiredPhase;if(kind==='verify')state.verifiedAt=task.proofVerifiedAt;else state.activatedAt=task.finishedAt;delete state.task;firestoreMigrationSaveState_(state);
+  if(kind==='activate'){props_().setProperties({NODE_FIRESTORE_CONFIG:JSON.stringify(state.target),NODE_STORAGE_PROVIDER:'firestore'});firestoreMigrationReset_();if(!firestoreMigrationReady_(config_()))fail_('MIGRATION_VERIFY_FAILED','切替後の保存先を確認できません。');return firestoreMigrationSummary_(state,{more:false,active:true,sourceUnchanged:true});}
+  return firestoreMigrationSummary_(state,{more:false,verified:true,frozen:true,activateConfirmation:'ACTIVATE:'+state.sourceHash});
+}
+function verifyNodeFirestoreMigration(){firestoreMigrationReset_();return withLock_(function(){var owner=requireOwner_(),state=firestoreMigrationState_(),config=config_();if(!state||state.rootHashVersion!==2||['ready','verified'].indexOf(state.phase)<0)fail_('MIGRATION_STATE','取り込みを完了してから検証してください。');var context=firestoreMigrationContext_(config);return firestoreMigrationRunVerification_(state,context,owner,'verify');});}
+/* The legacy activated proof remains readable. No source scan is needed to
+ * recover an already active provider, so later legitimate app writes survive. */
+function firestoreMigrationProofState_(proof){return {rootHashVersion:proof.rootHashVersion,target:{projectId:proof.projectId,databaseId:proof.databaseId,workbookId:proof.workbookId},sourceSpreadsheetId:proof.sourceSpreadsheetId,sourceConfigHash:proof.sourceConfigHash,runtimeConfigHash:proof.runtimeConfigHash,sourceHash:proof.sourceHash,importId:proof.importId};}
+function activateNodeFirestoreMigration(){firestoreMigrationReset_();try{return withLock_(function(){var owner=requireOwner_(),state=firestoreMigrationState_(),config=config_();if(!state||['verified','active'].indexOf(state.phase)<0)fail_('MIGRATION_STATE','移行データの検証を完了してから切り替えてください。');firestoreMigrationConfirm_('ACTIVATE:'+state.sourceHash);if(state.phase==='active'){
+  if(state.ownerEmail!==owner||state.runtimeConfigHash!==firestoreRuntimeConfigHash_(config))fail_('MIGRATION_VERIFY_FAILED','切替済みの保存先設定が一致しません。');var current=firestoreMigrationRead_(state.target,''),manifest=current&&firestoreDecodeFields_(current.fields),proof=manifest&&manifest.migrationProof;if(!manifest||manifest.sourceSpreadsheetId!==state.sourceSpreadsheetId||manifest.sourceConfigHash!==state.sourceConfigHash||manifest.runtimeConfigHash!==state.runtimeConfigHash||!Number.isSafeInteger(manifest.revision)||manifest.revision<0||!proof||proof.state!=='active'||stableJson_(firestoreMigrationBinding_(state))!==stableJson_(firestoreMigrationBinding_(firestoreMigrationProofState_(proof)))||!constantEqual_(proof.seal,firestoreMigrationSeal_(state)))fail_('MIGRATION_VERIFY_FAILED','切替済みのFirebase移行証明を確認できません。');if(props_().getProperty('NODE_STORAGE_PROVIDER')!=='firestore'||props_().getProperty('NODE_FIRESTORE_CONFIG')!==JSON.stringify(state.target))props_().setProperties({NODE_FIRESTORE_CONFIG:JSON.stringify(state.target),NODE_STORAGE_PROVIDER:'firestore'});firestoreMigrationReset_();if(!firestoreMigrationReady_(config))fail_('MIGRATION_VERIFY_FAILED','有効な保存先を確認できません。');return firestoreMigrationSummary_(state,{more:false,active:true});
+  }if(state.rootHashVersion!==2)fail_('MIGRATION_STATE','旧形式の未完了移行は中止して再確認してください。');var context=firestoreMigrationContext_(config);return firestoreMigrationRunVerification_(state,context,owner,'activate');});}finally{if(typeof firestoreClose_==='function')firestoreClose_();}}
+function cancelNodeFirestoreMigration(){firestoreMigrationReset_();return withLock_(function(){var owner=requireOwner_(),state=firestoreMigrationState_();if(!state||state.phase==='abandoned')return {more:false,canceled:true,sourceUnchanged:true};if(state.ownerEmail!==owner)fail_('FORBIDDEN','準備した所有者のみ移行を中止できます。');if(state.phase==='active'||props_().getProperty('NODE_STORAGE_PROVIDER')==='firestore')fail_('MIGRATION_ALREADY_ACTIVE','切替済みのため旧保存先には自動で戻しません。');firestoreMigrationConfirm_('CANCEL:'+state.sourceHash);state.phase='abandoned';state.abandonedAt=new Date().toISOString();delete state.scan;delete state.task;firestoreMigrationSaveState_(state);return firestoreMigrationSummary_(state,{more:false,canceled:true,sourceUnchanged:true});});}
+function firestoreMigrationReady_(config){if(props_().getProperty('NODE_STORAGE_PROVIDER')!=='firestore')return false;var state=firestoreMigrationState_();if(!state||state.phase!=='active'||state.sourceSpreadsheetId===NODE.originalId||state.sourceSpreadsheetId!==config.spreadsheetId||state.runtimeConfigHash!==firestoreRuntimeConfigHash_(config))return false;var target=firestoreConfig_();if(stableJson_(target)!==stableJson_(state.target))return false;var book=firestoreOpenBook_(config),manifest=book._firestoreManifest;if(!manifest||manifest.sourceSpreadsheetId!==config.spreadsheetId||manifest.sourceConfigHash!==state.sourceConfigHash||manifest.runtimeConfigHash!==state.runtimeConfigHash||!manifest.migrationProof)return false;var proof=manifest.migrationProof;return proof.state==='active'&&proof.sourceHash===state.sourceHash&&stableJson_(firestoreMigrationBinding_(state))===stableJson_(firestoreMigrationBinding_(firestoreMigrationProofState_(proof)))&&constantEqual_(proof.seal,firestoreMigrationSeal_(state));}
+
+/* Seven monthly targets. Included in Code.gs at release; no Google service is called at file load.
+ * Integration: authenticated/read-budgeted readMetricGoals -> readMetricGoals_;
+ * saveMetricGoals -> saveMetricGoals_ (also add it to nodeStorageMutation_).
+ * Snapshot metadata metricGoalsFeature=true must only be enabled with both routes deployed.
+ */
+var METRIC_GOALS_TAB='_NODE_metric_goals';
+var METRIC_GOALS_HEADERS=['playerId','month','targets','dailyBasis','customBusinessDays','version','updatedAt','actorId'];
+var METRIC_GOAL_STAGES=['候補者面談','提案','C面談予約','クライアント面談','内定','内定承諾','稼働開始'];
+function metricGoalMonth_(value){if(typeof value!=='string'||!/^(19\d{2}|20\d{2}|2100)-(0[1-9]|1[0-2])$/.test(value))fail_('VALIDATION','目標の年月を1900年〜2100年で指定してください。');return value;}
+function metricGoalDays_(month){metricGoalMonth_(month);var p=month.split('-').map(Number);return new Date(Date.UTC(p[0],p[1],0)).getUTCDate();}
+function metricGoalTargets_(value){writingObject_(value,METRIC_GOAL_STAGES);if(Object.keys(value).length!==METRIC_GOAL_STAGES.length)fail_('VALIDATION','7工程の目標を指定してください。');var targets={};METRIC_GOAL_STAGES.forEach(function(stage){var n=value[stage];if(n!==null&&(!Number.isSafeInteger(n)||n<0||n>9999))fail_('VALIDATION','目標は0〜9999の整数、未設定は空欄にしてください。');targets[stage]=n;});return targets;}
+function metricGoalBasis_(basis,customDays,month){var valid=(basis==='calendar'||basis==='weekdays')?customDays===null:basis==='custom'&&Number.isInteger(customDays)&&customDays>=1&&customDays<=metricGoalDays_(month);if(!valid)fail_('VALIDATION','日割り基準と指定営業日数を確認してください。');return basis;}
+function metricGoalTable_(book){
+ var state=intakeTable_(book,METRIC_GOALS_TAB,METRIC_GOALS_HEADERS),seen=Object.create(null);
+ state.entries=state.rows.map(function(row,index){
+  if(row.every(function(v){return v===''||v===null;}))return null;
+  var month,targets,basis;try{month=metricGoalMonth_(row[1]);targets=metricGoalTargets_(JSON.parse(row[2]));basis=metricGoalBasis_(row[3],row[4]===''?null:row[4],month);}catch(_){fail_('SCHEMA_MISMATCH','7工程目標の年月・数値・日割り基準を確認してください。');}
+  var key=row[0]+'|'+month;if(typeof row[0]!=='string'||!/^ND-\d+$/.test(row[0])||seen[key]||typeof row[5]!=='string'||!/^[A-Za-z0-9_-]{43}$/.test(row[5])||typeof row[6]!=='string'||!/^\d{4}-\d{2}-\d{2}T/.test(row[6])||!isFinite(Date.parse(row[6]))||typeof row[7]!=='string'||!/^[A-Za-z0-9_-]{1,30}$/.test(row[7]))fail_('SCHEMA_MISMATCH','7工程目標の担当者・重複・保存状態を確認してください。');
+  seen[key]=true;return {playerId:row[0],month:month,targets:targets,dailyBasis:basis,customBusinessDays:row[4]===''?null:row[4],version:row[5],updatedAt:row[6],row:index+2};
+ }).filter(Boolean);return state;
+}
+function publicMetricGoal_(goal,proposal){return {playerId:goal.playerId,month:goal.month,targets:Object.assign({},goal.targets,{'提案':proposal?proposal.target:null}),dailyBasis:goal.dailyBasis,customBusinessDays:goal.customBusinessDays,version:goal.version,updatedAt:goal.updatedAt};}
+function metricGoalCounts_(all,players){var result={};players.forEach(function(player){result[player.id]={};METRIC_GOAL_STAGES.forEach(function(stage){var n=all&&all[player.id]&&all[player.id][stage];result[player.id][stage]=Number.isSafeInteger(n)&&n>=0?n:0;});});return result;}
+function readMetricGoals_(request){
+ var session=authenticate_(request.token,false,request.background===true),accounts=readAccountStore_(),actor=activeActor_(accounts,session),payload=request.payload||{};writingObject_(payload,['month']);var month=metricGoalMonth_(payload.month),store=readStore_({readOnly:true},accounts),state=metricGoalTable_(store.book),legacy=monthlyTargetTable_(store.book),players=store.players.filter(function(p){return p.role==='player';}),ids=players.map(function(p){return p.id;}),counts=countActivities_(activities_(store),players),daily={};
+ Object.keys(counts).forEach(function(period){if(period.length===10&&period.slice(0,7)===month)daily[period]=metricGoalCounts_(counts[period],players);});
+ var result={feature:true,month:month,today:today_(),checkedAt:new Date().toISOString(),players:players.map(function(p){return {id:p.id,name:p.name,active:p.active};}),goals:state.entries.filter(function(g){return g.month===month&&ids.indexOf(g.playerId)>=0;}).map(function(g){return publicMetricGoal_(g,legacy.entries.find(function(p){return p.playerId===g.playerId&&p.month===month;}));}),legacyProposalGoals:legacy.entries.filter(function(g){return g.month===month&&ids.indexOf(g.playerId)>=0;}).map(publicMonthlyGoal_),counts:metricGoalCounts_(counts[month],players),dailyCounts:daily};
+ // Recheck both tables and the actor after reading. No candidate name, rate, memo or source is returned.
+ if(metricGoalTable_(store.book).fingerprint!==state.fingerprint||monthlyTargetTable_(store.book).fingerprint!==legacy.fingerprint)fail_('BUSY','月別目標が更新されています。最新の情報を取得してください。');snapshotActor_(store,request.token);return result;
+}
+function metricGoalPayload_(payload){
+ writingObject_(payload,['playerId','month','targets','dailyBasis','customBusinessDays','expectedVersion','expectedProposalVersion']);var playerId=shortText_(payload.playerId,30,true),month=metricGoalMonth_(payload.month),targets=metricGoalTargets_(payload.targets),basis=metricGoalBasis_(payload.dailyBasis,payload.customBusinessDays,month);
+ ['expectedVersion','expectedProposalVersion'].forEach(function(key){if(typeof payload[key]!=='string'||payload[key]!==''&&!/^[A-Za-z0-9_-]{43}$/.test(payload[key]))fail_('VALIDATION','最新の目標の保存状態を取得してください。');});
+ return {playerId:playerId,month:month,targets:targets,dailyBasis:basis,customBusinessDays:payload.customBusinessDays,expectedVersion:payload.expectedVersion,expectedProposalVersion:payload.expectedProposalVersion};
+}
+function metricGoalOwner_(store,actor,playerId){var owner=store.players.find(function(player){return player.id===playerId&&player.role==='player'&&(actor.role==='admin'||player.active);});if(!owner||actor.role!=='admin'&&actor.id!==playerId)fail_('FORBIDDEN','本人または管理者だけ月別目標を変更できます。');return owner;}
+function planMetricGoals_(store,actor,raw){
+ var payload=metricGoalPayload_(raw);guardProbeBusinessMutation_(store,actor,'saveMetricGoals',payload);if(probeReservation_(store,payload.playerId,false))fail_('FORBIDDEN','検証専用アカウントの目標は変更できません。');metricGoalOwner_(store,actor,payload.playerId);var state=metricGoalTable_(store.book),legacy=monthlyTargetTable_(store.book),old=state.entries.find(function(g){return g.playerId===payload.playerId&&g.month===payload.month;}),proposal=legacy.entries.find(function(g){return g.playerId===payload.playerId&&g.month===payload.month;});
+ if((old?old.version:'')!==payload.expectedVersion||(proposal?proposal.version:'')!==payload.expectedProposalVersion)fail_('CONFLICT','月別目標が更新されています。入力は保持したまま、最新の内容と比較してください。');
+ var now=new Date().toISOString(),version=random256_(),plan={requests:[],result:{playerId:payload.playerId,month:payload.month}};
+ intakeWritePlan_(store,plan,METRIC_GOALS_TAB,METRIC_GOALS_HEADERS,state,old?old.row:state.rows.length+2,[payload.playerId,payload.month,JSON.stringify(payload.targets),payload.dailyBasis,payload.customBusinessDays===null?'':payload.customBusinessDays,version,now,actor.id]);
+ // Never perform a second API write: the compatibility proposal and operation receipt
+ // commit in the SAME Sheets batch / Firestore transaction as the seven-stage row.
+ var legacyRow=proposal?proposal.row:legacy.sheet?legacy.sheet.getLastRow()+1:2;
+ if(payload.targets['提案']!==null||proposal)intakeWritePlan_(store,plan,NODE.monthlyTargetsTab,NODE.monthlyTargetHeaders,legacy,legacyRow,payload.targets['提案']===null?Array(NODE.monthlyTargetHeaders.length).fill(''):[payload.playerId,payload.month,payload.targets['提案'],version,now,actor.id]);
+ else {plan.intakeTableChecks.push({title:NODE.monthlyTargetsTab,headers:NODE.monthlyTargetHeaders,fingerprint:legacy.fingerprint,sheetId:legacy.sheet?legacy.sheet.getSheetId():null});}
+ return plan;
+}
+function saveMetricGoals_(request){
+ return withLock_(function(){
+  var session=authenticate_(request.token),store=readStore_({readOnly:true}),actor=activeActor_(store,session);assertManagedBook_(store.book);if(!writesEnabled_(store.config))fail_('WRITES_DISABLED','現在は読み取り専用です。');if(store.book.getSpreadsheetTimeZone()!=='Asia/Tokyo')fail_('TIMEZONE','保存先のタイムゾーンを確認してください。');
+  var payload=metricGoalPayload_(request.payload||{});guardProbeBusinessMutation_(store,actor,'saveMetricGoals',payload);if(probeReservation_(store,payload.playerId,false))fail_('FORBIDDEN','検証専用アカウントの目標は変更できません。');metricGoalOwner_(store,actor,payload.playerId);var operationId=shortText_(request.operationId,128,true);if(!/^[A-Za-z0-9_-]{16,128}$/.test(operationId))fail_('BAD_REQUEST','保存操作のIDが必要です。');
+  var payloadHash=hash_(stableJson_({action:'saveMetricGoals',payload:payload})),previous=operation_(store,operationId);
+  if(previous){if(previous.actorId!==actor.id||previous.action!=='saveMetricGoals'||previous.payloadHash!==payloadHash)fail_('OPERATION_CONFLICT','同じ保存IDを別の内容に使うことはできません。');snapshotActor_(store,request.token);return {committed:true,operationId:operationId};}
+  var plan=planMetricGoals_(store,actor,payload);commit_(store,actor,'saveMetricGoals',operationId,payloadHash,plan,request.token);
+  try {snapshotActor_(store,request.token);}catch(error){if(['AUTH_REQUIRED','UNAUTHENTICATED','UNAUTHORIZED','SESSION_EXPIRED'].indexOf(error.nodeCode)>=0)throw error;fail_('INTERNAL','保存結果を再確認してください。同じ保存IDで再試行できます。');}
+  return {committed:true,operationId:operationId};
+ });
+}
+
+/* Sales operations use the same atomic provider batch and operation receipt as activities.
+ * Integrate readSalesWorkflow and four planners in nodeHandle_, mutation/freeze/read budgets,
+ * teamMutationAction_ receipt handling, health feature, probe guard, and revalidateSalesPlan_.
+ * recordProposalSent must load a writable/full store because it may allocate a business row.
+ * This fragment never publishes private candidate data, financial terms or evidence references.
+ */
+var SALES_JOB_TAB='_NODE_work_jobs',SALES_PLAN_TAB='_NODE_proposal_plans',SALES_MATCH_TAB='_NODE_match_reports';
+var SALES_HEADERS=['id','body','version','updatedAt'];
+function salesMutationAction_(action){return ['saveWorkJob','saveProposalPlan','recordProposalSent','saveMatchReport'].indexOf(action)>=0;}
+function salesObject_(value,keys){if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(function(k){return keys.indexOf(k)<0;}))fail_('VALIDATION','営業管理の入力項目を確認してください。');return value;}
+function salesId_(value,empty){if(empty&&value==='')return '';if(!intakeId_(value))fail_('VALIDATION','営業管理のIDを確認してください。');return value;}
+function salesText_(value,max,required){var out=intakeText_(value,max).trim();if(required&&!out)fail_('VALIDATION','必須の項目を入力してください。');return out;}
+function salesNumber_(value,max){if(value!==null&&(typeof value!=='number'||!isFinite(value)||value<0||value>max))fail_('VALIDATION','数値を確認してください。未確認は空欄にしてください。');return value;}
+function salesDate_(value,empty){if(empty&&value==='')return '';var d=day_(value);if(typeof value!=='string'||!d||d!==value||d>today_())fail_('INVALID_DATE','実施済みの有効な日付を指定してください。');return d;}
+function salesPrice_(value){salesObject_(value,['amount','unit','tax']);return {amount:salesNumber_(value.amount,100000000),unit:choice_(value.unit,['unknown','hour','month','result']),tax:choice_(value.tax,['unknown','included','excluded'])};}
+function salesJobBody_(p){salesObject_(p,['company','title','product','description','requirements','target','workMode','contractPeriod','weekendPolicy','inexperiencedAllowed','requiredSalesType','requiredIndustries','requiredOther','preferredSalesType','preferredIndustries','preferredOther','clientReviewConditions','minMonthlyHours','minWeeklyDays','timeWindow','pcTools','workConditions','rateUnit','rateMin','rateMax','tax','status']);var out={company:salesText_(p.company,100,true),title:salesText_(p.title,120,true),product:salesText_(p.product,500,false),description:salesText_(p.description,3000,false),requirements:salesText_(p.requirements,2000,false),target:salesText_(p.target,500,false),workMode:choice_(p.workMode,['unknown','remote','onsite','remote_after_training']),contractPeriod:salesText_(p.contractPeriod,500,false),weekendPolicy:choice_(p.weekendPolicy,['unknown','allowed','not_allowed','negotiable']),inexperiencedAllowed:choice_(p.inexperiencedAllowed,['unknown','yes','no']),requiredSalesType:choice_(p.requiredSalesType,['unknown','b2b','b2c','both']),requiredIndustries:salesText_(p.requiredIndustries,500,false),requiredOther:salesText_(p.requiredOther,1000,false),preferredSalesType:choice_(p.preferredSalesType,['unknown','b2b','b2c','both']),preferredIndustries:salesText_(p.preferredIndustries,500,false),preferredOther:salesText_(p.preferredOther,1000,false),clientReviewConditions:salesText_(p.clientReviewConditions,1000,false),minMonthlyHours:salesNumber_(p.minMonthlyHours,744),minWeeklyDays:salesNumber_(p.minWeeklyDays,7),timeWindow:salesText_(p.timeWindow,200,false),pcTools:salesText_(p.pcTools,1000,false),workConditions:salesText_(p.workConditions,2000,false),rateUnit:choice_(p.rateUnit,['unknown','hour','month','result']),rateMin:salesNumber_(p.rateMin,100000000),rateMax:salesNumber_(p.rateMax,100000000),tax:choice_(p.tax,['unknown','included','excluded']),status:choice_(p.status,['open','paused','closed'])};if(out.rateMin!==null&&out.rateMax!==null&&out.rateMin>out.rateMax)fail_('VALIDATION','単価の下限と上限を確認してください。');return out;}
+function salesStamp_(v,empty){if(empty&&v==='')return '';if(typeof v!=='string'||!/^\d{4}-\d{2}-\d{2}T/.test(v)||!isFinite(Date.parse(v)))fail_('SCHEMA_MISMATCH','営業管理の日時を確認してください。');return v;}
+function salesTable_(book,title,kind){
+ var state=intakeTable_(book,title,SALES_HEADERS),seen=Object.create(null);
+ state.entries=state.rows.map(function(row,index){
+  var body;try{body=JSON.parse(row[1]);}catch(_){fail_('SCHEMA_MISMATCH','営業管理の保存内容を確認してください。');}
+  salesId_(row[0]);salesId_(row[2]);salesStamp_(row[3]);if(seen[row[0]])fail_('SCHEMA_MISMATCH','営業管理IDが重複しています。');seen[row[0]]=true;
+  if(!body||typeof body!=='object'||Array.isArray(body))fail_('SCHEMA_MISMATCH','営業管理の保存内容を確認してください。');
+  var meta=['version','createdAt','updatedAt'];
+  salesObject_(body,meta.concat(kind==='job'?['jobId','company','title','product','description','requirements','target','workMode','contractPeriod','weekendPolicy','inexperiencedAllowed','requiredSalesType','requiredIndustries','requiredOther','preferredSalesType','preferredIndustries','preferredOther','clientReviewConditions','minMonthlyHours','minWeeklyDays','timeWindow','pcTools','workConditions','rateUnit','rateMin','rateMax','tax','status','createdBy','updatedBy']:kind==='plan'?['planId','ownerId','recordId','profileId','company','jobId','status','reason','comment','sentDate','sentRecordId']:['reportId','ownerId','recordId','profileId','company','candidateName','agent','sale','wholesale','matchDate','comment','candidateEvidenceId','clientEvidenceId','status','confirmedBy','confirmedAt']));
+  if(kind==='job'){
+   var fields={};['company','title','product','description','requirements','target','workMode','contractPeriod','weekendPolicy','inexperiencedAllowed','requiredSalesType','requiredIndustries','requiredOther','preferredSalesType','preferredIndustries','preferredOther','clientReviewConditions','minMonthlyHours','minWeeklyDays','timeWindow','pcTools','workConditions','rateUnit','rateMin','rateMax','tax','status'].forEach(function(k){fields[k]=body[k];});salesJobBody_(fields);salesId_(body.jobId);teamAccount_(body.createdBy);teamAccount_(body.updatedBy);salesStamp_(body.createdAt);
+  }else if(kind==='plan'){
+   salesId_(body.planId);salesId_(body.recordId);salesId_(body.profileId,true);salesId_(body.jobId,true);salesId_(body.sentRecordId,true);teamAccount_(body.ownerId);salesText_(body.company,100,false);salesText_(body.reason,1000,false);salesText_(body.comment,2000,false);choice_(body.status,['planned','sent','unplaced','hold','canceled']);salesStamp_(body.createdAt);
+   if(body.sentDate&&(!day_(body.sentDate)||day_(body.sentDate)!==body.sentDate)||body.status==='sent'&&(!body.sentDate||!body.sentRecordId)||body.status==='planned'&&!body.company)fail_('SCHEMA_MISMATCH','提案予定と提案実績の状態を確認してください。');
+  }else{
+   salesId_(body.reportId);salesId_(body.recordId);salesId_(body.profileId,true);teamAccount_(body.ownerId);salesText_(body.company,100,false);salesText_(body.candidateName,60,true);salesText_(body.agent,100,false);salesText_(body.comment,2000,false);salesPrice_(body.sale);salesPrice_(body.wholesale);salesId_(body.candidateEvidenceId,true);salesId_(body.clientEvidenceId,true);choice_(body.status,['draft','submitted','returned','confirmed']);salesStamp_(body.createdAt);salesStamp_(body.confirmedAt,true);if(body.confirmedBy)teamAccount_(body.confirmedBy);
+   if(body.matchDate&&(!day_(body.matchDate)||day_(body.matchDate)!==body.matchDate))fail_('SCHEMA_MISMATCH','マッチ成立日を確認してください。');
+  }
+  var key=kind==='job'?'jobId':kind==='plan'?'planId':'reportId';if(body[key]!==row[0]||body.version!==row[2]||body.updatedAt!==row[3])fail_('SCHEMA_MISMATCH','営業管理の保存状態が一致しません。');body.row=index+2;return body;
+ });return state;
+}
+function salesPublic_(entry){var out=Object.assign({},entry);delete out.row;return out;}
+function salesTableCheck_(plan,title,state){teamTableCheck_(plan,title,SALES_HEADERS,state);}
+function salesWrite_(store,plan,title,state,previous,next){next.version=Utilities.getUuid();next.updatedAt=new Date().toISOString();var body=salesPublic_(next),key=title===SALES_JOB_TAB?'jobId':title===SALES_PLAN_TAB?'planId':'reportId';intakeWritePlan_(store,plan,title,SALES_HEADERS,state,previous?previous.row:state.rows.length+2,[body[key],JSON.stringify(body),body.version,body.updatedAt]);}
+function salesPrevious_(state,key,id,version){var previous=id?state.entries.find(function(p){return p[key]===salesId_(id);}):null;if(id&&!previous)fail_('NOT_FOUND','営業管理の対象が見つかりません。');if(previous?version!==previous.version:version!==undefined&&version!=='')fail_('CONFLICT','保存内容が更新されています。最新を取得してください。');return previous;}
+function salesRecord_(store,user,id,profileId,rowVersion){var record=findRecord_(store,salesId_(id));actorOwns_(user,record);if(profileId!==undefined&&salesId_(profileId,true)!==(record.profileId||''))fail_('CONFLICT','候補者の基本情報との関連が変わっています。');if(rowVersion!==undefined)checkVersion_(record,rowVersion);if(record.profileId){var profiles=candidateProfileTable_(store.book);matchingProfile_(store,profiles,record,record.playerId);}return record;}
+function salesPeriod_(value){if(value===undefined)return today_().slice(0,7);if(value==='all')return value;if(typeof value!=='string'||!/^(?:19\d{2}|20\d{2}|2100)-(?:0[1-9]|1[0-2])$/.test(value))fail_('VALIDATION','提案件数を表示する月を選んでください。');return value;}
+function salesReadCounts_(store,plans,period){var out=Object.create(null),seen=Object.create(null),owners=Object.create(null);store.players.forEach(function(p){if(p.role==='player')owners[p.id]=true;});store.records.forEach(function(r){var company=String(r.values[1]||'').trim(),date=r.dates[1];if(!owners[r.playerId]||!company||!date||period!=='all'&&date.slice(0,7)!==period||seen[r.recordId])return;seen[r.recordId]=true;var key=clientNameKey_(company);if(!out[key])out[key]={company:company,planned:0,sent:0};out[key].sent++;});plans.forEach(function(p){var record=findRecord_(store,p.recordId);if(p.status!=='planned'||!p.company||!owners[p.ownerId]||!record||record.playerId!==p.ownerId||p.profileId&&(record.profileId||'')!==p.profileId)return;var key=clientNameKey_(p.company);if(!out[key])out[key]={company:p.company,planned:0,sent:0};out[key].planned++;});return Object.keys(out).map(function(k){return out[k];}).sort(function(a,b){return b.sent-a.sent||a.company.localeCompare(b.company);});}
+function readSalesWorkflow_(request){
+ salesObject_(request.payload||{},['period']);var period=salesPeriod_((request.payload||{}).period),session=authenticate_(request.token,false,request.background===true),accounts=readAccountStore_(),user=activeActor_(accounts,session),store=readStore_({readOnly:true},accounts),jobs=salesTable_(store.book,SALES_JOB_TAB,'job'),plans=salesTable_(store.book,SALES_PLAN_TAB,'plan'),reports=salesTable_(store.book,SALES_MATCH_TAB,'report');
+ var visible=function(p){var record=findRecord_(store,p.recordId);return (user.role==='admin'||p.ownerId===user.id)&&record&&record.playerId===p.ownerId&&(!p.profileId||(record.profileId||'')===p.profileId);};
+ var ownPlans=plans.entries.filter(visible),result={feature:true,schemaVersion:1,period:period,jobs:jobs.entries.map(salesPublic_),plans:ownPlans.map(salesPublic_),reports:reports.entries.filter(visible).map(salesPublic_),companyCounts:salesReadCounts_(store,plans.entries,period),checkedAt:new Date().toISOString()};
+ snapshotActor_(store,request.token);return result;
+}
+function planWorkJob_(store,user,payload){
+ requireAdmin_(user);salesObject_(payload,['jobId','version','company','title','product','description','requirements','target','workMode','contractPeriod','weekendPolicy','inexperiencedAllowed','requiredSalesType','requiredIndustries','requiredOther','preferredSalesType','preferredIndustries','preferredOther','clientReviewConditions','minMonthlyHours','minWeeklyDays','timeWindow','pcTools','workConditions','rateUnit','rateMin','rateMax','tax','status']);var state=salesTable_(store.book,SALES_JOB_TAB,'job'),previous=salesPrevious_(state,'jobId',payload.jobId,payload.version),fields=Object.assign({},payload);delete fields.jobId;delete fields.version;
+ var next=Object.assign(salesJobBody_(fields),{jobId:previous?previous.jobId:Utilities.getUuid(),createdBy:previous?previous.createdBy:user.id,updatedBy:user.id,createdAt:previous?previous.createdAt:new Date().toISOString()}),plan={requests:[],result:{jobId:next.jobId},teamAdminRequired:true};salesWrite_(store,plan,SALES_JOB_TAB,state,previous,next);return plan;
+}
+function planProposalPlan_(store,user,payload){
+ salesObject_(payload,['planId','version','recordId','profileId','rowVersion','company','jobId','status','reason','comment']);var record=salesRecord_(store,user,payload.recordId,payload.profileId,payload.rowVersion),state=salesTable_(store.book,SALES_PLAN_TAB,'plan'),previous=salesPrevious_(state,'planId',payload.planId,payload.version),status=choice_(payload.status,['planned','unplaced','hold','canceled']),company=salesText_(payload.company,100,false),jobId=salesId_(payload.jobId,true),reason=salesText_(payload.reason,1000,false),comment=salesText_(payload.comment,2000,false);
+ if(previous&&(previous.recordId!==record.recordId||previous.ownerId!==record.playerId||previous.profileId&&previous.profileId!==(record.profileId||'')))fail_('FORBIDDEN','別の候補者の提案予定には変更できません。');if(previous&&previous.status==='sent')fail_('VALIDATION','提案済みの実績は実績の詳細から訂正してください。');
+ if(status==='planned'&&!company)fail_('VALIDATION','提案予定の会社を選んでください。');if(['unplaced','hold'].indexOf(status)>=0&&!reason)fail_('VALIDATION','提案先なし・保留の理由を記録してください。');if(status==='unplaced'&&(company||jobId))fail_('VALIDATION','提案先なしは会社・案件を空欄にしてください。');
+ var jobs=salesTable_(store.book,SALES_JOB_TAB,'job'),job=jobId?jobs.entries.find(function(j){return j.jobId===jobId;}):null;if(jobId&&(!job||job.status!=='open'||clientNameKey_(company)!==clientNameKey_(job.company)))fail_('VALIDATION','募集中の案件と会社を選び直してください。');
+ if(state.entries.some(function(p){return (!previous||p.planId!==previous.planId)&&p.ownerId===record.playerId&&(record.profileId?p.profileId===record.profileId:p.recordId===record.recordId)&&p.status===status&&(status==='unplaced'||clientNameKey_(p.company)===clientNameKey_(company)&&p.jobId===jobId);}))fail_('VALIDATION','同じ提案予定が登録済みです。既存の予定を編集してください。');
+ var next={planId:previous?previous.planId:Utilities.getUuid(),ownerId:record.playerId,recordId:record.recordId,profileId:record.profileId||'',company:company,jobId:jobId,status:status,reason:reason,comment:comment,sentDate:'',sentRecordId:'',createdAt:previous?previous.createdAt:new Date().toISOString()},plan={requests:[],result:{planId:next.planId}};salesWrite_(store,plan,SALES_PLAN_TAB,state,previous,next);salesTableCheck_(plan,SALES_JOB_TAB,jobs);addProfileRecordChecks_(plan,[record]);return plan;
+}
+function planProposalSent_(store,user,payload){
+ salesObject_(payload,['planId','version','rowVersion','date']);var state=salesTable_(store.book,SALES_PLAN_TAB,'plan'),previous=salesPrevious_(state,'planId',payload.planId,payload.version);if(!previous)fail_('NOT_FOUND','提案予定を選んでください。');var source=salesRecord_(store,user,previous.recordId,previous.profileId||undefined,payload.rowVersion),date=salesDate_(payload.date,false);if(previous.status!=='planned'||!previous.company)fail_('VALIDATION','提案予定を選んでから実施済みとして記録してください。');
+ var related=store.records.filter(function(r){return r.playerId===source.playerId&&(source.profileId?r.profileId===source.profileId:r.recordId===source.recordId);}),same=related.filter(function(r){return clientNameKey_(String(r.values[1]||''))===clientNameKey_(previous.company);});if(same.length>1)fail_('CONFLICT','同じ会社の提案行が複数あります。既存の履歴を確認してください。');var existing=same[0]||(!source.values[1]&&!source.dates[1]?source:null),plan,interview=related.map(function(r){return r.dates[0];}).filter(Boolean).sort()[0];if(!interview)fail_('VALIDATION','この候補者の面談実施を先に記録してください。');
+ if(existing&&existing.dates[1]){if(existing.dates[1]!==date)fail_('ALREADY_RECORDED','この会社への提案は記録済みです。実施日を履歴で確認してください。');plan={requests:[],result:{recordId:existing.recordId}};}
+ else{
+  // A same-name row is never chosen as the source. The exact record/profile relation was checked above.
+  var activity={playerId:source.playerId,candidateName:source.name,company:previous.company,stage:'提案',date:date,position:source.values[5],source:source.source||''};if(existing){activity.recordId=existing.recordId;activity.rowVersion=existing.version;}else if(source.profileId)activity.profileSourceRecordId=source.recordId;else fail_('VALIDATION','別会社への提案を追加する前に、この候補者の基本情報を保存してください。');
+  plan=planActivity_(store,user,activity);if(!existing||!existing.dates[0])setPatch_(plan,1,dayDate_(interview));
+ }
+ addProfileRecordChecks_(plan,related);if(source.profileId)addProfileGroupCheck_(store,plan,source.profileId);var target=plan.result.recordId,next=Object.assign({},previous,{status:'sent',profileId:source.profileId||'',sentDate:date,sentRecordId:target});delete next.row;plan.result.planId=previous.planId;salesWrite_(store,plan,SALES_PLAN_TAB,state,previous,next);return plan;
+}
+function planMatchReport_(store,user,payload){
+ salesObject_(payload,['reportId','version','recordId','profileId','rowVersion','agent','sale','wholesale','matchDate','comment','candidateEvidenceId','clientEvidenceId','status','confirmAgreement','recordMatch']);var record=salesRecord_(store,user,payload.recordId,payload.profileId,payload.rowVersion),state=salesTable_(store.book,SALES_MATCH_TAB,'report'),previous=salesPrevious_(state,'reportId',payload.reportId,payload.version),status=choice_(payload.status,['draft','submitted','returned','confirmed']);
+ if(previous&&(previous.recordId!==record.recordId||previous.ownerId!==record.playerId||previous.profileId&&previous.profileId!==(record.profileId||'')))fail_('FORBIDDEN','別の候補者のマッチ報告には変更できません。');if(!previous&&state.entries.some(function(p){return p.recordId===record.recordId;}))fail_('VALIDATION','この提案のマッチ報告は登録済みです。既存の報告を編集してください。');
+ if(previous&&previous.status==='confirmed')fail_('VALIDATION','確認済みの報告は変更できません。管理者へ訂正を依頼してください。');if(['returned','confirmed'].indexOf(status)>=0){requireAdmin_(user);if(!previous||previous.status!=='submitted')fail_('VALIDATION','提出済みの報告を選んでください。');}else if(previous&&previous.status==='submitted')fail_('VALIDATION','提出済みです。管理者による確認・差し戻しをお待ちください。');
+ if(typeof payload.confirmAgreement!=='boolean'||typeof payload.recordMatch!=='boolean')fail_('VALIDATION','成立の確認と実績反映の選択を確認してください。');
+ var sale=salesPrice_(payload.sale),wholesale=salesPrice_(payload.wholesale),date=salesDate_(payload.matchDate,true),agent=salesText_(payload.agent,100,false),comment=salesText_(payload.comment,2000,false),candidateEvidenceId=salesId_(payload.candidateEvidenceId,true),clientEvidenceId=salesId_(payload.clientEvidenceId,true),submitting=status==='submitted'||status==='confirmed';
+ if(submitting){if(!payload.confirmAgreement||!record.values[1]||!date||sale.amount===null||wholesale.amount===null||sale.unit==='unknown'||wholesale.unit==='unknown'||sale.tax==='unknown'||wholesale.tax==='unknown'||!candidateEvidenceId||!clientEvidenceId||candidateEvidenceId===clientEvidenceId)fail_('VALIDATION','成立日・会社・合意単価・税区分と、候補者側/クライアント側それぞれの証拠を確認してください。');if(typeof salesValidateEvidence_!=='function')fail_('FEATURE_UNAVAILABLE','証拠ファイルの権限確認を利用できないため、提出を停止しました。下書きは保存できます。');salesValidateEvidence_(store,user,[candidateEvidenceId,clientEvidenceId],record);}
+ if(status==='returned'&&!comment)fail_('VALIDATION','差し戻し理由を記録してください。');if(payload.recordMatch&&!submitting)fail_('VALIDATION','マッチ実績への反映は成立確認済みの提出時に選択してください。');
+ var plan={requests:[],result:{recordId:record.recordId}},matchIndex=NODE.stages.indexOf('内定承諾');if(submitting&&record.dates[matchIndex]&&record.dates[matchIndex]!==date)fail_('CONFLICT','登録済みのマッチ実施日と一致しません。履歴の日付を確認してください。');if(payload.recordMatch&&!record.dates[matchIndex])plan=planActivity_(store,user,{recordId:record.recordId,rowVersion:record.version,playerId:record.playerId,candidateName:record.name,company:String(record.values[1]||''),stage:'内定承諾',date:date,position:record.values[5],source:record.source||''});
+ var next={reportId:previous?previous.reportId:Utilities.getUuid(),ownerId:record.playerId,recordId:record.recordId,profileId:record.profileId||'',company:String(record.values[1]||''),candidateName:record.name,agent:agent,sale:sale,wholesale:wholesale,matchDate:date,comment:comment,candidateEvidenceId:candidateEvidenceId,clientEvidenceId:clientEvidenceId,status:status,confirmedBy:status==='confirmed'?user.id:'',confirmedAt:status==='confirmed'?new Date().toISOString():'',createdAt:previous?previous.createdAt:new Date().toISOString()};plan.result.reportId=next.reportId;salesWrite_(store,plan,SALES_MATCH_TAB,state,previous,next);addProfileRecordChecks_(plan,[record]);if(submitting)plan.salesEvidence={ids:[candidateEvidenceId,clientEvidenceId],recordId:record.recordId};return plan;
+}
+function revalidateSalesPlan_(store,user,plan){if(plan.salesEvidence){if(typeof salesValidateEvidence_!=='function')fail_('FEATURE_UNAVAILABLE','証拠の確認を利用できません。');salesValidateEvidence_(store,user,plan.salesEvidence.ids,findRecord_(store,plan.salesEvidence.recordId));}}
+
+/* Generated from the shared introduction V2 renderer. Do not edit. */
+var NODE_INTRODUCTION_V2 = (function(exports) {
+	Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
+	//#region lib/introduction-style.ts
+	/** Reusable structure recovered from the approved examples. Contains no candidate facts. */
+	const introductionHeadings = {
+		basic: "基本情報",
+		experience: "営業経験・職務経歴",
+		results: "営業における強み",
+		tools: "使用ツール",
+		availability: "面談可能日",
+		summary: "総評"
+	};
+	[
+		"保存済みの紹介文書式を毎回使用してください。参考文の再入力は不要です。",
+		"見出しは【基本情報】【営業経験・職務経歴】【営業における強み】【使用ツール】【面談可能日】【総評】です。項目順と省略は文章設定に従ってください。",
+		"基本情報は氏名・年齢・居住地・稼働条件などの入力済み項目を『項目：内容』で改行して記載します。",
+		"営業経験・職務経歴は在籍企業や期間が入力されている場合だけ『■ 企業名・期間』で区切ります。商材・営業手法・〈主な業務〉・〈営業実績〉も、入力に事実がある場合だけ使います。商材、対象（BtoB・BtoC等）、営業手法、担当した主な業務、営業実績を分け、別の会社・期間の情報を混ぜないでください。",
+		"営業における強みは入力済みの実績・強みだけを『・』で列挙します。確認・記録・準備・聞き方など、入力された具体的な行動や工夫を根拠にして書き、抽象的な能力評価へ膨らませないでください。本人の強みの申告は、自己申告であることを残してください。",
+		"使用ツールは入力された名称を『／』で区切り、使用経験あり・使用経験なし・未確認を区別してください。PC環境があるだけでツールを使えると判断せず、ツール名から業務経験や習熟度を補わないでください。未確認の欄を共有本文へ列挙する必要はありません。",
+		"面談可能日・面談予定は、入力にある候補日・時間帯・調整中の条件だけをまとめてください。未確定の候補を確定予定に変えず、稼働開始可能日とも混同しないでください。",
+		"総評は経験領域、代表的な実績、具体的な工夫、稼働条件の順を基本に、入力済みの事実を2〜4文程度で自然につなぎます。情報が少ない場合は短くし、人物の評価・推薦・新しい実績を作らないでください。材料がない要素は省略し、前の欄と同じ箇条書きやラベルを反復するだけの文章にはしないでください。",
+		"『約』『最大』『平均』『日次』『時間あたり』『目標』『実績』『本人申告』など、数字の意味・集計期間・対象を限定する修飾を厳密に残してください。目標を達成実績に、最大を平均に、日次を月次に置き換えないでください。月と日、期間と日時を取り違えないでください。",
+		"経験月数の合算、達成率やアポ率の算出、時間単価への換算は、元の入力に結果が明記されていない限り行わないでください。空白の単位や比較対象を推測して埋めないでください。",
+		"未経験を『ポテンシャルがある』『成長が期待できる』などと自動評価せず、勤怠・定着・人物像・適性も推測しないでください。未経験という事実と、確認済みの担当業務・希望条件を分けて伝えてください。",
+		"『即戦力』『確実にチームを牽引する』などの断定や、年齢からの評価は紹介文の型として採用しないでください。PCの所持状況や稼働の制約は確認済みの条件として扱い、その背景にある家庭・健康の事情は共有本文へ入れないでください。",
+		"口語・誤字は意味が確実な範囲だけ自然なビジネス文へ整えてください。人名・企業名・地名、数値、期間、否定、条件の範囲を変えないでください。曖昧な表記は勝手に確定せず、確認事項へ分けてください。",
+		"共有本文には空の見出しや『記載なし』『情報なし』を出さず、入力のない項目は省略してください。社内のヒアリング漏れ、提案先についての相談、担当者の主観、内部の確認作業は、クライアント向け本文へ入れないでください。",
+		"Markdownの太字やコードは使わず、そのままクライアントへ送れる日本語の本文にしてください。"
+	].join("\n");
+	const headingAliases = {
+		...Object.fromEntries(Object.values(introductionHeadings).map((heading) => [heading, heading])),
+		"基本情報・稼働条件": introductionHeadings.basic,
+		"営業経験・職歴": introductionHeadings.experience,
+		"確認済みの実績・強み": introductionHeadings.results,
+		"実績・強み": introductionHeadings.results,
+		"PC・使用ツール": introductionHeadings.tools,
+		"PC・利用ツール": introductionHeadings.tools,
+		"事実の紹介概要": introductionHeadings.summary,
+		"紹介概要": introductionHeadings.summary
+	};
+	Object.keys(headingAliases);
+	//#endregion
+	//#region lib/candidate-intake.ts
+	/** Candidate information is formatted in this browser. No external service is called. */
+	const interviewStringFields = [
+		"age",
+		"gender",
+		"residence",
+		"availableFrom",
+		"timeWindow",
+		"daysPerWeek",
+		"monthlyHours",
+		"sideJob",
+		"desiredHourlyRate",
+		"pcEnvironment",
+		"networkEnvironment",
+		"attendanceConcerns",
+		"workHistory",
+		"achievements",
+		"strengths",
+		"crmOther",
+		"chatOther",
+		"interviewAvailability",
+		"workStyle",
+		"pcSkills",
+		"additionalNotes",
+		"interviewMemo",
+		"selfReflection",
+		"interviewAdvice"
+	];
+	function blankInterviewFields() {
+		return Object.assign(Object.fromEntries(interviewStringFields.map((key) => [key, ""])), {
+			crmTools: [],
+			chatTools: []
+		});
+	}
+	/** Normalizes the known schema without shortening source information. */
+	function normalizeInterviewFields(value) {
+		const result = blankInterviewFields();
+		if (!value || typeof value !== "object" || Array.isArray(value)) return result;
+		const source = value;
+		for (const key of interviewStringFields) if (typeof source[key] === "string") result[key] = source[key].replace(/\r\n?/g, "\n");
+		for (const key of ["crmTools", "chatTools"]) if (Array.isArray(source[key])) result[key] = [...new Set(source[key].filter((item) => typeof item === "string").map((item) => item.trim()).filter(Boolean))];
+		return result;
+	}
+	function unicodeLength(value) {
+		return Array.from(value).length;
+	}
+	//#endregion
+	//#region lib/introduction-review.ts
+	const personalDetail = /(?:持病(?:で|が|の治療|を治療|あり|有り)|通院(?:しています|しております|しており|しているため|をしています|をしております|中です|予定です)|(?:毎週|定期的に|週\d+回|月\d+回)[^。\n]{0,8}通院|(?:家族|両親|親|父|母|祖父|祖母)の介護(?:で|のため|があり|中|をして|に伴|により|に専念|が必要|と両立|による)|(?:子ども|子供|お子様|息子|娘)(?:の|が)[^。\n]{0,10}(?:発熱|体調不良|送迎|通院|入院)(?:で|のため|があり|あり|への対応|によ|をして|をする|が必要|など|[：:]|$))/;
+	/** Apply the same content boundary to a model draft or a manually polished candidate. */
+	function introductionContentIssues(draft) {
+		const issues = [];
+		if (personalDetail.test(draft)) issues.push("source-private-detail");
+		if (/採用(?:すべき|を推奨|適性|可否)|不採用(?:を推奨|にすべき)|(?:能力|適性|人物)(?:評価|スコア|点数)|\d+\s*点満点|即戦力(?:です|として|と判断|人材|の人材)|優秀な(?:人材|候補者)|ポテンシャル(?:が高|の高|に期待)|成長が期待/.test(draft)) issues.push("source-assessment");
+		if (/(?<![〇零一二三四五六七八九十百千万億0-9０-９])[〇○◯●□]{2,}(?![〇零一二三四五六七八九十百千万億0-9０-９])|(?:\b|[：:])X{2,}(?=\b|[位件円年名社])/i.test(draft)) issues.push("source-format");
+		const schemaArtifact = /["'](?:\$schema|properties|required|additionalProperties|responseConstraint|minLength|maxLength|minItems|maxItems|draft|summary|questions|actions)["']\s*:|["']type["']\s*:\s*["'](?:object|array|string|integer|number|boolean|null)["']|```(?:json)?\s*[\[{]/i;
+		let decoded = draft;
+		for (let depth = 0; depth < 3; depth++) {
+			if (schemaArtifact.test(decoded)) {
+				issues.push("source-format");
+				break;
+			}
+			try {
+				const value = JSON.parse(decoded);
+				if (value !== null && typeof value === "object") {
+					issues.push("source-format");
+					break;
+				}
+				if (typeof value !== "string" || value === decoded) break;
+				decoded = value;
+			} catch {
+				break;
+			}
+		}
+		return issues;
+	}
+	//#endregion
+	//#region lib/introduction-normalization.ts
+	const rangeSeparator = /\s*(?:[〜～~－ー−–—-]|から)\s*/;
+	const currency = (value) => Number(value.replace(/,/g, "")).toLocaleString("en-US", { maximumFractionDigits: 8 }) + "円";
+	const timePart = (raw) => {
+		const part = raw.trim().replace(/時(?=\d)/, ":").replace(/時$/, "").replace(/分$/, "");
+		let h, m;
+		if (/^\d{1,2}:\d{2}$/.test(part)) [h, m] = part.split(":").map(Number);
+		else if (/^\d{1,2}$/.test(part)) {
+			h = Number(part);
+			m = 0;
+		} else if (/^\d{3,4}$/.test(part)) {
+			h = Number(part.slice(0, -2));
+			m = Number(part.slice(-2));
+		} else return null;
+		if (h > 23 || m > 59) return null;
+		return {
+			minutes: h * 60 + m,
+			text: `${h}:${String(m).padStart(2, "0")}`
+		};
+	};
+	function clockRange(value) {
+		let parts = value.split(rangeSeparator);
+		if (parts.length === 1 && /^\d{6,8}$/.test(value)) {
+			const split = value.length === 8 ? 4 : 3;
+			parts = [value.slice(0, split), value.slice(split)];
+		}
+		if (parts.length === 1) return timePart(value)?.text ?? null;
+		if (parts.length !== 2) return null;
+		const start = timePart(parts[0]), end = timePart(parts[1]);
+		if (!start || !end || end.minutes <= start.minutes) return null;
+		return `${start.text}〜${end.text}`;
+	}
+	function money(value) {
+		const parts = value.replace(/^(?:希望(?:単価)?|単価)\s*[：:]?\s*/, "").replace(/円/g, "").trim().split(rangeSeparator);
+		if (parts.length > 2 || parts.some((part) => !/^(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,4})?$/.test(part))) return null;
+		if (parts.some((part) => !Number.isFinite(Number(part.replace(/,/g, ""))) || Number(part.replace(/,/g, "")) > 0xe8d4a51000)) return null;
+		if (parts.length === 2 && Number(parts[0].replace(/,/g, "")) > Number(parts[1].replace(/,/g, ""))) return null;
+		return parts.map(currency).join("〜");
+	}
+	const prefectures = {
+		東京: "東京都",
+		京都: "京都府",
+		大阪: "大阪府",
+		北海道: "北海道",
+		...Object.fromEntries("青森 岩手 宮城 秋田 山形 福島 茨城 栃木 群馬 埼玉 千葉 神奈川 新潟 富山 石川 福井 山梨 長野 岐阜 静岡 愛知 三重 滋賀 兵庫 奈良 和歌山 鳥取 島根 岡山 広島 山口 徳島 香川 愛媛 高知 福岡 佐賀 長崎 熊本 大分 宮崎 鹿児島 沖縄".split(" ").map((name) => [name, `${name}県`]))
+	};
+	const toolNames = {
+		sf: "Salesforce",
+		salesforce: "Salesforce",
+		kintone: "kintone",
+		hubspot: "HubSpot",
+		slack: "Slack",
+		chatwork: "Chatwork",
+		teams: "Microsoft Teams",
+		zoom: "Zoom",
+		googlemeet: "Google Meet"
+	};
+	const salesStyleNames = {
+		てれあぽ: "テレアポ",
+		てれま: "テレマーケティング",
+		テレマ: "テレマーケティング",
+		いんさいどせーるす: "インサイドセールス",
+		ふぃーるどせーるす: "フィールドセールス",
+		かすたまーさくせす: "カスタマーサクセス",
+		あぽいんたー: "アポインター",
+		ほうじんえいぎょう: "法人営業",
+		こじんえいぎょう: "個人営業",
+		b2b: "BtoB",
+		btob: "BtoB",
+		b2c: "BtoC",
+		btoc: "BtoC"
+	};
+	function normalizeIntroductionValue(field, raw) {
+		const original = typeof raw === "string" ? raw : "";
+		const text = original.normalize("NFKC").replace(/\r\n?/g, "\n").trim();
+		const result = (value, kind) => ({
+			raw: original,
+			value,
+			status: value === original ? "unchanged" : "normalized",
+			...kind ? { kind } : {}
+		});
+		const ask = (question) => ({
+			raw: original,
+			value: original,
+			status: "needs-confirmation",
+			question
+		});
+		if (!text) return result("");
+		if (field === "timeWindow") {
+			const time = clockRange(text);
+			if (time) return result(time, "time");
+			if (/^[\d\s:時分〜～~－ー−–—-]+$/.test(text) || /^\d.*から\d/.test(text)) return ask("実在する開始・終了時刻を確認してください。日をまたぐ場合は「翌」を記入してください。");
+			return result(text);
+		}
+		if (field === "rate") {
+			const amount = money(text);
+			return amount ? result(amount, "money") : result(text);
+		}
+		if (field === "freeText") {
+			if (/^(?:希望(?:単価)?|単価)\s*[：:]?\s*\d/.test(text)) {
+				const amount = money(text);
+				if (amount) return result(amount, "money");
+			}
+			const parts = text.split(rangeSeparator);
+			if (parts.length === 2 && parts.every((part) => /^\d{1,4}$/.test(part))) {
+				const start = timePart(parts[0]), end = timePart(parts[1]);
+				if (/^\d{4}$/.test(parts[0]) && !parts[0].startsWith("0") && start && end) return ask("この数値は稼働時間ですか、希望単価の幅ですか？");
+				if (/^0\d{3}$/.test(parts[0]) && start && end && end.minutes > start.minutes) return result(`${start.text}〜${end.text}`, "time");
+				if (parts[0].length === 3 && start && end && end.minutes > start.minutes) return result(`${start.text}〜${end.text}`, "time");
+				if (!start && !end) {
+					const amount = money(text);
+					if (amount) return result(amount, "money");
+				}
+				return ask("この数値は稼働時間ですか、希望単価の幅ですか？");
+			}
+			if (/^\d{1,8}$/.test(text)) return ask("この数値が表す項目と単位を確認してください。");
+			return result(text);
+		}
+		if (field === "monthlyHours" && /^(?:月\s*)?\d+(?:\.\d+)?(?:\s*時間)?$/.test(text)) {
+			const amount = text.match(/\d+(?:\.\d+)?/)[0];
+			if (Number(amount) > 744) return ask("月間稼働時間が744時間を超えています。単位と数値を確認してください。");
+			return result(`${amount}時間`);
+		}
+		if (field === "age" && /^\d+(?:\s*歳)?$/.test(text)) {
+			const n = Number(text.match(/\d+/)[0]);
+			return n > 120 ? ask("年齢の数値を確認してください。") : result(`${n}歳`);
+		}
+		if (field === "residence") return result(prefectures[text] ?? text);
+		if (field === "availableFrom") {
+			const match = text.match(/^(?:(\d{4})[\/.-])?(\d{1,2})[\/.-](\d{1,2})(?:から)?$/);
+			if (match) {
+				const year = match[1] ? Number(match[1]) : 2e3, month = Number(match[2]), day = Number(match[3]);
+				const date = new Date(Date.UTC(year, month - 1, day));
+				if (date.getUTCFullYear() !== year || date.getUTCMonth() + 1 !== month || date.getUTCDate() !== day) return ask("実在する稼働開始日を確認してください。");
+				return result(`${match[1] ? `${match[1]}年` : ""}${month}月${day}日`);
+			}
+			return result(text);
+		}
+		if (field === "pcEnvironment") return result({
+			win: "Windows",
+			windows: "Windows",
+			mac: "Mac",
+			macbook: "MacBook"
+		}[text.toLowerCase()] ?? text);
+		if (field === "networkEnvironment" && /^(?:OK|回線OK)$/i.test(text)) return result("問題なし");
+		if (field === "attendanceNote" && /^(?:なし|懸念なし)$/.test(text)) return result("特になし");
+		if (field === "tool") return result(toolNames[text.toLowerCase().replace(/\s/g, "")] ?? text);
+		if (field === "salesStyle") return result(text.split(/([・、,／/\n]+)/).map((part) => salesStyleNames[part.trim().toLowerCase()] ?? part).join(""));
+		return result(text);
+	}
+	/** Only a year explicitly present in the source may be compared with today. */
+	function introductionStartDateState(raw, now = /* @__PURE__ */ new Date()) {
+		const text = normalizeIntroductionValue("availableFrom", raw).value;
+		const match = text.match(/^(\d{4})年(\d{1,2})月(\d{1,2})日$/);
+		if (!match) return /^\d{1,2}月\d{1,2}日$/.test(text) ? "year-unknown" : "unparsed";
+		return `${match[1]}-${match[2].padStart(2, "0")}-${match[3].padStart(2, "0")}` < new Intl.DateTimeFormat("sv-SE", {
+			timeZone: "Asia/Tokyo",
+			year: "numeric",
+			month: "2-digit",
+			day: "2-digit"
+		}).format(now) ? "past" : "not-past";
+	}
+	//#endregion
+	//#region lib/introduction-v2.ts
+	const introductionV2Version = "2026-11-06";
+	/** A safety/storage limit, not a writing target. Facts are never cut to fit it. */
+	const introductionV2MaxLength = 2e4;
+	const introductionV2Headings = [
+		"基本情報",
+		"営業経験・職務経歴",
+		"成果を出すための工夫",
+		"使用ツール・環境",
+		"総評"
+	];
+	const blankIntroductionRate = () => ({
+		amount: "",
+		unit: "unknown",
+		tax: "unknown"
+	});
+	const blankIntroductionV2Settings = () => ({
+		version: "initial",
+		sources: [],
+		sourceAliases: {},
+		blockedTerms: [],
+		clients: []
+	});
+	function blankIntroductionCareer(id) {
+		return {
+			id,
+			company: "",
+			product: "",
+			period: "",
+			salesStyle: "",
+			duties: [],
+			achievements: [],
+			tips: []
+		};
+	}
+	function blankIntroductionV2Profile(candidateName = "") {
+		return {
+			schemaVersion: 2,
+			candidateName,
+			source: "",
+			basic: {
+				furigana: "",
+				age: "",
+				residence: "",
+				availableFrom: "",
+				timeWindow: "",
+				monthlyHours: "",
+				desiredRate: blankIntroductionRate(),
+				pcEnvironment: "",
+				networkEnvironment: "",
+				shareableAttendanceNote: "",
+				daysPerWeek: "",
+				weekdays: "",
+				sideJob: "",
+				pcCamera: ""
+			},
+			careers: [],
+			experienceTotal: "",
+			tips: [],
+			tools: [],
+			interviewAvailability: "",
+			internalMemo: ""
+		};
+	}
+	function parseIntroductionRate(raw) {
+		const value = raw.normalize("NFKC").trim();
+		const unit = /時給|(?:円\s*)?[\/／]\s*(?:時(?:間)?|h)/i.test(value) ? "hour" : /日給|(?:円\s*)?[\/／]\s*日/.test(value) ? "day" : /月給|月額|(?:円\s*)?[\/／]\s*月/.test(value) ? "month" : /案件|一式|件単価|円\s*[\/／]\s*件/.test(value) ? "project" : "unknown";
+		const tax = /税込/.test(value) ? "inclusive" : /税抜|税別/.test(value) ? "exclusive" : "unknown";
+		return {
+			amount: normalizeIntroductionValue("rate", value.replace(/(?:時給|日給|月給|月額|件単価|希望単価|希望)/g, "").replace(/[（(]?(?:税込|税抜|税別)[）)]?/g, "").replace(/[\/／]\s*(?:時間|時|日|月|件|h)/gi, "").trim()).value,
+			unit,
+			tax
+		};
+	}
+	/** An explicit import adapter, not a data migration. Private legacy fields stay private. */
+	function introductionV2FromLegacy(candidateName, raw, source = "") {
+		const fields = normalizeInterviewFields(raw), profile = blankIntroductionV2Profile(candidateName);
+		profile.source = source;
+		for (const key of [
+			"age",
+			"residence",
+			"availableFrom",
+			"timeWindow",
+			"monthlyHours",
+			"pcEnvironment",
+			"networkEnvironment",
+			"daysPerWeek",
+			"sideJob"
+		]) profile.basic[key] = fields[key];
+		profile.basic.desiredRate = parseIntroductionRate(fields.desiredHourlyRate);
+		if (fields.workHistory.trim() || fields.achievements.trim()) profile.careers = [{
+			...blankIntroductionCareer("legacy-career"),
+			duties: fields.workHistory.trim() ? [fields.workHistory] : [],
+			achievements: fields.achievements.trim() ? [fields.achievements] : []
+		}];
+		profile.tips = fields.strengths.trim() ? [fields.strengths] : [];
+		profile.tools = [
+			...fields.crmTools.filter((tool) => tool !== "その他"),
+			fields.crmOther,
+			...fields.chatTools.filter((tool) => tool !== "その他"),
+			fields.chatOther,
+			fields.pcSkills
+		].filter((value) => value.trim());
+		profile.interviewAvailability = fields.interviewAvailability;
+		profile.internalMemo = [
+			fields.attendanceConcerns,
+			fields.additionalNotes,
+			fields.interviewMemo,
+			fields.selfReflection,
+			fields.interviewAdvice
+		].filter((value) => value.trim()).join("\n");
+		return profile;
+	}
+	const record = (value) => !!value && typeof value === "object" && !Array.isArray(value);
+	const text = (value, limit = 6e3) => typeof value === "string" && unicodeLength(value) <= limit && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value);
+	const list = (value, count = 30) => Array.isArray(value) && value.length <= count && value.every((item) => text(item));
+	function validIntroductionRate(value) {
+		return record(value) && text(value.amount, 200) && !/[\r\n]/.test(value.amount) && [
+			"hour",
+			"day",
+			"month",
+			"project",
+			"unknown"
+		].includes(String(value.unit)) && [
+			"exclusive",
+			"inclusive",
+			"unknown"
+		].includes(String(value.tax));
+	}
+	/** Whitelist persisted fields. Unknown properties, especially copied source documents,
+	* are not retained in the returned object. Invalid payloads fail rather than truncate. */
+	function parseIntroductionV2Profile(value) {
+		if (!record(value) || value.schemaVersion !== 2 || !record(value.basic) || !Array.isArray(value.careers) || value.careers.length > 30) return null;
+		const result = blankIntroductionV2Profile();
+		for (const key of [
+			"candidateName",
+			"source",
+			"experienceTotal",
+			"interviewAvailability",
+			"internalMemo"
+		]) {
+			if (!text(value[key]) || ["candidateName", "source"].includes(key) && /[\r\n]/.test(value[key])) return null;
+			result[key] = value[key];
+		}
+		for (const key of Object.keys(result.basic)) if (key === "desiredRate") {
+			if (!validIntroductionRate(value.basic[key])) return null;
+			result.basic.desiredRate = {
+				amount: value.basic[key].amount,
+				unit: value.basic[key].unit,
+				tax: value.basic[key].tax
+			};
+		} else {
+			if (!text(value.basic[key])) return null;
+			result.basic[key] = value.basic[key];
+		}
+		for (const key of ["tips", "tools"]) {
+			if (!list(value[key])) return null;
+			result[key] = [...value[key]];
+		}
+		const ids = /* @__PURE__ */ new Set();
+		for (const item of value.careers) {
+			if (!record(item) || !text(item.id, 120) || !item.id.trim() || ids.has(item.id)) return null;
+			ids.add(item.id);
+			const career = blankIntroductionCareer(item.id);
+			for (const key of [
+				"company",
+				"product",
+				"period",
+				"salesStyle"
+			]) {
+				if (!text(item[key])) return null;
+				career[key] = item[key];
+			}
+			for (const key of [
+				"duties",
+				"achievements",
+				"tips"
+			]) {
+				if (!list(item[key])) return null;
+				career[key] = [...item[key]];
+			}
+			result.careers.push(career);
+		}
+		return unicodeLength(JSON.stringify(result)) <= 1e5 ? result : null;
+	}
+	function parseIntroductionV2Settings(value) {
+		if (!record(value) || !text(value.version, 200) || !list(value.sources, 300) || !list(value.blockedTerms, 500) || !record(value.sourceAliases) || Object.keys(value.sourceAliases).length > 500 || !Array.isArray(value.clients) || value.clients.length > 500) return null;
+		const aliases = {};
+		for (const [key, item] of Object.entries(value.sourceAliases)) {
+			if (!text(key, 200) || !text(item, 200) || [
+				"__proto__",
+				"prototype",
+				"constructor"
+			].includes(key)) return null;
+			aliases[key] = item;
+		}
+		const clients = [], ids = /* @__PURE__ */ new Set();
+		for (const item of value.clients) {
+			if (!record(item) || !text(item.id, 200) || !item.id.trim() || ids.has(item.id) || !text(item.name, 200) || !list(item.mentions, 50) || item.rate !== void 0 && !validIntroductionRate(item.rate)) return null;
+			ids.add(item.id);
+			clients.push({
+				id: item.id,
+				name: item.name,
+				mentions: [...item.mentions],
+				...item.rate ? { rate: {
+					amount: item.rate.amount,
+					unit: item.rate.unit,
+					tax: item.rate.tax
+				} } : {}
+			});
+		}
+		return {
+			version: value.version,
+			sources: [...value.sources],
+			sourceAliases: aliases,
+			blockedTerms: [...value.blockedTerms],
+			clients
+		};
+	}
+	const unitLabels = {
+		hour: "／時",
+		day: "／日",
+		month: "／月",
+		project: "／件",
+		unknown: "（単位未確認）"
+	};
+	function formatIntroductionRate(rate) {
+		if (!rate.amount.trim()) return "未確認";
+		return `${normalizeIntroductionValue("rate", rate.amount).value}${unitLabels[rate.unit]}${rate.tax === "unknown" ? "（税区分未確認）" : rate.tax === "inclusive" ? "（税込）" : "（税抜）"}`;
+	}
+	/** Not an authentication hash. A compact local freshness key avoids putting
+	* private notes into document metadata as literal JSON. */
+	function introductionV2SourceKey(profile, settings, clientId = "") {
+		const source = JSON.stringify([
+			profile,
+			settings,
+			clientId
+		]);
+		let a = 2166136261, b = 2654435769;
+		for (const char of source) {
+			const code = char.codePointAt(0);
+			a = Math.imul(a ^ code, 16777619);
+			b = Math.imul(b ^ code, 2246822519);
+		}
+		return `v2:${(a >>> 0).toString(16)}${(b >>> 0).toString(16)}`;
+	}
+	function resolveIntroductionSource(source, settings) {
+		const raw = source.trim();
+		return Object.hasOwn(settings.sourceAliases, raw) ? settings.sourceAliases[raw].trim() : raw;
+	}
+	const filled = (values) => values.map((value) => value.trim()).filter(Boolean);
+	const line = (label, value) => `${label}：${value.trim() || "未確認"}`;
+	const factId = (path) => `introduction:${path}`;
+	function introductionV2NarrativeFacts(profile) {
+		const facts = [];
+		for (const career of profile.careers) for (const [key, kind] of [["duties", "duty"], ["tips", "tip"]]) career[key].forEach((value, index) => {
+			if (value.trim() && !introductionContentIssues(value).includes("source-private-detail")) facts.push({
+				factId: factId(`careers.${career.id}.${key}.${index}`),
+				careerId: career.id,
+				kind,
+				sourceText: value.trim()
+			});
+		});
+		profile.tips.forEach((value, index) => {
+			if (value.trim() && !introductionContentIssues(value).includes("source-private-detail")) facts.push({
+				factId: factId(`tips.${index}`),
+				careerId: "candidate",
+				kind: "tip",
+				sourceText: value.trim()
+			});
+		});
+		return facts;
+	}
+	function composeIntroductionV2(raw, rawSettings = blankIntroductionV2Settings(), clientId = "", now = /* @__PURE__ */ new Date(), edits = []) {
+		const profile = parseIntroductionV2Profile(raw), settings = parseIntroductionV2Settings(rawSettings);
+		if (!profile || !settings) throw new Error("紹介文の入力または設定の形式を確認してください。原文は保持してください。");
+		const checks = [], questions = [], factRefs = [];
+		const question = (field, label, prompt, required = true, careerId) => {
+			const id = `${careerId ?? "basic"}:${field}`;
+			if (!questions.some((item) => item.id === id)) questions.push({
+				id,
+				field,
+				label,
+				prompt,
+				required,
+				...careerId ? { careerId } : {}
+			});
+		};
+		const fixed = (path, rawValue, normField) => {
+			const normalized = normField ? normalizeIntroductionValue(normField, rawValue) : {
+				raw: rawValue,
+				value: rawValue.trim(),
+				status: "unchanged"
+			};
+			if (normalized.status === "needs-confirmation") {
+				checks.push({
+					code: "normalization",
+					severity: "review",
+					field: path,
+					sourceRef: factId(path),
+					message: normalized.question
+				});
+				question(path, path, normalized.question);
+			}
+			if (normalized.value.trim()) factRefs.push({
+				id: factId(path),
+				path,
+				value: normalized.value,
+				original: rawValue
+			});
+			return normalized.value.trim();
+		};
+		const narrative = new Map(introductionV2NarrativeFacts(profile).map((item) => [item.factId, item]));
+		const acceptedEdits = /* @__PURE__ */ new Map();
+		for (const edit of edits) {
+			const source = narrative.get(edit.factId);
+			if (source && edit.text.trim() === source.sourceText) acceptedEdits.set(edit.factId, edit.text.trim());
+			else if (source && isValidatedIntroductionNarrativeEdit(edit, source.sourceText)) acceptedEdits.set(edit.factId, edit.text.trim());
+			else checks.push({
+				code: "narrative-rejected",
+				severity: "review",
+				sourceRef: edit.factId,
+				message: "根拠を確認できなかった文章は、その項目の原文を使っています。"
+			});
+		}
+		const narrativeValue = (path, value) => {
+			const original = fixed(path, value);
+			return acceptedEdits.get(factId(path)) ?? original;
+		};
+		const name = fixed("candidateName", profile.candidateName);
+		if (!name) question("candidateName", "氏名", "候補者の氏名を確認してください。");
+		const source = resolveIntroductionSource(profile.source, settings);
+		if (!source) question("source", "紹介元", "紹介元を選択してください。未登録の選択肢は管理者に確認してください。");
+		if (source && settings.sources.length && !settings.sources.includes(source)) checks.push({
+			code: "source-unregistered",
+			severity: "review",
+			field: "source",
+			message: "紹介元が登録済みの選択肢と一致していません。正式な表記を確認してください。"
+		});
+		if (source) factRefs.push({
+			id: factId("source"),
+			path: "source",
+			value: source,
+			original: profile.source
+		});
+		const basic = profile.basic;
+		const basicValues = {
+			age: fixed("basic.age", basic.age, "age"),
+			residence: fixed("basic.residence", basic.residence, "residence"),
+			availableFrom: fixed("basic.availableFrom", basic.availableFrom, "availableFrom"),
+			timeWindow: fixed("basic.timeWindow", basic.timeWindow, "timeWindow"),
+			monthlyHours: fixed("basic.monthlyHours", basic.monthlyHours, "monthlyHours"),
+			pcEnvironment: fixed("basic.pcEnvironment", basic.pcEnvironment, "pcEnvironment"),
+			networkEnvironment: fixed("basic.networkEnvironment", basic.networkEnvironment, "networkEnvironment"),
+			shareableAttendanceNote: fixed("basic.shareableAttendanceNote", basic.shareableAttendanceNote, "attendanceNote")
+		};
+		const requiredLabels = {
+			age: "年齢",
+			residence: "居住地",
+			availableFrom: "稼働開始",
+			timeWindow: "稼働時間",
+			monthlyHours: "月間稼働時間",
+			pcEnvironment: "PC環境",
+			networkEnvironment: "ネット環境",
+			shareableAttendanceNote: "勤怠懸念"
+		};
+		for (const key of Object.keys(basicValues)) if (!basicValues[key]) question(`basic.${key}`, requiredLabels[key], `${requiredLabels[key]}を確認してください。分からなければ未確認のまま進められます。`);
+		fixed("basic.desiredRate.amount", basic.desiredRate.amount, "rate");
+		if (!basic.desiredRate.amount.trim()) question("basic.desiredRate.amount", "希望単価", "希望単価の数値と、時給・日給・月額などの単位を確認してください。");
+		if (basic.desiredRate.amount.trim() && basic.desiredRate.unit === "unknown") question("basic.desiredRate.unit", "単価の単位", "この希望単価は時給・日給・月額・案件単価のどれですか？");
+		if (basic.desiredRate.amount.trim() && basic.desiredRate.tax === "unknown") checks.push({
+			code: "tax-unknown",
+			severity: "review",
+			field: "basic.desiredRate.tax",
+			message: "希望単価の税込・税抜が未確認です。企業提示条件とあわせて確認してください。"
+		});
+		const dateState = introductionStartDateState(basic.availableFrom, now);
+		if (dateState === "past") checks.push({
+			code: "start-date-past",
+			severity: "review",
+			field: "basic.availableFrom",
+			message: "稼働開始日が過去です。現在の予定を確認してください。"
+		});
+		if (dateState === "year-unknown") question("basic.availableFrom.year", "稼働開始の年", "稼働開始の年は何年ですか？年を推測せず、入力どおりの月日で表示しています。", false);
+		if (basic.sideJob.trim() && !basic.shareableAttendanceNote.trim()) question("basic.shareableAttendanceNote", "副業の稼働への影響", "副業によって連絡可能時間や勤務時間に影響はありますか？個人的な事情ではなく、共有できる稼働上の影響だけを記入してください。");
+		const baseLines = [
+			line("氏名", name),
+			...basic.furigana.trim() ? [line("ふりがな", fixed("basic.furigana", basic.furigana))] : [],
+			line("年齢", basicValues.age),
+			line("居住地", basicValues.residence),
+			line("稼働開始", basicValues.availableFrom),
+			line("稼働時間", basicValues.timeWindow),
+			line("月間稼働時間", basicValues.monthlyHours),
+			line("希望単価", formatIntroductionRate(basic.desiredRate)),
+			line("PC環境", basicValues.pcEnvironment),
+			line("ネット環境", basicValues.networkEnvironment),
+			line("勤怠懸念", basicValues.shareableAttendanceNote)
+		];
+		for (const [key, label] of [
+			["daysPerWeek", "週の稼働数"],
+			["weekdays", "稼働曜日"],
+			["sideJob", "副業"],
+			["pcCamera", "PCカメラの有無"]
+		]) if (basic[key].trim()) baseLines.push(line(label, fixed(`basic.${key}`, basic[key])));
+		const experience = fixed("experienceTotal", profile.experienceTotal);
+		if (!experience) question("experienceTotal", "営業経験の通算", "通算の営業経験はどのくらいですか？重複する職歴期間を二重に数えず確認してください。", false);
+		const careerBlocks = [], tips = profile.tips.map((value, index) => narrativeValue(`tips.${index}`, value)).filter(Boolean);
+		for (const career of profile.careers) {
+			const prefix = `careers.${career.id}`, company = fixed(`${prefix}.company`, career.company), product = fixed(`${prefix}.product`, career.product), period = fixed(`${prefix}.period`, career.period), style = fixed(`${prefix}.salesStyle`, career.salesStyle, "salesStyle");
+			const duties = career.duties.map((value, index) => narrativeValue(`${prefix}.duties.${index}`, value)).filter(Boolean);
+			const achievements = career.achievements.map((value, index) => fixed(`${prefix}.achievements.${index}`, value)).filter(Boolean);
+			tips.push(...career.tips.map((value, index) => narrativeValue(`${prefix}.tips.${index}`, value)).filter(Boolean));
+			for (const [key, label, prompt] of [
+				[
+					"period",
+					"期間",
+					"開始・終了の年月を確認してください。"
+				],
+				[
+					"product",
+					"商材",
+					"扱った商品・サービスを確認してください。"
+				],
+				[
+					"salesStyle",
+					"営業スタイル",
+					"BtoB/BtoCと、テレアポ・商談などの手法を確認してください。"
+				],
+				[
+					"duties",
+					"業務内容",
+					"実際に担当した業務を確認してください。"
+				],
+				[
+					"achievements",
+					"実績",
+					"架電数・アポ数などを、単位と期間を含めて確認してください。"
+				]
+			]) if (Array.isArray(career[key]) ? !filled(career[key]).length : !career[key].trim()) question(`${prefix}.${key}`, label, `${company || product || "この職歴"}：${prompt}`, true, career.id);
+			const metrics = achievements.join("\n");
+			if (/(?:\d+\s*位|首位|トップ|No[.]?\s*\d+)/i.test(metrics) && (!/(?:\d+\s*(?:人|名|社)中|母数|比較対象|全\d+\s*(?:人|名|社))/.test(metrics) || !/(?:\d+年|\d+月|月間|年間|週間|日間|期間)/.test(metrics))) question(`${prefix}.rankContext`, "順位の比較対象と期間", `${company || "この職歴"}の順位について、何人・何社中か、いつの実績かを確認してください。未確認の母数や期間は補いません。`, false, career.id);
+			careerBlocks.push([
+				`■${company || "社名不明"}${product ? `／${product}` : ""}`,
+				line("期間", period),
+				line("商材", product),
+				line("営業スタイル", style),
+				"業務内容：",
+				...(duties.length ? duties : ["未確認"]).map((value) => `・${value}`),
+				"実績：",
+				...(achievements.length ? achievements : ["未確認"]).map((value) => `・${value}`)
+			].join("\n"));
+		}
+		if (!profile.careers.length) {
+			question("careers", "職歴", "営業経験・職歴について、会社・商材・期間・担当業務を確認してください。");
+			careerBlocks.push("■社名不明\n期間：未確認\n商材：未確認\n営業スタイル：未確認\n業務内容：\n・未確認\n実績：\n・未確認");
+		}
+		if (tips.length < 2) question("tips", "成果を出すための工夫", "成果につながった具体的な行動を確認してください。例文を事実として足さず、分かる範囲を記入してください。", true);
+		const tools = [...new Set(profile.tools.map((value, index) => fixed(`tools.${index}`, value, "tool")).filter(Boolean))];
+		if (!tools.length) question("tools", "使用ツール", "CRM・チャット・表計算など、実際に使用したツールを確認してください。");
+		const summary = renderIntroductionSummary(profile);
+		const sections = [
+			`【基本情報】\n${baseLines.join("\n")}`,
+			`【営業経験・職務経歴】\n${line("営業経験", experience)}\n${careerBlocks.join("\n\n")}`,
+			`【成果を出すための工夫】\n${(tips.length ? tips : ["未確認"]).map((value) => `・${value}`).join("\n")}`,
+			`【使用ツール・環境】\n${(tools.length ? tools : ["未確認"]).map((value) => `・${value}`).join("\n")}`,
+			...profile.interviewAvailability.trim() ? [`【面談可能日】\n${fixed("interviewAvailability", profile.interviewAvailability)}`] : [],
+			`【総評】\n${summary}`
+		];
+		const internalBody = sections.join("\n\n"), client = settings.clients.find((item) => item.id === clientId);
+		if (clientId && !client) checks.push({
+			code: "client-not-found",
+			severity: "block",
+			field: "clientId",
+			message: "選択した企業の設定が見つかりません。企業を選び直してください。"
+		});
+		let body = internalBody;
+		if (client?.rate) {
+			const rateIndex = baseLines.indexOf(line("希望単価", formatIntroductionRate(basic.desiredRate)));
+			body = [`【基本情報】\n${baseLines.map((value, index) => index === rateIndex ? line("希望単価", formatIntroductionRate(client.rate)) : value).join("\n")}`, ...sections.slice(1)].join("\n\n");
+			if (!client.rate.amount.trim()) checks.push({
+				code: "client-rate-empty",
+				severity: "review",
+				message: "企業別の提示単価が未登録です。"
+			});
+			if (client.rate.tax === "unknown" || client.rate.unit === "unknown") checks.push({
+				code: "client-rate-unconfirmed",
+				severity: "review",
+				message: "企業別の提示単価の単位または税区分が未確認です。"
+			});
+		}
+		const headingLine = `${name || "未確認"}（${source || "紹介元未確認"}）`;
+		const greeting = "お世話になっております。\n下記の人員をご紹介させていただきます。", closing = "ご検討のほどよろしくお願いいたします。";
+		const recommendation = renderIntroductionRecommendation(profile);
+		const mentions = client?.mentions.map((value) => value.trim()).filter(Boolean).join("\n") ?? "";
+		const clientText = [
+			mentions,
+			greeting,
+			recommendation,
+			closing,
+			headingLine,
+			body
+		].filter(Boolean).join("\n\n");
+		checks.push(...inspectIntroductionV2ClientText(clientText, profile, settings));
+		if (!compareIntroductionV2Bodies(internalBody, body, basic.desiredRate, client?.rate)) checks.push({
+			code: "client-fact-mismatch",
+			severity: "block",
+			message: "設定された単価以外の情報が社内版と企業向け版で異なります。"
+		});
+		const bodyChars = unicodeLength(internalBody), bodyLines = internalBody.split("\n").length;
+		if (bodyChars > 2e4 || unicodeLength(clientText) > 2e4) checks.push({
+			code: "document-length",
+			severity: "block",
+			message: "文章が保存可能な長さを超えています。原文を削らず、職歴を確認してください。"
+		});
+		return {
+			schemaVersion: 2,
+			templateVersion: introductionV2Version,
+			headingLine,
+			internalBody,
+			client: {
+				clientId,
+				mentions,
+				greeting,
+				recommendation,
+				closing,
+				body,
+				text: clientText
+			},
+			checks,
+			questions,
+			factRefs,
+			sourceKey: introductionV2SourceKey(profile, settings, clientId),
+			canCopyClient: !checks.some((check) => check.severity === "block"),
+			volume: {
+				bodyChars,
+				bodyLines,
+				withinTarget: bodyChars >= 764 && bodyChars <= 1125 && bodyLines >= 40 && bodyLines <= 58
+			}
+		};
+	}
+	/** The actual achievements remain verbatim in the career block. The summary
+	* selects existing evidence; it never creates a total, rate, rank or strength. */
+	function renderIntroductionSummary(profile) {
+		const careers = profile.careers.filter((career) => career.duties.some((value) => value.trim()) || career.product.trim());
+		if (!careers.length) return "営業経験・職務経歴と具体的な取り組みは未確認です。確認できた情報をもとに内容を整えます。";
+		const statements = [];
+		if (profile.experienceTotal.trim()) statements.push(`営業経験は${profile.experienceTotal.trim()}です。`);
+		for (const career of careers) {
+			const subject = [career.company, career.product].map((value) => value.trim()).filter(Boolean).join("の");
+			if (subject || career.salesStyle.trim()) statements.push(`${subject ? `${subject}で` : ""}${normalizeIntroductionValue("salesStyle", career.salesStyle).value || "記載の業務"}の経験があります。`);
+		}
+		const achievement = careers.flatMap((career) => filled(career.achievements))[0];
+		if (achievement) statements.push(`実績として「${achievement}」が記録されています。`);
+		const tip = [...filled(profile.tips), ...careers.flatMap((career) => filled(career.tips))][0];
+		if (tip) statements.push(`具体的な取り組みは「${tip}」です。`);
+		statements.push("同様の業務を紹介する際は、記載の経験と稼働条件をもとに、案件との具体的な接点を確認できます。");
+		return statements.join("");
+	}
+	function renderIntroductionRecommendation(profile) {
+		const first = profile.careers.find((career) => career.product.trim() || career.salesStyle.trim());
+		if (!first) return "候補者の基本情報を下記にまとめております。未確認の項目は確認を進めております。";
+		const experience = profile.experienceTotal.trim() ? `${profile.experienceTotal.trim()}の営業経験があり、` : "";
+		const fact = [first.product.trim(), normalizeIntroductionValue("salesStyle", first.salesStyle).value].filter(Boolean).join("・");
+		const achievement = filled(first.achievements)[0];
+		const tip = [...filled(first.tips), ...filled(profile.tips)][0];
+		return `${experience}${fact}の経験がある方です。${achievement ? `実績として「${achievement}」が記録されています。` : ""}${tip ? `「${tip}」という取り組みをされています。` : ""}`;
+	}
+	function compareIntroductionV2Bodies(internalBody, clientBody, sourceRate, clientRate) {
+		if (!clientRate) return internalBody === clientBody;
+		const sourceLine = line("希望単価", formatIntroductionRate(sourceRate)), clientLine = line("希望単価", formatIntroductionRate(clientRate));
+		const masked = (body, expectedLine) => {
+			const lines = body.split("\n"), index = lines.indexOf(expectedLine);
+			if (index < 0) return null;
+			lines[index] = "希望単価：__configured_rate__";
+			return lines.join("\n");
+		};
+		const sourceMasked = masked(internalBody, sourceLine), clientMasked = masked(clientBody, clientLine);
+		return sourceMasked !== null && clientMasked !== null && sourceMasked === clientMasked;
+	}
+	/** Call again immediately before copying or sharing manually edited prose. */
+	function inspectIntroductionV2ClientText(value, profile, settings) {
+		const comparable = (text) => text.normalize("NFKC").replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g, "").toLocaleLowerCase("ja");
+		const checks = [], normalized = comparable(value);
+		for (const term of settings.blockedTerms.map((term) => term.trim()).filter(Boolean)) if (normalized.includes(comparable(term))) checks.push({
+			code: "blocked-term",
+			severity: "block",
+			message: `企業向けに出力できない登録語句「${term}」が含まれています。`
+		});
+		if ([profile.internalMemo.trim(), ...profile.internalMemo.split(/[\n。]/).map((part) => part.trim())].filter((part) => Array.from(part).length >= 4 && !/^(?:特になし|なし|懸念なし|問題なし|未確認|不明|確認中)[。.]?$/.test(part)).some((part) => normalized.includes(comparable(part)))) checks.push({
+			code: "private-memo-leak",
+			severity: "block",
+			message: "社内メモと一致する内容が企業向け文章に含まれています。共有する内容を確認してください。"
+		});
+		for (const issue of introductionContentIssues(value.replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g, ""))) checks.push({
+			code: issue,
+			severity: "block",
+			message: issue === "source-private-detail" ? "個人的な事情が企業向け文章に含まれています。共有できる稼働条件だけを記載してください。" : "根拠のない人物評価、空の例示や機械向けの出力が含まれていないか確認してください。"
+		});
+		return checks;
+	}
+	const validatedNarrativeEdits = /* @__PURE__ */ new WeakMap();
+	function markValidatedIntroductionNarrativeEdit(edit, original) {
+		validatedNarrativeEdits.set(edit, {
+			original,
+			text: edit.text
+		});
+		return edit;
+	}
+	function isValidatedIntroductionNarrativeEdit(edit, original) {
+		const checked = validatedNarrativeEdits.get(edit);
+		return checked?.original === original && checked.text === edit.text;
+	}
+	/** Suggestion only: the caller asks the user to confirm the derived total.
+	* Inclusive month ranges are merged so overlapping jobs are not double-counted. */
+	function suggestIntroductionExperienceTotal(careers) {
+		if (!careers.length) return null;
+		const ranges = [];
+		for (const career of careers) {
+			const match = career.period.normalize("NFKC").trim().match(/^(\d{4})[\/年.-](\d{1,2})月?\s*[〜～~－ー−–—-]\s*(\d{4})[\/年.-](\d{1,2})月?$/);
+			if (!match) return null;
+			const [, y1, m1, y2, m2] = match.map(Number);
+			if (m1 < 1 || m1 > 12 || m2 < 1 || m2 > 12) return null;
+			const start = y1 * 12 + m1 - 1, end = y2 * 12 + m2 - 1;
+			if (end < start) return null;
+			ranges.push({
+				start,
+				end
+			});
+		}
+		const merged = [];
+		for (const range of ranges.sort((a, b) => a.start - b.start)) {
+			const last = merged.at(-1);
+			if (last && range.start <= last.end + 1) last.end = Math.max(last.end, range.end);
+			else merged.push({ ...range });
+		}
+		const months = merged.reduce((sum, range) => sum + range.end - range.start + 1, 0), years = Math.floor(months / 12), rest = months % 12;
+		return {
+			value: `${years ? `${years}年` : ""}${rest ? `${rest}か月` : ""}`,
+			months,
+			careerIds: careers.map((career) => career.id)
+		};
+	}
+	//#endregion
+	exports.blankIntroductionCareer = blankIntroductionCareer;
+	exports.blankIntroductionRate = blankIntroductionRate;
+	exports.blankIntroductionV2Profile = blankIntroductionV2Profile;
+	exports.blankIntroductionV2Settings = blankIntroductionV2Settings;
+	exports.compareIntroductionV2Bodies = compareIntroductionV2Bodies;
+	exports.composeIntroductionV2 = composeIntroductionV2;
+	exports.formatIntroductionRate = formatIntroductionRate;
+	exports.inspectIntroductionV2ClientText = inspectIntroductionV2ClientText;
+	exports.introductionV2FromLegacy = introductionV2FromLegacy;
+	exports.introductionV2Headings = introductionV2Headings;
+	exports.introductionV2MaxLength = introductionV2MaxLength;
+	exports.introductionV2NarrativeFacts = introductionV2NarrativeFacts;
+	exports.introductionV2SourceKey = introductionV2SourceKey;
+	exports.introductionV2Version = introductionV2Version;
+	exports.markValidatedIntroductionNarrativeEdit = markValidatedIntroductionNarrativeEdit;
+	exports.parseIntroductionRate = parseIntroductionRate;
+	exports.parseIntroductionV2Profile = parseIntroductionV2Profile;
+	exports.parseIntroductionV2Settings = parseIntroductionV2Settings;
+	exports.renderIntroductionRecommendation = renderIntroductionRecommendation;
+	exports.renderIntroductionSummary = renderIntroductionSummary;
+	exports.resolveIntroductionSource = resolveIntroductionSource;
+	exports.suggestIntroductionExperienceTotal = suggestIntroductionExperienceTotal;
+	exports.validIntroductionRate = validIntroductionRate;
+	return exports;
+})({});
+
+/* Renderer is generated from lib/introduction-v2.ts as NODE_INTRODUCTION_V2.
+ * Integration routes: readIntroductionV2_, saveIntroductionV2_, saveIntroductionSettings_.
+ * Add both writes to nodeStorageMutation_ and the read to the authenticated table budget.
+ * Bodies are derived on demand. The original profile, including private notes, is owner scoped.
+ */
+var INTRODUCTION_V2_TAB='_NODE_introduction_v2',INTRODUCTION_SETTINGS_TAB='_NODE_introduction_settings';
+var INTRODUCTION_V2_HEADERS=['draftKey','playerId','json0','json1','json2','json3','json4','json5','json6','json7','json8','json9','version','updatedAt','actorId'];
+var INTRODUCTION_SETTINGS_HEADERS=['id','json0','json1','json2','json3','json4','json5','json6','json7','json8','json9','version','updatedAt','actorId'];
+function introductionV2Engine_(){if(typeof NODE_INTRODUCTION_V2==='undefined'||!NODE_INTRODUCTION_V2.parseIntroductionV2Profile||!NODE_INTRODUCTION_V2.composeIntroductionV2)fail_('NOT_CONFIGURED','新しい紹介文の書式更新が完了していません。');return NODE_INTRODUCTION_V2;}
+function introductionV2Chunks_(value){var json=JSON.stringify(value);if(Array.from(json).length>100000||json.length>200000)fail_('VALIDATION','紹介文の入力情報が保存上限を超えています。原文を保持して管理者に確認してください。');var chunks=[],part='';Array.from(json).forEach(function(char){if(part.length+char.length>20000){chunks.push(part);part='';}part+=char;});chunks.push(part);if(chunks.length>10)fail_('VALIDATION','紹介文の保存上限を超えています。');while(chunks.length<10)chunks.push('');return chunks;}
+function introductionV2Version_(value){if(typeof value!=='string'||value!==''&&!/^[A-Za-z0-9_-]{43}$/.test(value))fail_('VALIDATION','紹介文の最新の保存状態を取得してください。');return value;}
+function introductionV2Table_(book){var state=intakeTable_(book,INTRODUCTION_V2_TAB,INTRODUCTION_V2_HEADERS),seen=Object.create(null),engine=introductionV2Engine_();state.entries=state.rows.map(function(row,index){if(row.every(function(cell){return cell===''||cell===null;}))return null;var profile;try{profile=engine.parseIntroductionV2Profile(JSON.parse(row.slice(2,12).join('')));}catch(_){profile=null;}if(!profile||typeof row[0]!=='string'||!row[0]||row[0].length>200||typeof row[1]!=='string'||!/^ND-\d+$/.test(row[1])||seen[row[0]]||typeof row[12]!=='string'||!/^[A-Za-z0-9_-]{43}$/.test(row[12])||typeof row[13]!=='string'||!isFinite(Date.parse(row[13]))||typeof row[14]!=='string'||!/^[A-Za-z0-9_-]{1,30}$/.test(row[14]))fail_('SCHEMA_MISMATCH','紹介文の保存済み情報・担当者・重複を管理者が確認してください。');seen[row[0]]=true;return {draftKey:row[0],playerId:row[1],profile:profile,version:row[12],updatedAt:row[13],row:index+2};}).filter(Boolean);return state;}
+function introductionSettingsTable_(book){var state=intakeTable_(book,INTRODUCTION_SETTINGS_TAB,INTRODUCTION_SETTINGS_HEADERS),engine=introductionV2Engine_();state.entries=state.rows.map(function(row,index){if(row.every(function(cell){return cell===''||cell===null;}))return null;var settings;try{settings=engine.parseIntroductionV2Settings(JSON.parse(row.slice(1,11).join('')));}catch(_){settings=null;}if(row[0]!=='shared'||!settings||typeof row[11]!=='string'||!/^[A-Za-z0-9_-]{43}$/.test(row[11])||settings.version!==row[11]||typeof row[12]!=='string'||!isFinite(Date.parse(row[12]))||typeof row[13]!=='string'||!/^[A-Za-z0-9_-]{1,30}$/.test(row[13]))fail_('SCHEMA_MISMATCH','紹介文の共有設定を管理者が確認してください。');return {settings:settings,version:row[11],updatedAt:row[12],row:index+2};}).filter(Boolean);if(state.entries.length>1)fail_('SCHEMA_MISMATCH','紹介文の共有設定が重複しています。');return state;}
+function currentIntroductionSettings_(state){return state.entries.length?state.entries[0].settings:introductionV2Engine_().blankIntroductionV2Settings();}
+function introductionV2Access_(store,actor,recordId){var record=findRecord_(store,recordId);if(!record)fail_('NOT_FOUND','候補者が見つかりません。最新の一覧を取得してください。');actorOwns_(actor,record);if(!record.playerId||!store.players.some(function(p){return p.id===record.playerId&&p.role==='player';}))fail_('FORBIDDEN','担当者を確認できる候補者だけ編集できます。');if(record.profileId&&store.records.some(function(r){return r.profileId===record.profileId&&r.playerId!==record.playerId;}))fail_('CONFLICT','面談情報に異なる担当者の候補者が関連付いています。管理者に確認してください。');return {record:record,draftKey:record.profileId||record.recordId};}
+function readIntroductionV2_(request){var session=authenticate_(request.token,false,request.background===true),accounts=readAccountStore_(),actor=activeActor_(accounts,session),payload=request.payload||{};writingObject_(payload,['recordId']);var settingsState=introductionSettingsTable_(accounts.book),settings=currentIntroductionSettings_(settingsState),recordId=payload.recordId===undefined?'':shortText_(payload.recordId,200,false),result={feature:true,recordId:recordId,draftKey:'',playerId:'',profile:null,version:'',updatedAt:'',settings:settings};if(recordId){var store=readStore_({readOnly:true},accounts),access=introductionV2Access_(store,actor,recordId),state=introductionV2Table_(store.book),entry=state.entries.find(function(e){return e.draftKey===access.draftKey;});if(entry&&entry.playerId!==access.record.playerId)fail_('FORBIDDEN','保存済みの紹介文の担当者が一致しません。');result.draftKey=access.draftKey;result.playerId=access.record.playerId;if(entry){result.profile=entry.profile;result.version=entry.version;result.updatedAt=entry.updatedAt;}
+ // Candidate ownership and shared-profile binding are checked again before returning private notes.
+ var latest=readStore_({readOnly:true},accounts),fresh=introductionV2Access_(latest,actor,recordId);if(fresh.draftKey!==access.draftKey||fresh.record.playerId!==access.record.playerId||introductionV2Table_(store.book).fingerprint!==state.fingerprint)fail_('BUSY','紹介文の対象または入力情報が更新されました。最新を取得してください。');}
+ if(introductionSettingsTable_(accounts.book).fingerprint!==settingsState.fingerprint)fail_('BUSY','共有設定が更新されました。最新を取得してください。');snapshotActor_(accounts,request.token);return result;}
+function introductionV2NameMatches_(profileName,recordName){return typeof profileName==='string'&&typeof recordName==='string'&&profileName.normalize('NFKC').replace(/\s/g,'').toLowerCase()===recordName.normalize('NFKC').replace(/\s/g,'').toLowerCase();}
+function planIntroductionV2_(store,actor,payload){
+ guardProbeBusinessMutation_(store,actor,'saveIntroductionV2',payload);writingObject_(payload,['recordId','profile','expectedVersion']);var recordId=shortText_(payload.recordId,200,true),access=introductionV2Access_(store,actor,recordId),expected=introductionV2Version_(payload.expectedVersion),engine=introductionV2Engine_(),profile=engine.parseIntroductionV2Profile(payload.profile);
+ if(!profile)fail_('VALIDATION','紹介文の入力形式・文字数・職歴の重複IDを確認してください。原文は保持されています。');if(!introductionV2NameMatches_(profile.candidateName,access.record.name))fail_('VALIDATION','紹介文の氏名が候補者名と一致していません。氏名の訂正は候補者情報で行ってから保存してください。');
+ var state=introductionV2Table_(store.book),previous=state.entries.find(function(e){return e.draftKey===access.draftKey;});if(previous&&previous.playerId!==access.record.playerId)fail_('FORBIDDEN','紹介文の担当者が一致しません。');if((previous?previous.version:'')!==expected)fail_('CONFLICT','紹介文の入力情報が更新されています。入力を保持し、最新の内容と比較してください。');
+ var settings=introductionSettingsTable_(store.book);try{engine.composeIntroductionV2(profile,currentIntroductionSettings_(settings),'',new Date());}catch(_){fail_('VALIDATION','紹介文を組み立てられません。入力を確認してください。');}
+ var version=random256_(),now=new Date().toISOString(),plan={requests:[],result:{recordId:recordId,draftKey:access.draftKey}},targetKey=access.draftKey;
+ if(!access.record.profileId){
+  // Establish only the stable relationship used by existing proposal flows. The
+  // original prose and private fields remain solely in the V2 table.
+  plan=planCandidateProfile_(store,actor,{recordId:recordId,rowVersion:access.record.version,fields:interviewFields_({}),introduction:'',profileVersion:''});targetKey=plan.result.profileId;
+  if(!intakeId_(targetKey)||state.entries.some(function(e){return e.draftKey===targetKey;}))fail_('CONFLICT','紹介文の関連付け先が重複しています。再取得してください。');
+  // A historical record-only V2 share remains the SAME approved publication and
+  // thread. Moving its source pointer never publishes changed prose silently.
+  var team=teamCandidateTable_(store.book),oldMarker=introductionV2PublicationMarker_(access.draftKey),shares=team.entries.filter(function(entry){return entry.sourceProfileId===oldMarker;});
+  if(shares.length>1||shares.some(function(entry){return entry.ownerId!==access.record.playerId||entry.sourceRecordId!==recordId;}))fail_('CONFLICT','紹介文の共有元を確認できません。管理者に確認してください。');
+  shares.forEach(function(entry){var updated=Object.assign({},entry,{sourceProfileId:introductionV2PublicationMarker_(targetKey),version:Utilities.getUuid(),updatedAt:now});intakeWritePlan_(store,plan,TEAM_CANDIDATE_TAB,TEAM_CANDIDATE_HEADERS,team,entry.row,teamCandidateValues_(updated));});
+  if(!shares.length)teamTableCheck_(plan,TEAM_CANDIDATE_TAB,TEAM_CANDIDATE_HEADERS,team);
+ }
+ plan.result=Object.assign({},plan.result,{recordId:recordId,draftKey:targetKey});
+ intakeWritePlan_(store,plan,INTRODUCTION_V2_TAB,INTRODUCTION_V2_HEADERS,state,previous?previous.row:state.rows.length+2,[targetKey,access.record.playerId].concat(introductionV2Chunks_(profile),[version,now,actor.id]));addProfileRecordChecks_(plan,[access.record]);if(access.record.profileId)addProfileGroupCheck_(store,plan,access.record.profileId);plan.intakeTableChecks.push({title:INTRODUCTION_SETTINGS_TAB,headers:INTRODUCTION_SETTINGS_HEADERS,fingerprint:settings.fingerprint,sheetId:settings.sheet?settings.sheet.getSheetId():null});return plan;
+}
+function planIntroductionSettings_(store,actor,payload){guardProbeBusinessMutation_(store,actor,'saveIntroductionSettings',payload);requireAdmin_(actor);writingObject_(payload,['settings','expectedVersion']);var expected=introductionV2Version_(payload.expectedVersion),state=introductionSettingsTable_(store.book),old=state.entries[0],engine=introductionV2Engine_(),settings=engine.parseIntroductionV2Settings(payload.settings);if(!settings)fail_('VALIDATION','紹介元・別名・禁止語・企業ごとの設定を確認してください。');if((old?old.version:'')!==expected)fail_('CONFLICT','共有設定が更新されています。入力を保持し、最新の内容と比較してください。');settings.version=random256_();var now=new Date().toISOString(),plan={requests:[],teamAdminRequired:true,result:{settingsVersion:settings.version}};intakeWritePlan_(store,plan,INTRODUCTION_SETTINGS_TAB,INTRODUCTION_SETTINGS_HEADERS,state,old?old.row:state.rows.length+2,['shared'].concat(introductionV2Chunks_(settings),[settings.version,now,actor.id]));return plan;}
+function saveIntroductionV2_(request){return introductionV2Mutation_(request,'saveIntroductionV2');}
+function saveIntroductionSettings_(request){return introductionV2Mutation_(request,'saveIntroductionSettings');}
+function introductionV2Mutation_(request,action){return withLock_(function(){var session=authenticate_(request.token),store=readStore_({readOnly:true}),actor=activeActor_(store,session);assertManagedBook_(store.book);if(!writesEnabled_(store.config))fail_('WRITES_DISABLED','現在は読み取り専用です。');if(store.book.getSpreadsheetTimeZone()!=='Asia/Tokyo')fail_('TIMEZONE','保存先のタイムゾーンを確認してください。');var payload=request.payload||{};guardProbeBusinessMutation_(store,actor,action,payload);if(action==='saveIntroductionSettings')requireAdmin_(actor);else introductionV2Access_(store,actor,shortText_(payload.recordId,200,true));var id=shortText_(request.operationId,128,true);if(!/^[A-Za-z0-9_-]{16,128}$/.test(id))fail_('BAD_REQUEST','保存操作のIDが必要です。');var digest=hash_(stableJson_({action:action,payload:payload})),previous=operation_(store,id);if(previous){if(previous.actorId!==actor.id||previous.action!==action||previous.payloadHash!==digest)fail_('OPERATION_CONFLICT','同じ保存IDを別の内容に使うことはできません。');snapshotActor_(store,request.token);return {committed:true,operationId:id};}var plan=action==='saveIntroductionSettings'?planIntroductionSettings_(store,actor,payload):action==='publishIntroductionV2'?planPublishIntroductionV2_(store,actor,payload):planIntroductionV2_(store,actor,payload);commit_(store,actor,action,id,digest,plan,request.token);try{snapshotActor_(store,request.token);}catch(error){if(['AUTH_REQUIRED','UNAUTHENTICATED','UNAUTHORIZED','SESSION_EXPIRED'].indexOf(error.nodeCode)>=0)throw error;fail_('INTERNAL','保存結果を再確認してください。同じ保存IDで再試行できます。');}return {committed:true,operationId:id};});}
+/* Private snapshot projection used by candidate chat and condition search.
+ * An orphan is kept for an administrator's full backup, never attached by name.
+ */
+function readIntroductionV2Profiles_(store,user){
+ var state=introductionV2Table_(store.book),result=[];
+ state.entries.forEach(function(entry){
+  var records=store.records.filter(function(record){return (record.profileId||record.recordId)===entry.draftKey;});
+  if(!records.length)return;
+  var visible=user.role==='admin'||entry.playerId===user.id||records.some(function(record){return record.playerId===user.id;});
+  if(!visible)return;
+  if(records.some(function(record){return record.playerId!==entry.playerId;}))fail_('CONFLICT','紹介文に関連する候補者の担当者が一致しません。管理者に確認してください。');
+  if(user.role!=='admin'&&entry.playerId!==user.id)return;
+  if(records.some(function(record){return !introductionV2NameMatches_(entry.profile.candidateName,record.name);}))return;
+  result.push({draftKey:entry.draftKey,playerId:entry.playerId,recordIds:records.map(function(record){return record.recordId;}),profile:entry.profile,version:entry.version,updatedAt:entry.updatedAt});
+ });
+ return result;
+}
+/* Explicit publication copies only the recomputed, reviewed prose. No private
+ * profile object or memo enters the team table or the operation receipt. */
+function introductionV2PublicationMarker_(draftKey){return 'V2-'+hash_(draftKey);}
+function teamIntroductionText_(value,sourceProfileId){var v2=typeof sourceProfileId==='string'&&/^V2-[A-Za-z0-9_-]{43}$/.test(sourceProfileId),text=teamText_(value,v2?40000:1000,true);if(v2&&Array.from(text).length>20000)fail_('VALIDATION','社内共有する紹介文は20,000文字以内で確認してください。');return text;}
+function planPublishIntroductionV2_(store,actor,payload){
+ writingObject_(payload,['recordId','rowVersion','introductionVersion','settingsVersion','publicationId','version','confirmPublication']);guardProbeBusinessMutation_(store,actor,'publishIntroductionV2',payload);if(payload.confirmPublication!==true)fail_('VALIDATION','この本文を社内全員へ共有することを確認してください。');
+ var access=introductionV2Access_(store,actor,shortText_(payload.recordId,200,true)),record=access.record;if(probeReservation_(store,actor.id,false)||probeReservation_(store,record.playerId,false))fail_('FORBIDDEN','検証専用アカウントの候補者は社内共有できません。');checkVersion_(record,payload.rowVersion);if(!store.players.some(function(p){return p.id===record.playerId&&p.role==='player'&&p.active;}))fail_('FORBIDDEN','有効な担当者の候補者だけ社内共有できます。');
+ var drafts=introductionV2Table_(store.book),draft=drafts.entries.find(function(entry){return entry.draftKey===access.draftKey&&entry.playerId===record.playerId;});if(!draft||draft.version!==payload.introductionVersion)fail_('CONFLICT','最新の紹介文V2の入力情報を保存・確認してから共有してください。');if(!introductionV2NameMatches_(draft.profile.candidateName,record.name))fail_('CONFLICT','紹介文の氏名と候補者名が一致しません。候補者情報を確認してください。');
+ var settingsState=introductionSettingsTable_(store.book),settings=currentIntroductionSettings_(settingsState),settingsVersion=settings.version==='initial'?'':settings.version;if(payload.settingsVersion!==settingsVersion)fail_('CONFLICT','紹介文の共有設定が変わりました。最新の本文を確認し直してください。');
+ var engine=introductionV2Engine_(),document=engine.composeIntroductionV2(draft.profile,settings,'',new Date()),text=document.headingLine+'\n\n'+document.internalBody;
+ if(document.checks.some(function(check){return check.severity==='block'&&check.code!=='document-length';})||engine.inspectIntroductionV2ClientText(text,draft.profile,settings).some(function(check){return check.severity==='block';}))fail_('VALIDATION','社内共有できない内容が紹介文に含まれています。非公開メモ・禁止語・個人事情を確認してください。');
+ var marker=introductionV2PublicationMarker_(access.draftKey),introduction=teamIntroductionText_(text,marker),state=teamCandidateTable_(store.book),previous=payload.publicationId?teamPublication_(state,payload.publicationId):null,relatedRecords=store.records.filter(function(r){return (r.profileId||r.recordId)===access.draftKey&&r.playerId===record.playerId;}).map(function(r){return r.recordId;});
+ function sameSource(p){return p.ownerId===record.playerId&&(p.sourceProfileId===marker||!!record.profileId&&p.sourceProfileId===record.profileId&&relatedRecords.indexOf(p.sourceRecordId)>=0);}
+ if(previous){if(!teamCanManage_(actor,previous)||!sameSource(previous))fail_('FORBIDDEN','別の候補者の共有内容を置き換えることはできません。');if(payload.version!==previous.version)fail_('CONFLICT','社内共有が更新されています。最新の本文と共有状態を確認してください。');}
+ else {if(payload.version!==undefined&&payload.version!=='')fail_('CONFLICT','新しい共有に過去のバージョンは使えません。');if(state.entries.some(sameSource))fail_('CONFLICT','この候補者は社内共有済みです。既存の共有を更新してください。');}
+ var now=new Date().toISOString(),publication={publicationId:previous?previous.publicationId:Utilities.getUuid(),ownerId:record.playerId,sourceRecordId:record.recordId,sourceProfileId:marker,sourceRowVersion:record.version,sourceProfileVersion:hash_(stableJson_([draft.version,settings.version])),candidateName:record.name,introduction:introduction,published:true,version:Utilities.getUuid(),createdAt:previous?previous.createdAt:now,updatedAt:now,publishedAt:now},plan={requests:[],result:{publicationId:publication.publicationId}};
+ intakeWritePlan_(store,plan,TEAM_CANDIDATE_TAB,TEAM_CANDIDATE_HEADERS,state,previous?previous.row:state.rows.length+2,teamCandidateValues_(publication));teamTableCheck_(plan,INTRODUCTION_V2_TAB,INTRODUCTION_V2_HEADERS,drafts);teamTableCheck_(plan,INTRODUCTION_SETTINGS_TAB,INTRODUCTION_SETTINGS_HEADERS,settingsState);addProfileRecordChecks_(plan,[record]);if(record.profileId)addProfileGroupCheck_(store,plan,record.profileId);return plan;
+}
+function publishIntroductionV2_(request){return introductionV2Mutation_(request,'publishIntroductionV2');}
+
+/* Private image evidence. Upload-session URLs are capabilities returned once in memory:
+ * never put one in a row, property, operation result, export, log, public token or ACL.
+ * Routes: beginMatchEvidence -> beginMatchEvidence_ (early wrapper; own budget/commit),
+ * completeMatchEvidence -> planCompleteMatchEvidence_ in normal receipt transaction,
+ * readMatchEvidence -> readMatchEvidence_ (normal authenticated read budget).
+ * Additional OAuth scope: devstorage.read_write. Firebase/Firestore active only.
+ */
+var MATCH_EVIDENCE_TAB='_NODE_match_evidence';
+var MATCH_EVIDENCE_HEADERS=['id','body','version','updatedAt'];
+var MATCH_EVIDENCE_MIMES=['image/png','image/jpeg','image/webp'];
+var MATCH_EVIDENCE_MAX=5*1024*1024;
+var MATCH_EVIDENCE_TTL=30*60*1000;
+function matchEvidenceOrigin_(value){if(value!=='https://insupnode.vifight.com'&&value!=='https://playmark0227-svg.github.io')fail_('VALIDATION','この画面からの画像添付は許可されていません。公開アプリを開き直してください。');return value;}
+function matchEvidenceStorage_(store){
+ if(!nodeUsesFirestore_())fail_('FEATURE_UNAVAILABLE','証拠の保存はFirebaseへの切り替え後に利用できます。下書きは保存できます。');
+ var storage=firestoreConfig_(),bucket=props_().getProperty('NODE_FIREBASE_STORAGE_BUCKET');
+ if(bucket!==storage.projectId+'.firebasestorage.app'&&bucket!==storage.projectId+'.appspot.com')fail_('FEATURE_UNAVAILABLE','証拠ファイルの保存先を確認してください。下書きは保存できます。');
+ if(store&&(!store.book||!store.book.storage||stableJson_(store.book.storage)!==stableJson_(storage)))fail_('FEATURE_UNAVAILABLE','有効なFirebase保存先を確認できません。');
+ return {bucket:bucket,namespace:storage.workbookId};
+}
+function matchEvidenceFeature_(){try{var state=firestoreMigrationState_();if(!state||state.phase!=='active')return false;matchEvidenceStorage_();return true;}catch(_){return false;}}
+function matchEvidenceUuid_(id){if(typeof id!=='string'||!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id))fail_('VALIDATION','ファイルの保存IDを確認してください。');return id;}
+function matchEvidenceTable_(book){
+ var state=intakeTable_(book,MATCH_EVIDENCE_TAB,MATCH_EVIDENCE_HEADERS),seen=Object.create(null);
+ state.entries=state.rows.map(function(row,index){var p;try{p=JSON.parse(row[1]);}catch(_){fail_('SCHEMA_MISMATCH','証拠ファイルの管理情報を確認してください。');}
+  salesObject_(p,['evidenceId','ownerId','recordId','profileId','kind','mime','size','status','generation','createdAt','expiresAt','completedAt','version','updatedAt']);
+  matchEvidenceUuid_(p.evidenceId);teamAccount_(p.ownerId);salesId_(p.recordId);salesId_(p.profileId,true);choice_(p.kind,['candidate','client']);choice_(p.mime,MATCH_EVIDENCE_MIMES);choice_(p.status,['pending','completed']);salesId_(p.version);salesStamp_(p.createdAt);salesStamp_(p.expiresAt);salesStamp_(p.updatedAt);salesStamp_(p.completedAt,true);
+  if(!Number.isSafeInteger(p.size)||p.size<1||p.size>MATCH_EVIDENCE_MAX||p.status==='pending'&&(p.generation!==''||p.completedAt!=='')||p.status==='completed'&&(!/^[1-9][0-9]{0,29}$/.test(p.generation)||!p.completedAt)||Date.parse(p.expiresAt)-Date.parse(p.createdAt)!==MATCH_EVIDENCE_TTL||row[0]!==p.evidenceId||row[2]!==p.version||row[3]!==p.updatedAt||seen[p.evidenceId])fail_('SCHEMA_MISMATCH','証拠ファイルの状態・期限・保存IDを確認してください。');
+  seen[p.evidenceId]=true;p.row=index+2;return p;
+ });return state;
+}
+function matchEvidencePublic_(entry){var result=Object.assign({},entry);delete result.row;return result;}
+function matchEvidenceWrite_(store,plan,state,previous,next){next.version=Utilities.getUuid();next.updatedAt=new Date().toISOString();var body=matchEvidencePublic_(next);intakeWritePlan_(store,plan,MATCH_EVIDENCE_TAB,MATCH_EVIDENCE_HEADERS,state,previous?previous.row:state.rows.length+2,[next.evidenceId,JSON.stringify(body),next.version,next.updatedAt]);}
+function matchEvidenceRecord_(store,user,entry){var record=findRecord_(store,entry.recordId);actorOwns_(user,record);if(record.playerId!==entry.ownerId||entry.profileId&&(record.profileId||'')!==entry.profileId)fail_('FORBIDDEN','証拠ファイルと候補者の担当・関連が一致しません。');return record;}
+function matchEvidenceName_(storage,entry){return 'node-evidence/'+storage.namespace+'/'+matchEvidenceUuid_(entry.evidenceId);}
+function matchEvidenceFetch_(method,url,extra){
+ if(typeof url!=='string'||!/^https:\/\/storage\.googleapis\.com\/(?:upload\/storage\/v1|storage\/v1)\/b\//.test(url)||/[\r\n#]/.test(url))fail_('VALIDATION','証拠ファイルの接続先を確認してください。');
+ var options=Object.assign({method:method,muteHttpExceptions:true,followRedirects:false},extra||{});options.headers=Object.assign({},options.headers||{},{Authorization:'Bearer '+ScriptApp.getOAuthToken()});
+ var response;try{response=UrlFetchApp.fetch(url,options);}catch(_){fail_('INTERNAL','証拠ファイルの応答を確認できませんでした。同じ保存IDで確認してください。');}
+ var code=response.getResponseCode();if(code===404)return null;if(code===401||code===403)fail_('STORAGE_ACCESS_DENIED','証拠ファイルの保存権限を確認してください。');if(code===409||code===412)fail_('CONFLICT','ファイルはすでに送信されています。保存結果を確認してください。');if(code===429)fail_('RATE_LIMITED','ファイルへのアクセスが集中しています。時間をおいて確認してください。');if(code<200||code>=300)fail_(code>=500||code===408?'INTERNAL':'STORAGE_REQUEST_FAILED','証拠ファイルの処理を完了できませんでした。');return response;
+}
+function matchEvidenceJson_(response){if(!response)return null;try{var text=response.getContentText();if(typeof text!=='string'||text.length>50000)throw Error();var p=JSON.parse(text);if(!p||typeof p!=='object'||Array.isArray(p))throw Error();return p;}catch(_){fail_('INTERNAL','証拠ファイルの応答形式を確認できませんでした。');}}
+function matchEvidencePrivateBucket_(storage){var data=matchEvidenceJson_(matchEvidenceFetch_('get','https://storage.googleapis.com/storage/v1/b/'+encodeURIComponent(storage.bucket)+'?fields=name,iamConfiguration'));if(!data||data.name!==storage.bucket||!data.iamConfiguration||data.iamConfiguration.publicAccessPrevention!=='enforced'||!data.iamConfiguration.uniformBucketLevelAccess||data.iamConfiguration.uniformBucketLevelAccess.enabled!==true)fail_('STORAGE_NOT_PRIVATE','証拠用ストレージの非公開設定を確認してください。公開禁止と均一アクセスが必要です。');}
+function matchEvidenceMetadata_(storage,entry){var url='https://storage.googleapis.com/storage/v1/b/'+encodeURIComponent(storage.bucket)+'/o/'+encodeURIComponent(matchEvidenceName_(storage,entry))+'?projection=full'+(entry.generation?'&generation='+encodeURIComponent(entry.generation):'');return matchEvidenceJson_(matchEvidenceFetch_('get',url));}
+function matchEvidenceCheckMetadata_(storage,entry,metadata){
+ var m=metadata&&metadata.metadata;if(!metadata||metadata.bucket!==storage.bucket||metadata.name!==matchEvidenceName_(storage,entry)||metadata.contentType!==entry.mime||String(metadata.size)!==String(entry.size)||typeof metadata.generation!=='string'||!/^[1-9][0-9]{0,29}$/.test(metadata.generation)||entry.generation&&metadata.generation!==entry.generation||!m||m.nodeEvidenceId!==entry.evidenceId||m.nodeOwnerId!==entry.ownerId||m.nodeRecordId!==entry.recordId||m.nodeKind!==entry.kind||m.nodeNamespace!==storage.namespace||m.firebaseStorageDownloadTokens!==undefined||metadata.acl&&metadata.acl.some(function(acl){return acl.entity==='allUsers'||acl.entity==='allAuthenticatedUsers';}))fail_('EVIDENCE_MISMATCH','証拠ファイルの内容・担当・種類が保存情報と一致しません。');return metadata;
+}
+function matchEvidenceBytes_(storage,entry,generation,range){var url='https://storage.googleapis.com/storage/v1/b/'+encodeURIComponent(storage.bucket)+'/o/'+encodeURIComponent(matchEvidenceName_(storage,entry))+'?alt=media&generation='+encodeURIComponent(generation),response=matchEvidenceFetch_('get',url,range?{headers:{Range:'bytes=0-31'}}:{});if(!response)fail_('NOT_FOUND','証拠ファイルが見つかりません。');var bytes;try{bytes=response.getBlob().getBytes();}catch(_){fail_('INTERNAL','証拠ファイルを読み込めませんでした。');}if(!bytes||!bytes.length||bytes.length>MATCH_EVIDENCE_MAX||!range&&bytes.length!==entry.size)fail_('EVIDENCE_MISMATCH','証拠ファイルの容量を確認できませんでした。');return bytes;}
+function matchEvidenceMagic_(bytes,mime,size){var b=Array.prototype.map.call(bytes,function(n){return (n+256)%256;}),valid=false;if(mime==='image/png')valid=b.length>=8&&[137,80,78,71,13,10,26,10].every(function(n,i){return b[i]===n;});if(mime==='image/jpeg')valid=b.length>=3&&b[0]===255&&b[1]===216&&b[2]===255;if(mime==='image/webp')valid=b.length>=12&&String.fromCharCode.apply(null,b.slice(0,4))==='RIFF'&&String.fromCharCode.apply(null,b.slice(8,12))==='WEBP'&&(b[4]+b[5]*256+b[6]*65536+b[7]*16777216+8)===size;if(!valid)fail_('EVIDENCE_TYPE','画像形式を確認できませんでした。PNG・JPEG・WebPの画像を添付してください。');}
+function matchEvidenceSession_(storage,entry,origin){
+ matchEvidenceOrigin_(origin);
+ matchEvidencePrivateBucket_(storage);var url='https://storage.googleapis.com/upload/storage/v1/b/'+encodeURIComponent(storage.bucket)+'/o?uploadType=resumable&ifGenerationMatch=0',response=matchEvidenceFetch_('post',url,{contentType:'application/json; charset=UTF-8',headers:{Origin:origin,'X-Upload-Content-Type':entry.mime,'X-Upload-Content-Length':String(entry.size)},payload:JSON.stringify({name:matchEvidenceName_(storage,entry),contentType:entry.mime,cacheControl:'private, no-store, max-age=0',metadata:{nodeEvidenceId:entry.evidenceId,nodeOwnerId:entry.ownerId,nodeRecordId:entry.recordId,nodeKind:entry.kind,nodeNamespace:storage.namespace}})}),headers=response&&response.getAllHeaders(),location=headers&&(headers.Location||headers.location);
+ var prefix='https://storage.googleapis.com/upload/storage/v1/b/'+encodeURIComponent(storage.bucket)+'/o?';if(typeof location!=='string'||location.indexOf(prefix)!==0||/[\r\n#]/.test(location)||location.length>8000||!/[?&]upload_id=[^&]+/.test(location))fail_('INTERNAL','ファイル送信先を確認できませんでした。新しい添付操作で再試行してください。');return location;
+}
+function beginMatchEvidence_(request){
+ var session=authenticate_(request.token);readBudget_(session.id,'beginMatchEvidence');
+ return withLock_(function(){
+  var payload=salesObject_(request.payload||{},['recordId','kind','mime','size','uploadId','origin']),origin=matchEvidenceOrigin_(payload.origin),id=matchEvidenceUuid_(payload.uploadId),kind=choice_(payload.kind,['candidate','client']),mime=choice_(payload.mime,MATCH_EVIDENCE_MIMES);if(!Number.isSafeInteger(payload.size)||payload.size<1||payload.size>MATCH_EVIDENCE_MAX)fail_('VALIDATION','画像は5MB以内で添付してください。');
+  var store=readStore_({readOnly:true}),user=activeActor_(store,authenticate_(request.token)),storage=matchEvidenceStorage_(store),record=salesRecord_(store,user,payload.recordId),state=matchEvidenceTable_(store.book),previous=state.entries.find(function(e){return e.evidenceId===id;}),operationId='evidence-begin-'+id,payloadHash=hash_(stableJson_({action:'beginMatchEvidence',payload:payload})),op=operation_(store,operationId);
+  if(!writesEnabled_(store.config)||firestoreMigrationFrozen_())fail_('WRITES_DISABLED','現在は証拠ファイルを保存できません。入力は保持してください。');guardProbeBusinessMutation_(store,user,'beginMatchEvidence',payload);
+  if(op&&(op.actorId!==user.id||op.action!=='beginMatchEvidence'||op.payloadHash!==payloadHash))fail_('OPERATION_CONFLICT','同じファイル保存IDを別の内容に使えません。');
+  if(previous&&(previous.ownerId!==record.playerId||previous.recordId!==record.recordId||previous.profileId&&previous.profileId!==(record.profileId||'')||previous.kind!==kind||previous.mime!==mime||previous.size!==payload.size))fail_('OPERATION_CONFLICT','同じファイル保存IDを別の候補者・内容に使えません。');
+  if(previous&&!op)fail_('SCHEMA_MISMATCH','ファイルの保存履歴と管理情報が一致しません。');var entry=previous;if(!entry){if(op)fail_('SCHEMA_MISMATCH','ファイルの保存履歴と管理情報が一致しません。');var now=new Date(),plan={requests:[],result:{evidenceId:id}};entry={evidenceId:id,ownerId:record.playerId,recordId:record.recordId,profileId:record.profileId||'',kind:kind,mime:mime,size:payload.size,status:'pending',generation:'',createdAt:now.toISOString(),expiresAt:new Date(now.getTime()+MATCH_EVIDENCE_TTL).toISOString(),completedAt:''};matchEvidenceWrite_(store,plan,state,null,entry);addProfileRecordChecks_(plan,[record]);commit_(store,user,'beginMatchEvidence',operationId,payloadHash,plan,request.token);}
+  matchEvidenceRecord_(store,user,entry);var result={evidenceId:entry.evidenceId,mime:entry.mime,size:entry.size,expiresAt:entry.expiresAt};if(entry.status==='completed'){snapshotActor_(store,request.token);result.completed=true;return result;}
+  if(Date.parse(entry.expiresAt)<=Date.now())fail_('UPLOAD_EXPIRED','添付の有効時間が切れました。新しい添付操作で再試行してください。');
+  var existing=matchEvidenceMetadata_(storage,entry);if(existing){matchEvidenceCheckMetadata_(storage,entry,existing);snapshotActor_(store,request.token);result.uploaded=true;return result;}
+  var uploadUrl=matchEvidenceSession_(storage,entry,origin);snapshotActor_(store,request.token);result.uploadUrl=uploadUrl;return result;
+ });
+}
+function planCompleteMatchEvidence_(store,user,payload){
+ salesObject_(payload,['evidenceId']);var storage=matchEvidenceStorage_(store),state=matchEvidenceTable_(store.book),entry=state.entries.find(function(p){return p.evidenceId===matchEvidenceUuid_(payload.evidenceId);});if(!entry)fail_('NOT_FOUND','添付の管理情報が見つかりません。');var record=matchEvidenceRecord_(store,user,entry),plan={requests:[],result:{evidenceId:entry.evidenceId}};if(entry.status==='completed'){addProfileRecordChecks_(plan,[record]);return plan;}if(Date.parse(entry.expiresAt)<=Date.now())fail_('UPLOAD_EXPIRED','添付の有効時間が切れました。新しい添付操作で再試行してください。');
+ var metadata=matchEvidenceCheckMetadata_(storage,entry,matchEvidenceMetadata_(storage,entry)),bytes=matchEvidenceBytes_(storage,entry,metadata.generation,true);matchEvidenceMagic_(bytes,entry.mime,entry.size);var next=Object.assign({},entry,{status:'completed',generation:metadata.generation,completedAt:new Date().toISOString()});delete next.row;matchEvidenceWrite_(store,plan,state,entry,next);addProfileRecordChecks_(plan,[record]);plan.matchEvidenceCheck={entry:next};return plan;
+}
+function revalidateMatchEvidencePlan_(store,user,plan){if(plan.matchEvidenceCheck){var entry=plan.matchEvidenceCheck.entry;matchEvidenceRecord_(store,user,entry);var storage=matchEvidenceStorage_(store);matchEvidenceCheckMetadata_(storage,entry,matchEvidenceMetadata_(storage,entry));}}
+function salesValidateEvidence_(store,user,ids,record){
+ if(!Array.isArray(ids)||ids.length!==2||ids[0]===ids[1]||!record)fail_('VALIDATION','候補者側・クライアント側それぞれの証拠が必要です。');actorOwns_(user,record);var storage=matchEvidenceStorage_(store),state=matchEvidenceTable_(store.book),kinds=[];
+ ids.forEach(function(id){var entry=state.entries.find(function(p){return p.evidenceId===matchEvidenceUuid_(id);});if(!entry||entry.status!=='completed'||entry.recordId!==record.recordId||entry.ownerId!==record.playerId||entry.profileId&&entry.profileId!==(record.profileId||''))fail_('FORBIDDEN','この候補者・提案の確認済み証拠を添付してください。');matchEvidenceRecord_(store,user,entry);kinds.push(entry.kind);matchEvidenceCheckMetadata_(storage,entry,matchEvidenceMetadata_(storage,entry));});
+ if(kinds.indexOf('candidate')<0||kinds.indexOf('client')<0)fail_('VALIDATION','候補者側・クライアント側の証拠を1つずつ添付してください。');
+}
+function readMatchEvidence_(request){salesObject_(request.payload||{},['evidenceId']);var session=authenticate_(request.token),accounts=readAccountStore_(),user=activeActor_(accounts,session),store=readStore_({readOnly:true},accounts),storage=matchEvidenceStorage_(store),entry=matchEvidenceTable_(store.book).entries.find(function(p){return p.evidenceId===matchEvidenceUuid_(request.payload.evidenceId);});if(!entry||entry.status!=='completed')fail_('NOT_FOUND','確認済みの証拠ファイルが見つかりません。');matchEvidenceRecord_(store,user,entry);matchEvidenceCheckMetadata_(storage,entry,matchEvidenceMetadata_(storage,entry));var bytes=matchEvidenceBytes_(storage,entry,entry.generation,false);matchEvidenceMagic_(bytes,entry.mime,entry.size);snapshotActor_(store,request.token);return {mime:entry.mime,base64:Utilities.base64Encode(bytes)};}
+
+/* Full administrator backup of all saved workflow months, states and drafts.
+ * readDataExport_ incorporates .data, .checks and .cells, then revalidates the
+ * actor and every table fingerprint before returning. This never writes data.
+ * Evidence is metadata only: no upload URL, GCS object name, bucket or file bytes.
+ */
+function workflowDataExport_(store,actor){
+ requireAdmin_(actor);
+ var checks=[],cells=0;
+ function table(title,headers,reader){
+  var state;
+  if(typeof reader!=='function'){
+   state=intakeTable_(store.book,title,headers);
+   if(state.sheet||state.rows.length)fail_('NOT_CONFIGURED','保存済み業務データを完全に書き出すには連携コードの更新が必要です。');
+   state.entries=[];
+  }else state=reader(store.book);
+  if(!state||!Array.isArray(state.rows)||!Array.isArray(state.entries)||typeof state.fingerprint!=='string')fail_('SCHEMA_MISMATCH','書き出す業務データの保存状態を確認してください。');
+  checks.push({title:title,headers:headers.slice(),fingerprint:state.fingerprint,sheetId:state.sheet?state.sheet.getSheetId():null});
+  cells+=(state.rows.length+(state.sheet?1:0))*headers.length;
+  return state;
+ }
+ // Table names/headers are fixed schema, including safe empty exports before a
+ // feature's first save. Missing storage must never be initialized by a read.
+ var metric=table('_NODE_metric_goals',['playerId','month','targets','dailyBasis','customBusinessDays','version','updatedAt','actorId'],typeof metricGoalTable_==='function'?metricGoalTable_:null);
+ var salesAvailable=typeof salesTable_==='function';
+ var jobs=table('_NODE_work_jobs',['id','body','version','updatedAt'],salesAvailable?function(book){return salesTable_(book,'_NODE_work_jobs','job');}:null);
+ var plans=table('_NODE_proposal_plans',['id','body','version','updatedAt'],salesAvailable?function(book){return salesTable_(book,'_NODE_proposal_plans','plan');}:null);
+ var reports=table('_NODE_match_reports',['id','body','version','updatedAt'],salesAvailable?function(book){return salesTable_(book,'_NODE_match_reports','report');}:null);
+ var draftHeaders=['draftKey','playerId','json0','json1','json2','json3','json4','json5','json6','json7','json8','json9','version','updatedAt','actorId'];
+ var settingHeaders=['id','json0','json1','json2','json3','json4','json5','json6','json7','json8','json9','version','updatedAt','actorId'];
+ var drafts=table('_NODE_introduction_v2',draftHeaders,typeof introductionV2Table_==='function'?introductionV2Table_:null);
+ var settings=table('_NODE_introduction_settings',settingHeaders,typeof introductionSettingsTable_==='function'?introductionSettingsTable_:null);
+ var evidence=table('_NODE_match_evidence',['id','body','version','updatedAt'],typeof matchEvidenceTable_==='function'?matchEvidenceTable_:null);
+ function body(entry){var out=Object.assign({},entry);delete out.row;return out;}
+ var evidenceFields=['evidenceId','ownerId','recordId','profileId','kind','mime','size','status','generation','createdAt','expiresAt','completedAt','version','updatedAt'];
+ var data={feature:true,schemaVersion:1,scope:'all-saved-private-workflows',
+  metricGoals:metric.entries.map(function(entry){var out=body(entry);out.actorId=metric.rows[entry.row-2][7];return out;}),
+  salesWorkflow:{jobs:jobs.entries.map(body),plans:plans.entries.map(body),reports:reports.entries.map(body)},
+  introductionV2:{drafts:drafts.entries.map(function(entry){return {draftKey:entry.draftKey,playerId:entry.playerId,profile:entry.profile,version:entry.version,updatedAt:entry.updatedAt,actorId:drafts.rows[entry.row-2][14]};}),settings:settings.entries.map(function(entry){return {id:'shared',settings:entry.settings,version:entry.version,updatedAt:entry.updatedAt,actorId:settings.rows[entry.row-2][13]};})},
+  matchEvidence:{scope:'metadata-only',files:evidence.entries.map(function(entry){var out={};evidenceFields.forEach(function(key){if(!Object.prototype.hasOwnProperty.call(entry,key))fail_('SCHEMA_MISMATCH','合意資料の書き出し項目が不足しています。');out[key]=entry[key];});return out;})}
+ };
+ return {data:data,checks:checks,cells:cells};
+}
 /* END GENERATED WORKFLOW FEATURES */

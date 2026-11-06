@@ -1,7 +1,10 @@
+import {validSnapshotCacheAccess,type SnapshotCacheAccess} from "./snapshot-cache-access.ts";
 import {abortReason, createDeadlineSignal, isTimeoutSignal, throwIfAborted} from "./abort-signal.ts";
 import { stages, type Activity, type Metric, type Player } from "./node-data.ts";
 import { interviewStringFields, crmOptions, chatOptions, pcOptions, genderOptions, type CandidateProfile } from "./candidate-intake.ts";
 import { validateWritingPreferences, type WritingPreferences } from './on-device-ai.ts';
+import { isFirestoreStorageBackend, type FirestoreStorageBackend } from "./storage-backend.ts";
+import { parseIntroductionV2SnapshotEntries, type IntroductionV2SnapshotEntry } from "./introduction-v2-adapter.ts";
 
 export type SheetPlayer = Player & { sheetNames?: string[] };
 export type Counts = Record<string, Record<string, Partial<Record<Metric, number>>>>;
@@ -10,7 +13,7 @@ export type CandidateRecord = { recordId: string; rowVersion: string; row: numbe
 export type ClientEntry = {id:string;name:string;active:boolean;version:string};
 export type ManagementCell = {column:number;value:string|number|boolean;display:string;kind:"text"|"date"|"time"|"number"|"percent"|"boolean";options:string[];readonly:boolean;note:string};
 export type ManagementRow = {row:number;version:string;cells:ManagementCell[]};
-export type ManagementTable = {sheetId:number;title:string;startRow:number;rowCount:number;columnCount:number;readonly:boolean;headers?:string[];rows:ManagementRow[]};
+export type ManagementTable = {sheetId:number;title:string;startRow:number;rowCount:number;columnCount:number;readonly:boolean;calculationReference?:boolean;headers?:string[];rows:ManagementRow[]};
 export type ManagementTableInfo = {sheetId:number;title:string;rowCount:number;columnCount:number};
 export type InterviewReview = {recordId:string;playerId:string;interviewDate:string;category:string;memo:string;nextAction:string;version:string;updatedAt:string};
 export type InterviewAdviceUsage = {userRemaining:number;teamRemaining:number;resetAt:string};
@@ -18,14 +21,23 @@ export type InterviewAdvice = {summary:string;actions:string[];count:number;gene
 export type InterviewAdviceState = {advice:InterviewAdvice|null;stale:boolean;count:number;usage:InterviewAdviceUsage;configured:boolean;pending:boolean};
 export type DeletedCandidate = {changeId:string;playerId:string;candidateName:string;deletedAt:string;companies:string[];recordCount:number};
 export type SheetSnapshot = {
+  /** Present only after the verified application-data cutover. Authentication stays unchanged. */
+  storageBackend?: FirestoreStorageBackend;
+  /** Authenticated, short-lived conditional-read stamp. Never stored in the display cache. */
+  snapshotVersion?: string;
   /** Authenticated display-cache key; never persisted with the snapshot. */
-  cacheAccess?: import("./snapshot-cache.ts").SnapshotCacheAccess;
+  cacheAccess?: SnapshotCacheAccess;
   operationsFeature?: boolean;
   teamWorkspaceFeature?: boolean;
   migrationFeature?: boolean;
   rewardsFeature?: boolean;
   candidateRegistrationFeature?: boolean;
   monthlyGoalsFeature?: boolean;
+  /** These versioned extensions are advertised only after their backend is ready. */
+  metricGoalsFeature?: true;
+  salesWorkflowFeature?: true;
+  introductionV2Feature?: true;
+  storageEvidenceFeature?: true;
   monthlyGoals?: {playerId:string;month:string;target:number;version:string;updatedAt:string}[];
   // Set when the server could not record this request's activity (busy lock); the input is reported again.
   activityDeferred?: boolean;
@@ -33,6 +45,8 @@ export type SheetSnapshot = {
   writingPreferences?: WritingPreferences;
   intakeFeature?: boolean;
   candidateProfiles?: CandidateProfile[];
+  /** Independent canonical V2 data. Never replace or save it through legacy profiles. */
+  candidateIntroductionV2?: IntroductionV2SnapshotEntry[];
   clients?: ClientEntry[];
   deletionFeature?: boolean;
   deletedCandidates?: DeletedCandidate[];
@@ -52,6 +66,60 @@ export type SheetSnapshot = {
   /** Per-account secret that unlocks this device's encrypted outbox. Memory only. */
   outboxKey?: string;
 };
+
+export type SnapshotUnchanged = {
+  snapshotUnchanged:true;
+  snapshotVersion:string;
+  self:SheetSnapshot["self"];
+  syncedAt:string;
+  cacheAccess:SnapshotCacheAccess;
+  activityDeferred?:true;
+};
+export function validSnapshotVersion(value:unknown):value is string {
+  return typeof value==="string"&&/^[A-Za-z0-9_-]{43}$/.test(value);
+}
+/** An unchanged receipt can renew only the exact live account/cache scope already in memory. */
+export function mergeSnapshotUnchanged(value:unknown,current:SheetSnapshot):SheetSnapshot {
+  const object=(item:unknown):item is Record<string,unknown>=>!!item&&typeof item==="object"&&!Array.isArray(item);
+  const invalid=()=>{throw new SheetApiError("INVALID_RESPONSE","同期の確認結果が変わりました。最新のデータを取得します。");};
+  if(!object(value)||value.snapshotUnchanged!==true||!validSnapshotVersion(value.snapshotVersion)||
+      Object.keys(value).some(key=>!["snapshotUnchanged","snapshotVersion","self","syncedAt","cacheAccess","activityDeferred"].includes(key))||
+      !object(value.self)||Object.keys(value.self).length!==2||Object.keys(value.self).some(key=>!["playerId","role"].includes(key))||
+      typeof value.self.playerId!=="string"||!value.self.playerId||!["admin","player"].includes(String(value.self.role))||
+      typeof value.syncedAt!=="string"||!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value.syncedAt)||
+      !Number.isFinite(Date.parse(value.syncedAt))||new Date(value.syncedAt).toISOString()!==value.syncedAt||
+      (value.activityDeferred!==undefined&&value.activityDeferred!==true)||!validSnapshotCacheAccess(value.cacheAccess))invalid();
+  const receipt=value as unknown as SnapshotUnchanged,access=receipt.cacheAccess,previous=current.cacheAccess;
+  if(Object.keys(access).length!==5||Object.keys(access).some(key=>!["version","self","scope","secret","expiresAt"].includes(key))||
+      Object.keys(access.self).length!==2||Object.keys(access.self).some(key=>!["playerId","role"].includes(key))||
+      !isFirestoreStorageBackend(current.storageBackend)||!validSnapshotVersion(current.snapshotVersion)||current.snapshotVersion!==receipt.snapshotVersion||
+      current.self.playerId!==receipt.self.playerId||current.self.role!==receipt.self.role||
+      !validSnapshotCacheAccess(previous)||previous.version!==access.version||previous.scope!==access.scope||previous.secret!==access.secret||
+      previous.self.playerId!==current.self.playerId||previous.self.role!==current.self.role||
+      access.self.playerId!==current.self.playerId||access.self.role!==current.self.role)invalid();
+  const {activityDeferred:_previousActivity,...existing}=current;
+  return {...existing,syncedAt:receipt.syncedAt,cacheAccess:access,...(receipt.activityDeferred?{activityDeferred:true}:{})};
+}
+
+export const sheetExtensionReadActions = ["readRewards", "readMigrationArchive", "readMetricGoals", "readSalesWorkflow", "readIntroductionV2", "readMatchEvidence", "beginMatchEvidence"] as const;
+export const sheetExtensionMutationActions = ["mutateRewards", "stageMigrationBatch", "applyMigrationItem", "saveMetricGoals", "saveWorkJob", "saveProposalPlan", "recordProposalSent", "saveMatchReport", "saveIntroductionV2", "saveIntroductionSettings", "publishIntroductionV2", "completeMatchEvidence"] as const;
+export type SheetExtensionReadAction = typeof sheetExtensionReadActions[number];
+export type SheetExtensionMutationAction = typeof sheetExtensionMutationActions[number];
+export type SheetExtensionRead = <T>(action: SheetExtensionReadAction, payload?: unknown) => Promise<T>;
+export type SheetExtensionMutation = (action: SheetExtensionMutationAction, payload: unknown, operationId: string) => Promise<void>;
+export function isSheetExtensionReadAction(value: unknown): value is SheetExtensionReadAction {
+  return typeof value === "string" && sheetExtensionReadActions.some(action => action === value);
+}
+/** Capability check only. Owner/admin authorization remains a server decision. */
+export function sheetExtensionMutationEnabled(action: string, snapshot: SheetSnapshot | null | undefined): boolean {
+  const features: Record<SheetExtensionMutationAction, keyof SheetSnapshot> = {
+    mutateRewards: "rewardsFeature", stageMigrationBatch: "migrationFeature", applyMigrationItem: "migrationFeature",
+    saveMetricGoals: "metricGoalsFeature", saveWorkJob: "salesWorkflowFeature", saveProposalPlan: "salesWorkflowFeature",
+    recordProposalSent: "salesWorkflowFeature", saveMatchReport: "salesWorkflowFeature", completeMatchEvidence: "storageEvidenceFeature",
+    saveIntroductionV2: "introductionV2Feature", saveIntroductionSettings: "introductionV2Feature", publishIntroductionV2:"introductionV2Feature",
+  };
+  return !!snapshot?.writesEnabled && Object.hasOwn(features, action) && snapshot[features[action as SheetExtensionMutationAction]] === true;
+}
 export type MutationResult = {
   snapshot: SheetSnapshot;
   credentials?: { id: string; password: string };
@@ -79,7 +147,7 @@ export class SheetApiError extends Error {
 
 // A committed write may still have lost its response. Reuse its payload and ID.
 export function isUncertainWrite(error: unknown): boolean {
-  return !(error instanceof SheetApiError) || ["NETWORK", "TIMEOUT", "HTTP", "NOT_JSON", "INTERNAL", "API", "SHEET_WRITE_FAILED", "SHEET_READ_FAILED", "INVALID_RESPONSE"].includes(error.code);
+  return !(error instanceof SheetApiError) || ["NETWORK", "TIMEOUT", "HTTP", "NOT_JSON", "INTERNAL", "API", "SHEET_WRITE_FAILED", "SHEET_READ_FAILED", "FIRESTORE_WRITE_FAILED", "FIRESTORE_READ_FAILED", "INVALID_RESPONSE"].includes(error.code);
 }
 
 // Credentials go only to a deployed Apps Script endpoint, never to a URL query.
@@ -262,11 +330,12 @@ export function assertSnapshot(value: unknown): asserts value is SheetSnapshot {
   const invalid = (message = "連携データの形式が正しくありません。Google側の連携コードを更新してください。") => {
     throw new SheetApiError("INVALID_RESPONSE", message);
   };
-  if (!object(value) || !object(value.self) || typeof value.self.role !== "string" || !["admin", "player"].includes(value.self.role) ||
+  if (!object(value) || "snapshotUnchanged" in value || !object(value.self) || typeof value.self.role !== "string" || !["admin", "player"].includes(value.self.role) ||
       typeof value.self.playerId !== "string" || !value.self.playerId || !Array.isArray(value.players) || !Array.isArray(value.activities) ||
       !object(value.counts) || typeof value.writesEnabled !== "boolean" ||
       (value.securityFeature !== undefined && typeof value.securityFeature !== "boolean") || (value.workspaceFeature !== undefined && typeof value.workspaceFeature !== "boolean") ||
       ["operationsFeature","monthlyGoalsFeature","teamWorkspaceFeature","candidateRegistrationFeature","migrationFeature","rewardsFeature"].some(key=>value[key]!==undefined&&typeof value[key]!=="boolean") ||
+      ["metricGoalsFeature","salesWorkflowFeature","introductionV2Feature","storageEvidenceFeature"].some(key=>value[key]!==undefined&&value[key]!==true) ||
       !Array.isArray(value.warnings) || value.warnings.some(w => typeof w !== "string") || typeof value.syncedAt !== "string" ||
       value.players.some(p => !object(p) || !strings(p, ["id", "name"]) || !p.id || !Number.isSafeInteger(p.target) || Number(p.target) < 1 ||
         !optionalStrings(p, ["team", "bio", "color"]) || (p.active!==undefined&&typeof p.active!=="boolean") || (p.sheetNames !== undefined && (!Array.isArray(p.sheetNames) || p.sheetNames.some(n => typeof n !== "string")))) ||
@@ -274,6 +343,8 @@ export function assertSnapshot(value: unknown): asserts value is SheetSnapshot {
         !a.id || !a.playerId || !stages.includes(a.stage as Activity["stage"]) || !/^\d{4}-\d{2}-\d{2}$/.test(String(a.date)) ||
         !optionalStrings(a, ["recordId", "rowVersion", "status", "probability", "interviewScheduledDate", "clientInterviewScheduledTime", "offerScheduledDate", "memo"]))) invalid();
   const s = value as unknown as SheetSnapshot;
+  if (s.storageBackend !== undefined && !isFirestoreStorageBackend(s.storageBackend)) invalid("保存先の情報を確認できませんでした。最新の接続状態を確認してください。");
+  if(s.snapshotVersion!==undefined&&(!isFirestoreStorageBackend(s.storageBackend)||!validSnapshotVersion(s.snapshotVersion)))invalid("同期の確認情報を確認できませんでした。最新の接続状態を確認してください。");
   if(s.monthlyGoals!==undefined&&(!Array.isArray(s.monthlyGoals)||s.monthlyGoals.some(goal=>!object(goal)||!strings(goal,["playerId","month","version","updatedAt"])||!/^\d{4}-(0[1-9]|1[0-2])$/.test(String(goal.month))||!Number.isSafeInteger(goal.target)||Number(goal.target)<0||Number(goal.target)>9999||!goal.version||!s.players.some(p=>p.id===goal.playerId)||(s.self.role==="player"&&goal.playerId!==s.self.playerId))||new Set(s.monthlyGoals.map(g=>`${g.playerId}:${g.month}`)).size!==s.monthlyGoals.length))invalid("月別目標の形式または閲覧権限を確認できませんでした。");
   if (new Set(s.players.map(p => p.id)).size !== s.players.length ||
       Object.values(s.counts).some(people => !object(people) || Object.values(people).some(metrics => !object(metrics) ||
@@ -302,6 +373,7 @@ export function assertSnapshot(value: unknown): asserts value is SheetSnapshot {
     const fields=p.fields;
     return interviewStringFields.some(k=>typeof fields[k]!=="string")||!Array.isArray(fields.crmTools)||fields.crmTools.some(v=>!crmOptions.some(o=>o===v))||!Array.isArray(fields.chatTools)||fields.chatTools.some(v=>!chatOptions.some(o=>o===v))||(fields.pcEnvironment!==""&&!pcOptions.some(o=>o===fields.pcEnvironment))||!genderOptions.some(o=>o===fields.gender);
   })||new Set(s.candidateProfiles.map(p=>p.profileId)).size!==s.candidateProfiles.length))invalid("候補者の基本情報の形式または閲覧権限を確認できませんでした。");
+  if(s.candidateIntroductionV2!==undefined&&(s.introductionV2Feature!==true||!parseIntroductionV2SnapshotEntries(s.candidateIntroductionV2,s.records||[],s.self)))invalid("新しい候補者情報の形式または閲覧権限を確認できませんでした。");
   if (s.deletedCandidates !== undefined && (!Array.isArray(s.deletedCandidates) || s.deletedCandidates.some(r => !object(r) || !strings(r,["changeId","playerId","candidateName","deletedAt"]) || !r.changeId || !r.candidateName || !Array.isArray(r.companies) || r.companies.some(v => typeof v !== "string") || !Number.isSafeInteger(r.recordCount) || Number(r.recordCount)<1 || (s.self.role==="player"&&r.playerId!==s.self.playerId)))) invalid("削除済み候補者の形式または閲覧権限を確認できませんでした。");
   if (s.destination !== undefined && (!object(s.destination) || s.self.role !== "admin" || typeof s.destination.title !== "string" ||
       ![s.destination.matchingUrl, s.destination.kpiUrl].every(url => typeof url === "string" && /^https:\/\/docs\.google\.com\/spreadsheets\/d\/[A-Za-z0-9_-]+\/edit(?:\?gid=\d+(?:#gid=\d+)?|#gid=\d+)$/.test(url)))) {
