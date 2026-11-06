@@ -1,3 +1,4 @@
+import type {StartupTiming} from "../lib/startup-diagnostics";
 import {persistSnapshotCache,readSnapshotCache,purgeSnapshotCache,validSnapshotCacheAccess,type SnapshotCacheAccess} from "../lib/snapshot-cache";
 import {createDeadlineSignal, type RequestDeadline} from "../lib/abort-signal";
 import { persistPendingSave, readPendingSaves, removePendingSave, replacePendingSave, pendingSaveResources, unlockPendingSaves, lockPendingSaves, purgeExpiredPendingSaves, type PendingSave } from "../lib/pending-saves";
@@ -9,6 +10,7 @@ import { matchingFields } from "../lib/management-data";
 import { interviewFieldLabels, interviewStringFields } from "../lib/candidate-intake";
 import { assertWritingKitState, validateWritingPreferences, type WritingKitState, type WritingPreferences, type WritingStyle } from "../lib/writing-ai";
 
+const timingNow=()=>typeof performance==="undefined"?Date.now():performance.now();
 const ENDPOINT_KEY = "insup.node.endpoint.v1";
 const SESSION_KEY = "insup.node.session.v1";
 // Signed by the server after a successful login. It only exempts this device from
@@ -24,7 +26,8 @@ export type BackgroundSaveState = {
   details: string[]; error: string; uncertain: boolean; changeId?: string; intakeInput?: boolean; refreshing?: boolean; localSaved?: boolean; pendingCount?: number; editable?: boolean; waitingForConnection?: boolean;
 };
 type BackgroundJob = { state: BackgroundSaveState; payload: unknown; endpoint: string; token: string; generation: number; account: string; savedInput: PendingSave; resources: string[] };
-const backgroundActions = new Set(["saveCandidateProfile", "saveClient", "deleteCandidate", "updateRecord", "createCandidate", "cancelAchievement", "restoreChange", "saveActivity", "updateProfile", "updateStatus", "saveManagementRow", "saveInterviewReview"]);
+const extensionActions=new Set(["mutateRewards","stageMigrationBatch","applyMigrationItem"]);
+const backgroundActions = new Set(["mutateRewards","stageMigrationBatch","applyMigrationItem","saveCandidateProfile", "saveClient", "deleteCandidate", "updateRecord", "createCandidate", "cancelAchievement", "restoreChange", "saveActivity", "updateProfile", "updateStatus", "saveManagementRow", "saveInterviewReview"]);
 // An open dialog or a focused field: background work must not change what someone is editing.
 const editing = () => typeof document !== "undefined" && !!(document.querySelector('[role="dialog"], [role="alertdialog"]') || document.activeElement?.matches('input, textarea, select, [contenteditable="true"]'));
 const readStorage = (storage: Storage, key: string) => { try { return storage.getItem(key); } catch { return null; } };
@@ -49,6 +52,7 @@ function writeDeviceToken(endpoint: string, id: string, token: unknown): void {
 
 export function useSheetsConnection() {
   const [ready, setReady] = useState(false);
+  const [startupTiming,setStartupTiming]=useState<StartupTiming|null>(null);
   const [endpoint, setEndpoint] = useState("");
   const [mode, setMode] = useState<"demo" | "live">("demo");
   const [players, setPlayers] = useState<SheetPlayer[]>(initialPlayers);
@@ -68,6 +72,7 @@ export function useSheetsConnection() {
   const [mustChangePassword, setMustChangePassword] = useState(false);
   const [backgroundSave, setBackgroundSave] = useState<BackgroundSaveState | null>(null);
   const backgroundJob = useRef<BackgroundJob | null>(null);
+  const extensionWaiters=useRef(new Map<string,{resolve:()=>void;reject:(error:unknown)=>void}>());
   const backgroundQueue = useRef<BackgroundJob[]>([]);
   const admissions = useRef(0);
   const correctionRunning = useRef<string|null>(null);
@@ -134,6 +139,7 @@ export function useSheetsConnection() {
   };
 
   const clearSession = useCallback(() => {
+    extensionWaiters.current.forEach(waiter=>waiter.reject(new SheetApiError("STALE_SESSION","ログイン状態が変わりました。保存結果は再ログイン後に確認してください。")));extensionWaiters.current.clear();
     activeRequest.current?.abort(); activeRequest.current = null; loginRunning.current = false;
     generation.current++; token.current = "";
     ++requestVersion.current;
@@ -213,6 +219,7 @@ export function useSheetsConnection() {
       } finally { if (isCurrent(g)) { setReady(true); finishLoad(g, controller); } }
     })();
     return () => {
+      extensionWaiters.current.forEach(waiter=>waiter.reject(new SheetApiError("STALE_SESSION","画面が閉じられました。保存結果は再ログイン後に確認してください。")));extensionWaiters.current.clear();
       mounted.current = false; ++generation.current; ++requestVersion.current;
       activeRequest.current?.abort(); activeRequest.current = null; loginRunning.current = false;
       backgroundJob.current = null; backgroundQueue.current = []; outboxLoad.current = null;cacheAccessRef.current=null;sourceRef.current=null;
@@ -244,6 +251,8 @@ export function useSheetsConnection() {
     const {controller, g} = beginLoad("authenticating");
     // Authentication and its first read share one deadline, so splitting the
     // requests cannot double the total time before the recovery screen appears.
+    const timingStart=timingNow();let readStart=timingStart;
+    const timing:StartupTiming={checkedAt:new Date().toISOString(),authenticationMs:null,cacheReadMs:null,dataReadMs:null,firstDisplayMs:null,totalMs:0,source:'failed'};setStartupTiming(null);
     let accepted = false, deadline: RequestDeadline | undefined;
     try {
       deadline = createDeadlineSignal(45_000, [controller.signal]);
@@ -251,6 +260,7 @@ export function useSheetsConnection() {
       const deviceToken = readDeviceToken(endpoint, id);
       const data = await sheetRequest<{token: string; deviceToken?: string; snapshot?: SheetSnapshot; mustChangePassword?: boolean;cacheAccess?:SnapshotCacheAccess}>(endpoint, "login", {id, password, sessionOnly: true, cacheSnapshot:true, idleAware: true, ...(deviceToken ? {deviceToken} : {})}, {signal});
       if (!isCurrent(g)) return;
+      timing.authenticationMs=timingNow()-timingStart;
       if (!data || typeof data.token !== "string" || data.token.length < 32) throw new Error("ログイン結果を確認できませんでした。");
       const cacheAccepted=validSnapshotCacheAccess(data.cacheAccess)&&data.cacheAccess.self.playerId===id.trim().toUpperCase();
       writeDeviceToken(endpoint, id, data.deviceToken);
@@ -258,31 +268,36 @@ export function useSheetsConnection() {
       writeStorage(sessionStorage, SESSION_KEY, JSON.stringify({endpoint, token: data.token,...(cacheAccepted?{cacheAvailable:true}:{})}));
       setAuthenticated(true); accepted = true;
       // An issued password only opens the change screen; no business data is requested.
-      if (data.mustChangePassword === true) { setMustChangePassword(true); return; }
+      if (data.mustChangePassword === true) { timing.source="password-change";timing.firstDisplayMs=timingNow()-timingStart;setMustChangePassword(true); return; }
       if(cacheAccepted&&data.cacheAccess){
         cacheAccessRef.current=data.cacheAccess;
+        readStart=timingNow();
         const cached=await readSnapshotCache(endpoint,data.cacheAccess,()=>isCurrent(g),signal);
+        timing.cacheReadMs=timingNow()-readStart;
         if(!isCurrent(g))return;
-        if(cached){applyCachedSnapshot(cached);loginRunning.current=false;finishLoad(g,controller);void refreshLatest.current(true);return;}
+        if(cached){timing.source="cache";timing.firstDisplayMs=timingNow()-timingStart;applyCachedSnapshot(cached);loginRunning.current=false;finishLoad(g,controller);void refreshLatest.current(true);return;}
       }
       setLoadPhase("loading");
       // Older deployments include a snapshot; updated ones authenticate first.
+      readStart=timingNow();
       const dataSnapshot = data.snapshot === undefined
         ? await sheetRequest<SheetSnapshot>(endpoint, "snapshot", {}, {token: data.token, signal})
         : data.snapshot;
-      if (isCurrent(g)) applySnapshot(dataSnapshot);
+      timing.dataReadMs=timingNow()-readStart;
+      if (isCurrent(g)) {applySnapshot(dataSnapshot);timing.source="latest";timing.firstDisplayMs=timingNow()-timingStart;}
     } catch (e) {
       if (!isCurrent(g)) return;
       // A server that reports the requirement only on the first read still opens the change screen.
-      if (accepted && isPasswordChangeRequired(e)) { setMustChangePassword(true); return; }
+      if (accepted && isPasswordChangeRequired(e)) {timing.source="password-change";timing.firstDisplayMs=timingNow()-timingStart;setMustChangePassword(true); return; }
       if (accepted && isExpired(e)) clearSession();
       setError(e instanceof Error ? e.message : accepted ? "実績を取得できませんでした。再取得してください。" : "ログインできませんでした。");
+      timing.failureCode=e instanceof SheetApiError?e.code:"CLIENT_ERROR";
       // Keep the token and clear the submitted password after successful auth.
       // The recovery screen retries data retrieval without sending credentials.
       if (!accepted || isExpired(e)) throw e;
     } finally {
       deadline?.dispose();
-      if (isCurrent(g)) { loginRunning.current = false; finishLoad(g, controller); }
+      if (isCurrent(g)) {timing.totalMs=timingNow()-timingStart;setStartupTiming(timing); loginRunning.current = false; finishLoad(g, controller); }
     }
   };
 
@@ -418,7 +433,7 @@ export function useSheetsConnection() {
       else job.state = {...job.state, status:"failed", error:"オフラインです。接続後に同じ内容で保存結果を確認してください。", waitingForConnection:false};
       publishQueue(); return;
     }
-    let updateAfterCommit = false, posted = false;
+    let updateAfterCommit = false, posted = false;const wasUncertain=job.state.uncertain;
     mutationRunning.current = true;
     ++requestVersion.current; activeRequest.current?.abort(); activeRequest.current = null;
     setSyncing(false); setLoadPhase(null); setBusy(false);
@@ -447,10 +462,15 @@ export function useSheetsConnection() {
       job.state = {...job.state, status:"saved", changeId:data.changeId, intakeInput:false, refreshing:updateAfterCommit};
       job.payload = null; job.savedInput.payload = null;
       backgroundQueue.current.shift(); backgroundJob.current = job; publishQueue();
+      extensionWaiters.current.get(job.state.operationId)?.resolve();extensionWaiters.current.delete(job.state.operationId);
     } catch (e) {
       if (!isCurrent(job.generation) || backgroundQueue.current[0] !== job) return;
       if (isExpired(e)) { clearSession(); setError("ログインの有効期限が切れました。入力はこの端末に残っています。再ログインすると未同期の入力を確認できます。"); return; }
-      job.state = {...job.state, status:"failed", error:e instanceof Error?e.message:"保存結果を確認できませんでした。", uncertain:posted&&isUncertainWrite(e),editable:!!latestSnapshot.current&&correctionFields(job.state.action,job.payload,latestSnapshot.current).length>0};
+      job.state = {...job.state, status:"failed", error:e instanceof Error?e.message:"保存結果を確認できませんでした。", uncertain:wasUncertain||posted&&isUncertainWrite(e),editable:!!latestSnapshot.current&&correctionFields(job.state.action,job.payload,latestSnapshot.current).length>0};
+      if(extensionActions.has(job.state.action)){
+        extensionWaiters.current.get(job.state.operationId)?.reject(wasUncertain&&!isUncertainWrite(e)?new SheetApiError("INTERNAL",`前回の保存結果はまだ未確認です。入力と同じ保存IDを保持しています。${e instanceof Error?e.message:"接続状態を確認してください。"}`):e);extensionWaiters.current.delete(job.state.operationId);
+        if(!job.state.uncertain){await removePendingSave(job.endpoint,job.account,job.state.operationId);if(isCurrent(job.generation)&&backgroundQueue.current[0]===job){backgroundQueue.current.shift();backgroundJob.current=null;}}
+      }
       publishQueue();
     } finally {
       if (isCurrent(job.generation)) {
@@ -713,6 +733,28 @@ export function useSheetsConnection() {
     finally{if(isCurrent(teamGeneration)){mutationRunning.current=false;setBusy(false);resumeBackgroundLatest.current();}}
   };
 
+  const readExtension=async<T,>(action:"readRewards"|"readMigrationArchive",payload:unknown={}):Promise<T>=>{
+    if(!teamToken||!snapshot||!isCurrent(teamGeneration)||token.current!==teamToken)throw new SheetApiError("STALE_SESSION","ログイン状態が変わりました。画面を開き直してください。");
+    try{const result=await sheetRequest<T>(endpoint,action,payload,{token:teamToken});if(!isCurrent(teamGeneration)||token.current!==teamToken)throw new SheetApiError("STALE_SESSION","ログイン状態が変わりました。");return result;}
+    catch(error){if(isCurrent(teamGeneration)&&isExpired(error))expire(error);throw error;}
+  };
+  const mutateExtension=async(action:"mutateRewards"|"stageMigrationBatch"|"applyMigrationItem",payload:unknown,operationId:string):Promise<void>=>{
+    if(!teamToken||!snapshot||!isCurrent(teamGeneration)||token.current!==teamToken)throw new SheetApiError("STALE_SESSION","ログイン状態が変わりました。画面を開き直してください。");
+    if(!latestSnapshot.current?.writesEnabled||!(action==="mutateRewards"?latestSnapshot.current.rewardsFeature:latestSnapshot.current.migrationFeature))throw new SheetApiError("READ_ONLY","連携が更新されていないか、現在は閲覧のみです。");
+    if(mutationRunning.current||loginRunning.current)throw new SheetApiError("MUTATION_PENDING","右上の保存結果を確認してから操作してください。");
+    await ensureOutbox();if(!isCurrent(teamGeneration)||token.current!==teamToken)throw new SheetApiError("STALE_SESSION","ログイン状態が変わりました。");
+    const queued=backgroundQueue.current.find(job=>job.state.operationId===operationId);
+    if(hasPendingBackground()&&(!queued||backgroundQueue.current[0]!==queued))throw new SheetApiError("MUTATION_PENDING","右上の保存結果を確認してから操作してください。");
+    if(queued&&(queued.state.action!==action||JSON.stringify(queued.payload)!==JSON.stringify(payload)))throw new SheetApiError("OPERATION_CONFLICT","同じ保存IDを別の内容に使うことはできません。");
+    if(extensionWaiters.current.has(operationId))throw new SheetApiError("MUTATION_PENDING","この保存を確認中です。");
+    let resolve!:()=>void,reject!:(error:unknown)=>void;const done=new Promise<void>((yes,no)=>{resolve=yes;reject=no;});
+    // Attach a handler before asynchronous local persistence can reject the waiter.
+    const observed=done.then(()=>undefined,error=>{throw error;});void observed.catch(()=>{});
+    extensionWaiters.current.set(operationId,{resolve,reject});
+    try{if(queued)void runBackground(queued);else await submitMutation(action,payload,operationId,saveLabel(action));await observed;}
+    catch(error){extensionWaiters.current.delete(operationId);throw error;}
+  };
+
   const logout = async () => {
     // Older deployments return no outbox secret and cannot accept new local
     // saves. They must still let the user clear this session without deleting
@@ -728,12 +770,12 @@ export function useSheetsConnection() {
     clearSession(); setMode("demo"); setPlayers(initialPlayers); setActivities(makeDemoActivities()); setError("");
   };
 
-  return { ready, endpoint, mode, players, setPlayers, activities, setActivities, snapshot, snapshotSource, cachedAt, authenticated, mustChangePassword, loadPhase, busy, error,
-    syncing, syncError, backgroundSave, hasPendingSave, submitMutation, retryBackgroundSave, dismissBackgroundSave, readBackgroundSaveCorrection, correctBackgroundSave, copyBackgroundIntakeInput, credentials, dismissCredentials:() => setCredentials(null), connect, login, logout, refresh, mutate, readManagement, readOperational, mutateOperational, readTeamWorkspace, mutateTeam, analyzeReviews, readAdvice, analyzeInsights, readInsights, readWritingKit, generateWritingKit, readWritingPreferences, saveWritingPreferences, readSecurity, changePassword, showDemo };
+  return { ready, startupTiming, endpoint, mode, players, setPlayers, activities, setActivities, snapshot, snapshotSource, cachedAt, authenticated, mustChangePassword, loadPhase, busy, error,
+    syncing, syncError, backgroundSave, hasPendingSave, submitMutation, retryBackgroundSave, dismissBackgroundSave, readBackgroundSaveCorrection, correctBackgroundSave, copyBackgroundIntakeInput, credentials, dismissCredentials:() => setCredentials(null), connect, login, logout, refresh, mutate, readManagement, readOperational, mutateOperational, readTeamWorkspace, mutateTeam, readExtension, mutateExtension, analyzeReviews, readAdvice, analyzeInsights, readInsights, readWritingKit, generateWritingKit, readWritingPreferences, saveWritingPreferences, readSecurity, changePassword, showDemo };
 }
 
 function saveLabel(action: string) {
-  return ({saveCandidateProfile:"候補者の基本情報",saveClient:"取引先の登録・編集",deleteCandidate:"候補者・提案の削除",updateRecord:"候補者の変更",createCandidate:"候補者の登録",cancelAchievement:"成果の取り消し",restoreChange:"変更の復元",saveActivity:"成果の登録",updateProfile:"プロフィール",updateStatus:"進捗の変更",saveManagementRow:"業務管理表",saveInterviewReview:"面談の振り返り"} as Record<string,string>)[action] || "変更";
+  return ({mutateRewards:"ポイント・特典の保存",stageMigrationBatch:"過去データの原文保管",applyMigrationItem:"過去データの登録",saveCandidateProfile:"候補者の基本情報",saveClient:"取引先の登録・編集",deleteCandidate:"候補者・提案の削除",updateRecord:"候補者の変更",createCandidate:"候補者の登録",cancelAchievement:"成果の取り消し",restoreChange:"変更の復元",saveActivity:"成果の登録",updateProfile:"プロフィール",updateStatus:"進捗の変更",saveManagementRow:"業務管理表",saveInterviewReview:"面談の振り返り"} as Record<string,string>)[action] || "変更";
 }
 function saveDetails(action: string, owned: unknown, snapshot: SheetSnapshot): string[] {
   const data = owned as Record<string, unknown>, detail: string[] = [];

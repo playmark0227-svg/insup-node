@@ -8,7 +8,7 @@ import {
   type WritingPreferences, type WritingStyle, type WritingKitState,
 } from "@/lib/writing-ai";
 import { getOnDeviceAiAvailability, generateCandidateIntroduction, generateInterviewCoaching } from "@/lib/on-device-ai";
-import {editedIntroductionIssues,introductionDocument,reviewIntroductionSource,type IntroductionReview} from "@/lib/introduction-review";
+import {editedIntroductionIssues,introductionDocument,reviewIntroductionSource,reviewIntroductionQuality,type IntroductionReview} from "@/lib/introduction-review";
 import "@/app/candidate-ai.css";
 
 type AssistantTab = "introduction" | "coaching";
@@ -42,7 +42,7 @@ export type CandidateAiAssistantProps = {
   onIntroductionStatus?: (status:"idle"|"waiting"|"running"|"ready"|"error")=>void;
 };
 
-const evidenceLabels:Record<string,string>={"source-number":"原文にない数値・期間","source-tool":"原文にない使用ツール","availability-as-start":"稼働開始可能日を開始済みとする表現","time-unit-changed":"月間・週間の時間数の取り違え","employment-type":"原文にない雇用形態","rate-unit-changed":"時給・月額などの単位の取り違え","self-report-removed":"本人申告という出所の省略","metric-period-changed":"日次・月次など実績の集計単位の変更","metric-qualifier-changed":"最大・平均・目標・実績の取り違え","experience-negation-changed":"未経験・未使用という記録と異なる表現","company-metric-changed":"会社ごとの実績の取り違え","metric-context-changed":"数値が表す業務・実績の取り違え","source-achievement":"原文にない研修・資格・受賞・役職","empty-draft":"文章が空欄","draft-length":"1000文字の上限超過","candidate-name":"候補者氏名の省略・変更","source-private-detail":"共有文に含めない健康・家庭の個人事情","rank-scope-removed":"順位の期間・比較対象の未確認という限定の省略","source-assessment":"原文にない能力評価・将来の貢献への期待","source-format":"紹介文の本文ではない形式"};
+const evidenceLabels:Record<string,string>={"source-number":"原文にない数値・期間","source-tool":"原文にない使用ツール","availability-as-start":"稼働開始可能日を開始済みとする表現","time-unit-changed":"月間・週間の時間数の取り違え","employment-type":"原文にない雇用形態","rate-unit-changed":"時給・月額などの単位の取り違え","self-report-removed":"本人申告という出所の省略","metric-period-changed":"日次・月次など実績の集計単位の変更","metric-qualifier-changed":"最大・平均・目標・実績の取り違え","experience-negation-changed":"未経験・未使用という記録と異なる表現","experience-period-changed":"経験期間の単位・限定・会社への紐づけの変更","company-metric-changed":"会社ごとの実績の取り違え","metric-context-changed":"数値が表す業務・実績の取り違え","source-achievement":"原文にない研修・資格・受賞・役職","empty-draft":"文章が空欄","draft-length":"1000文字の上限超過","candidate-name":"候補者氏名の省略・変更","source-private-detail":"共有文に含めない健康・家庭の個人事情","rank-scope-removed":"順位の期間・比較対象の未確認という限定の省略","source-assessment":"原文にない能力評価・将来の貢献への期待","source-format":"紹介文の本文ではない形式"};
 const localError = (error: unknown): string => {
   const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
   const phase = error && typeof error === "object" && "phase" in error ? error.phase : "";
@@ -123,6 +123,7 @@ function CandidateAiAssistantSession({ candidateName, fields, memo = "", introdu
   const stale = !!preview && preview.fingerprint !== currentFingerprint;
   const currentReview=reviewIntroductionSource(fields,[candidateName]);
   const editedIssues=preview?.edited&&preview.draft!==undefined?editedIntroductionIssues(preview.draft,candidateName,currentReview.fields):[];
+  const draftQuality=preview?.kind==="introduction"&&preview.engine==="device"&&preview.method!=="record-format"&&preview.draft?reviewIntroductionQuality(preview.draft,preview.review?.fields||currentReview.fields,preferences):null;
   const editedAfterStart = !!preview && introduction !== preview.introductionAtStart && introduction !== preview.draft;
   const supported = availability !== "checking" && availability !== "unavailable";
   const kitAvailable = !!kitState?.kit && kitState.kit.style === style && kitState.kit.preferenceVersion === preferences.version;
@@ -348,6 +349,7 @@ function CandidateAiAssistantSession({ candidateName, fields, memo = "", introdu
       {editedAfterStart && !stale && <p className="candidate-ai-warning">作成中に現在の紹介文が編集されました。編集した文章は保持しています。「この文章を使う」で置き換える前に比較してください。</p>}
       {preview.summary && <p className="candidate-ai-summary">{preview.summary}</p>}
       {preview.review&&renderReview(preview.review,true)}
+      {draftQuality&&<details className="candidate-ai-review" open={draftQuality.issues.length>0} aria-label="紹介文の仕上がりチェック"><summary>文章の仕上がりを確認{draftQuality.issues.length>0?`（${draftQuality.issues.length}件）`:""}</summary>{draftQuality.issues.length>0?<ul>{draftQuality.issues.map((issue,index)=><li key={`${issue.code}-${index}`}><strong>{issue.title}</strong><p>{issue.detail}</p>{issue.field&&onFocusField&&<button type="button" className="text-button" disabled={disabled||running} onClick={()=>onFocusField(issue.field!)}>原文の入力を確認</button>}</li>)}</ul>:<p>見出し、職歴の主要な業務語、丁寧語、同じ文章の反復を確認しました。共有前に、原文の意味と条件も照合してください。</p>}<p>表記の違いでも確認が出ます。必要な箇所は「候補文をその場で修正」から直せます。</p></details>}
       {preview.kind==="introduction"&&preview.draft!==undefined&&!preview.applied&&<div className="candidate-ai-edit"><button type="button" className="secondary-button" disabled={disabled||running||stale} onClick={()=>setEditingDraft(value=>!value)}>{editingDraft?"文章の表示に戻る":"候補文をその場で修正"}</button>{preview.edited&&<button type="button" className="text-button" disabled={disabled||running||stale} onClick={()=>{setPreview({...preview,draft:preview.originalDraft||"",edited:false});setCopied(false);setReplaceConfirm(false);}}>作成直後の候補に戻す</button>}
         {editingDraft&&<label htmlFor={`${id}-draft-editor`}>候補文を修正<textarea id={`${id}-draft-editor`} rows={12} maxLength={4000} disabled={disabled||running||stale} value={preview.draft} onChange={event=>{setPreview({...preview,draft:event.target.value,edited:true});setReplaceConfirm(false);setCopied(false);}}/><small>{unicodeLength(preview.draft)} / {introductionLimit}文字。新しい事実は経歴・実績などの入力欄へ追加してください。</small></label>}
         {preview.edited&&<p className={editedIssues.length?"candidate-ai-warning":"candidate-ai-notice"} role="status">{editedIssues.length?`修正文に${editedIssues.map(issue=>evidenceLabels[issue]).filter(Boolean).slice(0,2).join("・")}があります。元の入力と照合して修正してください。` :"修正文の数値・単位・出所を入力と照合しました。送る前に内容も確認してください。"}</p>}

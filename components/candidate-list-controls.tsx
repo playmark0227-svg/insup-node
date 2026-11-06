@@ -3,6 +3,7 @@ import { ArrowDownWideNarrow, ArrowUpNarrowWide, Check, Filter, SlidersHorizonta
 import { candidateAppointmentFilters, candidateFilterCount, candidateProfileFilters, candidateSortFields, type CandidateGroupFilter, type CandidateGroupSort } from "@/lib/candidate-groups";
 import type { SheetPlayer } from "@/lib/sheets-client";
 import { pcOptions, crmOptions } from "@/lib/candidate-intake";
+import { conditionCheckOptions, validConditionDate } from "@/lib/candidate-conditions";
 import "./candidate-list-controls.css";
 
 export type CandidateListControlsProps = {
@@ -25,6 +26,16 @@ export function CandidateListControls({ filter, onFilterChange, sort, onSortChan
   const missingOwner = admin && !["all", "unassigned", ...players.map(player => player.id)].includes(filter.owner);
   const sortLabel = candidateSortFields.find(option => option.value === sort.field)?.label || "最終面談日";
   const patch = (next: Partial<CandidateGroupFilter>) => onFilterChange({ ...filter, ...next });
+  const ranges = [{label:"週の稼働日数",unit:"日/週",min:"daysMin",max:"daysMax",cap:7,step:1},{label:"月の稼働時間",unit:"時間/月",min:"hoursMin",max:"hoursMax",cap:744,step:0.5},{label:"希望時給",unit:"円/時",min:"rateMin",max:"rateMax",cap:1000000,step:1}] as const;
+  function changeBound(key: typeof ranges[number]["min"] | typeof ranges[number]["max"], value: string, cap: number) {
+    if (!value) { patch({[key]:undefined}); return; }
+    const number=Number(value);if(/^\d+(?:\.\d+)?$/.test(value)&&Number.isFinite(number)&&number>=0&&number<=cap)patch({[key]:number});
+  }
+  const invalidRange=ranges.find(range=>filter[range.min]!==undefined&&filter[range.max]!==undefined&&filter[range.min]!>filter[range.max]!);
+  const invalidDays=[filter.daysMin,filter.daysMax].some(value=>value!==undefined&&!Number.isInteger(value));
+  const confirmationField=filter.conditionCheck?.split(":")[0];
+  const confirmationRange=confirmationField==="days"?ranges[0]:confirmationField==="hours"?ranges[1]:confirmationField==="rate"?ranges[2]:undefined;
+  const conflictingConfirmation=confirmationRange&&(filter[confirmationRange.min]!==undefined||filter[confirmationRange.max]!==undefined)||confirmationField==="start"&&!!filter.availableBy;
   function close() { const previous = open; setOpen(null); (previous === "filter" ? filterButton : sortButton).current?.focus(); }
   function reset() { onFilterChange({ owner: "all", status: "all", statuses: [], search: filter.search, appointment: "all", profile: "all" }); }
   function statusChanged(value: string, checked: boolean) {
@@ -43,9 +54,13 @@ export function CandidateListControls({ filter, onFilterChange, sort, onSortChan
         {intakeEnabled&&<fieldset className="candidate-profile-options"><legend>基本情報の登録内容から探す</legend><p>追加入力は不要です。記載された言葉・選択値で絞り込み、経験や適性は推定しません。</p><div>
           <label>PC環境<select aria-label="候補者のPC環境で絞り込み" value={companyValue(filter.pcEnvironment)} onChange={event=>{const value=event.target.value;if(value==="all")patch({pcEnvironment:undefined});else if(value==="none")patch({pcEnvironment:null});else{const choice=pcChoices.find(item=>companyValue(item)===value);if(choice!==undefined)patch({pcEnvironment:choice});}}}><option value="all">すべてのPC環境</option><option value="none">PC環境の記載なし</option>{pcChoices.map(choice=><option key={choice} value={companyValue(choice)}>{choice}</option>)}</select></label>
           <label>登録されたCRM<select aria-label="候補者の登録CRMで絞り込み" value={companyValue(filter.crmTool)} onChange={event=>{const value=event.target.value;if(value==="all")patch({crmTool:undefined});else if(value==="none")patch({crmTool:null});else{const choice=crmChoices.find(item=>companyValue(item)===value);if(choice!==undefined)patch({crmTool:choice});}}}><option value="all">すべてのCRM</option><option value="none">CRMの登録なし</option>{crmChoices.map(choice=><option key={choice} value={companyValue(choice)}>{choice}</option>)}</select></label>
-          <label>経験・強みの記載キーワード<input aria-label="候補者の経験・強みの記載で絞り込み" type="search" value={filter.experienceKeyword||""} onChange={event=>patch({experienceKeyword:event.target.value})} maxLength={200} placeholder="例：法人営業 テレアポ"/><small>営業経験・職歴、実績、強み、PCスキルの記載を検索</small></label>
+          <label>経験・強みの記載キーワード<input aria-label="候補者の経験・強みの記載で絞り込み" type="search" value={filter.experienceKeyword||""} onChange={event=>patch({experienceKeyword:event.target.value})} maxLength={200} placeholder="例：法人営業 テレアポ"/><small>営業経験・職歴、実績、強み、PCスキルを検索。SaaS・サース等の表記違いにも対応</small></label>
           <label>稼働条件の記載キーワード<input aria-label="候補者の稼働条件の記載で絞り込み" type="search" value={filter.availabilityKeyword||""} onChange={event=>patch({availabilityKeyword:event.target.value})} maxLength={200} placeholder="例：平日 週3日"/><small>開始可能日、時間帯、日数、時間数、稼働形態などを検索</small></label>
-        </div></fieldset>}
+        </div><div className="candidate-numeric-conditions">
+          {ranges.map(range=><fieldset key={range.min}><legend>{range.label}<small>{range.unit}</small></legend><div><label>下限<input type="number" inputMode="decimal" min={0} max={range.cap} step={range.step} aria-label={`${range.label}の下限`} value={filter[range.min]??""} onChange={event=>changeBound(range.min,event.target.value,range.cap)} placeholder="指定なし"/></label><span aria-hidden="true">〜</span><label>上限<input type="number" inputMode="decimal" min={0} max={range.cap} step={range.step} aria-label={`${range.label}の上限`} value={filter[range.max]??""} onChange={event=>changeBound(range.max,event.target.value,range.cap)} placeholder="指定なし"/></label></div></fieldset>)}
+          <label>この日までに開始可能<input aria-label="候補者の開始可能日の上限" type="date" value={filter.availableBy||""} onChange={event=>{const value=event.target.value;if(!value||validConditionDate(value))patch({availableBy:value||undefined});}}/></label>
+          <label>条件の記載・確認状態<select aria-label="候補者の条件の確認状態" value={filter.conditionCheck||"all"} onChange={event=>{const option=conditionCheckOptions.find(option=>option.value===event.target.value);if(option)patch({conditionCheck:option.value});}}>{conditionCheckOptions.map(option=><option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+        </div>{invalidDays&&<p className="form-error" role="alert">週の稼働日数は0〜7の整数で指定してください。現在の条件では表示しません。</p>}{invalidRange&&<p className="form-error" role="alert">{invalidRange.label}は下限を上限以下にしてください。現在の条件では表示しません。</p>}{conflictingConfirmation&&<p className="info-box">未記載・要確認の項目には、同じ項目の範囲条件を同時に適用できません。<button type="button" className="text-button" onClick={()=>confirmationRange?patch({[confirmationRange.min]:undefined,[confirmationRange.max]:undefined}):patch({availableBy:undefined})}>その項目の範囲だけ解除</button></p>}<details className="candidate-condition-explanation"><summary>数値条件と原文の確認について</summary><p>すべての条件を同じ基本情報で満たす候補者を表示します。記載範囲がある場合は、その全体が指定した範囲内にあるものが対象です。希望時給は「時給」「円/時」など単位が明記された値だけを使い、月額から換算しません。「程度」「応相談」や年のない開始日は「要確認」に分けます。原文は候補者の「基本情報・紹介文」から確認できます。</p><p>表記違いは限定した辞書で照合し、経験や適性は推定しません。経験キーワードの「未経験」「経験なし」等の記載は、経験がある候補として扱いません。</p></details></fieldset>}
         <fieldset className="candidate-progress-options"><legend>企業ごとの進捗 <small>複数選択可・未選択ですべて</small></legend><div>{statusOptions.map(status => <label key={status || "empty-status"}><input type="checkbox" aria-label={`進捗：${status || "未設定"}`} checked={selectedStatuses.includes(status)} onChange={event => statusChanged(status, event.target.checked)}/><span>{status || "進捗未設定"}</span></label>)}</div></fieldset>
       </div><footer><p>予定は未完了のC面談・合否回答期日・稼働開始予定です。該当する方の他の履歴も残して表示します。</p><button type="button" className="text-button" disabled={!count} onClick={reset}><X size={14}/>フィルターを解除</button></footer>
     </section>}

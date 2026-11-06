@@ -1290,3 +1290,78 @@ test('an expired old team read and a late team write cannot release a new login 
   assert.equal(h.calls.filter(call=>call.options.operationId==='third-team-save').length,0);
  }finally{newWrite.resolve({committed:true,operationId:'new-team-save'});await current;h.unmount();}
 });
+
+// Rewards and migration use the encrypted outbox, but their Promise resolves only
+// after the server receipt, so their own editors cannot announce a local save as final.
+const extensionSnapshot={...snapshot,self:{playerId:'ADMIN',role:'admin'},rewardsFeature:true,migrationFeature:true,teamWorkspaceFeature:true,operationsFeature:true};
+const extensionPayload={command:'adjust',playerId:'ND-001',delta:40,reason:'架空の確認済み調整'};
+
+test('extension writes wait for both local commits before POST and for a matching remote receipt before resolving',async()=>{
+ const admitted=deferred(),attempted=deferred(),response=deferred();
+ const h=harness(call=>call.action==='snapshot'?extensionSnapshot:response.promise,{storedToken:token,persistLocal:input=>input.attempted?attempted.promise:admitted.promise});await flush();
+ let completed=false;const saving=h.render().mutateExtension('mutateRewards',extensionPayload,'extension-local-operation').then(()=>{completed=true;});await flush();
+ assert.equal(completed,false);assert.equal(h.calls.filter(call=>call.action==='mutateRewards').length,0);assert.equal(h.pendingStore.size,0);
+ admitted.resolve();await flush();assert.equal(h.pendingStore.size,1);assert.equal(h.pendingStore.get('extension-local-operation').attempted,false);assert.equal(h.calls.filter(call=>call.action==='mutateRewards').length,0);
+ attempted.resolve();await flush();assert.equal(h.pendingStore.get('extension-local-operation').attempted,true);assert.equal(h.calls.filter(call=>call.action==='mutateRewards').length,1);assert.equal(completed,false);assert.equal(h.render().busy,false);
+ response.resolve({committed:true,operationId:'extension-local-operation'});await saving;await flush();assert.equal(completed,true);assert.equal(h.pendingStore.size,0);assert.equal(h.render().hasPendingSave,false);assert.equal(h.render().backgroundSave.status,'saved');h.unmount();
+});
+
+test('uncertain extension receipts survive rehydration without automatic replay and same-ID retry confirms only one remote commit',async()=>{
+ const committed=new Set();let attempts=0;
+ const remote=call=>{if(call.action==='snapshot')return extensionSnapshot;if(call.action==='mutateRewards'){attempts++;committed.add(call.options.operationId);if(attempts===1)throw new SheetApiError('NETWORK','架空：保存後の応答を失いました');return {committed:true,operationId:call.options.operationId};}throw new Error('Unexpected '+call.action);};
+ const h=harness(remote,{storedToken:token});await flush();await assert.rejects(h.render().mutateExtension('mutateRewards',extensionPayload,'extension-retained-operation'),{code:'NETWORK'});await flush();
+ assert.equal(h.render().backgroundSave.uncertain,true);assert.equal(h.pendingStore.size,1);const retained=structuredClone(h.pendingStore.get('extension-retained-operation'));assert.equal(retained.attempted,true);assert.deepEqual(retained.payload,extensionPayload);assert.equal(committed.size,1);h.unmount();
+ const restored=harness(remote,{storedToken:token,pendingSaves:[retained]});await flush();restored.render();await flush();assert.equal(attempts,1);assert.equal(restored.render().backgroundSave.uncertain,true);assert.equal(restored.render().hasPendingSave,true);
+ await assert.rejects(restored.render().mutateExtension('mutateRewards',{...extensionPayload,delta:900},retained.operationId),{code:'OPERATION_CONFLICT'});assert.equal(attempts,1);
+ await restored.render().mutateExtension('mutateRewards',retained.payload,retained.operationId);await flush();assert.equal(attempts,2);assert.equal(committed.size,1);assert.equal(restored.pendingStore.size,0);assert.equal(restored.render().hasPendingSave,false);restored.unmount();
+});
+
+for(const action of ['stageMigrationBatch','applyMigrationItem'])test(`${action} preserves a possibly posted input and uses the same operation ID on explicit retry`,async()=>{
+ const payload=action==='stageMigrationBatch'?{entries:[{sourceId:'fixture-post',workspace:'架空',channel:'架空',body:'管理者限定の架空原文'}]}:{id:'fixture-item',version:'fixture-version',mode:'ignore'};let first=true;
+ const h=harness(call=>{if(call.action==='snapshot')return extensionSnapshot;if(first){first=false;throw new SheetApiError('TIMEOUT','架空の応答待ち');}return {committed:true,operationId:call.options.operationId};},{storedToken:token});await flush();
+ await assert.rejects(h.render().mutateExtension(action,payload,`extension-${action}-operation`),{code:'TIMEOUT'});await flush();assert.equal(h.pendingStore.size,1);assert.equal(h.render().backgroundSave.uncertain,true);
+ await h.render().mutateExtension(action,payload,`extension-${action}-operation`);await flush();const writes=h.calls.filter(call=>call.action===action);assert.equal(writes.length,2);assert.equal(writes[0].options.operationId,writes[1].options.operationId);assert.deepEqual(writes[0].payload,writes[1].payload);assert.equal(h.pendingStore.size,0);h.unmount();
+});
+
+test('known extension validation failures release the outbox and allow a corrected new operation',async()=>{
+ let invalid=true;const h=harness(call=>{if(call.action==='snapshot')return extensionSnapshot;if(invalid)throw new SheetApiError('VALIDATION','確認した理由を入力してください');return {committed:true,operationId:call.options.operationId};},{storedToken:token});await flush();
+ await assert.rejects(h.render().mutateExtension('mutateRewards',extensionPayload,'extension-invalid-operation'),{code:'VALIDATION'});await flush();assert.equal(h.pendingStore.size,0);assert.equal(h.render().hasPendingSave,false);assert.notEqual(h.render().backgroundSave?.uncertain,true);
+ invalid=false;await h.render().mutateExtension('mutateRewards',{...extensionPayload,reason:'修正して確認した理由'},'extension-corrected-operation');await flush();assert.equal(h.pendingStore.size,0);assert.equal(h.calls.filter(call=>call.action==='mutateRewards').length,2);h.unmount();
+});
+
+test('uncertain extension results block other foreground APIs and a different extension operation',async()=>{
+ const h=harness(call=>{if(call.action==='snapshot')return extensionSnapshot;throw new SheetApiError('NETWORK','確定不明');},{storedToken:token});await flush();
+ await assert.rejects(h.render().mutateExtension('mutateRewards',extensionPayload,'extension-blocking-operation'),{code:'NETWORK'});await flush();const before=h.calls.length;
+ await assert.rejects(h.render().mutate('updateStatus',{recordId:'one',status:'提案'},'extension-following-business'),{code:'MUTATION_PENDING'});
+ await assert.rejects(h.render().mutateOperational('manageAccount',{command:'unused'},'extension-following-account'),{code:'MUTATION_PENDING'});
+ await assert.rejects(h.render().mutateTeam('saveTeamComment',{body:'must remain in editor'},'extension-following-team'),{code:'MUTATION_PENDING'});
+ await assert.rejects(h.render().mutateExtension('stageMigrationBatch',{entries:[]},'extension-following-migration'),{code:'MUTATION_PENDING'});
+ assert.equal(h.calls.length,before);assert.equal(h.pendingStore.size,1);assert.deepEqual(h.pendingStore.get('extension-blocking-operation').payload,extensionPayload);h.unmount();
+});
+
+test('extension callbacks from a previous actor cannot submit with a new session or alter its state',async()=>{
+ const secondToken=token+'-actor-two',next={...extensionSnapshot,self:{playerId:'ND-002',role:'player'},players:[player,{...player,id:'ND-002',name:'架空の別担当'}]};
+ const h=harness(call=>call.action==='snapshot'?extensionSnapshot:call.action==='logout'?{}:call.action==='login'?{token:secondToken,snapshot:next}:{committed:true,operationId:call.options.operationId},{storedToken:token});await flush();const previous=h.render().mutateExtension;
+ await h.render().logout();await h.render().login('ND-002','not-a-real-password');const before=h.calls.length,updates=h.updates();
+ await assert.rejects(previous('mutateRewards',extensionPayload,'extension-old-actor-operation'),{code:'STALE_SESSION'});assert.equal(h.calls.length,before);assert.equal(h.updates(),updates);assert.equal(h.render().snapshot,next);assert.equal(h.pendingStore.size,0);h.unmount();
+});
+
+test('an extension write waiting for a receipt rejects after hook unmount without losing retained input',async()=>{
+ const remote=deferred(),h=harness(call=>call.action==='snapshot'?extensionSnapshot:remote.promise,{storedToken:token});await flush();let error;
+ const pending=h.render().mutateExtension('mutateRewards',extensionPayload,'extension-unmounted-operation').catch(e=>{error=e;});await flush();assert.equal(h.pendingStore.size,1);h.unmount();await flush();assert.equal(error?.code,'STALE_SESSION');const updates=h.updates();
+ remote.resolve({committed:true,operationId:'extension-unmounted-operation'});await flush();assert.equal(h.updates(),updates);assert.equal(h.pendingStore.size,1);await pending;
+});
+
+test('independent candidate input may queue locally behind uncertain points but cannot POST before that result is resolved',async()=>{
+ let first=true;const h=harness(call=>{if(call.action==='snapshot')return extensionSnapshot;if(call.action==='mutateRewards'&&first){first=false;throw new SheetApiError('NETWORK','確定不明');}return {committed:true,operationId:call.options.operationId};},{storedToken:token});await flush();
+ await assert.rejects(h.render().mutateExtension('mutateRewards',extensionPayload,'extension-before-candidate'),{code:'NETWORK'});await flush();
+ await h.render().submitMutation('updateRecord',{recordId:'fictional-one',changes:{13:'別の候補者の暗号化した入力'}},'candidate-after-extension');await flush();assert.equal(h.pendingStore.size,2);assert.equal(h.calls.filter(call=>call.action==='updateRecord').length,0);
+ h.render().retryBackgroundSave();await flush();assert.deepEqual(h.calls.filter(call=>call.action!=='snapshot').map(call=>call.action),['mutateRewards','mutateRewards','updateRecord']);assert.equal(h.pendingStore.size,0);assert.equal(h.render().hasPendingSave,false);h.unmount();
+});
+
+test('a later pre-commit rejection cannot discard an earlier uncertain extension result',async()=>{
+ for(const code of ['WRITES_DISABLED','SCHEMA_MISMATCH']){let attempt=0;const h=harness(call=>{if(call.action==='snapshot')return extensionSnapshot;if(++attempt===1)throw new SheetApiError('NETWORK','最初の結果は不明');throw new SheetApiError(code,'現在は結果を照会できません');},{storedToken:token});await flush();
+  await assert.rejects(h.render().mutateExtension('mutateRewards',extensionPayload,`extension-previously-uncertain-${code}`),{code:'NETWORK'});await flush();
+  await assert.rejects(h.render().mutateExtension('mutateRewards',extensionPayload,`extension-previously-uncertain-${code}`));await flush();assert.equal(h.pendingStore.size,1,code);assert.equal(h.render().backgroundSave.uncertain,true,code);assert.equal(h.render().hasPendingSave,true,code);h.unmount();
+ }
+});

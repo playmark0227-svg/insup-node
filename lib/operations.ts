@@ -1,4 +1,6 @@
 import {parseTeamWorkspaceExport} from "./team-workspace.ts";
+import {parseRewards} from "./rewards.ts";
+import {safeMigrationAttachmentUrl,validSlackThreadId} from "./migration.ts";
 export type ManagedAccount = {id:string;name:string;team:string;role:"admin"|"player";active:boolean;sheetNames:string[];target:number;version:string;hasCredentials:boolean};
 export type AccountManagement = {checkedAt:string;accounts:ManagedAccount[];canManageAccounts:boolean};
 export type AccountAction = "stop"|"resume"|"revokeSessions";
@@ -22,17 +24,40 @@ export function assertOperationHistory(value:unknown):asserts value is Operation
  for(const row of value.entries)if(!object(row)||!Number.isSafeInteger(row.row)||Number(row.row)<2||["committedAt","actorId","action","summary"].some(k=>typeof row[k]!=="string"))throw new Error("操作履歴を確認できませんでした。");
 }
 
+/** Export parsers may not silently drop a new/unknown field from a backup. */
+function assertExportShape(raw:unknown,parsed:unknown):void {
+ if(Array.isArray(parsed)){if(!Array.isArray(raw)||raw.length!==parsed.length)throw new Error("書き出しデータの配列を確認できませんでした。");parsed.forEach((value,index)=>assertExportShape(raw[index],value));return;}
+ if(object(parsed)){if(!object(raw)||Object.keys(raw).length!==Object.keys(parsed).length||Object.keys(raw).some(key=>!Object.prototype.hasOwnProperty.call(parsed,key)))throw new Error("書き出しに想定外の情報、または欠けた項目があります。");for(const [key,value] of Object.entries(parsed))assertExportShape(raw[key],value);return;}
+ if(typeof raw!==typeof parsed||raw===null&&parsed!==null)throw new Error("書き出しデータの値を確認できませんでした。");
+}
+function validateMigrationExport(value:unknown):Record<string,unknown>[] {
+ if(!Array.isArray(value)||value.length>5000)throw new Error("移行原文の書き出し件数を確認できませんでした。");
+ const fields={id:128,sourceKey:43,workspace:100,channel:100,sourceId:12020,sourceUrl:300,postedAt:40,author:100,body:12000,candidateName:60,state:20,recordId:100,version:128,updatedAt:40,sourceThreadId:40},ids=new Set<string>(),sourceKeys=new Set<string>();
+ const timestamp=(text:string,empty=false)=>empty&&text===""||/^\d{4}-\d{2}-\d{2}T/.test(text)&&Number.isFinite(Date.parse(text));
+ return value.map(entry=>{
+  if(!object(entry)||Object.keys(entry).length!==Object.keys(fields).length+1||Object.keys(entry).some(key=>key!=="attachmentLinks"&&!Object.prototype.hasOwnProperty.call(fields,key)))throw new Error("移行原文の書き出し項目を確認できませんでした。");
+  for(const [key,max] of Object.entries(fields))if(typeof entry[key]!=="string"||String(entry[key]).length>max)throw new Error("移行原文の書き出し形式を確認できませんでした。");
+  const item=entry as Record<keyof typeof fields,string>;
+  if(!/^[A-Za-z0-9_-]{16,128}$/.test(item.id)||!/^[A-Za-z0-9_-]{16,128}$/.test(item.version)||!/^[A-Za-z0-9_-]{43}$/.test(item.sourceKey)||ids.has(item.id)||sourceKeys.has(item.sourceKey)||!item.workspace.trim()||!item.channel.trim()||!item.sourceId.trim()||!item.body.trim()||!["staged","imported","ignored"].includes(item.state)||!timestamp(item.updatedAt)||!timestamp(item.postedAt,true)||item.sourceUrl&&!/^https:\/\/[a-z0-9-]+\.slack\.com\/archives\/[A-Z0-9]+\/p\d+$/.test(item.sourceUrl)||item.state==="imported"&&!/^[A-Za-z0-9_-]{16,100}$/.test(item.recordId))throw new Error("移行原文の保存状態を確認できませんでした。");
+  if(!validSlackThreadId(item.sourceThreadId)||!Array.isArray(entry.attachmentLinks)||entry.attachmentLinks.length>20||new Set(entry.attachmentLinks).size!==entry.attachmentLinks.length||entry.attachmentLinks.some(link=>!safeMigrationAttachmentUrl(link)))throw new Error("移行原文の返信先・添付参照を確認できませんでした。");
+  ids.add(item.id);sourceKeys.add(item.sourceKey);return {...item,attachmentLinks:[...entry.attachmentLinks]};
+ });
+}
+
 /** Export is data for safekeeping, never an executable workbook or credential backup. */
 export function validateDataExport(value:unknown):Record<string,unknown> {
  if(!object(value)||value.schemaVersion!==1||value.scope!=="application-data"||typeof value.exportedAt!=="string"||!object(value.snapshot)||!Array.isArray(value.managementTables)||!object(value.limits))throw new Error("書き出しデータの形式を確認できませんでした。");
- const allowed=["schemaVersion","exportedAt","scope","snapshot","managementTables","limits","teamWorkspace"];
+ const allowed=["rewards","migrationArchive","schemaVersion","exportedAt","scope","snapshot","managementTables","limits","teamWorkspace"];
  if(Object.keys(value).some(k=>!allowed.includes(k)))throw new Error("書き出しに想定外の情報が含まれています。");
  const forbidden=new Set(["outboxKey","destination","credentials","password","token","deviceToken","pepper","apiKey","authRecord","cacheAccess","secret"]);
  const stack:{value:unknown;depth:number}[]=[{value,depth:0}];let visited=0;
  while(stack.length){const item=stack.pop()!;if(++visited>1000000||item.depth>32)throw new Error("書き出しデータが上限を超えています。");if(item.value&&typeof item.value==="object")for(const [key,child] of Object.entries(item.value)){if(forbidden.has(key))throw new Error("認証情報を含むデータは書き出せません。");stack.push({value:child,depth:item.depth+1});}}
  if(JSON.stringify(value).length>2000000)throw new Error("書き出しデータが上限を超えています。");
- if(value.teamWorkspace!==undefined)return {...value,teamWorkspace:parseTeamWorkspaceExport(value.teamWorkspace)};
- return value;
+ let result=value;
+ if(value.teamWorkspace!==undefined)result={...result,teamWorkspace:parseTeamWorkspaceExport(value.teamWorkspace)};
+ if(value.rewards!==undefined){const rewards=parseRewards(value.rewards);assertExportShape(value.rewards,rewards);result={...result,rewards};}
+ if(value.migrationArchive!==undefined)result={...result,migrationArchive:validateMigrationExport(value.migrationArchive)};
+ return result;
 }
 export const accountActionLabels:Record<AccountAction,string>={stop:"利用を停止",resume:"利用を再開",revokeSessions:"全端末からログアウト"};
-export const operationLabels:Record<string,string>={publishTeamCandidate:"紹介文を社内共有",unpublishTeamCandidate:"社内共有を停止",saveTeamComment:"社内コメント",saveTeamJob:"募集案件",saveActivity:"成果登録",updateStatus:"進捗更新",updateProfile:"プロフィール更新",createPlayer:"ID発行",createCandidate:"候補者登録",updateRecord:"候補者の記録更新",deleteCandidate:"候補者削除",cancelAchievement:"成果の取り消し",restoreChange:"変更の復元",saveManagementRow:"管理表更新",saveInterviewReview:"振り返り保存",saveCandidateProfile:"基本情報保存",saveClient:"取引先更新",manageAccount:"利用状況の変更",saveMonthlyTarget:"月別目標の保存"};
+export const operationLabels:Record<string,string>={mutateRewards:"ポイント・特典",stageMigrationBatch:"原文の保管",applyMigrationItem:"過去データの移行",publishTeamCandidate:"紹介文を社内共有",unpublishTeamCandidate:"社内共有を停止",saveTeamComment:"社内コメント",saveTeamJob:"募集案件",saveActivity:"成果登録",updateStatus:"進捗更新",updateProfile:"プロフィール更新",createPlayer:"ID発行",createCandidate:"候補者登録",updateRecord:"候補者の記録更新",deleteCandidate:"候補者削除",cancelAchievement:"成果の取り消し",restoreChange:"変更の復元",saveManagementRow:"管理表更新",saveInterviewReview:"振り返り保存",saveCandidateProfile:"基本情報保存",saveClient:"取引先更新",manageAccount:"利用状況の変更",saveMonthlyTarget:"月別目標の保存"};

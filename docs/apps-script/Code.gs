@@ -145,7 +145,7 @@ function withLock_(fn, waitMs) {
  * read, and rejected requests do not count. NODE_AI_QUOTA still governs Gemini.
  * Writes are not budgeted here; their reads are serialized by the script lock. A replayed operation
  * that answers with a snapshot writes nothing, so it is charged to the snapshot budget. */
-var NODE_READ_BUCKETS = Object.freeze({ readTeamWorkspace: 'table', snapshot: 'snapshot', resumeSession: 'snapshot', readInterviewAdvice: 'report', readWorkspaceInsights: 'report', analyzeInterviewReviews: 'report', analyzeWorkspaceInsights: 'report', auditSecurity: 'report', readAccountManagement:'report', readOperationHistory:'report', readDataExport:'export', managementTables: 'table', managementTable: 'table', readWritingKit: 'kit', readWritingPreferences: 'kit', generateWritingKit: 'kit' });
+var NODE_READ_BUCKETS = Object.freeze({ readRewards: 'table', readMigrationArchive:'table', readTeamWorkspace: 'table', snapshot: 'snapshot', resumeSession: 'snapshot', readInterviewAdvice: 'report', readWorkspaceInsights: 'report', analyzeInterviewReviews: 'report', analyzeWorkspaceInsights: 'report', auditSecurity: 'report', readAccountManagement:'report', readOperationHistory:'report', readDataExport:'export', managementTables: 'table', managementTable: 'table', readWritingKit: 'kit', readWritingPreferences: 'kit', generateWritingKit: 'kit' });
 var NODE_READ_LIMITS = Object.freeze({ snapshot: [40, 900], report: [20, 300], table: [40, 600], kit: [60, 1200], export:[2,10] });
 function readBudget_(id, action) {
   // id is always an ID the server already normalized (a session record or issueSession_), never request input.
@@ -185,11 +185,13 @@ function nodeHandle_(request) {
   if (action === 'readOperationHistory') return readOperationHistory_(request);
   if (action === 'readDataExport') return readDataExport_(request);
   if (action === 'readTeamWorkspace') return readTeamWorkspace_(request);
+  if (action === 'readMigrationArchive') return readMigrationArchive_(request);
+  if (action === 'readRewards') return readRewards_(request);
   // Real input while an editor is open: records activity without reading the business table. A background
   // touch only checks the session (idle and absolute limits) while a pending save pauses the polls.
   // deferred: the due refresh was not written (busy lock), so the client keeps the input to report again.
   if (action === 'touch') { var touched = authenticate_(request.token, false, passive); return passive ? { touched: false } : touched.touchDeferred ? { touched: false, deferred: true } : { touched: true }; }
-  if (['snapshot','logout','saveActivity','updateStatus','updateProfile','createPlayer','updateRecord','deleteCandidate','cancelAchievement','restoreChange','managementTables','managementTable','saveManagementRow','createCandidate','saveInterviewReview','saveCandidateProfile','saveClient','analyzeInterviewReviews','readInterviewAdvice','readWorkspaceInsights','analyzeWorkspaceInsights','readWritingKit','generateWritingKit','readWritingPreferences','saveWritingPreferences','publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob'].indexOf(action) < 0) fail_('BAD_REQUEST', '対応していない操作です。');
+  if (['snapshot','logout','saveActivity','updateStatus','updateProfile','createPlayer','updateRecord','deleteCandidate','cancelAchievement','restoreChange','managementTables','managementTable','saveManagementRow','createCandidate','saveInterviewReview','saveCandidateProfile','saveClient','analyzeInterviewReviews','readInterviewAdvice','readWorkspaceInsights','analyzeWorkspaceInsights','readWritingKit','generateWritingKit','readWritingPreferences','saveWritingPreferences','publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards'].indexOf(action) < 0) fail_('BAD_REQUEST', '対応していない操作です。');
   if (action === 'readWritingKit') return readWritingKit_(request);
   if (action === 'generateWritingKit') return generateWritingKit_(request);
   if (action === 'readWritingPreferences') return readWritingPreferences_(request);
@@ -216,9 +218,10 @@ function nodeHandle_(request) {
     var user = authenticate_(request.token, action === 'logout', action === 'logout');
     if (action === 'logout') { props_().deleteProperty(sessionKey_(request.token)); return { loggedOut: true }; }
     var activity = request.payload && request.payload.activity;
-    var existingRow = ['publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','saveInterviewReview','saveCandidateProfile','saveClient','updateStatus','updateRecord','deleteCandidate','cancelAchievement'].indexOf(action) >= 0 || action === 'saveActivity' && activity && activity.recordId;
+    var existingRow = ['publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards','saveInterviewReview','saveCandidateProfile','saveClient','updateStatus','updateRecord','deleteCandidate','cancelAchievement'].indexOf(action) >= 0 || action === 'saveActivity' && activity && activity.recordId;
     // Existing-row edits only need named candidate rows. New rows still inspect
     // the entire template, preserving blank-row and formula protection.
+    if(action==='applyMigrationItem'&&request.payload&&request.payload.mode==='candidate')existingRow=false;
     var store = readStore_({ readOnly: !!existingRow });
     user = activeActor_(store, user);
     if (!store.schemaCompatible) fail_('SCHEMA_MISMATCH','入力対象19列の見出しまたは順序が一致しません。管理者が実際の列を確認してください。');
@@ -237,6 +240,9 @@ function nodeHandle_(request) {
       return { user:user, result:previous.result, operationId:operationId, config:store.config };
     }
     var plan;
+    if (action === 'stageMigrationBatch') plan = planMigrationBatch_(store,user,payload);
+    if (action === 'applyMigrationItem') plan = planApplyMigration_(store,user,payload);
+    if (action === 'mutateRewards') plan = planRewards_(store,user,payload);
     if (action === 'saveInterviewReview') plan = planInterviewReview_(store,user,payload);
     if (action === 'saveActivity') plan = planActivity_(store, user, payload.activity);
     if (action === 'updateStatus') plan = planStatus_(store, user, payload);
@@ -258,19 +264,26 @@ function nodeHandle_(request) {
     return { user:user, result:plan.result || {}, operationId:operationId, config:store.config, secret:plan.secret };
   });
   if (action === 'logout') return committed;
-  if ((request.responseMode === 'receipt' || teamMutationAction_(action)) && action !== 'createPlayer') {
-    // The atomic batch and its idempotency record have completed. Return a
-    // receipt without making the caller wait for a second business-table scan.
-    var accounts = readAccountStore_(), actor = activeActor_(accounts, authenticate_(request.token));
-    if (actor.id !== committed.user.id || actor.role !== committed.user.role || stableJson_(accounts.config) !== stableJson_(committed.config)) fail_('INTERNAL', '保存結果を再確認してください。同じ内容で再試行できます。');
-    var receipt = { committed:true, operationId:committed.operationId };
-    if (committed.result.undo) receipt.changeId=committed.operationId;
-    return receipt;
+  try {
+    if ((request.responseMode === 'receipt' || teamMutationAction_(action)) && action !== 'createPlayer') {
+      // The atomic batch and its idempotency record have completed. Return a
+      // receipt without making the caller wait for a second business-table scan.
+      var accounts = readAccountStore_(), actor = activeActor_(accounts, authenticate_(request.token));
+      if (actor.id !== committed.user.id || actor.role !== committed.user.role || stableJson_(accounts.config) !== stableJson_(committed.config)) fail_('INTERNAL', '保存結果を再確認してください。同じ内容で再試行できます。');
+      var receipt = { committed:true, operationId:committed.operationId };
+      if (committed.result.undo) receipt.changeId=committed.operationId;
+      return receipt;
+    }
+    // The atomic write is complete. Do not make other writers wait for a fresh
+    // dashboard read, and do not fetch thousands of formula-only template rows.
+    var freshStore = readStore_({ readOnly:true });
+    return mutationResponse_(freshStore, committed.user, action, committed.result, committed.operationId, request.token, committed.secret);
+  } catch (error) {
+    // A post-commit validation/read failure cannot prove that the write failed.
+    // Keep its original operation ID for retry; expired sessions still log out.
+    if (['AUTH_REQUIRED','UNAUTHENTICATED','UNAUTHORIZED','SESSION_EXPIRED'].indexOf(error.nodeCode) >= 0) throw error;
+    fail_('INTERNAL', '保存結果を再確認してください。入力は保持しています。同じ内容で再試行できます。');
   }
-  // The atomic write is complete. Do not make other writers wait for a fresh
-  // dashboard read, and do not fetch thousands of formula-only template rows.
-  var freshStore = readStore_({ readOnly:true });
-  return mutationResponse_(freshStore, committed.user, action, committed.result, committed.operationId, request.token, committed.secret);
 }
 
 /* Authentication is entirely server-side. Tokens and passwords are never stored in sheet cells. */
@@ -672,7 +685,7 @@ function manageAccount_(request) {
   });
 }
 function rowUpdateAccountActive_(sheetId,row,active){return {updateCells:{range:{sheetId:sheetId,startRowIndex:row-1,endRowIndex:row,startColumnIndex:8,endColumnIndex:9},rows:[{values:[cell_(active)]}],fields:'userEnteredValue'}};}
-var NODE_OPERATION_SUMMARIES=Object.freeze({publishTeamCandidate:'候補者紹介文を社内共有',unpublishTeamCandidate:'候補者の社内共有を停止',saveTeamComment:'社内コメントを更新',saveTeamJob:'募集案件を更新',saveActivity:'実績日を登録',updateStatus:'進捗を更新',updateProfile:'プロフィール・目標を更新',createPlayer:'プレイヤーIDを発行',createCandidate:'候補者を登録',saveCandidateProfile:'候補者の基本情報を更新',saveClient:'取引先を更新',updateRecord:'候補者の進捗・実績を更新',deleteCandidate:'候補者・提案を削除',cancelAchievement:'実績を取り消し',restoreChange:'変更を復元',saveManagementRow:'管理表を更新',saveInterviewReview:'面談の振り返りを保存',manageAccount:'アカウントの利用状態を管理',saveMonthlyTarget:'月別目標を更新'});
+var NODE_OPERATION_SUMMARIES=Object.freeze({stageMigrationBatch:'過去データの原文を保管',applyMigrationItem:'過去データを業務データへ登録',mutateRewards:'ポイント・特典を更新',publishTeamCandidate:'候補者紹介文を社内共有',unpublishTeamCandidate:'候補者の社内共有を停止',saveTeamComment:'社内コメントを更新',saveTeamJob:'募集案件を更新',saveActivity:'実績日を登録',updateStatus:'進捗を更新',updateProfile:'プロフィール・目標を更新',createPlayer:'プレイヤーIDを発行',createCandidate:'候補者を登録',saveCandidateProfile:'候補者の基本情報を更新',saveClient:'取引先を更新',updateRecord:'候補者の進捗・実績を更新',deleteCandidate:'候補者・提案を削除',cancelAchievement:'実績を取り消し',restoreChange:'変更を復元',saveManagementRow:'管理表を更新',saveInterviewReview:'面談の振り返りを保存',manageAccount:'アカウントの利用状態を管理',saveMonthlyTarget:'月別目標を更新'});
 function readOperationHistory_(request) {
   var access=accountManagementStore_(request.token),store=access.store,payload=request.payload||{},limit=payload.limit===undefined?25:payload.limit,cursor=payload.cursor;
   if(!Number.isInteger(limit)||limit<1||limit>50||cursor!==undefined&&(!Number.isInteger(cursor)||cursor<2))fail_('VALIDATION','履歴の表示範囲を確認してください。');
@@ -686,7 +699,9 @@ function readDataExport_(request) {
   var access=accountManagementStore_(request.token),store=readStore_({readOnly:true},access.store),maxCells=50000,maxCharacters=2000000,total=store.records.length*26,tables=[];
   if(total>maxCells)fail_('EXPORT_LIMIT','アプリデータの書き出し上限です。');
   var snapshot=buildSnapshot_(store,access.actor);delete snapshot.outboxKey;delete snapshot.cacheAccess;delete snapshot.destination;
-  var teamExport=teamWorkspaceExport_(store,access.actor);total+=teamExport.cells;if(total>maxCells)fail_('EXPORT_LIMIT','社内共有を含むアプリデータの書き出し上限です。');
+  var teamExport=teamWorkspaceExport_(store,access.actor),rewardsState=rewardState_(store.book),migrationState=migrationTable_(store.book);
+  var extraChecks=[];[[REWARD_SETTINGS_TAB,REWARD_SETTINGS_HEADERS,rewardsState.settings],[REWARD_LEDGER_TAB,REWARD_LEDGER_HEADERS,rewardsState.ledger],[REWARD_REQUESTS_TAB,REWARD_REQUESTS_HEADERS,rewardsState.requests],[MIGRATION_TAB,MIGRATION_HEADERS,migrationState]].forEach(function(v){total+=(v[2].rows.length+(v[2].sheet?1:0))*v[1].length;extraChecks.push({title:v[0],headers:v[1],fingerprint:v[2].fingerprint,sheetId:v[2].sheet?v[2].sheet.getSheetId():null});});
+  total+=teamExport.cells;if(total>maxCells)fail_('EXPORT_LIMIT','社内共有を含むアプリデータの書き出し上限です。');
   store.book.getSheets().filter(function(sheet){return managementTabAllowed_(sheet.getName());}).forEach(function(sheet){
     var rowCount=sheet.getLastRow(),columnCount=Math.min(100,sheet.getLastColumn()),rows=[];
     if(sheet.getLastColumn()>100||rowCount>2000||total+rowCount*columnCount>maxCells)fail_('EXPORT_LIMIT','アプリデータの書き出し上限です。管理表の範囲を整理してから再試行してください。');
@@ -695,9 +710,9 @@ function readDataExport_(request) {
     tables.push({sheetId:sheet.getSheetId(),title:sheet.getName(),rowCount:rowCount,columnCount:columnCount,rows:rows});
   });
   if(total>maxCells)fail_('EXPORT_LIMIT','アプリデータの書き出し上限です。');
-  var result={schemaVersion:1,exportedAt:new Date().toISOString(),scope:'application-data',snapshot:snapshot,managementTables:tables,teamWorkspace:teamExport.data,limits:{maxCells:maxCells,maxCharacters:maxCharacters}};
+  var result={schemaVersion:1,exportedAt:new Date().toISOString(),scope:'application-data',snapshot:snapshot,managementTables:tables,teamWorkspace:teamExport.data,rewards:rewardPublic_(rewardsState,access.actor,store.players),migrationArchive:migrationState.entries.map(function(e){var item=Object.assign({},e);delete item.row;return item;}),limits:{maxCells:maxCells,maxCharacters:maxCharacters}};
   if(JSON.stringify(result).length>maxCharacters)fail_('EXPORT_LIMIT','アプリデータが書き出し上限を超えています。');
-  revalidateIntakePlan_(store,access.actor,{intakeTableChecks:teamExport.checks});requireAdmin_(snapshotActor_(store,request.token));return result;
+  revalidateIntakePlan_(store,access.actor,{intakeTableChecks:teamExport.checks.concat(extraChecks)});requireAdmin_(snapshotActor_(store,request.token));return result;
 }
 
 /* Explicit monthly goals are historical business data. Missing and zero stay distinct. */
@@ -964,7 +979,7 @@ function buildSnapshot_(store, user) {
   var all = activities_(store);
   var snapshot={ self: { playerId: user.id, role: user.role }, players: store.players.filter(function (p) { return p.role === 'player' && (user.role==='admin'||p.active); }).map(function(player){return publicPlayer_(player,user);}), activities: all.filter(function (a) { return user.role === 'admin' || a.playerId === user.id; }), counts: countActivities_(all, store.players.filter(function(p){return user.role==='admin'||p.active;})), syncedAt: new Date().toISOString(), warnings: store.warnings.slice(), writesEnabled: store.schemaCompatible&&writesEnabled_(store.config) && store.book.getSpreadsheetTimeZone() === 'Asia/Tokyo' };
   snapshot.interviewReviews=readInterviewReviews_(store,user);
-  snapshot.candidateRegistrationFeature=true; snapshot.teamWorkspaceFeature=true; snapshot.intakeFeature=true; snapshot.candidateProfiles=readCandidateProfiles_(store,user); snapshot.clients=clientEntries_(store.book);
+  snapshot.migrationFeature=true; snapshot.rewardsFeature=true; snapshot.candidateRegistrationFeature=true; snapshot.teamWorkspaceFeature=true; snapshot.intakeFeature=true; snapshot.candidateProfiles=readCandidateProfiles_(store,user); snapshot.clients=clientEntries_(store.book);
   snapshot.deletionFeature=true; snapshot.deletedCandidates=deletedCandidates_(store,user);
   snapshot.writingFeature=true; snapshot.writingPreferences=writingPreferences_();
   snapshot.reviewFeature=true; snapshot.monthlyGoalsFeature=true; snapshot.monthlyGoals=readMonthlyGoals_(store,user);
@@ -1179,6 +1194,7 @@ function commit_(store, user, action, operationId, payloadHash, plan, token) {
   revalidateManagementPlan_(store,user,plan);
   revalidateIntakePlan_(store,user,plan);
   revalidateTeamPlan_(store,user,plan);
+  revalidateRewardsPlan_(store,user,plan);
   if(token)snapshotActor_(store,token);
   Array.prototype.push.apply(requests, plan.requests || []);
   if(JSON.stringify(plan.result||{}).length>48000)fail_('VALIDATION','変更履歴が大きすぎます。長いメモは項目を分けて保存してください。');
@@ -1202,6 +1218,23 @@ function requireOwner_() {
   var raw = props_().getProperty(NODE.configKey);
   if (raw && JSON.parse(raw).ownerEmail !== active) fail_('FORBIDDEN', '設定した所有者のみ実行できます。');
   return active;
+}
+/** Editor-only aggregate verification. Optional workflow tables remain absent;
+ * neither private text nor account identifiers are returned or logged. */
+function verifyNodeCompletionReadOnly() {
+  var owner=requireOwner_(),config=config_();assertManagedBook_(config.spreadsheetId);
+  var accounts=readAccountStore_(config),rewards=rewardState_(accounts.book),archive=migrationTable_(accounts.book);
+  rewardBalances_(rewards,accounts.players);
+  var result={verified:true,readOnly:true,configUnchanged:true,
+    accounts:{count:accounts.players.length,active:accounts.players.filter(function(p){return p.active;}).length},
+    rewards:{enabled:rewards.policy.enabled===true,
+      settings:{exists:!!rewards.settings.sheet,count:rewards.settings.entries.length},
+      ledger:{exists:!!rewards.ledger.sheet,count:rewards.ledger.entries.length},
+      requests:{exists:!!rewards.requests.sheet,count:rewards.requests.entries.length}},
+    migration:{exists:!!archive.sheet,count:archive.entries.length}};
+  if(stableJson_(config_())!==stableJson_(config))fail_('BUSY','接続設定が確認中に更新されました。もう一度確認してください。');
+  assertManagedBook_(accounts.book);if(requireOwner_()!==owner)fail_('FORBIDDEN','確認中に実行者が変わりました。');
+  Logger.log(JSON.stringify(result));return result;
 }
 function seedPlayers_() {
   var raw=props_().getProperty(NODE.seedPlayersKey),seeds;if(!raw)return [];
@@ -1293,8 +1326,8 @@ function probeReservation_(store,actorId,allowExpired) {
   return probe;
 }
 function guardProbeBusinessMutation_(store,user,action,payload) {
-  if(['publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','saveActivity','updateStatus','updateRecord','deleteCandidate','cancelAchievement','restoreChange','saveManagementRow','createCandidate','saveCandidateProfile','saveClient'].indexOf(action)<0)return;
-  if((['publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob'].indexOf(action)>=0||action==='restoreChange'||action==='saveManagementRow'||action==='createCandidate'||action==='saveCandidateProfile'||action==='saveClient')&&probeReservation_(store,user.id,false))fail_('FORBIDDEN','検証専用アカウントにはこの操作は許可されていません。');
+  if(['publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards','saveActivity','updateStatus','updateRecord','deleteCandidate','cancelAchievement','restoreChange','saveManagementRow','createCandidate','saveCandidateProfile','saveClient'].indexOf(action)<0)return;
+  if((['publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards'].indexOf(action)>=0||action==='restoreChange'||action==='saveManagementRow'||action==='createCandidate'||action==='saveCandidateProfile'||action==='saveClient')&&probeReservation_(store,user.id,false))fail_('FORBIDDEN','検証専用アカウントにはこの操作は許可されていません。');
   var activity=payload.activity||{},recordId=action==='saveActivity'?activity.recordId:payload.recordId,record=recordId?findRecord_(store,recordId):null;
   var targetId=record?record.playerId:action==='saveActivity'?activity.playerId:null;
   var probe=probeReservation_(store,user.id,false),targetProbe=targetId&&targetId!==user.id?probeReservation_(store,targetId,false):null;
@@ -2266,10 +2299,19 @@ function clientNameKey_(name) {return name.normalize('NFKC').replace(/\s/g,'').t
 function clientEntries_(book) {return clientTable_(book).entries.map(function(entry){return {id:entry.id,name:entry.name,active:entry.active,version:entry.version};});}
 function intakeWritePlan_(store,plan,title,headers,state,row,values) {
   if(row>5001)fail_('INTAKE_LIMIT','保存上限に達しました。管理者に確認してください。');
-  plan.requests=plan.requests||[];plan.intakeTableChecks=plan.intakeTableChecks||[];plan.intakeTableChecks.push({title:title,headers:headers,fingerprint:state.fingerprint,sheetId:state.sheet?state.sheet.getSheetId():null});
-  var id;if(!state.sheet){do{id=Math.floor(Math.random()*1000000000)+1;}while(store.book.getSheets().some(function(sheet){return sheet.getSheetId()===id;}));plan.requests.push({addSheet:{properties:{sheetId:id,title:title,gridProperties:{rowCount:5001,columnCount:headers.length}}}});plan.requests.push(rowUpdateRequest_(id,1,headers));}
-  else{id=state.sheet.getSheetId();if(row>state.sheet.getMaxRows())plan.requests.push({appendDimension:{sheetId:id,dimension:'ROWS',length:row-state.sheet.getMaxRows()}});}
-  plan.requests.push(rowUpdateRequest_(id,row,values));
+  plan.requests=plan.requests||[];plan.intakeTableChecks=plan.intakeTableChecks||[];
+  var prior=plan.intakeTableChecks.find(function(check){return check.title===title;});
+  if(prior&&(prior.fingerprint!==state.fingerprint||prior.sheetId!==(state.sheet?state.sheet.getSheetId():null)))fail_('CONFLICT','同じ保存の管理表が変更されています。');
+  if(!prior)plan.intakeTableChecks.push({title:title,headers:headers,fingerprint:state.fingerprint,sheetId:state.sheet?state.sheet.getSheetId():null});
+  plan.intakeWriteTargets=plan.intakeWriteTargets||{};var target=plan.intakeWriteTargets[title],id;
+  if(!target){
+    if(!state.sheet){do{id=Math.floor(Math.random()*1000000000)+1;}while(store.book.getSheets().some(function(sheet){return sheet.getSheetId()===id;})||Object.keys(plan.intakeWriteTargets).some(function(key){return plan.intakeWriteTargets[key].id===id;}));
+      plan.requests.push({addSheet:{properties:{sheetId:id,title:title,gridProperties:{rowCount:5001,columnCount:headers.length}}}});plan.requests.push(rowUpdateRequest_(id,1,headers));target={id:id,rows:5001};
+    }else target={id:state.sheet.getSheetId(),rows:state.sheet.getMaxRows()};
+    plan.intakeWriteTargets[title]=target;
+  }
+  if(row>target.rows){plan.requests.push({appendDimension:{sheetId:target.id,dimension:'ROWS',length:row-target.rows}});target.rows=row;}
+  plan.requests.push(rowUpdateRequest_(target.id,row,values));
 }
 function addProfileRecordChecks_(plan,records) {
   plan.recordChecks=plan.recordChecks||[];records.forEach(function(record){if(!plan.recordChecks.some(function(c){return c.recordId===record.recordId;}))plan.recordChecks.push({recordId:record.recordId,row:record.row,version:record.version,profileId:record.profileId||'',playerId:record.playerId});});
@@ -3448,7 +3490,7 @@ var TEAM_COMMENT_HEADERS=['commentId','publicationId','parentId','authorId','bod
 var TEAM_JOB_TAB='_NODE_team_jobs';
 var TEAM_JOB_HEADERS=['jobId','company','title','description','requirements','workConditions','status','version','createdBy','updatedBy','createdAt','updatedAt'];
 var TEAM_JOB_STATUSES=['open','paused','closed'];
-function teamMutationAction_(action){return ['publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob'].indexOf(action)>=0;}
+function teamMutationAction_(action){return ['publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards'].indexOf(action)>=0;}
 function teamObject_(payload){if(!payload||typeof payload!=='object'||Array.isArray(payload))fail_('VALIDATION','社内共有の入力内容を確認してください。');return payload;}
 function teamId_(value){if(!intakeId_(value))fail_('VALIDATION','社内共有の管理IDを確認してください。');return value;}
 function teamAccount_(value){if(typeof value!=='string'||!(/^[A-Za-z0-9_-]{1,30}$/).test(value))fail_('SCHEMA_MISMATCH','社内共有の担当者を確認してください。');return value;}
@@ -3575,3 +3617,114 @@ function teamWorkspaceExport_(store,user){
  var cells=(candidates.rows.length+(candidates.sheet?1:0))*TEAM_CANDIDATE_HEADERS.length+(comments.rows.length+(comments.sheet?1:0))*TEAM_COMMENT_HEADERS.length+(jobs.rows.length+(jobs.sheet?1:0))*TEAM_JOB_HEADERS.length+store.players.length*4;
  return {data:data,cells:cells,checks:checks};
 }
+
+/* BEGIN GENERATED WORKFLOW FEATURES */
+/* BEGIN MIGRATION WORKSPACE: admin-only archive; never auto-publishes source text. */
+var MIGRATION_TAB='_NODE_migration_archive';
+var MIGRATION_HEADERS=['id','sourceKey','workspace','channel','sourceId','sourceUrl','postedAt','author','body','candidateName','state','recordId','version','updatedAt','sourceThreadId','attachmentLinks'];
+function migrationThread_(value,fromSheet){var thread=value===undefined?'':teamText_(value,40,false);if(thread&&!/^\d{9,12}\.\d{1,9}$/.test(thread))fail_(fromSheet?'SCHEMA_MISMATCH':'VALIDATION','返信先の投稿IDを確認してください。');return thread;}
+function migrationAttachmentUrl_(value){
+ if(typeof value!=='string')return null;var raw=value.trim();if(!raw||raw.length>2000||/[\s\u0000-\u001f\u007f]/.test(raw)||/%(?:0[0-9a-f]|1[0-9a-f]|7f)/i.test(raw))return null;
+ var match=/^https:\/\/([a-z0-9.-]+(?::\d{1,5})?)([/?#][^\s]*)?$/i.exec(raw);if(!match||match[1].indexOf('..')>=0||match[1].charAt(0)==='.'||match[1].charAt(0)==='-')return null;
+ var port=match[1].match(/:(\d+)$/);if(port&&(Number(port[1])<1||Number(port[1])>65535))return null;
+ var segments=raw.split(/[?#]/).slice(1);for(var n=0;n<segments.length;n++){var pairs=segments[n].split('&');for(var j=0;j<pairs.length;j++){var key=pairs[j].split('=')[0].replace(/\+/g,' ');try{for(var i=0;i<3;i++){var next=decodeURIComponent(key);if(next===key)break;key=next;}}catch(error){return null;}key=key.toLowerCase().replace(/[^a-z0-9]/g,'');if(/token|apikey|authorization|password|passwd|secret|signature|credential|accesskey|oauth|bearer|resourcekey|session|jwt|ticket|saml|^sso$|^auth$|^key$|^sig$|^code$|^rlkey$/.test(key))return null;}}
+ return 'https://'+match[1].toLowerCase()+(match[2]||'');
+}
+function migrationAttachmentLinks_(value,fromSheet){
+ var links=value===undefined?[]:value,code=fromSheet?'SCHEMA_MISMATCH':'VALIDATION';if(fromSheet){try{if(typeof value!=='string')throw new Error('type');links=JSON.parse(value);}catch(error){fail_(code,'添付参照の保存形式を確認してください。');}}
+ if(!Array.isArray(links)||links.length>20)fail_(code,'添付参照は20件以内で指定してください。');var seen={};return links.map(function(link){var safe=migrationAttachmentUrl_(link);if(!safe||seen[safe])fail_(code,'添付参照は秘密情報を含まないHTTPSリンクを重複なく指定してください。');seen[safe]=true;return safe;}).sort();
+}
+function migrationContent_(body,thread,links){return stableJson_([body,thread,links]);}
+function migrationTable_(book){var state=intakeTable_(book,MIGRATION_TAB,MIGRATION_HEADERS),seen={},keys={};state.entries=state.rows.map(function(row,index){var id=teamId_(row[0]);if(seen[id])fail_('SCHEMA_MISMATCH','移行元IDが重複しています。');seen[id]=true;var e={id:id,sourceKey:teamText_(row[1],100,true),workspace:teamText_(row[2],100,true),channel:teamText_(row[3],100,true),sourceId:teamText_(row[4],12020,true),sourceUrl:teamText_(row[5],300,false),postedAt:teamText_(row[6],40,false),author:teamText_(row[7],100,false),body:teamText_(row[8],12000,true),candidateName:teamText_(row[9],60,false),state:choice_(row[10],['staged','imported','ignored']),recordId:teamText_(row[11],100,false),version:teamId_(row[12]),updatedAt:teamTime_(row[13]),sourceThreadId:migrationThread_(row[14]||'',true),attachmentLinks:migrationAttachmentLinks_(row[15]||'[]',true),row:index+2};if(keys[e.sourceKey]||e.sourceKey!==hash_(stableJson_([e.workspace,e.channel,e.sourceId])))fail_('SCHEMA_MISMATCH','移行元の投稿キーが重複または変更されています。');keys[e.sourceKey]=true;return e;});return state;}
+function migrationValues_(e){return [e.id,e.sourceKey,e.workspace,e.channel,e.sourceId,e.sourceUrl,e.postedAt,e.author,e.body,e.candidateName,e.state,e.recordId,e.version,e.updatedAt,e.sourceThreadId||'',JSON.stringify(e.attachmentLinks||[])];}
+function readMigrationArchive_(request){var accounts=readAccountStore_(),user=activeActor_(accounts,authenticate_(request.token));requireAdmin_(user);var state=migrationTable_(accounts.book),cursor=request.payload&&request.payload.cursor!==undefined?request.payload.cursor:0;if(!Number.isSafeInteger(cursor)||cursor<0||cursor>50000)fail_('VALIDATION','表示位置を確認してください。');var entries=state.entries.slice().reverse(),result={feature:true,total:entries.length,entries:entries.slice(cursor,cursor+50).map(function(e){var x=Object.assign({},e);delete x.row;delete x.sourceKey;return x;}),nextCursor:cursor+50<entries.length?cursor+50:null};requireAdmin_(snapshotActor_(accounts,request.token));return result;}
+function planMigrationBatch_(store,user,payload){requireAdmin_(user);teamObject_(payload);if(!Array.isArray(payload.entries)||!payload.entries.length||payload.entries.length>10||JSON.stringify(payload.entries).length>24000)fail_('VALIDATION','原文は10件・24,000文字以内に分けて取り込んでください。');var state=migrationTable_(store.book),plan={requests:[],result:{staged:0,duplicates:0},teamAdminRequired:true},row=state.rows.length+2,seen={};
+ payload.entries.forEach(function(raw){teamObject_(raw);var workspace=teamText_(raw.workspace,100,true),channel=teamText_(raw.channel,100,true),sourceId=teamText_(raw.sourceId,12020,true),body=teamText_(raw.body,12000,true),thread=migrationThread_(raw.sourceThreadId,false),links=migrationAttachmentLinks_(raw.attachmentLinks,false),content=migrationContent_(body,thread,links),key=hash_(stableJson_([workspace,channel,sourceId]));if(Object.prototype.hasOwnProperty.call(seen,key)){if(seen[key]!==content)fail_('CONFLICT','同じ投稿IDに異なる原文・返信先・添付参照があります。保存する版を確認してください。');plan.result.duplicates++;return;}seen[key]=content;var previous=state.entries.find(function(e){return e.sourceKey===key;});if(previous){if(migrationContent_(previous.body,previous.sourceThreadId,previous.attachmentLinks)!==content)fail_('CONFLICT','同じ投稿IDの原文・返信先・添付参照が変更されています。既存原文を確認して、別の版として取り込んでください。');plan.result.duplicates++;return;}
+ var url=teamText_(raw.sourceUrl,300,false);if(url&&!/^https:\/\/[a-z0-9-]+\.slack\.com\/archives\/[A-Z0-9]+\/p\d+$/.test(url))fail_('VALIDATION','Slackの投稿リンクを確認してください。');var posted=teamText_(raw.postedAt,40,false);if(posted)teamTime_(posted);var item={id:Utilities.getUuid(),sourceKey:key,workspace:workspace,channel:channel,sourceId:sourceId,sourceUrl:url,postedAt:posted,author:teamText_(raw.author,100,false),body:body,candidateName:teamText_(raw.candidateName,60,false),state:'staged',recordId:'',version:Utilities.getUuid(),updatedAt:new Date().toISOString(),sourceThreadId:thread,attachmentLinks:links};intakeWritePlan_(store,plan,MIGRATION_TAB,MIGRATION_HEADERS,state,row++,migrationValues_(item));plan.result.staged++;});return plan;}
+function planApplyMigration_(store,user,payload){requireAdmin_(user);var state=migrationTable_(store.book),e=state.entries.find(function(item){return item.id===payload.id;});if(!e||e.version!==payload.version)fail_('CONFLICT','移行元が更新されています。再取得してください。');if(e.state==='imported')fail_('VALIDATION','この原文は登録済みです。候補者の一覧から確認してください。');var plan;
+ if(payload.mode==='ignore'){plan={requests:[],result:{ignored:true}};e=Object.assign({},e,{state:'ignored'});}
+ else if(payload.mode==='candidate'){
+  if(payload.confirmReviewed!==true)fail_('VALIDATION','担当者・候補者名・紹介文を確認してください。');
+  var introduction=teamText_(payload.introduction,1000,true),owner=store.players.find(function(p){return p.id===payload.playerId&&p.active&&p.role==='player';});if(!owner)fail_('VALIDATION','担当者を指定してください。');
+  if(store.records.some(function(r){return r.playerId===owner.id&&normalizeName_(r.values[2])===normalizeName_(payload.candidateName);}))fail_('POSSIBLE_DUPLICATE','同じ担当者・氏名の記録があります。候補者一覧で確認してください。原文は保管されています。');
+  plan=planCandidate_(store,user,{playerId:owner.id,candidateName:payload.candidateName,position:'アポインター',fields:interviewFields_(payload.fields||{}),introduction:introduction,profileVersion:''});e=Object.assign({},e,{state:'imported',recordId:plan.recordId||plan.result&&plan.result.recordId||''});
+ }else if(payload.mode==='job'){
+  if(payload.confirmReviewed!==true||payload.confirmInternalSharing!==true)fail_('VALIDATION','案件の内容と、社内全員への共有を確認してください。');
+  plan=planTeamJob_(store,user,payload.job||{});e=Object.assign({},e,{state:'imported',recordId:plan.result.jobId||''});
+ }else fail_('VALIDATION','移行する種類を選んでください。');
+ plan.teamAdminRequired=true;e.version=Utilities.getUuid();e.updatedAt=new Date().toISOString();intakeWritePlan_(store,plan,MIGRATION_TAB,MIGRATION_HEADERS,state,e.row,migrationValues_(e));plan.result=Object.assign({},plan.result,{migrationId:e.id});return plan;
+}
+/* END MIGRATION WORKSPACE */
+
+/* BEGIN REWARDS WORKSPACE — integrated into Code.gs by the release build. */
+var REWARD_SETTINGS_TAB='_NODE_reward_settings',REWARD_SETTINGS_HEADERS=['id','payload','version','updatedAt','actorId'];
+var REWARD_LEDGER_TAB='_NODE_reward_ledger',REWARD_LEDGER_HEADERS=['entryId','playerId','delta','kind','reference','reason','actorId','createdAt'];
+var REWARD_REQUESTS_TAB='_NODE_reward_requests',REWARD_REQUESTS_HEADERS=['requestId','playerId','rewardId','rewardName','points','status','version','createdAt','updatedAt','decidedBy','decisionNote'];
+var REWARD_METRICS=['候補者面談','提案','C面談予約','クライアント面談','内定承諾','稼働開始'];
+function rewardMonth_(value){if(typeof value!=='string'||!/^20\d{2}-(0[1-9]|1[0-2])$/.test(value))fail_('VALIDATION','ポイントの年月を確認してください。');return value;}
+function rewardInteger_(value,min,max){if(!Number.isSafeInteger(value)||value<min||value>max)fail_('VALIDATION','ポイントは指定された範囲の整数で入力してください。');return value;}
+function rewardPolicyBody_(value){writingObject_(value,['enabled','metric','pointsPerWin','tiePolicy','effectiveMonth']);if(typeof value.enabled!=='boolean')fail_('VALIDATION','制度の開始状態を確認してください。');return {enabled:value.enabled,metric:choice_(value.metric,REWARD_METRICS),pointsPerWin:rewardInteger_(value.pointsPerWin,1,10000),tiePolicy:choice_(value.tiePolicy,['all','hold']),effectiveMonth:rewardMonth_(value.effectiveMonth)};}
+function rewardInitialPolicy_(){return {enabled:false,metric:'提案',pointsPerWin:100,tiePolicy:'all',effectiveMonth:today_().slice(0,7),version:'initial-policy-00000000'};}
+function rewardState_(book){
+ var settings=intakeTable_(book,REWARD_SETTINGS_TAB,REWARD_SETTINGS_HEADERS),ledger=intakeTable_(book,REWARD_LEDGER_TAB,REWARD_LEDGER_HEADERS),requests=intakeTable_(book,REWARD_REQUESTS_TAB,REWARD_REQUESTS_HEADERS),seen=Object.create(null);
+ settings.entries=settings.rows.map(function(row,index){var id=String(row[0]||''),body;try{body=JSON.parse(row[1]);}catch(_){fail_('SCHEMA_MISMATCH','ポイント設定の本文を確認してください。');}if(seen[id]||!(/^(policy|catalog:[A-Za-z0-9_-]{16,128}|month:20\d{2}-(0[1-9]|1[0-2]))$/).test(id))fail_('SCHEMA_MISMATCH','ポイント設定のIDを確認してください。');seen[id]=true;teamId_(row[2]);teamTime_(row[3]);teamAccount_(row[4]);
+  if(id==='policy')body=rewardPolicyBody_(body);
+  else if(id.indexOf('catalog:')===0){writingObject_(body,['name','points','active']);if(typeof body.active!=='boolean')fail_('SCHEMA_MISMATCH','特典の状態を確認してください。');body={name:teamText_(body.name,80,true),points:rewardInteger_(body.points,1,1000000),active:body.active};}
+  else {writingObject_(body,['month','awards','policy']);rewardMonth_(body.month);if(id!=='month:'+body.month||!Array.isArray(body.awards)||body.awards.length>1000)fail_('SCHEMA_MISMATCH','月別ポイントを確認してください。');var ids=Object.create(null);body.awards=body.awards.map(function(a){writingObject_(a,['playerId','points','count']);var owner=teamAccount_(a.playerId);if(ids[owner])fail_('SCHEMA_MISMATCH','月別ポイントの対象者が重複しています。');ids[owner]=true;return {playerId:owner,points:rewardInteger_(a.points,1,10000),count:rewardInteger_(a.count,1,1000000)};});body.policy=rewardPolicyBody_(body.policy);}
+  return {id:id,body:body,version:row[2],updatedAt:row[3],actorId:row[4],row:index+2};
+ });
+ seen=Object.create(null);ledger.entries=ledger.rows.map(function(row,index){var id=teamId_(row[0]);if(seen[id])fail_('SCHEMA_MISMATCH','ポイント台帳のIDが重複しています。');seen[id]=true;return {entryId:id,playerId:teamAccount_(row[1]),delta:rewardInteger_(row[2],-100000000,100000000),kind:choice_(row[3],['award','correction','adjustment','redemption']),reference:teamText_(row[4],128,true),reason:teamText_(row[5],300,true),actorId:teamAccount_(row[6]),createdAt:teamTime_(row[7]),row:index+2};});
+ seen=Object.create(null);requests.entries=requests.rows.map(function(row,index){var id=teamId_(row[0]);if(seen[id])fail_('SCHEMA_MISMATCH','特典申請のIDが重複しています。');seen[id]=true;return {requestId:id,playerId:teamAccount_(row[1]),rewardId:teamId_(row[2]),rewardName:teamText_(row[3],80,true),points:rewardInteger_(row[4],1,1000000),status:choice_(row[5],['pending','approved','rejected','canceled']),version:teamId_(row[6]),createdAt:teamTime_(row[7]),updatedAt:teamTime_(row[8]),decidedBy:row[9]?teamAccount_(row[9]):'',decisionNote:teamText_(row[10],300,false),row:index+2};});
+ var policy=settings.entries.find(function(p){return p.id==='policy';}),state={settings:settings,ledger:ledger,requests:requests,policy:policy?Object.assign({},policy.body,{version:policy.version}):rewardInitialPolicy_()};state.version=hash_(stableJson_([settings.fingerprint,ledger.fingerprint,requests.fingerprint]));rewardIntegrity_(state);return state;
+}
+function rewardIntegrity_(state){
+ var settled=Object.create(null),redemptions=Object.create(null);state.settings.entries.filter(function(s){return s.id.indexOf('month:')===0;}).forEach(function(s){var expected=Object.create(null);s.body.awards.forEach(function(a){expected[a.playerId]=a.points;});settled[s.id]={expected:expected,actual:Object.create(null)};});
+ state.ledger.entries.forEach(function(e){if(e.delta===0||e.kind==='award'&&e.delta<0||e.kind==='redemption'&&e.delta>0)fail_('SCHEMA_MISMATCH','ポイント台帳の増減を確認してください。');if(e.kind==='award'||e.kind==='correction'){var target=settled[e.reference];if(!target)fail_('SCHEMA_MISMATCH','月別確定と台帳が一致しません。');target.actual[e.playerId]=(target.actual[e.playerId]||0)+e.delta;}if(e.kind==='redemption'){var request=state.requests.entries.find(function(r){return r.requestId===e.reference;});if(!request||request.status!=='approved'||request.playerId!==e.playerId||e.delta!==-request.points||redemptions[e.reference])fail_('SCHEMA_MISMATCH','特典交換と消費台帳が一致しません。');redemptions[e.reference]=true;}});
+ Object.keys(settled).forEach(function(key){var target=settled[key],ids=Object.create(null);Object.keys(target.expected).concat(Object.keys(target.actual)).forEach(function(id){ids[id]=true;});if(Object.keys(ids).some(function(id){return (target.expected[id]||0)!==(target.actual[id]||0);}))fail_('SCHEMA_MISMATCH','月別確定とポイント台帳の合計が一致しません。');});state.requests.entries.forEach(function(r){if(r.status==='approved'&&!redemptions[r.requestId])fail_('SCHEMA_MISMATCH','承認済み申請の消費台帳がありません。');});
+}
+function rewardBalances_(state,players){
+ var ids=Object.create(null);players.filter(function(p){return p.role==='player';}).forEach(function(p){ids[p.id]={playerId:p.id,name:p.name,active:p.active,balance:0,reserved:0,available:0};});
+ state.ledger.entries.forEach(function(e){if(!ids[e.playerId])fail_('SCHEMA_MISMATCH','ポイント台帳の担当者が名簿にありません。');ids[e.playerId].balance+=e.delta;});state.requests.entries.filter(function(r){return r.status==='pending';}).forEach(function(r){if(!ids[r.playerId])fail_('SCHEMA_MISMATCH','特典申請の担当者が名簿にありません。');ids[r.playerId].reserved+=r.points;});
+ return Object.keys(ids).map(function(id){var p=ids[id];p.available=p.balance-p.reserved;if(!Number.isSafeInteger(p.balance)||p.balance>100000000||p.available<0)fail_('SCHEMA_MISMATCH','ポイント残高と申請予約の整合性を確認してください。');return p;});
+}
+function rewardPublic_(state,user,players){var canSee=function(id){return user.role==='admin'||user.id===id;};return {feature:true,version:state.version,policy:state.policy,catalog:state.settings.entries.filter(function(p){return p.id.indexOf('catalog:')===0&&(user.role==='admin'||p.body.active);}).map(function(p){return Object.assign({id:p.id.slice(8),version:p.version},p.body);}),balances:rewardBalances_(state,players).filter(function(p){return canSee(p.playerId);}),ledger:state.ledger.entries.filter(function(e){return canSee(e.playerId);}).map(function(e){var p=Object.assign({},e);delete p.row;return p;}),requests:state.requests.entries.filter(function(e){return canSee(e.playerId);}).map(function(e){var p=Object.assign({},e);delete p.row;return p;}),months:user.role==='admin'?state.settings.entries.filter(function(p){return p.id.indexOf('month:')===0;}).map(function(p){return Object.assign({version:p.version,updatedAt:p.updatedAt,actorId:p.actorId},p.body);}):[]};}
+function rewardPolicyWithoutVersion_(policy){var body=Object.assign({},policy);delete body.version;return body;}
+function rewardPreview_(store,state,month){
+ rewardMonth_(month);if(month>=today_().slice(0,7))fail_('VALIDATION','ポイントを確定できるのは終了した月だけです。');var existing=state.settings.entries.find(function(p){return p.id==='month:'+month;}),policy=existing?existing.body.policy:rewardPolicyWithoutVersion_(state.policy);
+ if(month<policy.effectiveMonth)fail_('VALIDATION','制度の開始月より前の実績は確定できません。');var counts=countActivities_(activities_(store),store.players),eligible=store.players.filter(function(p){return p.role==='player';}).map(function(p){return {id:p.id,count:counts[month]&&counts[month][p.id]?counts[month][p.id][policy.metric]||0:0};}),top=Math.max.apply(null,[0].concat(eligible.map(function(p){return p.count;}))),winners=eligible.filter(function(p){return p.count===top&&top>0;}),awards=policy.tiePolicy==='hold'&&winners.length>1?[]:winners.map(function(p){return {playerId:p.id,points:policy.pointsPerWin,count:p.count};});
+ if(awards.length>1000)fail_('VALIDATION','対象者の上限を超えています。');awards.sort(function(a,b){return a.playerId.localeCompare(b.playerId);});var old=existing?existing.body.awards:[],ids=Object.create(null);old.concat(awards).forEach(function(p){ids[p.playerId]=true;});var changes=Object.keys(ids).sort().map(function(id){var before=old.find(function(p){return p.playerId===id;}),after=awards.find(function(p){return p.playerId===id;});return {playerId:id,delta:(after?after.points:0)-(before?before.points:0)};}).filter(function(p){return p.delta!==0;});
+ return {month:month,topCount:top,awards:awards,changes:changes,alreadySettled:!!existing,policy:policy,fingerprint:hash_(stableJson_([month,policy,eligible,state.version]))};
+}
+function readRewards_(request){var session=authenticate_(request.token,false,request.background===true),accounts=readAccountStore_(),user=activeActor_(accounts,session),state=rewardState_(accounts.book),result=rewardPublic_(state,user,accounts.players);if(request.payload&&request.payload.month){requireAdmin_(user);result.preview=rewardPreview_(readStore_({readOnly:true},accounts),state,request.payload.month);}if(rewardState_(accounts.book).version!==state.version)fail_('BUSY','ポイント情報が更新されました。もう一度取得してください。');snapshotActor_(accounts,request.token);return result;}
+function rewardTrack_(plan,state){[[REWARD_SETTINGS_TAB,REWARD_SETTINGS_HEADERS,state.settings],[REWARD_LEDGER_TAB,REWARD_LEDGER_HEADERS,state.ledger],[REWARD_REQUESTS_TAB,REWARD_REQUESTS_HEADERS,state.requests]].forEach(function(v){teamTableCheck_(plan,v[0],v[1],v[2]);});}
+function rewardWrite_(store,plan,title,headers,state,row,values){
+ var sheets=plan.rewardSheets||(plan.rewardSheets={}),write=sheets[title];if(!write){var id=state.sheet?state.sheet.getSheetId():null;if(!id){do{id=Math.floor(Math.random()*1000000000)+1;}while(store.book.getSheets().some(function(s){return s.getSheetId()===id;})||Object.keys(sheets).some(function(k){return sheets[k].id===id;}));plan.requests.push({addSheet:{properties:{sheetId:id,title:title,gridProperties:{rowCount:5001,columnCount:headers.length}}}});plan.requests.push(rowUpdateRequest_(id,1,headers));}write=sheets[title]={id:id,next:state.rows.length+2,maxRows:state.sheet?state.sheet.getMaxRows():5001};}
+ var target=row||write.next++;if(target>5001)fail_('INTAKE_LIMIT','ポイント台帳の上限です。管理者に確認してください。');if(target>write.maxRows){plan.requests.push({appendDimension:{sheetId:write.id,dimension:'ROWS',length:target-write.maxRows}});write.maxRows=target;}plan.requests.push(rowUpdateRequest_(write.id,target,values));
+}
+function rewardLedger_(store,state,plan,playerId,delta,kind,reference,reason,user,now){rewardWrite_(store,plan,REWARD_LEDGER_TAB,REWARD_LEDGER_HEADERS,state.ledger,null,[Utilities.getUuid(),playerId,delta,kind,reference,reason,user.id,now]);}
+function planRewards_(store,user,payload){
+ writingObject_(payload,['command','expectedVersion','policy','item','month','fingerprint','reason','playerId','delta','rewardId','requestId','decision','note']);var state=rewardState_(store.book);if(payload.expectedVersion!==state.version)fail_('CONFLICT','ポイント情報が更新されています。入力を控え、最新の内容と比較してください。');var command=choice_(payload.command,['policy','catalog','settle','adjust','request','review']),now=new Date().toISOString(),plan={requests:[],result:{command:command}},balances=rewardBalances_(state,store.players);rewardTrack_(plan,state);
+ if(['policy','catalog','settle','adjust'].indexOf(command)>=0){requireAdmin_(user);plan.teamAdminRequired=true;}
+ if(command==='policy'){
+  var policy=rewardPolicyBody_(payload.policy),old=state.settings.entries.find(function(p){return p.id==='policy';});rewardWrite_(store,plan,REWARD_SETTINGS_TAB,REWARD_SETTINGS_HEADERS,state.settings,old?old.row:null,['policy',JSON.stringify(policy),Utilities.getUuid(),now,user.id]);
+ }
+ if(command==='catalog'){
+  writingObject_(payload.item,['id','name','points','active']);var item=payload.item;if(typeof item.active!=='boolean')fail_('VALIDATION','特典の利用状態を確認してください。');var id=item.id?teamId_(item.id):Utilities.getUuid(),old=state.settings.entries.find(function(p){return p.id==='catalog:'+id;});if(item.id&&!old)fail_('NOT_FOUND','特典が見つかりません。');var body={name:teamText_(item.name,80,true),points:rewardInteger_(item.points,1,1000000),active:item.active};rewardWrite_(store,plan,REWARD_SETTINGS_TAB,REWARD_SETTINGS_HEADERS,state.settings,old?old.row:null,['catalog:'+id,JSON.stringify(body),Utilities.getUuid(),now,user.id]);plan.result.rewardId=id;
+ }
+ if(command==='settle'){
+  if(!state.policy.enabled)fail_('VALIDATION','制度を開始してから月を確定してください。');var preview=rewardPreview_(store,state,payload.month);if(payload.fingerprint!==preview.fingerprint)fail_('CONFLICT','実績がプレビュー後に更新されています。再確認してください。');var reason=teamText_(payload.reason,300,true),previous=state.settings.entries.find(function(p){return p.id==='month:'+preview.month;});if(previous&&!preview.changes.length)fail_('VALIDATION','確定済みで、ポイントの変更はありません。');preview.changes.forEach(function(change){var b=balances.find(function(p){return p.playerId===change.playerId;});if(!b||b.available+change.delta<0||b.balance+change.delta>100000000)fail_('INSUFFICIENT_POINTS','訂正で利用可能残高がマイナスになります。先に交換予約や付与内容を確認してください。');rewardLedger_(store,state,plan,change.playerId,change.delta,previous?'correction':'award','month:'+preview.month,reason,user,now);});var body={month:preview.month,awards:preview.awards,policy:preview.policy};rewardWrite_(store,plan,REWARD_SETTINGS_TAB,REWARD_SETTINGS_HEADERS,state.settings,previous?previous.row:null,['month:'+preview.month,JSON.stringify(body),Utilities.getUuid(),now,user.id]);plan.result.month=preview.month;plan.result.changes=preview.changes;plan.rewardSettlementCheck={month:preview.month,fingerprint:preview.fingerprint};
+ }
+ if(command==='adjust'){
+  var player=store.players.find(function(p){return p.id===payload.playerId&&p.role==='player';});if(!player)fail_('VALIDATION','対象プレイヤーを確認してください。');var delta=rewardInteger_(payload.delta,-1000000,1000000),reason=teamText_(payload.reason,300,true),balance=balances.find(function(p){return p.playerId===player.id;});if(!delta)fail_('VALIDATION','訂正ポイントは0以外にしてください。');if(balance.available+delta<0||balance.balance+delta>100000000)fail_('INSUFFICIENT_POINTS','訂正後の利用可能残高を確認してください。');rewardLedger_(store,state,plan,player.id,delta,'adjustment',Utilities.getUuid(),reason,user,now);
+ }
+ if(command==='request'){
+  if(user.role!=='player'||!state.policy.enabled||state.policy.effectiveMonth>today_().slice(0,7))fail_('FORBIDDEN','制度が開始済みのプレイヤーだけ交換を申請できます。');var reward=state.settings.entries.find(function(p){return p.id==='catalog:'+payload.rewardId&&p.body.active;}),balance=balances.find(function(p){return p.playerId===user.id;});if(!reward)fail_('VALIDATION','利用できる特典を選択してください。');if(state.requests.entries.some(function(r){return r.playerId===user.id&&r.rewardId===payload.rewardId&&r.status==='pending';}))fail_('VALIDATION','同じ特典の承認待ち申請があります。申請一覧を確認してください。');if(!balance||balance.available<reward.body.points)fail_('INSUFFICIENT_POINTS','利用可能なポイントが不足しています。');var id=Utilities.getUuid();rewardWrite_(store,plan,REWARD_REQUESTS_TAB,REWARD_REQUESTS_HEADERS,state.requests,null,[id,user.id,reward.id.slice(8),reward.body.name,reward.body.points,'pending',Utilities.getUuid(),now,now,'','']);plan.result.requestId=id;
+ }
+ if(command==='review'){
+  var request=state.requests.entries.find(function(p){return p.requestId===payload.requestId;}),decision=choice_(payload.decision,['approve','reject','cancel']),note=teamText_(payload.note,300,decision!=='cancel');if(!request||request.status!=='pending')fail_('CONFLICT','この交換申請は処理済み、または存在しません。');if(decision==='cancel'){if(user.role!=='admin'&&request.playerId!==user.id)fail_('FORBIDDEN','本人だけが交換申請を取り消せます。');}else{requireAdmin_(user);plan.teamAdminRequired=true;}var status=decision==='approve'?'approved':decision==='reject'?'rejected':'canceled';if(decision==='approve')rewardLedger_(store,state,plan,request.playerId,-request.points,'redemption',request.requestId,note,user,now);rewardWrite_(store,plan,REWARD_REQUESTS_TAB,REWARD_REQUESTS_HEADERS,state.requests,request.row,[request.requestId,request.playerId,request.rewardId,request.rewardName,request.points,status,Utilities.getUuid(),request.createdAt,now,user.id,note]);plan.result.requestId=request.requestId;
+ }
+ return plan;
+}
+function revalidateRewardsPlan_(store,user,plan){if(plan.rewardSettlementCheck){requireAdmin_(user);var latest=readStore_({readOnly:true},{config:store.config,book:store.book,playerSheet:store.playerSheet,players:readPlayers_(store.playerSheet)}),state=rewardState_(latest.book);if(rewardPreview_(latest,state,plan.rewardSettlementCheck.month).fingerprint!==plan.rewardSettlementCheck.fingerprint)fail_('CONFLICT','保存前に月の実績が変わりました。最新のプレビューで確認してください。');}}
+/* END REWARDS WORKSPACE */
+/* END GENERATED WORKFLOW FEATURES */

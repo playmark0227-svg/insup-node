@@ -22,6 +22,8 @@ export type SheetSnapshot = {
   cacheAccess?: import("./snapshot-cache.ts").SnapshotCacheAccess;
   operationsFeature?: boolean;
   teamWorkspaceFeature?: boolean;
+  migrationFeature?: boolean;
+  rewardsFeature?: boolean;
   candidateRegistrationFeature?: boolean;
   monthlyGoalsFeature?: boolean;
   monthlyGoals?: {playerId:string;month:string;target:number;version:string;updatedAt:string}[];
@@ -264,7 +266,7 @@ export function assertSnapshot(value: unknown): asserts value is SheetSnapshot {
       typeof value.self.playerId !== "string" || !value.self.playerId || !Array.isArray(value.players) || !Array.isArray(value.activities) ||
       !object(value.counts) || typeof value.writesEnabled !== "boolean" ||
       (value.securityFeature !== undefined && typeof value.securityFeature !== "boolean") || (value.workspaceFeature !== undefined && typeof value.workspaceFeature !== "boolean") ||
-      ["operationsFeature","monthlyGoalsFeature","teamWorkspaceFeature","candidateRegistrationFeature"].some(key=>value[key]!==undefined&&typeof value[key]!=="boolean") ||
+      ["operationsFeature","monthlyGoalsFeature","teamWorkspaceFeature","candidateRegistrationFeature","migrationFeature","rewardsFeature"].some(key=>value[key]!==undefined&&typeof value[key]!=="boolean") ||
       !Array.isArray(value.warnings) || value.warnings.some(w => typeof w !== "string") || typeof value.syncedAt !== "string" ||
       value.players.some(p => !object(p) || !strings(p, ["id", "name"]) || !p.id || !Number.isSafeInteger(p.target) || Number(p.target) < 1 ||
         !optionalStrings(p, ["team", "bio", "color"]) || (p.active!==undefined&&typeof p.active!=="boolean") || (p.sheetNames !== undefined && (!Array.isArray(p.sheetNames) || p.sheetNames.some(n => typeof n !== "string")))) ||

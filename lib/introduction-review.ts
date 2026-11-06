@@ -237,6 +237,31 @@ function negatedExperienceIssues(draft:string,sources:readonly string[]):boolean
  }
  return false;
 }
+type ExperienceDuration={quantity:string;unit:"year"|"month";half:boolean;company:string|null;approximate:boolean;limit:string|null};
+function experienceDurations(raw:string):ExperienceDuration[] {
+ const text=evidenceText(raw),companies=companyMentions(text),claims:ExperienceDuration[]=[];
+ for(const match of text.matchAll(/(?<![\d.年月])(\d+(?:\.\d+)?)\s*(年(?:間)?|か月|ヶ月|ケ月|カ月|ヵ月)(半)?(?![\d年月日])/g)){
+  // A calendar year (2026年) is not a duration. Calendar month/day notation
+  // cannot establish a number of months of experience either.
+  if(Number(match[1])>100||/^\s*(?:あたり|当たり|につき)/.test(text.slice(match.index+match[0].length))||/[\/／]\s*$/.test(text.slice(0,match.index)))continue;
+  const boundary=[...text.slice(0,match.index).matchAll(/【[^】]+】/g)].at(-1)?.index??-1;
+  const company=companies.filter(item=>item.start<match.index&&item.start>boundary).at(-1)?.name??null;
+  const before=text.slice(Math.max(0,match.index-12),match.index),after=text.slice(match.index+match[0].length);
+  const approximate=/(?:約|およそ|概ね)\s*$/.test(before)||/^\s*(?:程度|ほど|前後)/.test(after);
+  const limit=after.match(/^\s*(以上|以下|未満|超)/)?.[1]??before.match(/(最大|最長|最低|最短)\s*$/)?.[1]??null;
+  claims.push({quantity:String(Number(match[1])),unit:match[2].startsWith("年")?"year":"month",half:!!match[3],company,approximate,limit});
+ }
+ return claims;
+}
+function changedExperiencePeriod(draft:string,sources:readonly string[]):boolean {
+ const known=sources.flatMap(experienceDurations);
+ return experienceDurations(draft).some(claim=>{
+  let candidates=known.filter(source=>source.quantity===claim.quantity&&source.unit===claim.unit&&source.half===claim.half);
+  if(claim.company&&candidates.some(source=>source.company))candidates=candidates.filter(source=>source.company===claim.company);
+  return !candidates.some(source=>(!source.approximate||claim.approximate)&&source.limit===claim.limit);
+ });
+}
+
 function unsupportedAchievement(draft:string,source:string):boolean {
  // Explicit events only; ordinary paraphrases of strengths and capabilities are
  // deliberately not graded by a keyword-based factual checker.
@@ -275,6 +300,7 @@ export function introductionEvidenceIssues(draft:string,candidateName:string,pre
  if(/本人申告/.test(source)&&!/(?:本人申告|本人による|本人から|と伺|と聞|とのこと|との申告)/.test(draft)&&/(?:経験|担当|実績|達成|勤務)/.test(draft))issues.push("self-report-removed");
  issues.push(...metricEvidenceIssues(draft,sourceParts));
  if(negatedExperienceIssues(draft,sourceParts))issues.push("experience-negation-changed");
+ if(changedExperiencePeriod(draft,sourceParts))issues.push("experience-period-changed");
  if(unsupportedAchievement(draft,source))issues.push("source-achievement");
  if(unsupportedNarrativeAssessment(draft,source))issues.push("source-assessment");
  const rankQualifications=sourceParts.flatMap(introductionRankQualifications);
@@ -312,4 +338,46 @@ export function introductionDocument(text:string):{heading:string;body:string}[]
  const sections:{heading:string;body:string}[]=[];let current={heading:"",body:""};
  for(const line of text.split(/\r?\n/)){const match=line.trim().match(/^【([^】\n]{1,40})】$/);if(match){if(current.heading||current.body.trim())sections.push({...current,body:current.body.trim()});current={heading:match[1],body:""};}else current.body+=(current.body?"\n":"")+line;}
  if(current.heading||current.body.trim())sections.push({...current,body:current.body.trim()});return sections;
+}
+
+export type IntroductionQualityIssue = {code:"missing-section"|"source-coverage"|"note-fragments"|"repeated-sentence";title:string;detail:string;field?:InterviewStringField};
+export type IntroductionQualityReview = {issues:IntroductionQualityIssue[];checkedSections:string[]};
+
+/** Editorial checks only. Vocabulary coverage can flag a valid paraphrase, so
+ * these are review prompts rather than a factual guarantee or an adoption gate. */
+export function reviewIntroductionQuality(draft:string,fields:InterviewFields,settings:{tone:"formal"|"plain";includeSummary:boolean}):IntroductionQualityReview {
+ const document=introductionDocument(draft),section=(heading:string)=>document.find(part=>part.heading===heading)?.body||"";
+ const expected:[string,InterviewStringField][]=[];
+ const evidence=(value:string)=>!!value.trim()&&!/^(?:未確認|確認中|記載なし|情報なし|未入力)[。．]?$/u.test(value.trim());
+ if(evidence(fields.workHistory))expected.push(["営業経験・職務経歴","workHistory"]);
+ if(evidence(fields.achievements)||evidence(fields.strengths))expected.push(["営業における強み",evidence(fields.strengths)?"strengths":"achievements"]);
+ if(settings.includeSummary&&expected.length)expected.push(["総評","workHistory"]);
+ const issues:IntroductionQualityIssue[]=[];
+ for(const [heading,field] of expected)if(!section(heading).trim())issues.push({code:"missing-section",field,title:`${heading}の材料を確認`,detail:`入力に材料がありますが、「${heading}」の節がありません。ほかの節に含めたか、必要な説明が抜けていないか確認してください。`});
+ const experience=section("営業経験・職務経歴"),sources=fields.workHistory.normalize("NFKC").toLocaleLowerCase("ja"),body=experience.normalize("NFKC").toLocaleLowerCase("ja");
+ if(experience&&evidence(fields.workHistory)){
+  const groups:readonly (readonly [string,readonly string[]])[]=[
+   ["法人向け",["法人","btob","b2b","tob"]],["個人向け",["個人","btoc","b2c","toc"]],
+   ["SaaS",["saas"]],["電話での営業・案内",["テレアポ","架電","電話営業","電話案内","電話で","電話による","アウトバウンド"]],
+   ["リスト作成",["リスト作成","リストの作成","リストを作成"]],["ヒアリング",["ヒアリング","聞き取り","聞き取","聞き出"]],
+   ["訪問販売",["訪問販売","訪問営業"]],["接客",["接客","来店者への応対","来店客への応対"]],
+  ];
+  const missing=groups.filter(([,aliases])=>aliases.some(value=>sources.includes(value))&&!aliases.some(value=>body.includes(value))).map(([label])=>label);
+  for(const company of new Set(companyMentions(fields.workHistory).map(item=>item.name)))if(!experience.includes(company))missing.push(company);
+  const durations=(value:string)=>new Map([...evidenceText(value).matchAll(/(\d+(?:\.\d+)?)\s*(年(?:間)?|か月|ヶ月|ケ月|カ月|ヵ月)(?![0-9０-９日])/g)].map(match=>[`${Number(match[1])}:${match[2].startsWith("年")?"year":"month"}`,match[0]]));
+  const sourceDurations=durations(fields.workHistory),bodyDurations=durations(experience);
+  for(const [key,label] of sourceDurations)if(!bodyDurations.has(key))missing.push(label);
+  if(missing.length)issues.push({code:"source-coverage",field:"workHistory",title:"職歴から抜けた説明がないか確認",detail:`原文にある「${missing.slice(0,6).join("」「")}」に対応する表記が職歴本文では見つかりません。言い換えで残っているかを読み直し、必要なら候補文を修正してください。`});
+ }
+ const narrative=document.filter(part=>["営業経験・職務経歴","営業における強み","総評"].includes(part.heading));
+ if(settings.tone==="formal"&&narrative.some(part=>["営業経験・職務経歴","総評"].includes(part.heading)&&part.body.trim()&&!/(?:です|ます|ました|でした|おります)[。！？\s]/u.test(part.body+"\n")))issues.push({code:"note-fragments",title:"メモの羅列になっていないか確認",detail:"丁寧語の設定ですが、職歴または総評が単語・体言止め中心です。担当していた仕事が読み手へ伝わる文章になっているか確認してください。"});
+ const seen=new Set<string>();let repeated=false;
+ for(const part of narrative)for(const line of part.body.split(/[。\n！？]/)){
+  if(/本人申告の内容を含みます|順位の確認範囲/.test(line))continue;
+  const normalized=line.normalize("NFKC").replace(/[\s・、,「」『』〈〉]/g,"");
+  if(unicodeLength(normalized)<18)continue;
+  if(seen.has(normalized))repeated=true;seen.add(normalized);
+ }
+ if(repeated)issues.push({code:"repeated-sentence",title:"同じ文章の繰り返しを確認",detail:"同じ文が複数の場所にあります。職歴は担当内容、強みは具体的な工夫、総評は全体像という役割に分けると読みやすくなります。"});
+ return {issues,checkedSections:expected.map(([heading])=>heading)};
 }
