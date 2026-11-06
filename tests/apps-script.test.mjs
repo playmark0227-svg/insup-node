@@ -139,8 +139,8 @@ class MockRange {
 }
 
 class MockSheet {
-  constructor(spreadsheet, { id, name, values = [], formulas = [] }) {
-    Object.assign(this, { spreadsheet, id, name, values: clone(values), formulas: clone(formulas), validations: {}, formats: {}, maxRows: Math.max(1000, values.length), protections: [], hidden: false });
+  constructor(spreadsheet, { id, name, values = [], formulas = [], rawCells = {} }) {
+    Object.assign(this, { spreadsheet, id, name, values: clone(values), formulas: clone(formulas), rawCells: clone(rawCells), validations: {}, formats: {}, maxRows: Math.max(1000, values.length), protections: [], hidden: false });
     formulas.forEach((row, r) => row.forEach((formula, c) => {
       if (formula) { this.values[r] ??= []; this.values[r][c] ??= formula; }
     }));
@@ -337,6 +337,9 @@ export function createHarness({ spreadsheetId = "test-spreadsheet", sheets = [],
         const match=range.match(/^'(.+)'!([A-Z]+)(\d+):([A-Z]+)(\d+)$/);assert.ok(match,range);const sheet=book.getSheetByName(match[1].replace(/''/g,"'")),start=Number(match[3]),end=Number(match[5]),width=columnNumber(match[4]);
         return {properties:{sheetId:sheet.id},data:[{startRow:start-1,startColumn:0,rowData:Array.from({length:end-start+1},(_,i)=>({values:Array.from({length:width},(_,j)=>{
           const v=sheet.values[start+i-1]?.[j]??"",f=sheet.formulas[start+i-1]?.[j],key=`${start+i},${j+1}`,fmt=sheet.formats[key];
+          // Explicit CellData fixtures preserve rich chips, notes, formatted and
+          // effective values exactly; ordinary fixtures keep their old behavior.
+          if(Object.hasOwn(sheet.rawCells,key))return clone(sheet.rawCells[key]);
           const raw=f?{formulaValue:f}:v instanceof Date?{numberValue:(v.getTime()+9*3600*1000)/86400000+25569}:typeof v==="number"?{numberValue:v}:typeof v==="boolean"?{boolValue:v}:v!==""?{stringValue:v}:{};
           return {userEnteredValue:raw,formattedValue:String(v),...(sheet.validations[key]?{dataValidation:clone(sheet.validations[key])}:{}),...(fmt?{userEnteredFormat:clone(fmt)}:{})};
         })}))}]};

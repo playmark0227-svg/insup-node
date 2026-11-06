@@ -175,6 +175,21 @@ var NODE_INTRODUCTION_V2 = (function(exports) {
 		zoom: "Zoom",
 		googlemeet: "Google Meet"
 	};
+	const salesStyleNames = {
+		てれあぽ: "テレアポ",
+		てれま: "テレマーケティング",
+		テレマ: "テレマーケティング",
+		いんさいどせーるす: "インサイドセールス",
+		ふぃーるどせーるす: "フィールドセールス",
+		かすたまーさくせす: "カスタマーサクセス",
+		あぽいんたー: "アポインター",
+		ほうじんえいぎょう: "法人営業",
+		こじんえいぎょう: "個人営業",
+		b2b: "BtoB",
+		btob: "BtoB",
+		b2c: "BtoC",
+		btoc: "BtoC"
+	};
 	function normalizeIntroductionValue(field, raw) {
 		const original = typeof raw === "string" ? raw : "";
 		const text = original.normalize("NFKC").replace(/\r\n?/g, "\n").trim();
@@ -250,6 +265,7 @@ var NODE_INTRODUCTION_V2 = (function(exports) {
 		if (field === "networkEnvironment" && /^(?:OK|回線OK)$/i.test(text)) return result("問題なし");
 		if (field === "attendanceNote" && /^(?:なし|懸念なし)$/.test(text)) return result("特になし");
 		if (field === "tool") return result(toolNames[text.toLowerCase().replace(/\s/g, "")] ?? text);
+		if (field === "salesStyle") return result(text.split(/([・、,／/\n]+)/).map((part) => salesStyleNames[part.trim().toLowerCase()] ?? part).join(""));
 		return result(text);
 	}
 	/** Only a year explicitly present in the source may be compared with today. */
@@ -673,7 +689,7 @@ var NODE_INTRODUCTION_V2 = (function(exports) {
 		if (!experience) question("experienceTotal", "営業経験の通算", "通算の営業経験はどのくらいですか？重複する職歴期間を二重に数えず確認してください。", false);
 		const careerBlocks = [], tips = profile.tips.map((value, index) => narrativeValue(`tips.${index}`, value)).filter(Boolean);
 		for (const career of profile.careers) {
-			const prefix = `careers.${career.id}`, company = fixed(`${prefix}.company`, career.company), product = fixed(`${prefix}.product`, career.product), period = fixed(`${prefix}.period`, career.period), style = fixed(`${prefix}.salesStyle`, career.salesStyle);
+			const prefix = `careers.${career.id}`, company = fixed(`${prefix}.company`, career.company), product = fixed(`${prefix}.product`, career.product), period = fixed(`${prefix}.period`, career.period), style = fixed(`${prefix}.salesStyle`, career.salesStyle, "salesStyle");
 			const duties = career.duties.map((value, index) => narrativeValue(`${prefix}.duties.${index}`, value)).filter(Boolean);
 			const achievements = career.achievements.map((value, index) => fixed(`${prefix}.achievements.${index}`, value)).filter(Boolean);
 			tips.push(...career.tips.map((value, index) => narrativeValue(`${prefix}.tips.${index}`, value)).filter(Boolean));
@@ -814,7 +830,7 @@ var NODE_INTRODUCTION_V2 = (function(exports) {
 		if (profile.experienceTotal.trim()) statements.push(`営業経験は${profile.experienceTotal.trim()}です。`);
 		for (const career of careers) {
 			const subject = [career.company, career.product].map((value) => value.trim()).filter(Boolean).join("の");
-			if (subject || career.salesStyle.trim()) statements.push(`${subject ? `${subject}で` : ""}${career.salesStyle.trim() || "記載の業務"}の経験があります。`);
+			if (subject || career.salesStyle.trim()) statements.push(`${subject ? `${subject}で` : ""}${normalizeIntroductionValue("salesStyle", career.salesStyle).value || "記載の業務"}の経験があります。`);
 		}
 		const achievement = careers.flatMap((career) => filled(career.achievements))[0];
 		if (achievement) statements.push(`実績として「${achievement}」が記録されています。`);
@@ -827,7 +843,7 @@ var NODE_INTRODUCTION_V2 = (function(exports) {
 		const first = profile.careers.find((career) => career.product.trim() || career.salesStyle.trim());
 		if (!first) return "候補者の基本情報を下記にまとめております。未確認の項目は確認を進めております。";
 		const experience = profile.experienceTotal.trim() ? `${profile.experienceTotal.trim()}の営業経験があり、` : "";
-		const fact = [first.product, first.salesStyle].map((value) => value.trim()).filter(Boolean).join("・");
+		const fact = [first.product.trim(), normalizeIntroductionValue("salesStyle", first.salesStyle).value].filter(Boolean).join("・");
 		const achievement = filled(first.achievements)[0];
 		const tip = [...filled(first.tips), ...filled(profile.tips)][0];
 		return `${experience}${fact}の経験がある方です。${achievement ? `実績として「${achievement}」が記録されています。` : ""}${tip ? `「${tip}」という取り組みをされています。` : ""}`;

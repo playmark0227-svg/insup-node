@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {randomUUID} from 'node:crypto';
 import {createRestFixture,emulatorOrigin,DEMO_PROJECT,plain} from './helpers/firestore-emulator.mjs';
 
+function finishMigration(h,method){for(let attempt=0;attempt<2000;attempt++){const result=h.context[method]();if(result.more!==true)return result;}throw Error('Migration resume did not finish: '+method);}
+
 const target=process.env.NODE_FIRESTORE_EMULATOR_URL;
 const success=value=>{assert.equal(value.ok,true,JSON.stringify(value));return plain(value.data);};
 const failure=(value,code)=>{assert.equal(value.ok,false,JSON.stringify(value));if(code)assert.equal(value.error.code,code,JSON.stringify(value));return value.error;};
@@ -16,11 +18,11 @@ test('real Firestore migration and authenticated workflows use only an explicitl
  const originalSource=f.source(),authBefore=Object.fromEntries(Object.entries(h.properties).filter(([key])=>key.startsWith('NODE_AUTH_')||key==='NODE_PEPPER')),configBefore=h.properties.NODE_CONFIG;
  let migrated;
  await t.test('owner migrates every row and receipt, verifies the real REST data, then activates without changing Sheets or credentials',()=>{
-  const preview=plain(h.context.previewNodeFirestoreMigration());assert.equal(preview.recordIdCount,4);assert.equal(preview.operationCount,1);assert.equal(preview.tableCount,4);
-  h.properties.NODE_FIRESTORE_MIGRATION_CONFIRM='PREPARE:'+preview.sourceHash;const prepared=h.context.prepareNodeFirestoreMigration();assert.equal(prepared.frozen,true);
-  let result;do{result=h.context.importNodeFirestoreMigration();}while(result.more);assert.equal(result.phase,'ready');
-  const verified=h.context.verifyNodeFirestoreMigration();assert.equal(verified.verified,true);assert.equal(h.properties.NODE_STORAGE_PROVIDER,undefined);
-  h.properties.NODE_FIRESTORE_MIGRATION_CONFIRM='ACTIVATE:'+preview.sourceHash;migrated=h.context.activateNodeFirestoreMigration();assert.equal(migrated.active,true);assert.equal(h.properties.NODE_STORAGE_PROVIDER,'firestore');
+  const preview=plain(finishMigration(h,'previewNodeFirestoreMigration'));assert.equal(preview.recordIdCount,4);assert.equal(preview.operationCount,1);assert.equal(preview.tableCount,4);
+  h.properties.NODE_FIRESTORE_MIGRATION_CONFIRM='PREPARE:'+preview.sourceHash;const prepared=finishMigration(h,'prepareNodeFirestoreMigration');assert.equal(prepared.frozen,true);
+  let result;do{result=finishMigration(h,'importNodeFirestoreMigration');}while(result.more);assert.equal(result.phase,'ready');
+  const verified=finishMigration(h,'verifyNodeFirestoreMigration');assert.equal(verified.verified,true);assert.equal(h.properties.NODE_STORAGE_PROVIDER,undefined);
+  h.properties.NODE_FIRESTORE_MIGRATION_CONFIRM='ACTIVATE:'+preview.sourceHash;migrated=finishMigration(h,'activateNodeFirestoreMigration');assert.equal(migrated.active,true);assert.equal(h.properties.NODE_STORAGE_PROVIDER,'firestore');
   assert.equal(h.properties.NODE_CONFIG,configBefore);assert.deepEqual(Object.fromEntries(Object.entries(h.properties).filter(([key])=>key.startsWith('NODE_AUTH_')||key==='NODE_PEPPER')),authBefore);assert.equal(f.source(),originalSource);
   const saved=f.readDocument('nodeWorkbooks/'+f.migrationState().target.workbookId);assert.equal(saved.status,200);const manifest=h.context.firestoreDecodeFields_(saved.body.fields);assert.equal(manifest.migrationProof.state,'active');assert.equal(manifest.migrationProof.sourceHash,preview.sourceHash);assert.equal(manifest.migrationProof.recordIdCount,4);assert.ok(manifest.migrationProof.seal);
  });

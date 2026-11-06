@@ -1,7 +1,7 @@
 /** Deterministic presentation changes only. Keep `raw` beside the result; an
  * ambiguous number is a question, never a guessed candidate fact. */
 export type IntroductionNormalizationField = "timeWindow" | "rate" | "monthlyHours" | "age" | "residence" |
-  "availableFrom" | "pcEnvironment" | "networkEnvironment" | "attendanceNote" | "tool" | "freeText";
+  "availableFrom" | "pcEnvironment" | "networkEnvironment" | "attendanceNote" | "tool" | "salesStyle" | "freeText";
 export type IntroductionNormalizedValue = {
   raw: string; value: string; status: "unchanged" | "normalized" | "needs-confirmation";
   question?: string; kind?: "time" | "money";
@@ -44,6 +44,15 @@ const prefectures: Record<string, string> = {
   ...Object.fromEntries("青森 岩手 宮城 秋田 山形 福島 茨城 栃木 群馬 埼玉 千葉 神奈川 新潟 富山 石川 福井 山梨 長野 岐阜 静岡 愛知 三重 滋賀 兵庫 奈良 和歌山 鳥取 島根 岡山 広島 山口 徳島 香川 愛媛 高知 福岡 佐賀 長崎 熊本 大分 宮崎 鹿児島 沖縄".split(" ").map(name => [name, `${name}県`])),
 };
 const toolNames: Record<string, string> = { sf: "Salesforce", salesforce: "Salesforce", kintone: "kintone", hubspot: "HubSpot", slack: "Slack", chatwork: "Chatwork", teams: "Microsoft Teams", zoom: "Zoom", googlemeet: "Google Meet" };
+// Whole labels only. A sentence such as "てれあぽは未経験" must retain its
+// qualification; this dictionary never infers a role or modifies employer names.
+const salesStyleNames: Record<string, string> = {
+  てれあぽ: "テレアポ", てれま: "テレマーケティング", テレマ: "テレマーケティング",
+  いんさいどせーるす: "インサイドセールス", ふぃーるどせーるす: "フィールドセールス",
+  かすたまーさくせす: "カスタマーサクセス", あぽいんたー: "アポインター",
+  ほうじんえいぎょう: "法人営業", こじんえいぎょう: "個人営業",
+  b2b: "BtoB", btob: "BtoB", b2c: "BtoC", btoc: "BtoC",
+};
 
 export function normalizeIntroductionValue(field: IntroductionNormalizationField, raw: string): IntroductionNormalizedValue {
   const original = typeof raw === "string" ? raw : "";
@@ -103,6 +112,7 @@ export function normalizeIntroductionValue(field: IntroductionNormalizationField
   if (field === "networkEnvironment" && /^(?:OK|回線OK)$/i.test(text)) return result("問題なし");
   if (field === "attendanceNote" && /^(?:なし|懸念なし)$/.test(text)) return result("特になし");
   if (field === "tool") return result(toolNames[text.toLowerCase().replace(/\s/g, "")] ?? text);
+  if (field === "salesStyle") return result(text.split(/([・、,／/\n]+)/).map(part => salesStyleNames[part.trim().toLowerCase()] ?? part).join(""));
   return result(text);
 }
 

@@ -55,3 +55,18 @@ test('home inbox routes an unscheduled proposal to its exact record and labels d
  assert.match(text(tree),/日程・結果などの確認/);assert.match(text(tree),/C面談の予定日は未登録/);
  const button=nodes(tree).find(node=>node.type==='button'&&text(node).includes('提案を確認'));assert.ok(button);button.props.onClick();assert.deepEqual(calls,[['未調整の提案','schedule_missing']]);
 });
+
+test('mobile feature visibility intersects role permissions and closes before supported navigation',()=>{
+ const calls=[];
+ const restricted=exports.WorkspaceMobileMenu({open:true,onClose:()=>calls.push('close'),view:'home',admin:false,allowedViews:['home','players','workbook','connection'],onNavigate:view=>calls.push(view),onHelp(){}});
+ assert.ok(!text(restricted).includes('月別目標・達成率'));assert.ok(!text(restricted).includes('提案検討・案件'));
+ assert.ok(!text(restricted).includes('プレイヤー管理'));assert.ok(!text(restricted).includes('業務管理表'));assert.ok(!text(restricted).includes('データ連携'));
+ const enabled=exports.WorkspaceMobileMenu({open:true,onClose:()=>calls.push('close'),view:'home',admin:false,allowedViews:['home','metric-goals','sales','players'],onNavigate:view=>calls.push(view),onHelp(){}});
+ for(const destination of ['月別目標・達成率','提案検討・案件'])assert.ok(text(enabled).includes(destination));
+ const button=nodes(enabled).find(node=>node.type==='button'&&text(node).startsWith('提案検討・案件'));assert.ok(button);button.props.onClick();assert.deepEqual(calls,['close','sales']);
+});
+
+test('contextual help cannot advertise unsupported destinations or expand a player role',()=>{
+ const tree=exports.WorkspaceGuide({open:true,view:'sales',admin:false,allowedViews:['home','players','connection'],onClose(){},onNavigate(){assert.fail('no unavailable navigation should be offered');}});
+ assert.ok(!text(tree).includes('候補者・進捗を確認'));assert.ok(!text(tree).includes('社内で相談'));assert.ok(!text(tree).includes('関連する作業'));
+});

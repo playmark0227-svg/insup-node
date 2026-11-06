@@ -4,19 +4,21 @@ import {randomUUID} from 'node:crypto';
 import {createRestFixture,emulatorOrigin,DEMO_PROJECT,plain} from './helpers/firestore-emulator.mjs';
 import {blankWorkJob} from '../lib/sales-workflow.ts';
 import {blankIntroductionV2Profile} from '../lib/introduction-v2.ts';
+function finishMigration(h,method){for(let attempt=0;attempt<2000;attempt++){const result=h.context[method]();if(result.more!==true)return result;}throw Error('Migration resume did not finish: '+method);}
+
 const target=process.env.NODE_FIRESTORE_EMULATOR_URL;
 const ok=value=>{assert.equal(value.ok,true,JSON.stringify(value));return plain(value.data);};
 const denied=(value,code)=>{assert.equal(value.ok,false,JSON.stringify(value));if(code)assert.equal(value.error.code,code,JSON.stringify(value));assert.equal('data'in value,false);return value.error;};
 
 test('new authenticated workflows execute against the local Firestore emulator without legacy writes',{skip:!target,timeout:240000},async t=>{
  const f=createRestFixture(emulatorOrigin(target)),h=f.h;
- const original=f.source(),preview=plain(h.context.previewNodeFirestoreMigration());
- h.properties.NODE_FIRESTORE_MIGRATION_CONFIRM='PREPARE:'+preview.sourceHash;h.context.prepareNodeFirestoreMigration();
+ const original=f.source(),preview=plain(finishMigration(h,'previewNodeFirestoreMigration'));
+ h.properties.NODE_FIRESTORE_MIGRATION_CONFIRM='PREPARE:'+preview.sourceHash;finishMigration(h,'prepareNodeFirestoreMigration');
  await t.test('all new write actions stop during migration freeze before parsing or writing business data',()=>{
   for(const action of ['saveMetricGoals','saveWorkJob','saveProposalPlan','recordProposalSent','saveMatchReport','saveIntroductionV2','saveIntroductionSettings','publishIntroductionV2','beginMatchEvidence','completeMatchEvidence'])denied(f.api(action,{},'player',randomUUID(),{responseMode:'receipt'}),'INTERNAL');
   assert.equal(f.source(),original);
  });
- let imported;do{imported=h.context.importNodeFirestoreMigration();}while(imported.more);h.context.verifyNodeFirestoreMigration();h.properties.NODE_FIRESTORE_MIGRATION_CONFIRM='ACTIVATE:'+preview.sourceHash;assert.equal(h.context.activateNodeFirestoreMigration().active,true);assert.equal(f.source(),original);f.forbidSheets();
+ let imported;do{imported=finishMigration(h,'importNodeFirestoreMigration');}while(imported.more);finishMigration(h,'verifyNodeFirestoreMigration');h.properties.NODE_FIRESTORE_MIGRATION_CONFIRM='ACTIVATE:'+preview.sourceHash;assert.equal(finishMigration(h,'activateNodeFirestoreMigration').active,true);assert.equal(f.source(),original);f.forbidSheets();
  const snapshot=(as='player')=>ok(f.api('snapshot',{},as));
  const receipt=(action,payload,as='player',id=randomUUID())=>ok(f.api(action,payload,as,id,{responseMode:'receipt'}));
  const create=(name,date)=>{receipt('createCandidate',{playerId:'ND-001',candidateName:name,company:'架空の先行会社',position:'アポインター',interviewDate:date,profileVersion:'',fields:{monthlyHours:'100',daysPerWeek:'5',workHistory:'架空の法人向け電話案内',interviewMemo:'外部に出さない架空の私的メモ'},introduction:'架空の法人向け電話案内の経験。'});return snapshot().records.filter(r=>r.candidateName===name).at(-1);};

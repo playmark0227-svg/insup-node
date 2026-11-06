@@ -87,6 +87,16 @@ function nodeStorageProvider_() {
   fail_('NOT_CONFIGURED','保存先の設定を確認してください。');
 }
 function nodeUsesFirestore_(){return nodeStorageProvider_()==='firestore';}
+/* New workflows only use the signed, active Firebase destination. An explicit
+ * separately registered verification copy remains usable for bounded tests;
+ * deploying compatible code never initializes new tables on production Sheets. */
+var NODE_WORKFLOW_V2_ACTIONS=['readMetricGoals','saveMetricGoals','readSalesWorkflow','saveWorkJob','saveProposalPlan','recordProposalSent','saveMatchReport','readIntroductionV2','saveIntroductionV2','saveIntroductionSettings','publishIntroductionV2','beginMatchEvidence','completeMatchEvidence','readMatchEvidence'];
+function nodeWorkflowV2Verification_(config){var verification=props_().getProperty(NODE.verificationKey),destination=props_().getProperty(NODE.destinationKey);return !!(config.purpose==='verification'&&verification&&destination&&config.spreadsheetId===verification&&verification!==destination&&verification!==NODE.originalId&&destination!==NODE.originalId);}
+function nodeWorkflowV2Available_(config){
+  config=config||config_();if(nodeWorkflowV2Verification_(config))return true;
+  if(!nodeUsesFirestore_())return false;
+  return firestoreMigrationReady_(config)===true;
+}
 function nodeStorageMutation_(action){return ['manageAccount','saveMonthlyTarget','saveActivity','updateStatus','updateProfile','createPlayer','updateRecord','deleteCandidate','cancelAchievement','restoreChange','saveManagementRow','createCandidate','saveInterviewReview','saveCandidateProfile','saveClient','saveWritingPreferences','publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards','saveMetricGoals','saveWorkJob','saveProposalPlan','recordProposalSent','saveMatchReport','saveIntroductionV2','saveIntroductionSettings','publishIntroductionV2','beginMatchEvidence','completeMatchEvidence'].indexOf(action)>=0;}
 function nodeOpenBook_(config){if(!nodeUsesFirestore_())return SpreadsheetApp.openById(config.spreadsheetId);var book=firestoreOpenBook_(config);if(!firestoreMigrationReady_(config))fail_('NOT_CONFIGURED','Firebaseへの移行確認が完了していません。管理者が保存先を確認してください。');return book;}
 function nodeFlush_(){if(!nodeUsesFirestore_())SpreadsheetApp.flush();}
@@ -216,9 +226,13 @@ function nodeHandle_(request) {
   if(nodeStorageMutation_(action)&&firestoreMigrationFrozen_()){authenticate_(request.token);fail_('INTERNAL','保存先を切り替えています。入力を保持したまま、同じ保存IDで後ほど再試行してください。');}
   // Budget expensive reads per account after authentication and before any sheet, AI or audit read.
   // hasOwnProperty keeps inherited names such as 'constructor' answering BAD_REQUEST below.
-  if(action==='beginMatchEvidence')return beginMatchEvidence_(request);
+  // Upload initialization owns its rate budget; its subsequent readStore_ verifies
+  // the live signed Firebase proof. Keep this precheck Properties-only so rejected
+  // quota calls cannot start a Firestore transaction or spend the budget twice.
+  if(action==='beginMatchEvidence'){authenticate_(request.token,false,passive);if(!nodeWorkflowV2Verification_(config_())&&!nodeUsesFirestore_())fail_('NOT_CONFIGURED','この機能はFirebaseへの移行が完了すると利用できます。現在のデータは変更していません。');return beginMatchEvidence_(request);}
   var budgeted = null;
   if (Object.prototype.hasOwnProperty.call(NODE_READ_BUCKETS, action)) { budgeted = authenticate_(request.token, false, passive); readBudget_(budgeted.id, action); }
+  if(NODE_WORKFLOW_V2_ACTIONS.indexOf(action)>=0){authenticate_(request.token,false,passive);if(!nodeWorkflowV2Available_(config_()))fail_('NOT_CONFIGURED','この機能はFirebaseへの移行が完了すると利用できます。現在のデータは変更していません。');}
   if (action === 'resumeSession') {var accounts=readAccountStore_(),actor=activeActor_(accounts,budgeted);var access=snapshotCacheAccess_(accounts,actor);snapshotActor_(accounts,request.token);return {cacheAccess:access};}
   if (action === 'auditSecurity') return auditSecurity_(request);
   if (action === 'readAccountManagement') return readAccountManagement_(request);
@@ -258,6 +272,8 @@ function nodeHandle_(request) {
   }
   if (action === 'snapshot') {
     // The read budget above has already authenticated this token before any sheet read.
+    var unchanged = firestoreUnchangedSnapshot_(request, budgeted);
+    if (unchanged) return unchanged;
     var snapshotStore = readStore_({ readOnly: true }), snapshot = authenticatedSnapshot_(snapshotStore, request.token);
     // Older frontends ignore this field; the current one reports the input again on the next poll.
     if (budgeted && budgeted.touchDeferred) snapshot.activityDeferred = true;
@@ -928,7 +944,7 @@ function readStore_(options, accountStore) {
   try { fullGridCache = CacheService.getScriptCache(); useFullGrid = fullGridCache.get(fullGridKey) === '1'; } catch (_) { /* Cache is optional. */ }
   // This caches only a choice to read the entire grid, never a data snapshot or
   // a shortened boundary. Edits cannot be omitted by an outdated cache entry.
-  if (options && options.readOnly && !useFullGrid) {
+  if (options && options.readOnly && (nodeUsesFirestore_() || !useFullGrid)) {
     // Formula-filled template rows make getLastRow much larger than the actual
     // candidate table. A:D is enough to retain every named/unknown-owner row.
     // Mutations still load the full grid for blank-row and formula protection.
@@ -1032,12 +1048,38 @@ function snapshotCacheAccess_(store,user) {
   var scope=hmac_('display-cache-scope-v1|'+stableJson_({version:1,config:store.config,self:user,roster:store.players,authVersion:auth.version||null,storageProvider:nodeStorageProvider_(),storageBinding:nodeUsesFirestore_()?firestoreConfig_():null}),pepper);
   return {version:1,self:{playerId:user.id,role:user.role},scope:scope,secret:hmac_('display-cache-encryption-v1|'+scope,pepper),expiresAt:Date.now()+3600000};
 }
+/* A stamp is only an authenticated cache validator, never a credential. Bump
+ * this backend stamp when the full snapshot projection/meaning changes. */
+var NODE_FIRESTORE_SNAPSHOT_STAMP='node-firestore-snapshot-v1-20261106';
+function firestoreSnapshotVersion_(store,user,cacheAccess,preferences,evidenceEnabled,canWrite){
+  if(!nodeUsesFirestore_())return '';
+  var book=store.book,manifest=book&&book.manifest,pepper=props_().getProperty(NODE.pepperKey);
+  if(!book||!book.transaction||!manifest||!Number.isSafeInteger(manifest.revision)||manifest.revision<0||!cacheAccess||!(/^[A-Za-z0-9_-]{43}$/).test(cacheAccess.scope)||cacheAccess.self.playerId!==user.id||cacheAccess.self.role!==user.role||!pepper)fail_('FIRESTORE_READ_FAILED','表示データの確認位置を検証できません。');
+  return hmac_('authenticated-firestore-snapshot-v1|'+stableJson_({backend:NODE_FIRESTORE_SNAPSHOT_STAMP,revision:manifest.revision,scope:cacheAccess.scope,writingPreferences:preferences,evidenceEnabled:evidenceEnabled===true,writesEnabled:canWrite===true,refreshWindow:Math.floor(Date.now()/300000)}),pepper);
+}
+function firestoreSnapshotRequestVersion_(request){
+  var payload=request.payload;
+  // Older callers may send ignored role/player hints. They grant no authority;
+  // preserve that behavior and interpret only the new explicit validator.
+  if(!payload||typeof payload!=='object'||!Object.prototype.hasOwnProperty.call(payload,'ifSnapshotVersion'))return '';
+  var value=payload.ifSnapshotVersion;if(typeof value!=='string'||!(/^[A-Za-z0-9_-]{43}$/).test(value))fail_('BAD_REQUEST','表示データの確認値を確認してください。');return value;
+}
+function firestoreUnchangedSnapshot_(request,session){
+  var expected=firestoreSnapshotRequestVersion_(request);
+  if(!expected||request.background!==true||!nodeUsesFirestore_())return null;
+  // Only the current roster is read. Every response still passes the existing
+  // outside-transaction roster/manifest proof in doPost before it is sent.
+  var accounts=readAccountStore_(),actor=activeActor_(accounts,session||authenticate_(request.token,false,true)),access=snapshotCacheAccess_(accounts,actor),preferences=writingPreferences_(),evidence=matchEvidenceFeature_(),canWrite=writesEnabled_(accounts.config),version=firestoreSnapshotVersion_(accounts,actor,access,preferences,evidence,canWrite);
+  if(!constantEqual_(expected,version))return null;
+  snapshotActor_(accounts,request.token);
+  var result={snapshotUnchanged:true,snapshotVersion:version,self:{playerId:actor.id,role:actor.role},syncedAt:new Date().toISOString(),cacheAccess:access};if(session&&session.touchDeferred)result.activityDeferred=true;return result;
+}
 function publicPlayer_(player,user) { var own=user.role==='admin'||user.id===player.id;return { id: player.id, name: player.name, team: player.team, color: player.color, target: player.target, bio: own?player.bio:'', sheetNames: own?player.sheetNames.slice():[], active:player.active }; }
 function buildSnapshot_(store, user) {
   var all = activities_(store);
   var snapshot={ self: { playerId: user.id, role: user.role }, players: store.players.filter(function (p) { return p.role === 'player' && (user.role==='admin'||p.active); }).map(function(player){return publicPlayer_(player,user);}), activities: all.filter(function (a) { return user.role === 'admin' || a.playerId === user.id; }), counts: countActivities_(all, store.players.filter(function(p){return user.role==='admin'||p.active;})), syncedAt: new Date().toISOString(), warnings: store.warnings.slice(), writesEnabled: store.schemaCompatible&&writesEnabled_(store.config) && store.book.getSpreadsheetTimeZone() === 'Asia/Tokyo' };
   snapshot.interviewReviews=readInterviewReviews_(store,user);
-  snapshot.metricGoalsFeature=true; snapshot.salesWorkflowFeature=true; snapshot.introductionV2Feature=true; snapshot.candidateIntroductionV2=readIntroductionV2Profiles_(store,user); snapshot.storageEvidenceFeature=matchEvidenceFeature_()?true:undefined; snapshot.migrationFeature=true; snapshot.rewardsFeature=true; snapshot.candidateRegistrationFeature=true; snapshot.teamWorkspaceFeature=true; snapshot.intakeFeature=true; snapshot.candidateProfiles=readCandidateProfiles_(store,user); snapshot.clients=clientEntries_(store.book);
+  var workflowV2=nodeWorkflowV2Available_(store.config);if(workflowV2){snapshot.metricGoalsFeature=true;snapshot.salesWorkflowFeature=true;snapshot.introductionV2Feature=true;snapshot.candidateIntroductionV2=readIntroductionV2Profiles_(store,user);}snapshot.storageEvidenceFeature=workflowV2&&matchEvidenceFeature_()?true:undefined; snapshot.migrationFeature=true; snapshot.rewardsFeature=true; snapshot.candidateRegistrationFeature=true; snapshot.teamWorkspaceFeature=true; snapshot.intakeFeature=true; snapshot.candidateProfiles=readCandidateProfiles_(store,user); snapshot.clients=clientEntries_(store.book);
   snapshot.deletionFeature=true; snapshot.deletedCandidates=deletedCandidates_(store,user);
   snapshot.writingFeature=true; snapshot.writingPreferences=writingPreferences_();
   snapshot.reviewFeature=true; snapshot.monthlyGoalsFeature=true; snapshot.monthlyGoals=readMonthlyGoals_(store,user);
@@ -1048,7 +1090,7 @@ function buildSnapshot_(store, user) {
   if(pepper)snapshot.cacheAccess=snapshotCacheAccess_(store,user);
   if(pepper)snapshot.outboxKey=hmac_('outbox-v2|'+store.config.spreadsheetId+'|'+user.role+'|'+user.id,pepper);
   snapshot.records=store.schemaCompatible ? store.records.filter(function(r){return user.role==='admin'||r.playerId===user.id;}).map(publicRecord_) : [];
-  if(nodeUsesFirestore_())snapshot.storageBackend=firestoreStorageInfo_();
+  if(nodeUsesFirestore_()){snapshot.storageBackend=firestoreStorageInfo_();snapshot.snapshotVersion=firestoreSnapshotVersion_(store,user,snapshot.cacheAccess,snapshot.writingPreferences,snapshot.storageEvidenceFeature===true,snapshot.writesEnabled);}
   if(user.role==='admin'&&!nodeUsesFirestore_()){
     var prefix='https://docs.google.com/spreadsheets/d/'+encodeURIComponent(store.config.spreadsheetId)+'/edit#gid=';
     snapshot.destination={title:store.book.getName(),matchingUrl:prefix+Number(store.config.matchingSheetId),kpiUrl:prefix+Number(store.config.kpiSheetId)};
@@ -3851,10 +3893,13 @@ function firestoreBatch_(bookId,requests){var book=firestoreLoadedBook_();if(!bo
 var FIRESTORE_MIGRATION_KEY='NODE_FIRESTORE_MIGRATION_STATE';
 var FIRESTORE_MIGRATION_TARGET_KEY='NODE_FIRESTORE_MIGRATION_TARGET';
 var FIRESTORE_MIGRATION_CONFIRM_KEY='NODE_FIRESTORE_MIGRATION_CONFIRM';
+var FIRESTORE_MIGRATION_PREVIEW_KEY='NODE_FIRESTORE_PREVIEW_V2';
+var FIRESTORE_MIGRATION_PAGE_ROWS=64;
+var FIRESTORE_MIGRATION_PAGE_BYTES=4*1024*1024;
 
 function firestoreMigrationState_(){
   var raw=props_().getProperty(FIRESTORE_MIGRATION_KEY);if(!raw)return null;
-  try{var state=JSON.parse(raw);if(!state||['prepared','importing','ready','verified','active','abandoned'].indexOf(state.phase)<0)throw new Error('state');return state;}
+  try{var state=JSON.parse(raw);if(!state||['prepared','importing','ready','verified','active','abandoned'].indexOf(state.phase)<0)throw new Error('state');if(state.rootHashVersion===2)firestoreMigrationCheckpointValidate_(state);return state;}
   catch(error){fail_('MIGRATION_STATE','Firebase移行状態を確認してください。安全のため保存を停止しています。');}
 }
 function firestoreMigrationFrozen_(){var state=firestoreMigrationState_();return !!state&&(['prepared','importing','ready','verified'].indexOf(state.phase)>=0||state.phase==='active'&&props_().getProperty('NODE_STORAGE_PROVIDER')!=='firestore');}
@@ -4005,91 +4050,120 @@ function verifyNodeFirestoreAccess(){
   if(requireOwner_()!==owner||stableJson_(firestoreMigrationTarget_())!==stableJson_(target))fail_('BUSY','接続確認中に設定が変わりました。もう一度確認してください。');
   var result={verified:true,readOnly:true,locationId:data.locationId,type:data.type};Logger.log(JSON.stringify({locationId:result.locationId,type:result.type}));return result;
 }
-function firestoreMigrationBinding_(state){return {projectId:state.target.projectId,databaseId:state.target.databaseId,workbookId:state.target.workbookId,sourceSpreadsheetId:state.sourceSpreadsheetId,sourceConfigHash:state.sourceConfigHash,runtimeConfigHash:state.runtimeConfigHash,sourceHash:state.sourceHash,importId:state.importId};}
+function firestoreMigrationBinding_(state){var binding={projectId:state.target.projectId,databaseId:state.target.databaseId,workbookId:state.target.workbookId,sourceSpreadsheetId:state.sourceSpreadsheetId,sourceConfigHash:state.sourceConfigHash,runtimeConfigHash:state.runtimeConfigHash,sourceHash:state.sourceHash,importId:state.importId};if(state.rootHashVersion===2)binding.rootHashVersion=2;return binding;}
 function firestoreMigrationSeal_(state){var pepper=props_().getProperty(NODE.pepperKey);if(!pepper)fail_('NOT_CONFIGURED','認証設定が未完了のため移行できません。');return hmac_(stableJson_(firestoreMigrationBinding_(state)),pepper);}
 function firestoreMigrationProof_(state,phase){return Object.assign({state:phase,preparedAt:state.preparedAt,verifiedAt:state.verifiedAt||'',seal:firestoreMigrationSeal_(state)},firestoreMigrationBinding_(state),state.counts);}
-function firestoreMigrationAssertCurrent_(state,source,config,owner){
-  if(requireOwner_()!==owner||state.ownerEmail!==owner)fail_('FORBIDDEN','移行の実行者が変わりました。');
-  if(stableJson_(config_())!==stableJson_(config)||hash_(stableJson_(config))!==state.sourceConfigHash||source.sourceHash!==state.sourceHash)fail_('MIGRATION_SOURCE_CHANGED','移行元または接続設定が変わりました。元データへ書かずに停止しました。旧接続へ戻す場合は移行を中止してください。');
-}
 function firestoreMigrationWrite_(target,writes){
   if(!writes.length)return;var body={writes:writes};if(firestoreMigrationUtf8Length_(body)>8000000)fail_('MIGRATION_LIMIT','移行バッチが大きすぎます。');
   var result=firestoreRequest_('post',':commit',body,target);if(!result||!Array.isArray(result.writeResults)||result.writeResults.length!==writes.length)fail_('INTERNAL','移行の保存結果を確認できません。入力を変えずに同じ移行を再実行してください。');return result;
 }
 function firestoreMigrationDocument_(target,path,data,precondition){var result={update:{name:firestoreDocumentName_(target,'nodeWorkbooks/'+target.workbookId+(path?'/'+path:'')),fields:firestoreEncodeFields_(data)}};if(precondition)result.currentDocument=precondition;return result;}
 function firestoreMigrationRead_(target,path){return firestoreRequest_('get','nodeWorkbooks/'+target.workbookId+(path?'/'+path:''),undefined,target);}
-function previewNodeFirestoreMigration(){
-  firestoreMigrationReset_();var owner=requireOwner_(),config=config_();if(props_().getProperty('NODE_STORAGE_PROVIDER')==='firestore')fail_('MIGRATION_ALREADY_ACTIVE','Firebaseへの切替は完了しています。');
-  var source=firestoreMigrationSource_(config);if(requireOwner_()!==owner||stableJson_(config_())!==stableJson_(config))fail_('BUSY','確認中に設定が変わりました。');return firestoreMigrationSummary_({phase:'preview',sourceHash:source.sourceHash,counts:source.counts},{readOnly:true,readStats:source.readStats,prepareConfirmation:'PREPARE:'+source.sourceHash});
+/* Version 2 signs only a bounded cursor and hashes. Source prose, raw cells,
+ * OAuth credentials and document arrays never enter Script Properties. */
+function firestoreMigrationCheckpointPayload_(value){var out={};Object.keys(value).forEach(function(key){if(key!=='checkpointSeal')out[key]=value[key];});return out;}
+function firestoreMigrationCheckpointValidate_(value){
+  var pepper=props_().getProperty(NODE.pepperKey),body=firestoreMigrationCheckpointPayload_(value);
+  if(!pepper||value.rootHashVersion!==2||typeof value.checkpointSeal!=='string'||firestoreMigrationUtf8Length_(value)>8192||!constantEqual_(value.checkpointSeal,hmac_(stableJson_(body),pepper)))fail_('MIGRATION_CHECKPOINT','移行の確認位置を検証できません。保存先を切り替えず停止しました。');
+  return value;
 }
-function prepareNodeFirestoreMigration(){
-  firestoreMigrationReset_();return withLock_(function(){var owner=requireOwner_(),config=config_();if(props_().getProperty('NODE_STORAGE_PROVIDER')==='firestore')fail_('MIGRATION_ALREADY_ACTIVE','Firebaseへの切替は完了しています。');var source=firestoreMigrationSource_(config),target=firestoreMigrationTarget_(),old=firestoreMigrationState_();
-    firestoreMigrationConfirm_('PREPARE:'+source.sourceHash);
-    if(old&&old.phase!=='abandoned'){if(old.sourceHash!==source.sourceHash||old.target.projectId!==target.projectId||old.target.databaseId!==target.databaseId)fail_('MIGRATION_IN_PROGRESS','別の移行が進行中です。先に状態を確認してください。');return firestoreMigrationSummary_(old,{frozen:true});}
-    var id=Utilities.getUuid().replace(/-/g,''),state={phase:'prepared',importId:id,target:Object.assign({},target,{workbookId:'migration-'+id}),ownerEmail:owner,sourceSpreadsheetId:config.spreadsheetId,sourceConfigHash:source.sourceConfigHash,runtimeConfigHash:source.runtimeConfigHash,sourceHash:source.sourceHash,counts:source.counts,cursor:0,preparedAt:new Date().toISOString()};
-    if(requireOwner_()!==owner||stableJson_(config_())!==stableJson_(config))fail_('BUSY','確認中に設定が変わりました。');props_().setProperty(FIRESTORE_MIGRATION_KEY,JSON.stringify(state));return firestoreMigrationSummary_(state,{frozen:true});
-  });
+function firestoreMigrationCheckpointSave_(key,value){var pepper=props_().getProperty(NODE.pepperKey);if(!pepper)fail_('NOT_CONFIGURED','認証設定が未完了です。');value.updatedAt=new Date().toISOString();value.checkpointSeal=hmac_(stableJson_(firestoreMigrationCheckpointPayload_(value)),pepper);var text=JSON.stringify(value);if(firestoreMigrationUtf8Length_(text)>8192)fail_('MIGRATION_LIMIT','移行の確認位置が保存上限を超えています。');props_().setProperty(key,text);return value;}
+function firestoreMigrationSaveState_(state){if(state.rootHashVersion===2)return firestoreMigrationCheckpointSave_(FIRESTORE_MIGRATION_KEY,state);props_().setProperty(FIRESTORE_MIGRATION_KEY,JSON.stringify(state));return state;}
+function firestoreMigrationPreview_(){var text=props_().getProperty(FIRESTORE_MIGRATION_PREVIEW_KEY);if(!text)return null;var result;try{result=JSON.parse(text);}catch(_){fail_('MIGRATION_CHECKPOINT','移行前確認の保存形式を確認してください。');}return firestoreMigrationCheckpointValidate_(result);}
+/* Catalog and visible metadata are small, independent of the row count. Each
+ * source page obtains only its own values/formulas/raw CellData. */
+function firestoreMigrationContext_(config){
+  var started=Date.now();if(config.spreadsheetId===NODE.originalId)fail_('PROTECTED_SOURCE','原本からの移行は実行しません。登録済みの管理コピーを使ってください。');assertManagedBook_(config.spreadsheetId);
+  var book=SpreadsheetApp.openById(config.spreadsheetId);if(book.getSpreadsheetTimeZone()!=='Asia/Tokyo')fail_('TIMEZONE','移行元のタイムゾーンを確認してください。');var tabs=resolveBusinessTabs_(book);if(tabs.matchingSheetId!==Number(config.matchingSheetId)||tabs.kpiSheetId!==Number(config.kpiSheetId))fail_('SCHEMA_MISMATCH','移行元の業務タブIDが設定と一致しません。');
+  var catalog=Object.create(null),tables=book.getSheets().slice().sort(function(a,b){return a.getSheetId()-b.getSheetId();}).map(function(sheet){var id=sheet.getSheetId(),info={id:id,sheet:sheet,title:sheet.getName(),lastRow:sheet.getLastRow(),lastColumn:sheet.getLastColumn(),rowCount:sheet.getMaxRows(),columnCount:sheet.getMaxColumns()};if(!Number.isSafeInteger(id)||id<0||Object.prototype.hasOwnProperty.call(catalog,id)||typeof info.title!=='string'||!info.title||!Number.isSafeInteger(info.rowCount)||info.rowCount<1||!Number.isSafeInteger(info.columnCount)||info.columnCount<1||!Number.isSafeInteger(info.lastRow)||info.lastRow<0||info.lastRow>info.rowCount||!Number.isSafeInteger(info.lastColumn)||info.lastColumn<0||info.lastColumn>info.columnCount)fail_('MIGRATION_SOURCE','移行元の表の範囲を確認してください。');catalog[id]=info;return info;});
+  var metadata=firestoreMigrationMetadata_(book.getId(),catalog),cellCount=0;
+  tables.forEach(function(info){var prefix=info.id+':',lastMetadataRow=0;Object.keys(metadata.rowMetadata).forEach(function(key){if(key.indexOf(prefix)===0)lastMetadataRow=Math.max(lastMetadataRow,Number(key.slice(prefix.length)));});info.end=Math.max(info.lastRow,lastMetadataRow);info.width=Math.max(1,info.lastColumn);cellCount+=info.end*info.width;if(cellCount>2000000||info.end>50000||info.columnCount>1000||tables.length>200)fail_('MIGRATION_LIMIT','移行元の表が検証できる上限を超えています。');});
+  var plainTables=tables.map(function(info){return {sheetId:info.id,title:info.title,rowCount:info.rowCount,columnCount:info.columnCount,lastRow:info.lastRow,lastColumn:info.lastColumn,end:info.end,width:info.width,legacyMetadata:metadata.tableMetadata[info.id]||[]};});
+  if(firestoreMigrationUtf8Length_([plainTables,metadata])>4000000)fail_('MIGRATION_LIMIT','管理IDの目録が安全な検証サイズを超えています。');
+  var context={startedAt:started,bookId:book.getId(),title:book.getName(),timeZone:book.getSpreadsheetTimeZone(),tables:tables,rowMetadata:metadata.rowMetadata,tableMetadata:metadata.tableMetadata,legacyMetadata:metadata.legacyMetadata,maxMetadataId:metadata.maxMetadataId,metadataCount:metadata.metadataCount,matchingSheetId:Number(config.matchingSheetId),sourceConfigHash:hash_(stableJson_(config)),runtimeConfigHash:firestoreRuntimeConfigHash_(config),catalogHash:hash_(stableJson_([book.getId(),book.getName(),book.getSpreadsheetTimeZone(),plainTables])),metadataHash:hash_(stableJson_([metadata.rowMetadata,metadata.tableMetadata,metadata.legacyMetadata,metadata.maxMetadataId])),readStats:{metadataCount:metadata.metadataCount,gridRequests:0,rowsRead:0,elapsedMs:Date.now()-started}};
+  return context;
 }
-function importNodeFirestoreMigration(){
-  firestoreMigrationReset_();return withLock_(function(){var owner=requireOwner_(),state=firestoreMigrationState_(),config=config_();if(!state||['prepared','importing','ready'].indexOf(state.phase)<0)fail_('MIGRATION_STATE','先に移行準備を実行してください。');if(state.phase==='ready')return firestoreMigrationSummary_(state,{frozen:true});
-    var source=firestoreMigrationSource_(config);firestoreMigrationAssertCurrent_(state,source,config,owner);
-    if(state.phase==='prepared'){
-      var manifest=Object.assign({},source.manifest,{migrationProof:firestoreMigrationProof_(state,'importing')}),existing=firestoreMigrationRead_(state.target,'');if(existing){if(stableJson_(firestoreDecodeFields_(existing.fields))!==stableJson_(manifest))fail_('MIGRATION_VERIFY_FAILED','移行先に異なるデータがあります。上書きせず停止しました。');}else firestoreMigrationWrite_(state.target,[firestoreMigrationDocument_(state.target,'',manifest,{exists:false})]);state.phase='importing';props_().setProperty(FIRESTORE_MIGRATION_KEY,JSON.stringify(state));
+function firestoreMigrationTableData_(context,info,bound){var data={sheetId:info.id,title:info.title,rowCount:info.rowCount,columnCount:info.columnCount,lastRow:info.lastRow,lastColumn:info.lastColumn,legacyMetadata:context.tableMetadata[info.id]||[]};if(info.id===context.matchingSheetId)data.identityReadBound=Math.min(info.rowCount,bound);return data;}
+function firestoreMigrationManifest_(context){var manifest={schemaVersion:1,revision:0,title:context.title,timeZone:context.timeZone,sourceSpreadsheetId:context.bookId,sourceConfigHash:context.sourceConfigHash,runtimeConfigHash:context.runtimeConfigHash,tables:context.tables.map(function(table){return {sheetId:table.id,title:table.title};}),nextMetadataId:context.maxMetadataId+1,legacyMetadata:context.legacyMetadata};if(firestoreMigrationUtf8Length_(manifest)>880000)fail_('MIGRATION_LIMIT','移行目録が保存上限を超えています。');return manifest;}
+function firestoreMigrationPageGrid_(context,info,start,end){
+  var response;context.readStats.gridRequests++;try{response=Sheets.Spreadsheets.get(context.bookId,{ranges:["'"+info.title.replace(/'/g,"''")+"'!A"+start+':'+columnName_(info.width)+end],fields:'sheets(properties(sheetId),data(startRow,startColumn,rowData(values(userEnteredValue,effectiveValue,formattedValue,dataValidation,userEnteredFormat(numberFormat),chipRuns,note))))'});}catch(_){fail_('SHEET_READ_FAILED','移行元のセル情報を取得できませんでした。元データは変更していません。');}
+  if(!response||!Array.isArray(response.sheets)||response.sheets.length!==1||!response.sheets[0].properties||response.sheets[0].properties.sheetId!==info.id||!Array.isArray(response.sheets[0].data)||response.sheets[0].data.length!==1)fail_('SHEET_READ_FAILED','要求した範囲のセル情報が欠落・重複しています。');var responseBytes=firestoreMigrationUtf8Length_(response);if(responseBytes>4*1024*1024){if(end>start)return null;fail_('MIGRATION_LIMIT','1行のセル情報が安全な読取サイズを超えています。');}context.readStats.maxRawResponseBytes=Math.max(context.readStats.maxRawResponseBytes||0,responseBytes);
+  var part=response.sheets[0].data[0],grid=[],rawRowByteHint=1;if(!part||typeof part!=='object'||Array.isArray(part)||(part.startRow===undefined?0:part.startRow)!==start-1||(part.startColumn===undefined?0:part.startColumn)!==0||part.rowData!==undefined&&!Array.isArray(part.rowData)||(part.rowData||[]).length>end-start+1)fail_('SHEET_READ_FAILED','要求した範囲のセル位置が一致しません。');
+  (part.rowData||[]).forEach(function(row,index){if(!row||typeof row!=='object'||Array.isArray(row)||row.values!==undefined&&!Array.isArray(row.values)||(row.values||[]).length>info.width)fail_('SHEET_READ_FAILED','移行元のセル範囲を確認できませんでした。');rawRowByteHint=Math.max(rawRowByteHint,firestoreMigrationUtf8Length_(row));grid[index]=(row.values||[]).map(function(cell){if(!cell||typeof cell!=='object'||Array.isArray(cell))fail_('SHEET_READ_FAILED','移行元のセル形式を確認できませんでした。');return cell;});});info.rawRowByteHint=rawRowByteHint;return grid;
+}
+function firestoreMigrationSourcePage_(context,cursor){
+  if(!cursor||!Number.isSafeInteger(cursor.tableIndex)||cursor.tableIndex<0||cursor.tableIndex>context.tables.length||!Number.isSafeInteger(cursor.row)||cursor.row<1)fail_('MIGRATION_CHECKPOINT','移行元の確認位置が不正です。');
+  var tableIndex=cursor.tableIndex,info=context.tables[tableIndex],documents=[],delta={rowDocumentCount:0,recordIdCount:0,operationCount:0},bound=0,bytes=2,nextCursor,range;
+  if(!info){if(cursor.row!==1)fail_('MIGRATION_CHECKPOINT','移行元の確認位置が不正です。');range={tableIndex:tableIndex,sheetId:null,startRow:1,endRow:0};return {documents:[],pageHash:hash_(stableJson_([range,[]])),range:range,nextCursor:{tableIndex:tableIndex,row:1},done:true,countsDelta:delta,matchingIdentityBound:0,readStats:{rowsRead:0,gridRequests:0,bytes:2}};}
+  if(cursor.row>Math.max(1,info.end))fail_('MIGRATION_CHECKPOINT','移行元の行位置が表の範囲を超えています。');var start=cursor.row,end=Math.min(info.end,start+FIRESTORE_MIGRATION_PAGE_ROWS-1),processed=start-1,requestsBefore=context.readStats.gridRequests;
+  /* Start each table with eight raw rows, then adapt up to 32 rows from
+   * observed raw row bytes (256 KiB target). Raw data is checked before values
+   * and formulas; an oversized response is discarded and retried at half size.
+   * The hint is ephemeral, so it never changes page boundaries or source hashes. */
+  pageBlocks:for(var blockStart=start;blockStart<=end;){var chunk=info.rawRowByteHint?Math.max(1,Math.min(32,Math.floor(262144/info.rawRowByteHint))):8,blockEnd=Math.min(end,blockStart+chunk-1),grid=firestoreMigrationPageGrid_(context,info,blockStart,blockEnd);while(grid===null){chunk=Math.max(1,Math.floor((blockEnd-blockStart+1)/2));blockEnd=blockStart+chunk-1;grid=firestoreMigrationPageGrid_(context,info,blockStart,blockEnd);}var values=info.sheet.getRange(blockStart,1,blockEnd-blockStart+1,info.width).getValues(),formulas=info.sheet.getRange(blockStart,1,blockEnd-blockStart+1,info.width).getFormulas();if(!Array.isArray(values)||!Array.isArray(formulas)||values.length!==blockEnd-blockStart+1||formulas.length!==blockEnd-blockStart+1||values.some(function(row){return !Array.isArray(row)||row.length!==info.width;})||formulas.some(function(row){return !Array.isArray(row)||row.length!==info.width;}))fail_('SHEET_READ_FAILED','移行元の値・数式の範囲が一致しません。');
+    for(var row=blockStart;row<=blockEnd;row++){
+      var index=row-blockStart,rowValues=values[index].map(firestoreMigrationPlain_),rowFormulas=formulas[index].map(function(value){return String(value||'');}),cells=Array.from({length:info.width},function(_,column){return grid[index]&&grid[index][column]||{};}),metadata=context.rowMetadata[info.id+':'+row]||{},hasMetadata=Object.keys(metadata).length>0;
+      if(rowValues.some(function(value){return value!=='';})||rowFormulas.some(Boolean)||cells.some(function(cell){return Object.keys(cell).length>0;})||hasMetadata){var data={row:row,hasMetadata:hasMetadata,payload:stableJson_({values:rowValues,formulas:rowFormulas,cells:cells,metadata:metadata})};if(firestoreMigrationUtf8Length_(data)>880000)fail_('MIGRATION_LIMIT','1行の保存サイズが大きいため移行を停止しました。元データは変更していません。');var item={path:'tables/'+info.id+'/rows/'+('00000000'+row).slice(-8),data:data},size=firestoreMigrationUtf8Length_(item)+(documents.length?1:0);if(bytes+size>FIRESTORE_MIGRATION_PAGE_BYTES){if(!documents.length)fail_('MIGRATION_LIMIT','移行ページの保存サイズが大きすぎます。');break pageBlocks;}bytes+=size;documents.push(item);delta.rowDocumentCount++;if(metadata[NODE.recordKey])delta.recordIdCount++;if(info.title===NODE.operationsTab&&row>1&&rowValues[0]!==''&&!rowFormulas[0])delta.operationCount++;}
+      if(info.id===context.matchingSheetId&&normalizeName_(rowValues[2]))bound=Math.max(bound,row);processed=row;
     }
-    var start=state.cursor,end=Math.min(source.documents.length,start+400);
-    for(var cursor=start;cursor<end;){var batch=[],bytes=0;
-      while(cursor<end&&batch.length<80){var item=source.documents[cursor],write=firestoreMigrationDocument_(state.target,item.path,item.data),size=firestoreMigrationUtf8Length_(write);if(batch.length&&bytes+size>6000000)break;batch.push(write);bytes+=size;cursor++;}
-      firestoreMigrationWrite_(state.target,batch);state.cursor=cursor;props_().setProperty(FIRESTORE_MIGRATION_KEY,JSON.stringify(state));
-    }
-    if(state.cursor===source.documents.length){var current=firestoreMigrationRead_(state.target,''),manifest=firestoreDecodeFields_(current.fields);manifest.migrationProof=firestoreMigrationProof_(state,'ready');firestoreMigrationWrite_(state.target,[firestoreMigrationDocument_(state.target,'',manifest,{updateTime:current.updateTime})]);state.phase='ready';props_().setProperty(FIRESTORE_MIGRATION_KEY,JSON.stringify(state));}
-    return firestoreMigrationSummary_(state,{frozen:true,more:state.phase!=='ready'});
-  });
+    values=null;formulas=null;grid=null;blockStart=blockEnd+1;
+  }
+  if(!info.end)processed=0;var finished=processed>=info.end;nextCursor=finished?{tableIndex:tableIndex+1,row:1}:{tableIndex:tableIndex,row:processed+1};range={tableIndex:tableIndex,sheetId:info.id,startRow:start,endRow:processed};context.readStats.rowsRead+=Math.max(0,processed-start+1);
+  return {documents:documents,pageHash:hash_(stableJson_([range,documents])),range:range,nextCursor:nextCursor,done:nextCursor.tableIndex===context.tables.length,countsDelta:delta,matchingIdentityBound:bound,readStats:{rowsRead:Math.max(0,processed-start+1),gridRequests:context.readStats.gridRequests-requestsBefore,bytes:bytes}};
 }
-function firestoreMigrationVerifyTarget_(state,source,activation){
-    var current=firestoreMigrationRead_(state.target,'');if(!current)fail_('MIGRATION_VERIFY_FAILED','Firebaseの移行目録がありません。保存先は切り替えていません。');var manifest=firestoreDecodeFields_(current.fields),expected=Object.assign({},source.manifest,{migrationProof:manifest.migrationProof});
-    if(stableJson_(manifest)!==stableJson_(expected)||!manifest.migrationProof||(activation?['verified','active']:['ready','verified']).indexOf(manifest.migrationProof.state)<0||stableJson_(manifest.migrationProof)!==stableJson_(firestoreMigrationProof_(state,manifest.migrationProof.state)))fail_('MIGRATION_VERIFY_FAILED','Firebaseの移行目録が一致しません。保存先は切り替えていません。');
-    var expectedRows={},seenRows={},rowCount=0;
-    source.documents.forEach(function(item){if(item.path.indexOf('/rows/')<0){var document=firestoreMigrationRead_(state.target,item.path);if(!document)fail_('MIGRATION_VERIFY_FAILED','Firebaseの移行表が不足しています。');if(stableJson_(firestoreDecodeFields_(document.fields))!==stableJson_(item.data))fail_('MIGRATION_VERIFY_FAILED','Firebaseの移行表が元データと一致しません。');}else expectedRows[firestoreDocumentName_(state.target,'nodeWorkbooks/'+state.target.workbookId+'/'+item.path)]=item.data;});
-    source.manifest.tables.forEach(function(table){var pageToken='',pages=0;do{
-      var path='nodeWorkbooks/'+state.target.workbookId+'/tables/'+table.sheetId+'/rows?pageSize=300'+(pageToken?'&pageToken='+encodeURIComponent(pageToken):''),page=firestoreRequest_('get',path,undefined,state.target);
-      if(!page||page.documents!==undefined&&!Array.isArray(page.documents)||++pages>200)fail_('MIGRATION_VERIFY_FAILED','Firebaseの移行一覧を検証できませんでした。');
-      (page.documents||[]).forEach(function(document){if(!expectedRows[document.name]||seenRows[document.name]||stableJson_(firestoreDecodeFields_(document.fields))!==stableJson_(expectedRows[document.name]))fail_('MIGRATION_VERIFY_FAILED','Firebaseの行が不足・重複・変更されています。保存先は切り替えていません。');seenRows[document.name]=true;rowCount++;});
-      var next=page.nextPageToken||'';if(typeof next!=='string'||next===pageToken&&next)fail_('MIGRATION_VERIFY_FAILED','Firebaseの表示位置が不正です。');pageToken=next;
-    }while(pageToken);});
-    if(rowCount!==source.counts.rowDocumentCount)fail_('MIGRATION_VERIFY_FAILED','Firebaseの行件数が元データと一致しません。保存先は切り替えていません。');
-    return {current:current,manifest:manifest};
+function firestoreMigrationRowsSeed_(){return hash_('NODE_FIRESTORE_ROWS_V2');}
+function firestoreMigrationRowsAdd_(root,item){return hash_(stableJson_(['NODE_FIRESTORE_ROW_V2',root,item.path,item.data]));}
+function firestoreMigrationScan_(context){var matching=context.tables.filter(function(t){return t.id===context.matchingSheetId;})[0];return {cursor:{tableIndex:0,row:1},rollingRoot:hash_(stableJson_(['NODE_FIRESTORE_SOURCE_V2',context.bookId,context.title,context.timeZone,context.sourceConfigHash,context.runtimeConfigHash,context.catalogHash,context.metadataHash])),rowsRoot:firestoreMigrationRowsSeed_(),counts:{tableCount:context.tables.length,rowDocumentCount:0,recordIdCount:0,operationCount:0},matchingIdentityBound:matching?Math.min(40,matching.rowCount):0,maxDocumentBytes:0,pageCount:0,done:false};}
+function firestoreMigrationScanPage_(context,scan){if(scan.done)fail_('MIGRATION_CHECKPOINT','確認済みの範囲を重ねて実行できません。');var page=firestoreMigrationSourcePage_(context,scan.cursor);scan.rollingRoot=hash_(stableJson_(['NODE_FIRESTORE_PAGE_V2',scan.rollingRoot,page.pageHash]));page.documents.forEach(function(item){scan.rowsRoot=firestoreMigrationRowsAdd_(scan.rowsRoot,item);scan.maxDocumentBytes=Math.max(scan.maxDocumentBytes,firestoreMigrationUtf8Length_(item));});Object.keys(page.countsDelta).forEach(function(key){scan.counts[key]+=page.countsDelta[key];});scan.matchingIdentityBound=Math.max(scan.matchingIdentityBound,page.matchingIdentityBound);scan.cursor=page.nextCursor;scan.pageCount++;scan.done=page.done;if(scan.done)scan.sourceHash=hash_(stableJson_(['NODE_FIRESTORE_ROOT_V2',scan.rollingRoot,scan.rowsRoot,scan.counts,scan.matchingIdentityBound,scan.maxDocumentBytes,scan.pageCount]));return page;}
+function firestoreMigrationContextBinding_(context){return {sourceSpreadsheetId:context.bookId,sourceConfigHash:context.sourceConfigHash,runtimeConfigHash:context.runtimeConfigHash,catalogHash:context.catalogHash,metadataHash:context.metadataHash};}
+function firestoreMigrationAssertContext_(state,context,owner){if(requireOwner_()!==owner||(state.ownerEmail!==undefined?state.ownerEmail!==owner:state.ownerHash!==hash_(owner)))fail_('FORBIDDEN','移行の実行者が変わりました。');var binding=firestoreMigrationContextBinding_(context);if(Object.keys(binding).some(function(key){return state[key]!==binding[key];})||hash_(stableJson_(config_()))!==context.sourceConfigHash)fail_('MIGRATION_SOURCE_CHANGED','移行元の目録・管理ID・接続設定が変わりました。元データへ書かずに停止しました。');if(state.target){var target=firestoreMigrationTarget_();if(target.projectId!==state.target.projectId||target.databaseId!==state.target.databaseId)fail_('MIGRATION_SOURCE_CHANGED','移行先設定が変わりました。');}}
+function firestoreMigrationAssertScan_(state,scan){if(!scan.done||scan.sourceHash!==state.sourceHash||stableJson_(scan.counts)!==stableJson_(state.counts)||scan.rowsRoot!==state.rowsRoot||scan.matchingIdentityBound!==state.matchingIdentityBound||scan.maxDocumentBytes!==state.maxDocumentBytes)fail_('MIGRATION_SOURCE_CHANGED','移行元の内容が確認した版から変わりました。保存先を切り替えず停止しました。');}
+function firestoreMigrationBudget_(context){return {remaining:16,deadline:context.startedAt+28000};}
+function firestoreMigrationBudgetNext_(budget){if(budget.remaining<1||Date.now()>budget.deadline)return false;budget.remaining--;return true;}
+function previewNodeFirestoreMigration(){firestoreMigrationReset_();return withLock_(function(){var owner=requireOwner_(),config=config_();if(props_().getProperty('NODE_STORAGE_PROVIDER')==='firestore')fail_('MIGRATION_ALREADY_ACTIVE','Firebaseへの切替は完了しています。');var context=firestoreMigrationContext_(config),preview=firestoreMigrationPreview_();if(preview&&preview.scan.done)preview=null;if(!preview)preview=Object.assign({rootHashVersion:2,ownerHash:hash_(owner),createdAt:new Date().toISOString(),scan:firestoreMigrationScan_(context)},firestoreMigrationContextBinding_(context));firestoreMigrationAssertContext_(preview,context,owner);var budget=firestoreMigrationBudget_(context);while(!preview.scan.done&&firestoreMigrationBudgetNext_(budget)){firestoreMigrationScanPage_(context,preview.scan);firestoreMigrationCheckpointSave_(FIRESTORE_MIGRATION_PREVIEW_KEY,preview);}firestoreMigrationAssertContext_(preview,context,owner);context.readStats.elapsedMs=Date.now()-context.startedAt;return firestoreMigrationSummary_({phase:'preview',sourceHash:preview.scan.sourceHash||'',counts:preview.scan.counts},{rootHashVersion:2,more:!preview.scan.done,readOnly:true,readStats:context.readStats,prepareConfirmation:preview.scan.done?'PREPARE:'+preview.scan.sourceHash:''});});}
+function prepareNodeFirestoreMigration(){firestoreMigrationReset_();return withLock_(function(){var owner=requireOwner_(),config=config_();if(props_().getProperty('NODE_STORAGE_PROVIDER')==='firestore')fail_('MIGRATION_ALREADY_ACTIVE','Firebaseへの切替は完了しています。');if(props_().getProperty(NODE.probeKey))fail_('COPY_PROBE_PENDING','保存確認の予約が残っています。先に確認を完了してください。');var context=firestoreMigrationContext_(config),target=firestoreMigrationTarget_(),state=firestoreMigrationState_();
+  if(!state||state.phase==='abandoned'){var preview=firestoreMigrationPreview_();if(!preview||!preview.scan.done)fail_('MIGRATION_CONFIRM_REQUIRED','移行前の分割確認を最後まで実行してください。');firestoreMigrationAssertContext_(preview,context,owner);firestoreMigrationConfirm_('PREPARE:'+preview.scan.sourceHash);var id=Utilities.getUuid().replace(/-/g,'');state=Object.assign({rootHashVersion:2,phase:'prepared',importId:id,target:Object.assign({},target,{workbookId:'migration-'+id}),ownerEmail:owner,sourceHash:preview.scan.sourceHash,counts:preview.scan.counts,rowsRoot:preview.scan.rowsRoot,matchingIdentityBound:preview.scan.matchingIdentityBound,maxDocumentBytes:preview.scan.maxDocumentBytes,cursor:0,preparedAt:new Date().toISOString(),preparedComplete:false,scan:firestoreMigrationScan_(context)},firestoreMigrationContextBinding_(context));firestoreMigrationSaveState_(state);}
+  if(state.rootHashVersion!==2)fail_('MIGRATION_STATE','旧形式の未完了移行は先に中止し、新しい確認からやり直してください。');firestoreMigrationAssertContext_(state,context,owner);firestoreMigrationConfirm_('PREPARE:'+state.sourceHash);if(state.phase!=='prepared')return firestoreMigrationSummary_(state,{more:false,frozen:true});var budget=firestoreMigrationBudget_(context);while(!state.preparedComplete&&firestoreMigrationBudgetNext_(budget)){firestoreMigrationScanPage_(context,state.scan);if(state.scan.done){firestoreMigrationAssertScan_(state,state.scan);state.preparedComplete=true;delete state.scan;}firestoreMigrationSaveState_(state);}return firestoreMigrationSummary_(state,{more:!state.preparedComplete,frozen:true});
+});}
+function firestoreMigrationBatchRead_(target,items){if(!items.length)return {};var names=items.map(function(item){return firestoreDocumentName_(target,'nodeWorkbooks/'+target.workbookId+'/'+item.path);});if(names.length>64)fail_('MIGRATION_LIMIT','検証ページの件数が多すぎます。');var response=firestoreRequest_('post',':batchGet',{documents:names},target),found=Object.create(null),seen=Object.create(null);if(!Array.isArray(response)||response.length!==names.length)fail_('MIGRATION_VERIFY_FAILED','Firebaseの確認応答が欠落しています。');response.forEach(function(entry){var name=entry&&entry.found&&entry.found.name||entry&&entry.missing;if(typeof name!=='string'||names.indexOf(name)<0||seen[name]||!!entry.found===!!entry.missing)fail_('MIGRATION_VERIFY_FAILED','Firebaseの確認位置が重複・不一致です。');seen[name]=true;if(entry.found)found[name]=entry.found;});return found;}
+function firestoreMigrationEnsureDocuments_(target,items){var found=firestoreMigrationBatchRead_(target,items),writes=[];items.forEach(function(item){var name=firestoreDocumentName_(target,'nodeWorkbooks/'+target.workbookId+'/'+item.path),existing=found[name];if(existing){if(stableJson_(firestoreDecodeFields_(existing.fields))!==stableJson_(item.data))fail_('MIGRATION_VERIFY_FAILED','移行先に異なる内容があります。上書きせず停止しました。');}else writes.push(firestoreMigrationDocument_(target,item.path,item.data,{exists:false}));});firestoreMigrationWrite_(target,writes);}
+function firestoreMigrationCheckDocuments_(target,items){var found=firestoreMigrationBatchRead_(target,items);items.forEach(function(item){var existing=found[firestoreDocumentName_(target,'nodeWorkbooks/'+target.workbookId+'/'+item.path)];if(!existing||stableJson_(firestoreDecodeFields_(existing.fields))!==stableJson_(item.data))fail_('MIGRATION_VERIFY_FAILED','Firebaseの行が不足・変更されています。保存先は切り替えていません。');});}
+function firestoreMigrationAcceptProof_(state,proof){if(stableJson_(proof)===stableJson_(firestoreMigrationProof_(state,proof.state)))return true;var task=state.task;if(task&&task.kind==='verify'&&proof.state==='verified'&&typeof task.proofVerifiedAt==='string'){var future=Object.assign({},state,{verifiedAt:task.proofVerifiedAt});return stableJson_(proof)===stableJson_(firestoreMigrationProof_(future,'verified'));}return false;}
+function firestoreMigrationCheckManifest_(state,context,allowed){var current=firestoreMigrationRead_(state.target,'');if(!current||typeof current.updateTime!=='string'||!current.updateTime)fail_('MIGRATION_VERIFY_FAILED','Firebaseの移行目録がありません。');var manifest=firestoreDecodeFields_(current.fields),proof=manifest.migrationProof,expected=Object.assign({},firestoreMigrationManifest_(context),{migrationProof:proof});if(!proof||allowed.indexOf(proof.state)<0||stableJson_(manifest)!==stableJson_(expected)||!firestoreMigrationAcceptProof_(state,proof))fail_('MIGRATION_VERIFY_FAILED','Firebaseの移行目録・証明が一致しません。');return {current:current,manifest:manifest};}
+function importNodeFirestoreMigration(){firestoreMigrationReset_();return withLock_(function(){var owner=requireOwner_(),state=firestoreMigrationState_(),config=config_();if(!state||state.rootHashVersion!==2||['prepared','importing','ready'].indexOf(state.phase)<0||!state.preparedComplete)fail_('MIGRATION_STATE','分割した移行準備を最後まで実行してください。');var context=firestoreMigrationContext_(config);firestoreMigrationAssertContext_(state,context,owner);if(state.phase==='ready')return firestoreMigrationSummary_(state,{more:false,frozen:true});
+  if(state.phase==='prepared'){var manifest=Object.assign({},firestoreMigrationManifest_(context),{migrationProof:firestoreMigrationProof_(state,'importing')}),existing=firestoreMigrationRead_(state.target,'');if(existing){if(stableJson_(firestoreDecodeFields_(existing.fields))!==stableJson_(manifest))fail_('MIGRATION_VERIFY_FAILED','移行先の目録が異なります。');}else firestoreMigrationWrite_(state.target,[firestoreMigrationDocument_(state.target,'',manifest,{exists:false})]);var tables=context.tables.map(function(info){return {path:'tables/'+info.id,data:firestoreMigrationTableData_(context,info,state.matchingIdentityBound)};});for(var offset=0;offset<tables.length;offset+=64)firestoreMigrationEnsureDocuments_(state.target,tables.slice(offset,offset+64));state.phase='importing';state.scan=firestoreMigrationScan_(context);firestoreMigrationSaveState_(state);}
+  var budget=firestoreMigrationBudget_(context);while(!state.scan.done&&firestoreMigrationBudgetNext_(budget)){var page=firestoreMigrationScanPage_(context,state.scan);firestoreMigrationEnsureDocuments_(state.target,page.documents);state.cursor=context.tables.length+state.scan.counts.rowDocumentCount;firestoreMigrationSaveState_(state);}if(state.scan.done){firestoreMigrationAssertScan_(state,state.scan);var checked=firestoreMigrationCheckManifest_(state,context,['importing','ready']);if(checked.manifest.migrationProof.state!=='ready'){checked.manifest.migrationProof=firestoreMigrationProof_(state,'ready');firestoreMigrationWrite_(state.target,[firestoreMigrationDocument_(state.target,'',checked.manifest,{updateTime:checked.current.updateTime})]);}state.phase='ready';delete state.scan;firestoreMigrationSaveState_(state);}return firestoreMigrationSummary_(state,{more:state.phase!=='ready',frozen:true});
+});}
+function firestoreMigrationTargetListPage_(state,context,task){var list=task.list,prefix='nodeWorkbooks/'+state.target.workbookId,root=firestoreDocumentName_(state.target,prefix),page;
+  if(!list.tablesDone){page=firestoreRequest_('get',prefix+'/tables?pageSize=64&showMissing=true'+(list.pageToken?'&pageToken='+encodeURIComponent(list.pageToken):''),undefined,state.target);firestoreMigrationListEnvelope_(page,list.pageToken);(page.documents||[]).forEach(function(document){var path=document&&document.name;if(typeof path!=='string'||path.indexOf(root+'/tables/')!==0||path.slice((root+'/tables/').length).indexOf('/')>=0||path<=list.lastName)fail_('MIGRATION_VERIFY_FAILED','Firebaseの表の一覧が重複・不一致です。');var idText=path.slice((root+'/tables/').length),info=context.tables.filter(function(t){return String(t.id)===idText;})[0];if(!info||!document.fields||stableJson_(firestoreDecodeFields_(document.fields))!==stableJson_(firestoreMigrationTableData_(context,info,state.matchingIdentityBound)))fail_('MIGRATION_VERIFY_FAILED','Firebaseに余分な表・変更された表があります。');list.lastName=path;list.tablesSeen++;});list.pageToken=page.nextPageToken||'';if(!list.pageToken){if(list.tablesSeen!==context.tables.length)fail_('MIGRATION_VERIFY_FAILED','Firebaseの表の件数が一致しません。');list.tablesDone=true;list.lastName='';}return;}
+  if(list.tableIndex>=context.tables.length){if(list.rowCount!==state.counts.rowDocumentCount||list.rowsRoot!==state.rowsRoot)fail_('MIGRATION_VERIFY_FAILED','Firebaseの行の内容・件数が元データと一致しません。');list.done=true;return;}
+  var info=context.tables[list.tableIndex],rowPrefix=root+'/tables/'+info.id+'/rows/';page=firestoreRequest_('get',prefix+'/tables/'+info.id+'/rows?pageSize='+Math.max(1,Math.min(64,Math.floor(3500000/Math.max(1,state.maxDocumentBytes))))+'&showMissing=true'+(list.pageToken?'&pageToken='+encodeURIComponent(list.pageToken):''),undefined,state.target);firestoreMigrationListEnvelope_(page,list.pageToken);(page.documents||[]).forEach(function(document){var path=document&&document.name,idText=typeof path==='string'&&path.slice(rowPrefix.length),row=Number(idText);if(typeof path!=='string'||path.indexOf(rowPrefix)!==0||!/^\d{8}$/.test(idText)||row<1||row>info.end||path<=list.lastName)fail_('MIGRATION_VERIFY_FAILED','Firebaseに余分な行・重複行・範囲外の行があります。');if(!document.fields)fail_('MIGRATION_VERIFY_FAILED','Firebaseに内容のない親行があります。');var data=firestoreDecodeFields_(document.fields);if(data.row!==row||typeof data.payload!=='string'||typeof data.hasMetadata!=='boolean'||firestoreMigrationUtf8Length_(data)>880000)fail_('MIGRATION_VERIFY_FAILED','Firebaseの行の保存形式が一致しません。');list.rowsRoot=firestoreMigrationRowsAdd_(list.rowsRoot,{path:'tables/'+info.id+'/rows/'+idText,data:data});list.rowCount++;if(list.rowCount>state.counts.rowDocumentCount)fail_('MIGRATION_VERIFY_FAILED','Firebaseに余分な行があります。');list.lastName=path;});list.pageToken=page.nextPageToken||'';if(!list.pageToken){list.tableIndex++;list.lastName='';}
 }
-function verifyNodeFirestoreMigration(){
-  firestoreMigrationReset_();return withLock_(function(){var owner=requireOwner_(),state=firestoreMigrationState_(),config=config_();if(!state||['ready','verified'].indexOf(state.phase)<0)fail_('MIGRATION_STATE','原文の取り込みを完了してから検証してください。');var source=firestoreMigrationSource_(config);firestoreMigrationAssertCurrent_(state,source,config,owner);
-    var verified=firestoreMigrationVerifyTarget_(state,source,false),current=verified.current,manifest=verified.manifest;
-    // Re-read the source after all remote reads: a manual Sheets edit is outside
-    // the script lock and must invalidate a verification that ran across it.
-    var after=firestoreMigrationSource_(config);firestoreMigrationAssertCurrent_(state,after,config,owner);state.phase='verified';state.verifiedAt=new Date().toISOString();manifest.migrationProof=firestoreMigrationProof_(state,'verified');firestoreMigrationWrite_(state.target,[firestoreMigrationDocument_(state.target,'',manifest,{updateTime:current.updateTime})]);props_().setProperty(FIRESTORE_MIGRATION_KEY,JSON.stringify(state));return firestoreMigrationSummary_(state,{verified:true,frozen:true,activateConfirmation:'ACTIVATE:'+state.sourceHash});
-  });
+function firestoreMigrationListEnvelope_(page,prior){if(!page||typeof page!=='object'||Array.isArray(page)||page.documents!==undefined&&!Array.isArray(page.documents)||(page.documents||[]).length>64||page.nextPageToken!==undefined&&(typeof page.nextPageToken!=='string'||page.nextPageToken.length>3000||page.nextPageToken&&page.nextPageToken===prior))fail_('MIGRATION_VERIFY_FAILED','Firebaseの一覧の確認位置が不正です。');}
+function firestoreMigrationRunVerification_(state,context,owner,kind){
+  firestoreMigrationAssertContext_(state,context,owner);if(!state.task||state.task.kind!==kind){if(state.task)fail_('MIGRATION_STATE','別の検証が途中です。同じ確認を続けてください。');var initial=firestoreMigrationCheckManifest_(state,context,kind==='activate'?['verified']:['ready','verified']);state.task={kind:kind,stage:'sourceBefore',manifestUpdateTime:initial.current.updateTime,proofVerifiedAt:kind==='verify'?new Date().toISOString():'',scan:firestoreMigrationScan_(context)};firestoreMigrationSaveState_(state);}
+  var task=state.task,budget=firestoreMigrationBudget_(context);/* A persisted finalize cursor may be a lost proof receipt. Recheck from a fresh pass instead of trusting a possibly old completed scan. */if(task.stage==='finalize'){var recovery=firestoreMigrationCheckManifest_(state,context,kind==='activate'?['verified','active']:['ready','verified']);task.stage='sourceBefore';task.manifestUpdateTime=recovery.current.updateTime;task.scan=firestoreMigrationScan_(context);delete task.finishedAt;firestoreMigrationSaveState_(state);}if(task.stage!=='finalize'){var current=firestoreMigrationCheckManifest_(state,context,kind==='activate'?['verified','active']:['ready','verified']);if(current.current.updateTime!==task.manifestUpdateTime)fail_('MIGRATION_VERIFY_FAILED','確認中にFirebaseの目録が変更されました。');}
+  while(task.stage!=='finalize'&&firestoreMigrationBudgetNext_(budget)){
+    if(task.stage==='targetList'){firestoreMigrationTargetListPage_(state,context,task);if(task.list.done){delete task.list;task.stage='sourceAfter';task.scan=firestoreMigrationScan_(context);}}
+    else {var page=firestoreMigrationScanPage_(context,task.scan);if(task.stage==='targetExact'||task.stage==='sourceAfter')firestoreMigrationCheckDocuments_(state.target,page.documents);if(task.scan.done){firestoreMigrationAssertScan_(state,task.scan);if(task.stage==='sourceBefore'){task.stage='targetExact';task.scan=firestoreMigrationScan_(context);var tables=context.tables.map(function(info){return {path:'tables/'+info.id,data:firestoreMigrationTableData_(context,info,state.matchingIdentityBound)};});for(var i=0;i<tables.length;i+=64)firestoreMigrationCheckDocuments_(state.target,tables.slice(i,i+64));}else if(task.stage==='targetExact'){delete task.scan;task.stage='targetList';task.list={tablesDone:false,tablesSeen:0,tableIndex:0,pageToken:'',lastName:'',rowCount:0,rowsRoot:firestoreMigrationRowsSeed_(),done:false};}else {delete task.scan;task.stage='finalize';task.finishedAt=new Date().toISOString();}}}
+    firestoreMigrationSaveState_(state);
+  }
+  if(task.stage!=='finalize')return firestoreMigrationSummary_(state,{rootHashVersion:2,more:true,frozen:true,verificationStage:task.stage});
+  firestoreMigrationAssertContext_(state,context,owner);var desiredState=Object.assign({},state);if(kind==='verify')desiredState.verifiedAt=task.proofVerifiedAt;var desiredPhase=kind==='activate'?'active':'verified',desiredProof=firestoreMigrationProof_(desiredState,desiredPhase),doc=firestoreMigrationRead_(state.target,''),manifest=doc&&firestoreDecodeFields_(doc.fields),expected=Object.assign({},firestoreMigrationManifest_(context),{migrationProof:manifest&&manifest.migrationProof});if(!manifest||stableJson_(manifest)!==stableJson_(expected))fail_('MIGRATION_VERIFY_FAILED','切替直前の移行目録が一致しません。');
+  if(stableJson_(manifest.migrationProof)!==stableJson_(desiredProof)){if(doc.updateTime!==task.manifestUpdateTime||stableJson_(manifest.migrationProof)!==stableJson_(firestoreMigrationProof_(state,manifest.migrationProof.state)))fail_('MIGRATION_VERIFY_FAILED','検証中に移行証明が変わりました。');manifest.migrationProof=desiredProof;firestoreMigrationWrite_(state.target,[firestoreMigrationDocument_(state.target,'',manifest,{updateTime:doc.updateTime})]);}
+  state.phase=desiredPhase;if(kind==='verify')state.verifiedAt=task.proofVerifiedAt;else state.activatedAt=task.finishedAt;delete state.task;firestoreMigrationSaveState_(state);
+  if(kind==='activate'){props_().setProperties({NODE_FIRESTORE_CONFIG:JSON.stringify(state.target),NODE_STORAGE_PROVIDER:'firestore'});firestoreMigrationReset_();if(!firestoreMigrationReady_(config_()))fail_('MIGRATION_VERIFY_FAILED','切替後の保存先を確認できません。');return firestoreMigrationSummary_(state,{more:false,active:true,sourceUnchanged:true});}
+  return firestoreMigrationSummary_(state,{more:false,verified:true,frozen:true,activateConfirmation:'ACTIVATE:'+state.sourceHash});
 }
-function activateNodeFirestoreMigration(){
-  firestoreMigrationReset_();try{return withLock_(function(){var owner=requireOwner_(),state=firestoreMigrationState_(),config=config_();if(!state||['verified','active'].indexOf(state.phase)<0)fail_('MIGRATION_STATE','移行データの検証を完了してから切り替えてください。');firestoreMigrationConfirm_('ACTIVATE:'+state.sourceHash);if(state.phase==='active'){
-      if(state.ownerEmail!==owner||state.runtimeConfigHash!==firestoreRuntimeConfigHash_(config))fail_('MIGRATION_VERIFY_FAILED','切替済みの保存先設定が一致しません。');
-      var active=firestoreMigrationRead_(state.target,''),activeManifest=active&&firestoreDecodeFields_(active.fields),proof=activeManifest&&activeManifest.migrationProof;
-      if(!activeManifest||activeManifest.sourceSpreadsheetId!==state.sourceSpreadsheetId||activeManifest.sourceConfigHash!==state.sourceConfigHash||activeManifest.runtimeConfigHash!==state.runtimeConfigHash||!Number.isSafeInteger(activeManifest.revision)||activeManifest.revision<0||!proof||proof.state!=='active'||stableJson_(firestoreMigrationBinding_(state))!==stableJson_(firestoreMigrationBinding_({target:{projectId:proof.projectId,databaseId:proof.databaseId,workbookId:proof.workbookId},sourceSpreadsheetId:proof.sourceSpreadsheetId,sourceConfigHash:proof.sourceConfigHash,runtimeConfigHash:proof.runtimeConfigHash,sourceHash:proof.sourceHash,importId:proof.importId}))||!constantEqual_(proof.seal,firestoreMigrationSeal_(state)))fail_('MIGRATION_VERIFY_FAILED','切替済みのFirebase移行証明を確認できません。');
-      var currentProvider=props_().getProperty('NODE_STORAGE_PROVIDER'),currentTarget=props_().getProperty('NODE_FIRESTORE_CONFIG');
-      if(currentProvider!=='firestore'||currentTarget!==JSON.stringify(state.target))props_().setProperties({NODE_FIRESTORE_CONFIG:JSON.stringify(state.target),NODE_STORAGE_PROVIDER:'firestore',NODE_FIRESTORE_MIGRATION_STATE:JSON.stringify(state)});
-      firestoreMigrationReset_();if(!firestoreMigrationReady_(config))fail_('MIGRATION_VERIFY_FAILED','有効な保存先を確認できません。');return firestoreMigrationSummary_(state,{active:true});
-    }var source=firestoreMigrationSource_(config);firestoreMigrationAssertCurrent_(state,source,config,owner);
-    var verified=firestoreMigrationVerifyTarget_(state,source,true),current=verified.current,manifest=verified.manifest;
-    var after=firestoreMigrationSource_(config);firestoreMigrationAssertCurrent_(state,after,config,owner);
-    manifest.migrationProof=firestoreMigrationProof_(state,'active');firestoreMigrationWrite_(state.target,[firestoreMigrationDocument_(state.target,'',manifest,{updateTime:current.updateTime})]);state.phase='active';state.activatedAt=new Date().toISOString();props_().setProperties({NODE_FIRESTORE_CONFIG:JSON.stringify(state.target),NODE_STORAGE_PROVIDER:'firestore',NODE_FIRESTORE_MIGRATION_STATE:JSON.stringify(state)});firestoreMigrationReset_();if(!firestoreMigrationReady_(config))fail_('MIGRATION_VERIFY_FAILED','切替後の保存先を確認できません。新しい保存を止めて設定を確認してください。');return firestoreMigrationSummary_(state,{active:true,sourceUnchanged:true});
-  });}finally{if(typeof firestoreClose_==='function')firestoreClose_();}
-}
-function cancelNodeFirestoreMigration(){
-  firestoreMigrationReset_();return withLock_(function(){var owner=requireOwner_(),state=firestoreMigrationState_();if(!state||state.phase==='abandoned')return {canceled:true,sourceUnchanged:true};if(state.ownerEmail!==owner)fail_('FORBIDDEN','準備した所有者のみ移行を中止できます。');if(state.phase==='active'||props_().getProperty('NODE_STORAGE_PROVIDER')==='firestore')fail_('MIGRATION_ALREADY_ACTIVE','切替済みのため自動では旧保存先に戻しません。新しい変更を失わないため個別の復旧確認が必要です。');firestoreMigrationConfirm_('CANCEL:'+state.sourceHash);state.phase='abandoned';state.abandonedAt=new Date().toISOString();props_().setProperty(FIRESTORE_MIGRATION_KEY,JSON.stringify(state));return firestoreMigrationSummary_(state,{canceled:true,sourceUnchanged:true});});
-}
-function firestoreMigrationReady_(config){
-  if(props_().getProperty('NODE_STORAGE_PROVIDER')!=='firestore')return false;var state=firestoreMigrationState_();if(!state||state.phase!=='active'||state.sourceSpreadsheetId===NODE.originalId||state.sourceSpreadsheetId!==config.spreadsheetId||state.runtimeConfigHash!==firestoreRuntimeConfigHash_(config))return false;
-  var target=firestoreConfig_();if(stableJson_(target)!==stableJson_(state.target))return false;var book=firestoreOpenBook_(config),manifest=book._firestoreManifest;
-  if(!manifest||manifest.sourceSpreadsheetId!==config.spreadsheetId||manifest.sourceConfigHash!==state.sourceConfigHash||manifest.runtimeConfigHash!==state.runtimeConfigHash||!manifest.migrationProof)return false;var proof=manifest.migrationProof;
-  return proof.state==='active'&&proof.sourceHash===state.sourceHash&&stableJson_(firestoreMigrationBinding_(state))===stableJson_(firestoreMigrationBinding_({target:{projectId:proof.projectId,databaseId:proof.databaseId,workbookId:proof.workbookId},sourceSpreadsheetId:proof.sourceSpreadsheetId,sourceConfigHash:proof.sourceConfigHash,runtimeConfigHash:proof.runtimeConfigHash,sourceHash:proof.sourceHash,importId:proof.importId}))&&constantEqual_(proof.seal,firestoreMigrationSeal_(state));
-}
+function verifyNodeFirestoreMigration(){firestoreMigrationReset_();return withLock_(function(){var owner=requireOwner_(),state=firestoreMigrationState_(),config=config_();if(!state||state.rootHashVersion!==2||['ready','verified'].indexOf(state.phase)<0)fail_('MIGRATION_STATE','取り込みを完了してから検証してください。');var context=firestoreMigrationContext_(config);return firestoreMigrationRunVerification_(state,context,owner,'verify');});}
+/* The legacy activated proof remains readable. No source scan is needed to
+ * recover an already active provider, so later legitimate app writes survive. */
+function firestoreMigrationProofState_(proof){return {rootHashVersion:proof.rootHashVersion,target:{projectId:proof.projectId,databaseId:proof.databaseId,workbookId:proof.workbookId},sourceSpreadsheetId:proof.sourceSpreadsheetId,sourceConfigHash:proof.sourceConfigHash,runtimeConfigHash:proof.runtimeConfigHash,sourceHash:proof.sourceHash,importId:proof.importId};}
+function activateNodeFirestoreMigration(){firestoreMigrationReset_();try{return withLock_(function(){var owner=requireOwner_(),state=firestoreMigrationState_(),config=config_();if(!state||['verified','active'].indexOf(state.phase)<0)fail_('MIGRATION_STATE','移行データの検証を完了してから切り替えてください。');firestoreMigrationConfirm_('ACTIVATE:'+state.sourceHash);if(state.phase==='active'){
+  if(state.ownerEmail!==owner||state.runtimeConfigHash!==firestoreRuntimeConfigHash_(config))fail_('MIGRATION_VERIFY_FAILED','切替済みの保存先設定が一致しません。');var current=firestoreMigrationRead_(state.target,''),manifest=current&&firestoreDecodeFields_(current.fields),proof=manifest&&manifest.migrationProof;if(!manifest||manifest.sourceSpreadsheetId!==state.sourceSpreadsheetId||manifest.sourceConfigHash!==state.sourceConfigHash||manifest.runtimeConfigHash!==state.runtimeConfigHash||!Number.isSafeInteger(manifest.revision)||manifest.revision<0||!proof||proof.state!=='active'||stableJson_(firestoreMigrationBinding_(state))!==stableJson_(firestoreMigrationBinding_(firestoreMigrationProofState_(proof)))||!constantEqual_(proof.seal,firestoreMigrationSeal_(state)))fail_('MIGRATION_VERIFY_FAILED','切替済みのFirebase移行証明を確認できません。');if(props_().getProperty('NODE_STORAGE_PROVIDER')!=='firestore'||props_().getProperty('NODE_FIRESTORE_CONFIG')!==JSON.stringify(state.target))props_().setProperties({NODE_FIRESTORE_CONFIG:JSON.stringify(state.target),NODE_STORAGE_PROVIDER:'firestore'});firestoreMigrationReset_();if(!firestoreMigrationReady_(config))fail_('MIGRATION_VERIFY_FAILED','有効な保存先を確認できません。');return firestoreMigrationSummary_(state,{more:false,active:true});
+  }if(state.rootHashVersion!==2)fail_('MIGRATION_STATE','旧形式の未完了移行は中止して再確認してください。');var context=firestoreMigrationContext_(config);return firestoreMigrationRunVerification_(state,context,owner,'activate');});}finally{if(typeof firestoreClose_==='function')firestoreClose_();}}
+function cancelNodeFirestoreMigration(){firestoreMigrationReset_();return withLock_(function(){var owner=requireOwner_(),state=firestoreMigrationState_();if(!state||state.phase==='abandoned')return {more:false,canceled:true,sourceUnchanged:true};if(state.ownerEmail!==owner)fail_('FORBIDDEN','準備した所有者のみ移行を中止できます。');if(state.phase==='active'||props_().getProperty('NODE_STORAGE_PROVIDER')==='firestore')fail_('MIGRATION_ALREADY_ACTIVE','切替済みのため旧保存先には自動で戻しません。');firestoreMigrationConfirm_('CANCEL:'+state.sourceHash);state.phase='abandoned';state.abandonedAt=new Date().toISOString();delete state.scan;delete state.task;firestoreMigrationSaveState_(state);return firestoreMigrationSummary_(state,{more:false,canceled:true,sourceUnchanged:true});});}
+function firestoreMigrationReady_(config){if(props_().getProperty('NODE_STORAGE_PROVIDER')!=='firestore')return false;var state=firestoreMigrationState_();if(!state||state.phase!=='active'||state.sourceSpreadsheetId===NODE.originalId||state.sourceSpreadsheetId!==config.spreadsheetId||state.runtimeConfigHash!==firestoreRuntimeConfigHash_(config))return false;var target=firestoreConfig_();if(stableJson_(target)!==stableJson_(state.target))return false;var book=firestoreOpenBook_(config),manifest=book._firestoreManifest;if(!manifest||manifest.sourceSpreadsheetId!==config.spreadsheetId||manifest.sourceConfigHash!==state.sourceConfigHash||manifest.runtimeConfigHash!==state.runtimeConfigHash||!manifest.migrationProof)return false;var proof=manifest.migrationProof;return proof.state==='active'&&proof.sourceHash===state.sourceHash&&stableJson_(firestoreMigrationBinding_(state))===stableJson_(firestoreMigrationBinding_(firestoreMigrationProofState_(proof)))&&constantEqual_(proof.seal,firestoreMigrationSeal_(state));}
 
 /* Seven monthly targets. Included in Code.gs at release; no Google service is called at file load.
  * Integration: authenticated/read-budgeted readMetricGoals -> readMetricGoals_;
@@ -4414,6 +4488,21 @@ var NODE_INTRODUCTION_V2 = (function(exports) {
 		zoom: "Zoom",
 		googlemeet: "Google Meet"
 	};
+	const salesStyleNames = {
+		てれあぽ: "テレアポ",
+		てれま: "テレマーケティング",
+		テレマ: "テレマーケティング",
+		いんさいどせーるす: "インサイドセールス",
+		ふぃーるどせーるす: "フィールドセールス",
+		かすたまーさくせす: "カスタマーサクセス",
+		あぽいんたー: "アポインター",
+		ほうじんえいぎょう: "法人営業",
+		こじんえいぎょう: "個人営業",
+		b2b: "BtoB",
+		btob: "BtoB",
+		b2c: "BtoC",
+		btoc: "BtoC"
+	};
 	function normalizeIntroductionValue(field, raw) {
 		const original = typeof raw === "string" ? raw : "";
 		const text = original.normalize("NFKC").replace(/\r\n?/g, "\n").trim();
@@ -4489,6 +4578,7 @@ var NODE_INTRODUCTION_V2 = (function(exports) {
 		if (field === "networkEnvironment" && /^(?:OK|回線OK)$/i.test(text)) return result("問題なし");
 		if (field === "attendanceNote" && /^(?:なし|懸念なし)$/.test(text)) return result("特になし");
 		if (field === "tool") return result(toolNames[text.toLowerCase().replace(/\s/g, "")] ?? text);
+		if (field === "salesStyle") return result(text.split(/([・、,／/\n]+)/).map((part) => salesStyleNames[part.trim().toLowerCase()] ?? part).join(""));
 		return result(text);
 	}
 	/** Only a year explicitly present in the source may be compared with today. */
@@ -4912,7 +5002,7 @@ var NODE_INTRODUCTION_V2 = (function(exports) {
 		if (!experience) question("experienceTotal", "営業経験の通算", "通算の営業経験はどのくらいですか？重複する職歴期間を二重に数えず確認してください。", false);
 		const careerBlocks = [], tips = profile.tips.map((value, index) => narrativeValue(`tips.${index}`, value)).filter(Boolean);
 		for (const career of profile.careers) {
-			const prefix = `careers.${career.id}`, company = fixed(`${prefix}.company`, career.company), product = fixed(`${prefix}.product`, career.product), period = fixed(`${prefix}.period`, career.period), style = fixed(`${prefix}.salesStyle`, career.salesStyle);
+			const prefix = `careers.${career.id}`, company = fixed(`${prefix}.company`, career.company), product = fixed(`${prefix}.product`, career.product), period = fixed(`${prefix}.period`, career.period), style = fixed(`${prefix}.salesStyle`, career.salesStyle, "salesStyle");
 			const duties = career.duties.map((value, index) => narrativeValue(`${prefix}.duties.${index}`, value)).filter(Boolean);
 			const achievements = career.achievements.map((value, index) => fixed(`${prefix}.achievements.${index}`, value)).filter(Boolean);
 			tips.push(...career.tips.map((value, index) => narrativeValue(`${prefix}.tips.${index}`, value)).filter(Boolean));
@@ -5053,7 +5143,7 @@ var NODE_INTRODUCTION_V2 = (function(exports) {
 		if (profile.experienceTotal.trim()) statements.push(`営業経験は${profile.experienceTotal.trim()}です。`);
 		for (const career of careers) {
 			const subject = [career.company, career.product].map((value) => value.trim()).filter(Boolean).join("の");
-			if (subject || career.salesStyle.trim()) statements.push(`${subject ? `${subject}で` : ""}${career.salesStyle.trim() || "記載の業務"}の経験があります。`);
+			if (subject || career.salesStyle.trim()) statements.push(`${subject ? `${subject}で` : ""}${normalizeIntroductionValue("salesStyle", career.salesStyle).value || "記載の業務"}の経験があります。`);
 		}
 		const achievement = careers.flatMap((career) => filled(career.achievements))[0];
 		if (achievement) statements.push(`実績として「${achievement}」が記録されています。`);
@@ -5066,7 +5156,7 @@ var NODE_INTRODUCTION_V2 = (function(exports) {
 		const first = profile.careers.find((career) => career.product.trim() || career.salesStyle.trim());
 		if (!first) return "候補者の基本情報を下記にまとめております。未確認の項目は確認を進めております。";
 		const experience = profile.experienceTotal.trim() ? `${profile.experienceTotal.trim()}の営業経験があり、` : "";
-		const fact = [first.product, first.salesStyle].map((value) => value.trim()).filter(Boolean).join("・");
+		const fact = [first.product.trim(), normalizeIntroductionValue("salesStyle", first.salesStyle).value].filter(Boolean).join("・");
 		const achievement = filled(first.achievements)[0];
 		const tip = [...filled(first.tips), ...filled(profile.tips)][0];
 		return `${experience}${fact}の経験がある方です。${achievement ? `実績として「${achievement}」が記録されています。` : ""}${tip ? `「${tip}」という取り組みをされています。` : ""}`;

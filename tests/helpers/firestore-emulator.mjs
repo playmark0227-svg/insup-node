@@ -32,7 +32,7 @@ export function createRestFixture(origin){
   assert.equal(u.origin,'https://firestore.googleapis.com','Test traffic must originate from the real Firestore facade');
   assert.ok(!u.username&&!u.password&&!u.hash);
   const path=decodeURIComponent(u.pathname),prefix=`/v1/${DOCUMENT_PREFIX.slice(0,-1)}`;
-  assert.ok(path===prefix+':beginTransaction'||path===prefix+':rollback'||path===prefix+':batchGet'||path===prefix+':commit'||new RegExp('^'+prefix.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'/nodeWorkbooks/[A-Za-z0-9_-]+(?:/tables/[0-9]+(?:/rows(?:/[0-9]{8})?)?)?(?::runQuery)?$').test(path),'Only demo-insup-node workbook paths can be used: '+path);
+  assert.ok(path===prefix+':beginTransaction'||path===prefix+':rollback'||path===prefix+':batchGet'||path===prefix+':commit'||String(options.method||'get').toLowerCase()==='get'&&new RegExp('^'+prefix.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'/nodeWorkbooks/[A-Za-z0-9_-]+/tables$').test(path)||new RegExp('^'+prefix.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'/nodeWorkbooks/[A-Za-z0-9_-]+(?:/tables/[0-9]+(?:/rows(?:/[0-9]{8})?)?)?(?::runQuery)?$').test(path),'Only demo-insup-node workbook paths can be used: '+path);
   const payload=options.payload===undefined?undefined:JSON.parse(options.payload);
   for(const write of payload?.writes||[])assert.ok(write.update?.name?.startsWith(DOCUMENT_PREFIX+'nodeWorkbooks/'),'No production document write');
   for(const name of payload?.documents||[])assert.ok(name.startsWith(DOCUMENT_PREFIX+'nodeWorkbooks/'),'No production document read');

@@ -46,6 +46,23 @@ test("unlabelled ambiguous values ask instead of picking time or rate; invalid h
   assert.equal(normalizeIntroductionValue("availableFrom", "2/30").status, "needs-confirmation");
 });
 
+test("known sales labels are readable in output without changing source, negation or employer names", () => {
+  const raw = "Ｂ２Ｂ・てれあぽ／いんさいどせーるす";
+  assert.deepEqual(normalizeIntroductionValue("salesStyle", raw), { raw, value: "BtoB・テレアポ/インサイドセールス", status: "normalized" });
+  for (const value of ["てれあぽは未経験", "てれあぽ希望（経験は未確認）", "架空てれあぽ株式会社", "商談は担当していない"]) {
+    assert.equal(normalizeIntroductionValue("salesStyle", value).value, value.normalize("NFKC"));
+  }
+  const profile = fixture(); profile.careers[0].salesStyle = raw;
+  profile.careers[0].company = "架空てれあぽ株式会社";
+  const before = structuredClone(profile), doc = composeIntroductionV2(profile);
+  assert.deepEqual(profile, before);
+  assert.match(doc.internalBody, /営業スタイル：BtoB・テレアポ\/インサイドセールス/);
+  assert.match(doc.internalBody, /架空てれあぽ株式会社/);
+  assert.match(doc.client.recommendation, /BtoB・テレアポ\/インサイドセールス/);
+  const ref = doc.factRefs.find(ref => ref.path === "careers.employer-a.salesStyle");
+  assert.equal(ref?.original, raw); assert.equal(ref?.value, "BtoB・テレアポ/インサイドセールス");
+});
+
 test("past-date validation uses JST and never supplies an absent year", () => {
   const now = new Date("2026-11-05T16:00:00Z");
   assert.equal(introductionStartDateState("2026/11/5", now), "past");

@@ -4,7 +4,8 @@ import fs from "node:fs";
 import vm from "node:vm";
 import ts from "typescript";
 import {projectSnapshotForCache,validSnapshotCacheAccess} from "../lib/snapshot-cache.ts";
-import {assertSnapshot, assertMutationReceipt, isUncertainWrite, validateEndpoint, SheetApiError, sheetExtensionMutationActions, isSheetExtensionReadAction, sheetExtensionMutationEnabled} from "../lib/sheets-client.ts";
+import {storageBackendOf} from "../lib/storage-backend.ts";
+import {assertSnapshot, validSnapshotVersion, mergeSnapshotUnchanged, assertMutationReceipt, isUncertainWrite, validateEndpoint, SheetApiError, sheetExtensionMutationActions, isSheetExtensionReadAction, sheetExtensionMutationEnabled} from "../lib/sheets-client.ts";
 import {correctionFields,correctedPayload,mutationDateErrors} from "../lib/save-correction.ts";
 import {pendingSaveResources,unlockPendingSaves as unlockRealPendingSaves,lockPendingSaves as lockRealPendingSaves} from "../lib/pending-saves.ts";
 import {createDeadlineSignal, isTimeoutSignal, throwIfAborted, abortReason} from "../lib/abort-signal.ts";
@@ -80,7 +81,7 @@ function harness(handle, {storedToken, malformedSession, deadlineController, mak
   const context=vm.createContext({exports,module:{exports},AbortController,AbortSignal:deadlineSignals,JSON,Error,localStorage,sessionStorage,TEST_PRODUCTION:production,crypto,
     ...(browser || {}),
     fetch:async()=>{if(manifestFailure)throw new Error("設定取得失敗");return {ok:true,json:async()=>({endpoint:manifestEndpoint})};},
-    require:name=>name==="react" ? react : name.includes("snapshot-cache") ? cacheApi : name.includes("abort-signal") ? deadlineApi : name.includes("save-correction") ? {correctionFields,correctedPayload,mutationDateErrors} : name.includes("pending-saves") ? pendingApi : name.includes("node-data") ? {initialPlayers:[player],makeDemoActivities:()=>[]} : name.includes("management-data") ? {matchingFields} : name.includes("candidate-intake") ? {interviewFieldLabels,interviewStringFields} : name.includes("writing-ai") ? {assertWritingKitState,validateWritingPreferences} : {assertSnapshot,assertMutationReceipt,isUncertainWrite,validateEndpoint,SheetApiError,sheetRequest,sheetExtensionMutationActions,isSheetExtensionReadAction,sheetExtensionMutationEnabled}});
+    require:name=>name==="react" ? react : name.includes("storage-backend") ? {storageBackendOf} : name.includes("snapshot-cache") ? cacheApi : name.includes("abort-signal") ? deadlineApi : name.includes("save-correction") ? {correctionFields,correctedPayload,mutationDateErrors} : name.includes("pending-saves") ? pendingApi : name.includes("node-data") ? {initialPlayers:[player],makeDemoActivities:()=>[]} : name.includes("management-data") ? {matchingFields} : name.includes("candidate-intake") ? {interviewFieldLabels,interviewStringFields} : name.includes("writing-ai") ? {assertWritingKitState,validateWritingPreferences} : {assertSnapshot,validSnapshotVersion,mergeSnapshotUnchanged,assertMutationReceipt,isUncertainWrite,validateEndpoint,SheetApiError,sheetRequest,sheetExtensionMutationActions,isSheetExtensionReadAction,sheetExtensionMutationEnabled}});
   vm.runInContext(source,context);
   const render = () => {cursor=0; const result=exports.useSheetsConnection(); while(effects.length) effects.shift()(); return result;};
   render();
@@ -1184,7 +1185,7 @@ test('issued-password and failed logins never read display cache or persist a ca
  const access=displayGrant();for(const type of ['issued','wrong']){const h=harness(call=>{if(call.action==='login'){if(type==='wrong')throw new SheetApiError('INVALID_CREDENTIALS','wrong');return {token,cacheAccess:access,mustChangePassword:true};}throw new Error('Business read must not occur');},{cacheRead:async()=>{throw new Error('Cache must not open');}});await flush();try{await h.render().login('ND-001','private-password');}catch{}assert.equal(h.cacheReads.length,0);assert.equal(h.render().snapshot,null);const disk=JSON.stringify([...h.sessionStorage.values,...h.localStorage.values]);assert.ok(!disk.includes(access.secret));assert.ok(!disk.includes('private-password'));h.unmount();}
 });
 test('restored cache-capable sessions are freshly checked before cache opens and legacy sessions keep their old restore path',async()=>{
- const access=displayGrant(),fresh=deferred(),h=harness(call=>call.action==='resumeSession'?{cacheAccess:access}:fresh.promise,{storedToken:token,storedCacheAvailable:true,cacheRead:async()=>({snapshot:projectSnapshotForCache(snapshot),savedAt:Date.now()-1000})});await flush();assert.equal(h.calls[0].action,'resumeSession');assert.equal(h.render().snapshotSource,'cache');assert.equal(h.calls[1].action,'snapshot');fresh.resolve({...snapshot,cacheAccess:access});await flush();assert.equal(h.render().snapshotSource,'live');h.unmount();
+ const access=displayGrant(),fresh=deferred(),h=harness(call=>call.action==='resumeSession'?{cacheAccess:access}:fresh.promise,{storedToken:token,storedCacheAvailable:true,cacheRead:async()=>({snapshot:projectSnapshotForCache(snapshot),savedAt:Date.now()-1000})});await flush();assert.equal(h.calls[0].action,'resumeSession');assert.equal(h.render().snapshotSource,'cache');assert.equal(h.calls[1].action,'snapshot');assert.equal(h.calls[1].target,endpoint);fresh.resolve({...snapshot,cacheAccess:access});await flush();assert.equal(h.render().snapshotSource,'live');h.unmount();
  const denied=harness(()=>{throw new SheetApiError('UNAUTHENTICATED','revoked');},{storedToken:token,storedCacheAvailable:true,cacheRead:async()=>{throw new Error('must not read');}});await flush();assert.equal(denied.cacheReads.length,0);assert.equal(denied.render().snapshot,null);assert.equal(denied.render().authenticated,false);denied.unmount();
 });
 test('logout during cache decryption and late first reads cannot populate another login or rewrite cache',async()=>{
@@ -1397,4 +1398,101 @@ test('a later pre-commit rejection cannot discard an earlier uncertain extension
   await assert.rejects(h.render().mutateExtension('mutateRewards',extensionPayload,`extension-previously-uncertain-${code}`),{code:'NETWORK'});await flush();
   await assert.rejects(h.render().mutateExtension('mutateRewards',extensionPayload,`extension-previously-uncertain-${code}`));await flush();assert.equal(h.pendingStore.size,1,code);assert.equal(h.render().backgroundSave.uncertain,true,code);assert.equal(h.render().hasPendingSave,true,code);h.unmount();
  }
+});
+
+function conditionalSnapshot(overrides={}){
+ return {...snapshot,records:[{recordId:'conditional-record',rowVersion:'row-v1',row:2,playerId:player.id,candidateName:'架空候補者・メモリのみ',source:'',values:Array(26).fill('元の非公開面談原文'),formulaColumns:[]}],counts:{all:{[player.id]:{'提案':2}}},storageBackend:{kind:'firestore',projectId:'insup-node-test',migratedAt:'2026-11-06T01:00:00.000Z'},snapshotVersion:'V'.repeat(43),cacheAccess:displayGrant(),...overrides};
+}
+function conditionalReceipt(full,overrides={}){
+ return {snapshotUnchanged:true,snapshotVersion:full.snapshotVersion,self:{...full.self},syncedAt:'2026-11-06T02:01:00.000Z',cacheAccess:{...full.cacheAccess,self:{...full.self},expiresAt:Date.now()+61*60*1000},...overrides};
+}
+
+test('only passive background reads of this session full Firestore snapshot send a conditional stamp',async()=>{
+ const full=conditionalSnapshot(),reply=conditionalReceipt(full),h=harness(call=>call.payload.ifSnapshotVersion?reply:full,{storedToken:token});
+ await flush();const initial=h.render().snapshot;assert.equal(initial,full);assert.deepEqual(Object.keys(h.calls[0].payload),[]);
+ assert.equal(await h.render().refresh(true),true);
+ const updated=h.render().snapshot;assert.equal(h.calls[1].payload.ifSnapshotVersion,full.snapshotVersion);assert.equal(h.calls[1].options.background,true);
+ assert.equal(updated.records,initial.records);assert.equal(updated.players,initial.players);assert.equal(updated.counts,initial.counts);assert.equal(updated.outboxKey,initial.outboxKey);assert.equal(updated.cacheAccess,reply.cacheAccess);assert.equal(updated.syncedAt,reply.syncedAt);
+ assert.equal(h.render().snapshotSource,'live');assert.equal(h.render().busy,false);assert.equal(h.cacheWrites.length,2);
+ assert.equal(h.cacheWrites[1].value.snapshotVersion,undefined);assert.deepEqual(h.cacheWrites[1].value.records,[]);assert.ok(!JSON.stringify(h.cacheWrites[1].value).includes('非公開面談原文'));
+ await h.render().refresh();assert.deepEqual(Object.keys(h.calls[2].payload),[]);assert.equal(h.calls[2].options.background,undefined);h.unmount();
+});
+
+test('a restored display cache never sends a stamp before the first complete network snapshot',async()=>{
+ const full=conditionalSnapshot(),fresh=deferred();let reads=0;
+ const h=harness(call=>call.action==='login'?{token,cacheAccess:full.cacheAccess}:++reads===1?fresh.promise:conditionalReceipt(full),{cacheRead:async()=>({snapshot:{...projectSnapshotForCache(full),snapshotVersion:full.snapshotVersion},savedAt:Date.now()-1000})});
+ await flush();await h.render().login(player.id,'private-test-password');await flush();assert.equal(h.render().snapshotSource,'cache');assert.deepEqual(Object.keys(h.calls[1].payload),[]);
+ fresh.resolve(full);await flush();assert.equal(h.render().snapshotSource,'live');assert.equal(h.render().snapshot.records,full.records);
+ await h.render().refresh(true);assert.equal(h.calls[2].payload.ifSnapshotVersion,full.snapshotVersion);h.unmount();
+});
+
+test('legacy, ungranted and freshly active background reads remain complete reads',async()=>{
+ for(const full of [snapshot,conditionalSnapshot({snapshotVersion:undefined}),conditionalSnapshot({cacheAccess:undefined}),conditionalSnapshot({cacheAccess:{...displayGrant(),expiresAt:Date.now()-1}})]){
+  const h=harness(()=>full,{storedToken:token});await flush();await h.render().refresh(true);assert.deepEqual(Object.keys(h.calls[1].payload),[]);assert.equal(h.render().snapshot,full);h.unmount();
+ }
+ const browser=autoSyncBrowser(),full=conditionalSnapshot(),h=harness(()=>full,{storedToken:token,browser});await flush();h.render();browser.listeners.get('keydown')();
+ await h.render().refresh(true);assert.deepEqual(Object.keys(h.calls[1].payload),[]);assert.equal(h.calls[1].options.background,undefined);
+ await h.render().refresh(true);assert.equal(h.calls[2].payload.ifSnapshotVersion,full.snapshotVersion);assert.equal(h.calls[2].options.background,true);h.unmount();
+});
+
+test('malformed unchanged results fetch one full snapshot before applying changed grants or roles',async()=>{
+ for(const kind of ['scope','secret','role','stamp','extra']){
+  const full=conditionalSnapshot(),nextSelf={playerId:'ADMIN',role:'admin'},nextGrant={...displayGrant(nextSelf),scope:'N'.repeat(43),secret:'R'.repeat(43)},next=conditionalSnapshot({self:nextSelf,records:[],counts:{all:{[player.id]:{'提案':9}}},snapshotVersion:'W'.repeat(43),cacheAccess:nextGrant});
+  const changes=kind==='scope'?{cacheAccess:{...full.cacheAccess,scope:'Z'.repeat(43)}}:kind==='secret'?{cacheAccess:{...full.cacheAccess,secret:'Z'.repeat(43)}}:kind==='role'?{self:nextSelf}:kind==='stamp'?{snapshotVersion:'Z'.repeat(43)}:{records:full.records};
+  let reads=0;const h=harness(()=>++reads===1?full:reads===2?conditionalReceipt(full,changes):next,{storedToken:token});await flush();const locks=h.locks.count;
+  assert.equal(await h.render().refresh(true),true,kind);assert.equal(reads,3,kind);assert.equal(h.calls[1].payload.ifSnapshotVersion,full.snapshotVersion);assert.deepEqual(Object.keys(h.calls[2].payload),[]);
+  assert.equal(h.render().snapshot,next);assert.equal(h.render().snapshot.cacheAccess,nextGrant);assert.equal(h.cacheWrites.length,2,'the invalid grant must not re-encrypt the old private snapshot: '+kind);assert.equal(h.cacheWrites[1].access,nextGrant);assert.equal(h.cacheWrites[1].value.counts.all[player.id]['提案'],9);assert.equal(h.locks.count,locks);assert.equal(h.render().authenticated,true);h.unmount();
+ }
+});
+
+test('failed unchanged fallback retains local input and forces the following read to be complete',async()=>{
+ const full=conditionalSnapshot(),bad=conditionalReceipt(full,{cacheAccess:{...full.cacheAccess,scope:'X'.repeat(43)}});let reads=0;
+ const h=harness(()=>{if(++reads===1||reads===4)return full;if(reads===2)return bad;throw new SheetApiError('NETWORK','retry full');},{storedToken:token});await flush();h.render();
+ const local={operationId:'retained-only-on-disk',payload:{memo:'未送信の原文を保持'}};h.pendingStore.set(local.operationId,local);const locks=h.locks.count;
+ assert.equal(await h.render().refresh(true),false);assert.equal(reads,3);assert.equal(h.render().snapshot,full);assert.equal(h.cacheWrites.length,1);assert.equal(h.pendingStore.get(local.operationId),local);assert.equal(h.locks.count,locks);assert.equal(h.render().authenticated,true);
+ assert.equal(await h.render().refresh(true),true);assert.deepEqual(Object.keys(h.calls[3].payload),[]);assert.equal(h.pendingStore.get(local.operationId),local);h.unmount();
+});
+
+test('an unsolicited or repeated unchanged response cannot substitute for a required full read',async()=>{
+ for(const manual of [false,true]){
+  const full=conditionalSnapshot({snapshotVersion:manual?'V'.repeat(43):undefined}),reply=conditionalReceipt({...full,snapshotVersion:'V'.repeat(43)});let reads=0;
+  const h=harness(()=>++reads===1?full:reply,{storedToken:token});await flush();const before=h.render().snapshot;
+  if(manual)await assert.rejects(h.render().refresh(),{code:'INVALID_RESPONSE'});else assert.equal(await h.render().refresh(true),false);
+  assert.equal(reads,3);assert.deepEqual(Object.keys(h.calls[1].payload),[]);assert.deepEqual(Object.keys(h.calls[2].payload),[]);assert.equal(h.render().snapshot,before);assert.equal(h.cacheWrites.length,1);h.unmount();
+ }
+});
+
+test('a late unchanged receipt cannot change a newly opened editor or begin a fallback during editing',async()=>{
+ const browser=autoSyncBrowser(),full=conditionalSnapshot(),pending=deferred();let reads=0;
+ const h=harness(()=>++reads===1?full:pending.promise,{storedToken:token,browser});await flush();const before=h.render().snapshot,running=h.render().refresh(true);browser.document.editorOpen=true;
+ pending.resolve(conditionalReceipt(full,{cacheAccess:{...full.cacheAccess,secret:'X'.repeat(43)}}));assert.equal(await running,undefined);assert.equal(reads,2);assert.equal(h.render().snapshot,before);assert.equal(h.cacheWrites.length,1);h.unmount();
+});
+
+test('a pending local admission invalidates an earlier unchanged response without discarding its immutable input',async()=>{
+ const full=conditionalSnapshot(),pending=deferred(),local=deferred(),write=deferred();let reads=0;
+ const h=harness(call=>call.action==='snapshot'?(++reads===1?full:pending.promise):write.promise,{storedToken:token,persistLocal:()=>local.promise});await flush();const before=h.render().snapshot,running=h.render().refresh(true);
+ const accepted=h.render().submitMutation('updateStatus',{recordId:'conditional-record',status:'提案候補'},'conditional-admission');await flush();pending.resolve(conditionalReceipt(full));assert.equal(await running,undefined);assert.equal(h.render().snapshot,before);assert.equal(h.cacheWrites.length,1);
+ local.resolve();await accepted;await flush();assert.equal(h.pendingStore.get('conditional-admission').payload.status,'提案候補');write.resolve({snapshot:{...full,snapshotVersion:'W'.repeat(43)}});await flush();assert.equal(h.render().snapshot.snapshotVersion,'W'.repeat(43));h.unmount();
+});
+
+test('previous-session unchanged responses cannot populate a later login or rewrite its cache',async()=>{
+ const full=conditionalSnapshot(),pending=deferred(),nextToken=token+'-next',next=conditionalSnapshot({snapshotVersion:'W'.repeat(43),cacheAccess:{...displayGrant(),scope:'N'.repeat(43)}});let reads=0;
+ const h=harness(call=>call.action==='snapshot'?(++reads===1?full:pending.promise):call.action==='logout'?{}:call.action==='login'?{token:nextToken,snapshot:next}:null,{storedToken:token});await flush();const running=h.render().refresh(true);await h.render().logout();await h.render().login(player.id,'not-stored-password');const cacheWrites=h.cacheWrites.length;
+ pending.resolve(conditionalReceipt(full));assert.equal(await running,undefined);assert.equal(h.render().snapshot,next);assert.equal(h.cacheWrites.length,cacheWrites);assert.equal(JSON.parse(h.sessionStorage.getItem(SESSION_KEY)).token,nextToken);assert.equal(reads,2);h.unmount();
+});
+
+test('a changed full response replaces the stamp and an old backend response disables future conditional reads',async()=>{
+ const full=conditionalSnapshot(),changed=conditionalSnapshot({snapshotVersion:'W'.repeat(43),counts:{all:{[player.id]:{'提案':3}}}}),legacy={...changed,snapshotVersion:undefined};let reads=0;
+ const h=harness(()=>++reads===1?full:reads===2?changed:legacy,{storedToken:token});await flush();await h.render().refresh(true);assert.equal(h.calls[1].payload.ifSnapshotVersion,full.snapshotVersion);assert.equal(h.render().snapshot,changed);
+ await h.render().refresh(true);assert.equal(h.calls[2].payload.ifSnapshotVersion,changed.snapshotVersion);assert.equal(h.render().snapshot,legacy);
+ await h.render().refresh(true);assert.deepEqual(Object.keys(h.calls[3].payload),[]);h.unmount();
+});
+
+test('a retained refresh callback cannot send a new endpoint session to the old endpoint',async()=>{
+ const full=conditionalSnapshot();let logins=0;
+ const h=harness(call=>call.action==='health'?{configured:true}:call.action==='logout'?{}:call.action==='login'?{token:logins++?token+'-new-endpoint':token,snapshot:full}:conditionalReceipt(full),{manifestEndpoint:''});
+ await flush();await h.render().connect(endpoint);await h.render().login(player.id,'private-test-password');const previous=h.render().refresh;
+ await h.render().logout();await h.render().connect(otherEndpoint);await h.render().login(player.id,'private-test-password');const count=h.calls.length;
+ assert.equal(await previous(true),undefined);assert.equal(h.calls.length,count);
+ await h.render().refresh(true);assert.equal(h.calls.at(-1).target,otherEndpoint);assert.equal(h.calls.at(-1).options.token,token+'-new-endpoint');h.unmount();
 });
