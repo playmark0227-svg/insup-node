@@ -42,3 +42,5 @@ test("archive validation requires its explicit scope and redacted deleted-commen
  archive.comments[0].deleted=true;assert.throws(()=>parseTeamWorkspaceExport(archive),/削除済みコメントの本文/);archive.comments[0].body="";archive.comments[0].mentionIds=[];assert.equal(parseTeamWorkspaceExport(archive).comments[0].body,"");
  archive.comments[0].publicationId=id(99);assert.throws(()=>parseTeamWorkspaceExport(archive),/共有先/);
 });
+
+test("publication parser retains up to 20k Unicode characters without cutting long V2 prose",()=>{const input=fixture();input.candidates[0].introduction="架空の紹介文🌱".repeat(2000);assert.equal(Array.from(input.candidates[0].introduction).length<=20000,true);assert.equal(parseTeamWorkspace(input).candidates[0].introduction,input.candidates[0].introduction);input.candidates[0].introduction="文".repeat(20001);assert.throws(()=>parseTeamWorkspace(input),/20,000/);});

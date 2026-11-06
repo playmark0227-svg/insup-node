@@ -26,6 +26,20 @@ FirestoreはGoogle Sheetsの数式を実行しない。旧表の数式と移行�
 
 この保存先移行ではCloud FunctionsやFirebase Authenticationを追加しない。Apps Scriptの起動・ネットワーク時間は残る。Firebase FunctionsへAPIを移す場合は、別途Blazeプラン、実行者、費用、セッション移行を確認する。
 
+### 公開コードの順序
+
+移行受付停止に対応した最新版の `Code.gs` とmanifestを保存し、必要なGoogle認可を完了して、**既存の `/exec` URLへ互換版を公開してから** PREPARE を行う。古い公開版は受付停止・Firestore切替を認識しないため、エディターだけを更新して移行を始めてはいけない。切替後に旧公開版へ戻さない。
+
+### 非公開の金額合意画像
+
+Blazeへの切り替えと請求先の連携は本人が最終操作する。予算通知は支出上限ではない。新しいFirebase Storageの利用には[公式のプラン要件](https://firebase.google.com/docs/storage/faqs-storage-changes-announced-sept-2024)も確認する。
+
+プロジェクトIDと同じ `<project>.firebasestorage.app` または既存の `<project>.appspot.com` のバケットだけを使用する。Public Access Preventionをenforced、Uniform Bucket Level Accessを有効にし、Storage Rulesは `firebase/storage.rules` ですべてのブラウザSDKアクセスを拒否する。プロパティ `NODE_FIREBASE_STORAGE_BUCKET` に確認済みのバケット名を保存し、Apps Scriptの `devstorage.read_write` スコープを認可する。公開ダウンロードトークン、共有ACL、サービスアカウント秘密鍵は発行しない。
+
+サーバーは担当者・候補者との関連を確認して、一つの変更不可オブジェクト用の一時アップロードURLを返す。このURLはブラウザのメモリー内だけで使い、ログ・台帳・書き出しへ保存しない。画像は5MB以内のPNG/JPEG/WebPに限定し、完了時に形式・容量・世代番号・所有関係を再検査する。提出時にも候補者側・クライアント側それぞれの資料を再確認する。画像の閲覧は認証したサーバー経由とし、無条件公開URLは作らない。
+
+ブラウザからのアップロードには[初回の再開可能アップロード要求のOrigin指定](https://docs.cloud.google.com/storage/docs/resumable-uploads)が必要。サーバーは公開アプリの2オリジンだけを受け付ける。`firebase/storage.cors.json` はXML API用も含む運用設定であり、CORSを認可の代わりにしない。JSON APIはバケットのCORS設定を認可境界として評価しない。
+
 ## 所有者が実行する手順
 
 以下はApps Scriptエディターの所有者専用関数で、公開APIのactionからは実行できない。
@@ -76,4 +90,4 @@ FirestoreはGoogle Sheetsの数式を実行しない。旧表の数式と移行�
 
 ## 確認の境界
 
-自動テストはローカルの架空シート・Firestoreモックに対するもの。実プロジェクトのIAM、Firestore Rules、リージョン、実データの取り込み、Googleでの認可、公開デプロイ、端末の実際の通信速度は別に確認する。移行ツールが存在するだけで本番切替済みとは扱わない。
+自動テストはローカルの架空データ・モックに加え、実Firestore EmulatorのREST APIで実施する。添付ファイルのGCS側はモックであり、実接続の証明ではない。実プロジェクトのIAM、Firestore/Storage Rules、リージョン、実データの取り込み、Googleでの認可、公開デプロイ、端末の実際の通信速度は別に確認する。移行ツールが存在するだけで本番切替済みとは扱わない。

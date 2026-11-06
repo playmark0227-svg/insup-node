@@ -3,6 +3,7 @@ import { interviewFieldLabels, interviewStringFields, type CandidateProfile } fr
 import { matchingFields, valueAt } from "./management-data.ts";
 import { businessToday, type CandidateRecord, type InterviewReview } from "./sheets-client.ts";
 import { buildCandidateChatGuidance, renderCandidateChatChecks, resolveCandidateChatQuestion } from "./candidate-chat-guidance.ts";
+import { candidateAnalysisV2Source, introductionV2ChatSections, introductionV2ChatSection } from "./introduction-v2-adapter.ts";
 
 export type CandidateChatSource = {
   id: string;
@@ -110,14 +111,21 @@ export function buildCandidateChatContext({ group, profiles, reviews = [], selec
     if (!profile.profileId || seenProfiles.has(profile.profileId) || profile.playerId !== group.playerId || selectedProfileId&&profile.profileId!==selectedProfileId || !linkedRecords(profile).length) return false;
     seenProfiles.add(profile.profileId); return true;
   });
-  const profileSources: CandidateChatSource[] = eligibleProfiles.slice(0, 20).map(profile => ({
+  const profileSources: CandidateChatSource[] = eligibleProfiles.slice(0, 20).flatMap(profile => {
+    const v2=candidateAnalysisV2Source(profile);
+    if(v2)return introductionV2ChatSections(v2).map(section=>({id:section.id,kind:"profile" as const,
+      recordIds:linkedRecords(profile).map(record=>record.recordId),
+      label:short(`${section.label} · ${linkedRecords(profile).map(recordLabel).join(" / ")}`,200),
+      facts:section.facts.map(entry=>fact(entry.label,entry.value)).filter(nonempty)}));
+    return [{
     id: `profile:${profile.profileId}`, kind: "profile",
     recordIds:linkedRecords(profile).map(record=>record.recordId),
     label: short(`基本情報 · ${linkedRecords(profile).map(recordLabel).join(" / ")}`, 200),
     facts: interviewStringFields.filter(key => key !== "interviewAdvice")
       .map(key => fact(interviewFieldLabels[key], profile.fields[key]))
       .concat([fact("CRM", profile.fields.crmTools.join("・")), fact("チャット", profile.fields.chatTools.join("・"))]).filter(nonempty),
-  }));
+    }];
+  });
   const seenReviews = new Set<string>();
   const eligibleReviews = [...reviews].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).filter(review => {
     if (!ids.has(review.recordId) || review.playerId !== group.playerId || seenReviews.has(review.recordId)) return false;
@@ -148,7 +156,7 @@ export function buildCandidateChatContext({ group, profiles, reviews = [], selec
     }
   }
   context.omittedRecords = totalRecords - context.sources.filter(source => source.kind === "record").length;
-  const omittedProfiles = eligibleProfiles.length - context.sources.filter(source => source.kind === "profile").length;
+  const omittedProfiles = profileSources.length - context.sources.filter(source => source.kind === "profile").length;
   const omittedReviews = eligibleReviews.length - context.sources.filter(source => source.kind === "review").length;
   if ((omittedProfiles || omittedReviews) && context.sources[0]) {
     const facts = context.sources[0].facts;
@@ -162,7 +170,7 @@ export function buildCandidateChatContext({ group, profiles, reviews = [], selec
 
 const summaryLabels = new Set(["会社名", "ステータス", "担当ポジション", "面談実施日", "C面談予定日", "C面談予定開始時刻", "C面談実施日", "候補者承諾日・マッチ日", "稼働開始予定日", "稼働開始日"]);
 const conditionLabels = new Set(["居住地", "稼働開始", "希望時間帯", "週の稼働日数", "月間稼働時間", "副業・兼業", "希望単価", "PC環境", "通信環境", "勤怠・稼働上の確認事項", "面談可能日", "稼働形態"]);
-const experienceLabels = new Set(["営業経験・職歴", "実績", "強み", "PC操作・スキル", "CRM", "その他のCRM", "チャット", "その他のチャット"]);
+const experienceLabels = new Set(["営業経験・職歴", "営業経験の通算", "実績", "強み", "PC操作・スキル", "CRM", "その他のCRM", "チャット", "その他のチャット", "職歴の会社", "職歴の期間", "商材", "営業スタイル", "担当業務"]);
 
 function specificConditionLabels(query: string): Set<string> {
   const labels = new Set<string>();
@@ -181,7 +189,7 @@ function specificConditionLabels(query: string): Set<string> {
 }
 
 const upcomingInterviewQuestion = (query: string) => /(?:次回|次の).*(?:面談|商談).*(?:いつ|何日|何時|日時|日程)|(?:次回|次の)(?:面談|商談)(?:は|が)?[?？]?$/.test(query.normalize("NFKC").replace(/\s/g,""));
-const canonicalChatLabel=(label:string)=>({"進捗":"ステータス","営業経験":"営業経験・職歴","職歴":"営業経験・職歴","希望報酬":"希望単価"} as Record<string,string>)[label]||label;
+const canonicalChatLabel=(label:string)=>({"進捗":"ステータス","営業経験":"営業経験・職歴","職歴":"営業経験・職歴","希望報酬":"希望単価","成果を出すための工夫":"強み"} as Record<string,string>)[label]||label;
 const sourceValue = (source: CandidateChatSource,label:string) => source.facts.find(fact=>canonicalChatLabel(fact.label)===label)?.value.trim()||"";
 function companyFocus(context:CandidateChatContext,query:string):string|undefined {
  return [...new Set(context.sources.filter(source=>source.kind==="record").map(source=>sourceValue(source,"会社名")).filter(Boolean))]
@@ -193,13 +201,19 @@ function companySources(context:CandidateChatContext,company:string|undefined):C
  const ids=new Set(records.map(record=>record.id));
  return context.sources.filter(source=>source.kind==="record"?ids.has(source.id):source.recordIds?.some(id=>ids.has(id)));
 }
+function careerFocusSources(context:CandidateChatContext,query:string):CandidateChatSource[] {
+ const explicit=/経験|職歴|経歴|勤務先|在籍/.test(query);
+ if(!explicit&&(!/実績|成果|架電|アポ|工夫|商材|担当業務/.test(query)||/進捗|提案先|C面談|マッチ|合否/.test(query)||companyFocus(context,query)))return [];
+ return context.sources.filter(source=>introductionV2ChatSection(source.id)==="career"&&source.facts.some(fact=>fact.label==="職歴の会社"&&!!fact.value.trim()&&query.includes(fact.value.trim())));
+}
 
 /** Select registered evidence for the current question before native inference. Never
  * derive candidate facts from the conversation; a followup only supplies the topic. */
 export function selectCandidateChatContext(context:CandidateChatContext,question:string,history:Array<{role:"user"|"assistant";content:string}>=[]):CandidateChatContext {
  if(context.identityIssue)return {...context,sources:[]};
  const query=resolveCandidateChatQuestion(question,history),guidance=buildCandidateChatGuidance(context,question,history);
- const focused=companySources(context,companyFocus(context,query)),labels=new Set<string>(),specific=specificConditionLabels(query);
+ const careerFocus=careerFocusSources(context,query);
+ const focused=careerFocus.length?careerFocus:companySources(context,companyFocus(context,query)),labels=new Set<string>(),specific=specificConditionLabels(query);
  const missing=guidance.intent==="missing-information",summary=guidance.intent==="summary",next=guidance.intent==="next-actions";
  if(summary||next)for(const label of summaryLabels)labels.add(label);
  if(summary)for(const label of [...conditionLabels,...experienceLabels])labels.add(label);
@@ -212,7 +226,7 @@ export function selectCandidateChatContext(context:CandidateChatContext,question
  }
  if(specific.size&&!/希望条件|勤務条件|稼働条件/.test(query))for(const label of specific)labels.add(label);
  else if(/条件|希望/.test(query))for(const label of conditionLabels)labels.add(label);
- if(/経験|職歴|経歴|営業歴|スキル|強み|CRM|ツール|PC操作/i.test(query))for(const label of experienceLabels)labels.add(label);
+ if(/経験|職歴|経歴|営業歴|スキル|強み|工夫|CRM|ツール|PC操作|架電|アポ|実績/i.test(query))for(const label of experienceLabels)labels.add(label);
  if(/メモ|注意|補足|振り返|理由|うまく|マッチしな/.test(query))for(const label of ["メモ","合否メモ","その他・補足","面談のメモ","自分の振り返り","記録された未マッチ理由","確認した理由・事実"])labels.add(label);
  if(/紹介元|流入|どこから/.test(query))labels.add("紹介元");
  if(/担当/.test(query))labels.add("担当");
@@ -290,19 +304,20 @@ export function answerCandidateFacts(context: CandidateChatContext, question: st
     const labels = specificConditions.size && !/希望条件|勤務条件|稼働条件|条件.*(?:整理|まとめ|一覧|全体)/.test(query) ? specificConditions : conditionLabels;
     for (const label of labels) requested.add(label);
   }
-  if (/経験|職歴|営業歴|スキル|強み|CRM|ツール|PC操作/.test(query)) for (const label of experienceLabels) requested.add(label);
+  if (/経験|職歴|経歴|営業歴|スキル|強み|工夫|CRM|ツール|PC操作|架電|アポ|実績/.test(query)) for (const label of experienceLabels) requested.add(label);
   if (/メモ|注意|補足|振り返|理由|うまく|マッチしな/.test(query)) for (const label of ["メモ", "合否メモ", "その他・補足", "面談のメモ", "自分の振り返り", "記録された未マッチ理由", "確認した理由・事実"]) requested.add(label);
   if (/紹介元|流入|どこから/.test(query)) requested.add("紹介元");
   if (/名前|氏名/.test(query)) requested.add("候補者氏名");
   if (/担当/.test(query)) requested.add("担当");
   if (/ヨミ|確度|見込/.test(query)) requested.add("ヨミ確度");
   for (const label of Object.values(interviewFieldLabels)) if (query.includes(label) && (label !== "稼働開始" || specificConditions.has(label))) requested.add(label);
-  if (mode === "summary") for (const label of summaryLabels) requested.add(label);
+  if (mode === "summary") for (const label of [...summaryLabels,...conditionLabels,...experienceLabels]) requested.add(label);
   if (mode === "checks") for (const label of ["会社名", "ステータス", "C面談予定日", "C面談実施日", "希望単価", "稼働開始", "希望時間帯", "週の稼働日数", "面談可能日"]) requested.add(label);
   const company=companyFocus(context,query);
   if (company && !requested.size) { requested.add("会社名"); requested.add("ステータス"); }
   if (!requested.size) return { text: "その項目に対応する記録は見つかりません。会社・進捗・面談日・予定・希望条件・経験・メモについて確認できます。", sourceIds: [] };
-  const matches = companySources(context,company).map(source => ({ source, facts: source.facts.filter(entry => requested.has(canonicalChatLabel(entry.label))) }))
+  const careerFocus=careerFocusSources(context,query);
+  const matches = (careerFocus.length?careerFocus:companySources(context,company)).map(source => ({ source, facts: source.facts.filter(entry => requested.has(canonicalChatLabel(entry.label))) }))
     .filter(({ facts }) => facts.length);
   const missing = [...requested].filter(label => !matches.some(match => match.facts.some(entry => canonicalChatLabel(entry.label) === label)));
   const sections: string[] = [], sourceIds: string[] = [];

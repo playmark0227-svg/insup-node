@@ -1,9 +1,11 @@
-export type WorkspaceView = "home" | "ranking" | "records" | "profile" | "players" | "connection" | "workbook" | "reviews" | "insights" | "security" | "team" | "reminders" | "migration";
+export type WorkspaceView = "home" | "ranking" | "records" | "profile" | "players" | "connection" | "workbook" | "reviews" | "insights" | "security" | "team" | "reminders" | "migration" | "metric-goals" | "sales";
 export type WorkspacePurpose = { title: string; goal: string; steps: string[]; links: { view: WorkspaceView; label: string }[] };
 const purposes: Record<WorkspaceView, WorkspacePurpose> = {
+  "metric-goals":{title:"月別目標・達成率",goal:"個人と月ごとの7工程の目標を保存し、成果と日割りの目安を比較します。",steps:["月を選び、面談・提案・C面談・合格・マッチ・稼働開始をそれぞれ設定します。","0件の目標と未設定を区別します。過去月の目標も残ります。","日割りは暦日・平日・指定日数から選びます。平日は祝日を含みます。"],links:[{view:"home",label:"成果ミーティングを見る"},{view:"ranking",label:"ランキングを見る"}]},
+  sales:{title:"提案検討・案件",goal:"案件条件と候補者を照らし合わせ、検討中の提案と実際に送った提案を分けて管理します。",steps:["案件の稼働条件・必須経験を確認し、候補者ごとに複数の提案先を選びます。","提案予定の選択だけでは実績は増えません。実際に提案した日に「提案済み」を記録します。","提案先なし・保留には理由を残します。案件が更新されたら再検討できます。","マッチ報告は金額と合意資料を確認して提出します。金額・資料は担当者と管理者が確認できます。"],links:[{view:"records",label:"候補者・進捗を確認"},{view:"team",label:"社内で相談"}]},
   reminders:{title:"通知・前日確認",goal:"明日のC面談と稼働予定を確認し、アプリ内・PC通知で確認漏れを減らします。",steps:["未完了の予定を確認して、対象の提案を開きます。","PC通知は自分で許可した場合だけ有効です。通知本文に候補者名や会社名は表示しません。","アプリを開き、ログインが有効な間に通知します。閉じている間の通知は行いません。"],links:[{view:"records",label:"候補者・提案を確認"}]},
   migration:{title:"過去データの移行",goal:"Slackの原文を保管し、担当者と内容を確認して候補者・案件へ登録します。",steps:["Slack JSONまたはコピーした本文を読み込み、原文を管理者限定で保管します。","同じ投稿は重複登録せず、原文の変更は自動上書きしません。","担当者・内容・共有先を確認してから業務データへ登録します。"],links:[{view:"records",label:"登録済み候補者を確認"},{view:"team",label:"共有した案件を確認"}]},
-  team:{title:"社内共有・案件",goal:"共有した候補者の紹介文、社内の相談、募集案件を一か所で確認します。",steps:["面談情報と紹介文は候補者・提案で保存してから、公開する氏名・紹介文を確認します。","社内共有した候補者へコメント・返信・担当者への言及を残せます。","案件の条件を確認して、本人が担当する候補者への提案を登録します。","候補者の内部メモや元の記録は、社内共有へ自動で公開されません。"],links:[{view:"records",label:"自分の候補者を確認"}]},
+  team:{title:"社内共有",goal:"共有した候補者の紹介文、社内の相談、募集案件を一か所で確認します。",steps:["面談情報と紹介文は候補者・提案で保存してから、公開する氏名・紹介文を確認します。","社内共有した候補者へコメント・返信・担当者への言及を残せます。","案件の条件を確認して、本人が担当する候補者への提案を登録します。","候補者の内部メモや元の記録は、社内共有へ自動で公開されません。"],links:[{view:"records",label:"自分の候補者を確認"}]},
   home: { title: "ホーム", goal: "今日確認する提案と、今月の成果をひとつの場所で確認します。", steps: ["「今日の確認」から対象の会社・提案を開きます。", "実施した工程の日付を記録すると、成果とランキングに反映されます。", "保存状況は右上で確認できます。同期中も別の作業を続けられます。"], links: [{view:"records",label:"候補者・提案を開く"},{view:"insights",label:"確認対象をすべて見る"}] },
   records: { title: "候補者・提案", goal: "候補者の基本情報と、会社ごとの提案・進捗・実績を管理します。", steps: ["初めての人は「候補者を登録」から追加します。", "基本情報・紹介文はその人の条件や職歴、提案の履歴は会社ごとの状況を確認する場所です。", "面談・提案・合格・承諾・稼働開始は、実際に進んだ工程の日付を記録します。予定日と実績日は分けます。", "同じ人を複数社へ提案しても、候補者リストは一人ひとつ。会社ごとの履歴から対象を選んで編集します。"], links: [{view:"reviews",label:"不成立の理由を振り返る"},{view:"ranking",label:"登録した成果を見る"}] },
   ranking: { title: "ランキング", goal: "同じ期間・同じ指標で、チームの実績を比較します。", steps: ["今日・月別・累計から比較する期間を選びます。", "提案数、C面談、マッチ数など比較したい指標を選びます。", "同じ件数は同順位です。面談は候補者単位、提案以降は会社への提案行単位で数えます。"], links: [{view:"records",label:"成果の元になった記録を見る"}] },
@@ -12,20 +14,20 @@ const purposes: Record<WorkspaceView, WorkspacePurpose> = {
   profile: { title: "マイプロフィール", goal: "自分の表示名・ひとこと・現在の月間提案目標を設定します。", steps: ["累計実績と今月の順位を確認します。", "プロフィール編集から表示名・ひとこと・提案目標を変更できます。", "候補者の基本情報はこの画面ではなく、候補者リストから編集します。"], links: [{view:"security",label:"パスワードを変更する"}] },
   players: { title: "プレイヤー管理", goal: "メンバーのログインID、表示名・目標、シート上の担当名を管理します。", steps: ["新しいメンバーにはIDを発行します。パスワードは一度だけ表示されます。", "表示名・目標と、既存シートの担当名の対応を確認します。", "担当名の対応を変えると閲覧・集計の対象が変わります。別の人の名前を推測で入れないでください。"], links: [{view:"security",label:"アクセスの状態を確認"}] },
   workbook: { title: "業務管理表", goal: "候補者リスト以外の案件・エージェント・稼働者などを表形式で管理します。", steps: ["目的の管理表を選び、対象の行を開きます。", "編集可能な項目だけ変更して保存します。数式・読み取り専用のセルは保護されます。", "候補者の提案・実績は、候補者リストからの編集が分かりやすくなっています。"], links: [{view:"records",label:"候補者・提案を開く"}] },
-  connection: { title: "データ連携", goal: "接続先と同期状態を確認するための管理者用設定です。", steps: ["接続中の管理シートと、書き込みが有効かを確認します。", "通常の入力は候補者・提案や実績登録から行います。毎回ここで同期する必要はありません。", "右上の保存状況で、端末保存・同期中・シート保存完了を確認できます。"], links: [{view:"records",label:"通常の入力へ戻る"},{view:"security",label:"アクセス状態を確認"}] },
+  connection: { title: "データ連携", goal: "接続先と同期状態を確認するための管理者用設定です。", steps: ["接続中の保存先と、書き込みが有効かを確認します。", "通常の入力は候補者・提案や実績登録から行います。毎回ここで同期する必要はありません。", "右上の保存状況で、端末保存・同期中・サーバー保存完了を確認できます。"], links: [{view:"records",label:"通常の入力へ戻る"},{view:"security",label:"アクセス状態を確認"}] },
   security: { title: "アカウント・安全設定", goal: "自分のパスワードと、利用できるアクセスの状態を確認します。", steps: ["パスワード変更は本人のアカウントに適用されます。", "変更後は他の端末もログアウトされるため、新しいパスワードで再ログインします。", "未同期の入力がある場合は、右上の保存状況を確認してからログアウトします。"], links: [{view:"home",label:"ホームに戻る"}] },
 };
 export function allowedWorkspaceViews(admin: boolean): WorkspaceView[] {
-  return admin ? ["home","ranking","records","team","reviews","insights","reminders","migration","players","workbook","connection","security"] : ["home","ranking","records","team","reviews","insights","reminders","profile","security"];
+  return admin ? ["home","ranking","metric-goals","records","sales","team","reviews","insights","reminders","migration","players","workbook","connection","security"] : ["home","ranking","metric-goals","records","sales","team","reviews","insights","reminders","profile","security"];
 }
 export function workspacePurpose(view: WorkspaceView, admin: boolean): WorkspacePurpose {
   const selected = allowedWorkspaceViews(admin).includes(view) ? view : "home";
   const purpose = purposes[selected];
-  const value = selected === "home" && admin ? { ...purpose, title: "成果ミーティング", goal: "全員の数字を同じ期間で比較し、一人ずつの発表・振り返りを進めます。", steps: ["今日・月別・累計から、発表する実績の期間を選びます。", "全員の比較で差や目標を確認し、一人ずつの発表に切り替えます。", "不足している実績は対象の記録を確認して修正します。現在の目標設定は、過去月の保存済み目標ではありません。"] } : purpose;
+  const value = selected === "home" && admin ? { ...purpose, title: "成果ミーティング", goal: "全員の数字を同じ期間で比較し、一人ずつの発表・振り返りを進めます。", steps: ["今日・月別・累計から、発表する実績の期間を選びます。", "全員の比較で差や目標を確認し、一人ずつの発表に切り替えます。", "不足している実績は対象の記録を確認して修正します。月別目標・達成率で7工程それぞれの目標を確認できます。"] } : purpose;
   return { ...value, links: value.links.filter(link => allowedWorkspaceViews(admin).includes(link.view)) };
 }
 export const workspaceNavigationGroups = [
-  { label: "成果の確認", views: ["home","ranking"] },
-  { label: "日々の営業", views: ["records","team","reviews","insights","reminders"] },
+  { label: "成果の確認", views: ["home","ranking","metric-goals"] },
+  { label: "日々の営業", views: ["records","sales","team","reviews","insights","reminders"] },
   { label: "管理・設定", views: ["profile","players","workbook","migration","connection","security"] },
 ] as const;

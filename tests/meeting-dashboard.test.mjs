@@ -27,7 +27,7 @@ function harness(options = {}) {
     "2026-10": { "ND-001": { "候補者面談": 9, "提案": 24 }, "ND-002": { "提案": 3 } },
     "2026-09": { "ND-001": { "候補者面談": 10, "提案": 20 }, "ND-002": { "提案": 5 } },
   };
-  const calls = { registered: [], corrected: [], players: 0, records: 0 };
+  const calls = { registered: [], corrected: [], players: 0, records: 0, goals: 0, csv: [], downloads: [] };
   let cursor = 0;
   const slots = [];
   const react = {
@@ -40,7 +40,9 @@ function harness(options = {}) {
   };
   const exports = {}, jsx = (type, props, key) => ({ type, props: props || {}, key });
   vm.runInNewContext(source, {
-    exports, module: { exports }, Intl, Date,
+    exports, module: { exports }, Intl, Date, Blob,
+    URL: { createObjectURL(blob) { calls.csv.push(blob); return "blob:synthetic-meeting"; }, revokeObjectURL() {} },
+    document: { createElement() { const anchor={href:"",download:"",click(){calls.downloads.push(this.download);}};return anchor; } }, setTimeout(fn) { fn(); },
     require: name => name === "react" ? react : name === "react/jsx-runtime" ? { jsx, jsxs: jsx, Fragment: "fragment" }
       : name === "lucide-react" ? new Proxy({}, { get: (_, key) => `icon:${String(key)}` })
         : name === "@/lib/node-data" ? nodeData : name === "@/lib/performance-metrics" ? { performanceMetrics }
@@ -78,12 +80,12 @@ function harness(options = {}) {
 
 test("monthly comparison exposes official counts, signed differences and current target meaning", () => {
   const h = harness();
-  assert.equal(h.byClass("meeting-total").length, 6);
+  assert.equal(h.byClass("meeting-total").length, 7);
   assert.match(h.text(), /2026年10月/);
   assert.match(h.text(), /2026年9月との比較/);
   assert.match(h.text(), /同日までの比較ではありません/);
   const firstRow = nodes(h.render()).find(node => node.type === "tr" && node.key === "ND-001");
-  assert.equal(nodes(firstRow).filter(node => hasClass(node, "meeting-count-cell")).length, 6);
+  assert.equal(nodes(firstRow).filter(node => hasClass(node, "meeting-count-cell")).length, 7);
   assert.match(text(firstRow), /前月差\s*-1\s*件/);
   assert.match(text(firstRow), /前月差\s*\+4\s*件/);
   assert.match(text(firstRow), /24 \/ 20件120%/);
@@ -167,7 +169,7 @@ test("roster and period empty states provide the correct follow-up action", () =
   assert.equal(noPlayers.button("一人ずつ発表").props.disabled, true);
   noPlayers.click("プレイヤー管理を開く"); assert.equal(noPlayers.calls.players, 1);
   const noCounts = harness({ counts: {} });
-  assert.match(noCounts.text(), /2026年10月の6項目はすべて0件です/);
+  assert.match(noCounts.text(), /2026年10月の7項目はすべて0件です/);
   assert.match(noCounts.text(), /各工程の日付を確認/);
   noCounts.click("人材・進捗を確認"); assert.equal(noCounts.calls.records, 1);
 });
@@ -218,3 +220,14 @@ test("meeting presentations do not call zero proposals first place and preserve 
  const mixed=harness({counts:{"2026-10":{"ND-001":{"提案":0},"ND-002":{"提案":3}}}});mixed.click("検証 一郎の発表画面を開く");assert.doesNotMatch(text(mixed.byClass("meeting-speaker-heading")[0]),/提案数.*位/);mixed.click("次の人");assert.match(text(mixed.byClass("meeting-speaker-heading")[0]),/提案数 1位/);
  const tied=harness({counts:{"2026-10":{"ND-001":{"提案":3},"ND-002":{"提案":3}}}});tied.click("一人ずつ発表");assert.match(text(tied.byClass("meeting-speaker-heading")[0]),/提案数 1位/);tied.click("次の人");assert.match(text(tied.byClass("meeting-speaker-heading")[0]),/提案数 1位/);
 });
+
+
+test("seven-step meeting separates client pass and matching in cards, correction, presentation, sorting and CSV", async()=>{
+ const counts={"2026-10":{"ND-001":{"内定":2,"内定承諾":1},"ND-002":{"内定":5,"内定承諾":0}},"2026-09":{"ND-001":{"内定":1,"内定承諾":3},"ND-002":{"内定":0,"内定承諾":2}}};
+ const h=harness({counts});assert.equal(h.byClass("meeting-total").length,7);assert.match(h.text(),/合格（クライアント）/);assert.doesNotMatch(h.text(),/7項目はすべて0件/);
+ const passCard=h.byClass("meeting-total").find(node=>text(node).includes("合格（クライアント）")),matchCard=h.byClass("meeting-total").find(node=>text(node).includes("マッチ数"));assert.match(text(passCard),/7件/);assert.match(text(matchCard),/1件/);
+ h.click("検証 一郎の合格（クライアント）を記録");h.click("検証 一郎の合格（クライアント）を減らす・修正");assert.deepEqual(h.calls.registered,[["ND-001","内定"]]);assert.deepEqual(h.calls.corrected,[["ND-001","内定"]]);
+ h.find(node=>node.type==="select").props.onChange({target:{value:"内定"}});h.click("一人ずつ発表");assert.match(text(h.byClass("meeting-speaker-heading")[0]),/検証 二郎/);assert.equal(h.byClass("meeting-person-metric").length,7);assert.match(h.text(),/クライアント側の合格日/);assert.match(h.text(),/候補者が承諾した日/);assert.match(h.text(),/件数だけで転換率は判断しません/);
+ h.click("CSV保存");assert.equal(h.calls.csv.length,1);const csv=await h.calls.csv[0].text(),csvRows=csv.replace(/^\uFEFF/,"").split("\r\n").map(row=>row.split(",").map(cell=>cell.replace(/^"|"$/g,"")));const header=csvRows[0],first=csvRows.find(row=>row[1]==="ND-001");assert.equal(header.indexOf("合格（クライアント）")+1,header.indexOf("マッチ数"));assert.equal(first[header.indexOf("合格（クライアント）")],"2");assert.equal(first[header.indexOf("マッチ数")],"1");assert.equal(first[header.indexOf("合格（クライアント） 前月差")],"1");assert.equal(first[header.indexOf("マッチ数 前月差")],"-2");assert.deepEqual(h.calls.downloads,["insup-node-meeting-2026-10.csv"]);
+});
+test("goal review uses the dedicated goal action while roster checks keep the player-management action",()=>{const h=harness({extraTeamCounts:{内定:1},props:{onReviewGoals:()=>h.calls.goals++}});h.click("目標を確認");assert.equal(h.calls.goals,1);assert.equal(h.calls.players,0);h.click("担当者の対応を確認");assert.equal(h.calls.players,1);h.click("検証 二郎の発表画面を開く");h.click("目標を確認");assert.equal(h.calls.goals,2);});

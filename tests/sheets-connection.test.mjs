@@ -4,13 +4,14 @@ import fs from "node:fs";
 import vm from "node:vm";
 import ts from "typescript";
 import {projectSnapshotForCache,validSnapshotCacheAccess} from "../lib/snapshot-cache.ts";
-import {assertSnapshot, assertMutationReceipt, isUncertainWrite, validateEndpoint, SheetApiError} from "../lib/sheets-client.ts";
+import {assertSnapshot, assertMutationReceipt, isUncertainWrite, validateEndpoint, SheetApiError, sheetExtensionMutationActions, isSheetExtensionReadAction, sheetExtensionMutationEnabled} from "../lib/sheets-client.ts";
 import {correctionFields,correctedPayload,mutationDateErrors} from "../lib/save-correction.ts";
 import {pendingSaveResources,unlockPendingSaves as unlockRealPendingSaves,lockPendingSaves as lockRealPendingSaves} from "../lib/pending-saves.ts";
 import {createDeadlineSignal, isTimeoutSignal, throwIfAborted, abortReason} from "../lib/abort-signal.ts";
 import {matchingFields} from "../lib/management-data.ts";
 import {interviewFieldLabels,interviewStringFields,blankInterviewFields} from "../lib/candidate-intake.ts";
 import {assertWritingKitState,validateWritingPreferences,defaultWritingPreferences,writingSectionIds,writingTopicCodes} from "../lib/writing-ai.ts";
+import {blankIntroductionV2Profile,blankIntroductionCareer,parseIntroductionV2Profile} from "../lib/introduction-v2.ts";
 
 const endpoint = "https://script.google.com/macros/s/AKfycb_TEST_DEPLOYMENT_1234567890/exec";
 const otherEndpoint = endpoint.replace("TEST_DEPLOYMENT", "OTHER_DEPLOYMENT");
@@ -79,7 +80,7 @@ function harness(handle, {storedToken, malformedSession, deadlineController, mak
   const context=vm.createContext({exports,module:{exports},AbortController,AbortSignal:deadlineSignals,JSON,Error,localStorage,sessionStorage,TEST_PRODUCTION:production,crypto,
     ...(browser || {}),
     fetch:async()=>{if(manifestFailure)throw new Error("設定取得失敗");return {ok:true,json:async()=>({endpoint:manifestEndpoint})};},
-    require:name=>name==="react" ? react : name.includes("snapshot-cache") ? cacheApi : name.includes("abort-signal") ? deadlineApi : name.includes("save-correction") ? {correctionFields,correctedPayload,mutationDateErrors} : name.includes("pending-saves") ? pendingApi : name.includes("node-data") ? {initialPlayers:[player],makeDemoActivities:()=>[]} : name.includes("management-data") ? {matchingFields} : name.includes("candidate-intake") ? {interviewFieldLabels,interviewStringFields} : name.includes("writing-ai") ? {assertWritingKitState,validateWritingPreferences} : {assertSnapshot,assertMutationReceipt,isUncertainWrite,validateEndpoint,SheetApiError,sheetRequest}});
+    require:name=>name==="react" ? react : name.includes("snapshot-cache") ? cacheApi : name.includes("abort-signal") ? deadlineApi : name.includes("save-correction") ? {correctionFields,correctedPayload,mutationDateErrors} : name.includes("pending-saves") ? pendingApi : name.includes("node-data") ? {initialPlayers:[player],makeDemoActivities:()=>[]} : name.includes("management-data") ? {matchingFields} : name.includes("candidate-intake") ? {interviewFieldLabels,interviewStringFields} : name.includes("writing-ai") ? {assertWritingKitState,validateWritingPreferences} : {assertSnapshot,assertMutationReceipt,isUncertainWrite,validateEndpoint,SheetApiError,sheetRequest,sheetExtensionMutationActions,isSheetExtensionReadAction,sheetExtensionMutationEnabled}});
   vm.runInContext(source,context);
   const render = () => {cursor=0; const result=exports.useSheetsConnection(); while(effects.length) effects.shift()(); return result;};
   render();
@@ -1295,6 +1296,38 @@ test('an expired old team read and a late team write cannot release a new login 
 // after the server receipt, so their own editors cannot announce a local save as final.
 const extensionSnapshot={...snapshot,self:{playerId:'ADMIN',role:'admin'},rewardsFeature:true,migrationFeature:true,teamWorkspaceFeature:true,operationsFeature:true};
 const extensionPayload={command:'adjust',playerId:'ND-001',delta:40,reason:'架空の確認済み調整'};
+
+const workflowExtensionSnapshot={...extensionSnapshot,metricGoalsFeature:true,salesWorkflowFeature:true,introductionV2Feature:true,storageEvidenceFeature:true};
+for(const action of ['saveMetricGoals','saveWorkJob','saveProposalPlan','recordProposalSent','saveMatchReport','saveIntroductionV2','saveIntroductionSettings','publishIntroductionV2','completeMatchEvidence'])test(`${action} uses the encrypted extension outbox and waits for a matching receipt`,async()=>{
+ const response=deferred(),payload={recordId:'fictional-workflow-record',expectedVersion:'fictional-revision'};
+ const h=harness(call=>call.action==='snapshot'?workflowExtensionSnapshot:response.promise,{storedToken:token});await flush();
+ let resolved=false;const save=h.render().mutateExtension(action,payload,`workflow-${action}-operation`).then(()=>{resolved=true;});await flush();
+ assert.equal(h.pendingStore.size,1);assert.equal(resolved,false);const post=h.calls.find(call=>call.action===action);assert.equal(post.options.responseMode,'receipt');assert.equal(post.options.token,token);
+ response.resolve({committed:true,operationId:`workflow-${action}-operation`});await save;await flush();assert.equal(resolved,true);assert.equal(h.pendingStore.size,0);h.unmount();
+});
+
+test('new extension writes require their own capability and retain identity-bound callbacks',async()=>{
+ const h=harness(call=>call.action==='snapshot'?extensionSnapshot:{committed:true,operationId:call.options.operationId},{storedToken:token});await flush();
+ for(const action of ['saveMetricGoals','saveWorkJob','saveIntroductionV2','completeMatchEvidence'])await assert.rejects(h.render().mutateExtension(action,{},`disabled-${action}`),{code:'READ_ONLY'});
+ assert.equal(h.pendingStore.size,0);assert.equal(h.calls.some(call=>call.action==='saveMetricGoals'),false);h.unmount();
+});
+
+test('evidence upload setup uses the identity-bound read transport without entering the outbox',async()=>{
+ const upload={uploadId:'fictional-upload-id',operationId:'fictional-upload-operation'},response={uploadUrl:'https://storage.googleapis.com/fictional-only'};
+ const h=harness(call=>call.action==='snapshot'?workflowExtensionSnapshot:response,{storedToken:token});await flush();
+ assert.equal(await h.render().readExtension('beginMatchEvidence',upload),response);const call=h.calls.find(call=>call.action==='beginMatchEvidence');assert.equal(call.options.token,token);assert.deepEqual(call.payload,upload);assert.equal(h.pendingStore.size,0);
+ await assert.rejects(h.render().readExtension('changePassword',{}),{code:'INVALID_ACTION'});h.unmount();
+});
+
+test('a long V2 draft keeps its complete original input and operation ID across an uncertain result and explicit retry',async()=>{
+ const profile=blankIntroductionV2Profile('架空の長文確認候補者');profile.careers=Array.from({length:6},(_,index)=>({...blankIntroductionCareer(`fictional-employer-${index}`),company:`架空会社${index}`,duties:['架空の記録確認を担当。'.repeat(400)],achievements:['本人申告：月間8件の架空実績。'.repeat(50)]}));profile.internalMemo='架空の社内原文。'.repeat(300)+'最後の記録を保持';assert.ok(parseIntroductionV2Profile(profile));
+ const payload={recordId:'fictional-long-v2-record-00001',profile,expectedVersion:''};assert.ok(JSON.stringify(payload).length>32768);
+ let first=true;const h=harness(call=>{if(call.action==='snapshot')return workflowExtensionSnapshot;if(first){first=false;throw new SheetApiError('NETWORK','架空の応答不明');}return {committed:true,operationId:call.options.operationId};},{storedToken:token});await flush();
+ await assert.rejects(h.render().mutateExtension('saveIntroductionV2',payload,'long-v2-original-operation'),{code:'NETWORK'});await flush();
+ assert.equal(h.pendingStore.size,1);assert.equal(h.render().backgroundSave.uncertain,true);const retained=structuredClone(h.pendingStore.get('long-v2-original-operation'));assert.deepEqual(retained.payload,payload);h.unmount();
+ const restored=harness(call=>call.action==='snapshot'?workflowExtensionSnapshot:{committed:true,operationId:call.options.operationId},{storedToken:token,pendingSaves:[retained]});await flush();assert.equal(restored.calls.some(call=>call.action==='saveIntroductionV2'),false);
+ await restored.render().mutateExtension('saveIntroductionV2',payload,'long-v2-original-operation');await flush();const post=restored.calls.find(call=>call.action==='saveIntroductionV2');assert.deepEqual(post.payload,payload);assert.equal(post.options.operationId,'long-v2-original-operation');assert.equal(restored.pendingStore.size,0);restored.unmount();
+});
 
 test('extension writes wait for both local commits before POST and for a matching remote receipt before resolving',async()=>{
  const admitted=deferred(),attempted=deferred(),response=deferred();

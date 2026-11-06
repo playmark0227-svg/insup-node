@@ -228,6 +228,12 @@ async function generate(task: string, input: unknown, schema: unknown, options: 
   try { return JSON.parse(output); } catch { throw new OnDeviceAiError("INVALID_RESPONSE"); }
 }
 
+/** Internal structured native-model runner. V2 uses this same bounded,
+ * abortable local-only path; it does not introduce a cloud transport. */
+export async function runOnDeviceStructuredTask(task: string, input: unknown, schema: unknown, options: OnDeviceAiOptions = {}, outputTokenReserve = 2_000): Promise<unknown> {
+  return generate(task, input, schema, options, outputTokenReserve);
+}
+
 function sourceText(value: unknown, maximum: number): string {
   if (value === undefined) return "";
   if (!validText(value, maximum, true)) throw new OnDeviceAiError("INVALID_INPUT");

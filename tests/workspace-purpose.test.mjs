@@ -39,7 +39,7 @@ test('an empty read-only inbox can browse but cannot start registration',()=>{
 test('contextual help closes before it navigates and distinguishes local from shared saving',()=>{
  const calls=[];const tree=exports.WorkspaceGuide({open:true,view:'records',admin:false,onClose:()=>calls.push('close'),onNavigate:view=>calls.push(view)});
  const button=nodes(tree).find(node=>node.type==='button'&&text(node)==='不成立の理由を振り返る');assert.ok(button);button.props.onClick();assert.deepEqual(calls,['close','reviews']);
- assert.ok(text(tree).includes('端末に保存済み・同期中'));assert.ok(text(tree).includes('シートへの反映は続いています'));
+ assert.ok(text(tree).includes('端末に保存済み・同期中'));assert.ok(text(tree).includes('サーバーへの反映は続いています'));
 });
 
 test('mobile logout closes its menu then uses the same draft and pending-save guarded callback',()=>{

@@ -1,5 +1,6 @@
 import type { CandidateChatContext, CandidateChatSource } from "./candidate-chat.ts";
 import { businessToday } from "./sheets-client.ts";
+import { introductionV2ChatSection } from "./introduction-v2-adapter.ts";
 
 export type CandidateChatIntent = "missing-information" | "next-actions" | "summary" | "question";
 type ChatHistory = Array<{ role: "user" | "assistant"; content: string }>;
@@ -94,7 +95,7 @@ export function buildCandidateChatGuidance(context: CandidateChatContext, questi
   const intent = classifyCandidateChatIntent(question, history);
   const focus = requestedFields(resolveCandidateChatQuestion(question, history));
   const candidates: Array<CandidateChatCheck & { priority: number }> = [];
-  const profiles = context.sources.filter(source => source.kind === "profile");
+  const profiles = context.sources.filter(source => source.kind === "profile"&&introductionV2ChatSection(source.id)!=="internal");
   const add = (source: CandidateChatSource, field: string, priority: number, reason: string, nextQuestion: string) => {
     const sourceScope = profiles.length > 1 ? `資料${quote(source.label)}についての確認です。` : "";
     candidates.push({ field, priority, reason: sourceScope + reason, question: nextQuestion, sourceIds: [source.id] });
@@ -108,12 +109,16 @@ export function buildCandidateChatGuidance(context: CandidateChatContext, questi
   };
 
   for (const source of profiles) {
+    const section=introductionV2ChatSection(source.id);
+    if(section!=="career"){
     const pay = value(source, "希望単価");
     if (hasValue(pay) && !hasPayUnit(pay)) {
       add(source, "希望単価", 100, `希望単価の記録は${quote(pay)}で、時給・月額・件単価のどれかを特定できません。`, "この希望単価は時給・月額・1件あたりのどれですか？ 税込・税別も確認できますか？");
     } else if (!hasValue(pay)) {
       missing(source, "希望単価", 96, "提案条件を合わせるために報酬の金額と単位を確認すると役立ちます。", "希望する報酬の金額と単位（時給・月額・1件あたり）は決まっていますか？");
     }
+    }
+    if(section!=="basic"){
     const achievement = value(source, "実績");
     const achievementText = achievement || value(source, "営業経験・職歴");
     const gaps = achievementGaps(achievementText);
@@ -123,7 +128,9 @@ export function buildCandidateChatGuidance(context: CandidateChatContext, questi
     else if (focus.has("実績") && !hasValue(achievement)) missing(source, "実績", 94,
       "経験を具体的に説明できる数値・対象期間があれば、提案時に使えます。実績がない場合は作らず、その状況を記録できます。",
       "担当した業務の対象期間と、獲得件数・売上など説明できる実績はありますか？ まだなければ、未経験・実績未確認などの状況を教えてください。");
+    }
 
+    if(section!=="career"){
     const days = value(source, "週の稼働日数"), hours = value(source, "月間稼働時間");
     const time = value(source, "希望時間帯");
     if (!hasValue(time)) {
@@ -134,17 +141,23 @@ export function buildCandidateChatGuidance(context: CandidateChatContext, questi
     }
     if (!hasLinkedInterviewSchedule(source, context.sources)) missing(source, "面談可能日", 84, "提案先との面談調整に使う候補日時を確認すると役立ちます。既に面談予定が決まっている場合は追加確認は不要です。", "提案先との面談ができる候補日時はありますか？ 既に予定が決まっていれば、その予定を確認してください。");
     missing(source, "稼働開始", 83, "案件の開始日と合わせるため、稼働を始められる日を確認すると役立ちます。", "いつから稼働できますか？ 決まっている場合は年月日を教えてもらえますか？");
+    }
 
+    if(section!=="basic"){
     const workHistory = value(source, "営業経験・職歴");
-    if (hasValue(workHistory) && !/\d+\s*(?:年|[ヶかカ]月)|未経験|経験なし|職歴なし/.test(workHistory)) {
+    if (hasValue(workHistory) && !hasValue(value(source,"職歴の期間")) && !/\d+\s*(?:年|[ヶかカ]月)|未経験|経験なし|職歴なし/.test(workHistory)) {
       add(source, "営業経験・職歴", 72, `${quote(workHistory)}からは経験した期間が読み取れません。`, "その業務をいつからいつまで担当し、どんな商材・相手に対応しましたか？");
     } else if (!hasValue(workHistory)) {
       missing(source, "営業経験・職歴", 71, "提案時に説明する経験・担当業務を確認すると役立ちます。", "これまでの担当業務と経験期間を教えてもらえますか？ 未経験の場合はそのまま記録できます。");
     }
+    if(section==="career")missing(source,"担当業務",73,"会社・商材だけでは担当した業務の内容は確定しません。","この職歴では、実際にどの業務を担当しましたか？");
+    }
+    if(section!=="career"){
     missing(source, "週の稼働日数", 70, "案件の必要稼働日数と合わせるために確認すると役立ちます。", "週に何日程度稼働できますか？");
     missing(source, "PC環境", 66, "業務に使える端末・OSを確認すると、案件の利用ツールと照合できます。", "業務に使うPCとOSは何ですか？ 用意できていない場合はその状況を教えてください。");
     missing(source, "通信環境", 65, "オンライン業務が可能な回線環境を確認すると役立ちます。", "業務をする場所の通信環境はどのような回線ですか？");
     missing(source, "稼働形態", 64, "出社・リモートなどの希望が案件と合うか確認すると役立ちます。", "リモート・出社など、希望する稼働形態はありますか？");
+    }
   }
   if (!profiles.length && context.sources.length) {
     const source = context.sources.find(source => source.kind === "record") ?? context.sources[0];

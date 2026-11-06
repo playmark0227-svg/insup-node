@@ -1,0 +1,8 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Authenticated application server grants one immutable upload destination.
+    // The public browser SDK cannot read or write private agreement images.
+    match /{object=**} { allow read, write: if false; }
+  }
+}

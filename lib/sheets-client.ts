@@ -3,6 +3,7 @@ import { stages, type Activity, type Metric, type Player } from "./node-data.ts"
 import { interviewStringFields, crmOptions, chatOptions, pcOptions, genderOptions, type CandidateProfile } from "./candidate-intake.ts";
 import { validateWritingPreferences, type WritingPreferences } from './on-device-ai.ts';
 import { isFirestoreStorageBackend, type FirestoreStorageBackend } from "./storage-backend.ts";
+import { parseIntroductionV2SnapshotEntries, type IntroductionV2SnapshotEntry } from "./introduction-v2-adapter.ts";
 
 export type SheetPlayer = Player & { sheetNames?: string[] };
 export type Counts = Record<string, Record<string, Partial<Record<Metric, number>>>>;
@@ -29,6 +30,11 @@ export type SheetSnapshot = {
   rewardsFeature?: boolean;
   candidateRegistrationFeature?: boolean;
   monthlyGoalsFeature?: boolean;
+  /** These versioned extensions are advertised only after their backend is ready. */
+  metricGoalsFeature?: true;
+  salesWorkflowFeature?: true;
+  introductionV2Feature?: true;
+  storageEvidenceFeature?: true;
   monthlyGoals?: {playerId:string;month:string;target:number;version:string;updatedAt:string}[];
   // Set when the server could not record this request's activity (busy lock); the input is reported again.
   activityDeferred?: boolean;
@@ -36,6 +42,8 @@ export type SheetSnapshot = {
   writingPreferences?: WritingPreferences;
   intakeFeature?: boolean;
   candidateProfiles?: CandidateProfile[];
+  /** Independent canonical V2 data. Never replace or save it through legacy profiles. */
+  candidateIntroductionV2?: IntroductionV2SnapshotEntry[];
   clients?: ClientEntry[];
   deletionFeature?: boolean;
   deletedCandidates?: DeletedCandidate[];
@@ -55,6 +63,26 @@ export type SheetSnapshot = {
   /** Per-account secret that unlocks this device's encrypted outbox. Memory only. */
   outboxKey?: string;
 };
+
+export const sheetExtensionReadActions = ["readRewards", "readMigrationArchive", "readMetricGoals", "readSalesWorkflow", "readIntroductionV2", "readMatchEvidence", "beginMatchEvidence"] as const;
+export const sheetExtensionMutationActions = ["mutateRewards", "stageMigrationBatch", "applyMigrationItem", "saveMetricGoals", "saveWorkJob", "saveProposalPlan", "recordProposalSent", "saveMatchReport", "saveIntroductionV2", "saveIntroductionSettings", "publishIntroductionV2", "completeMatchEvidence"] as const;
+export type SheetExtensionReadAction = typeof sheetExtensionReadActions[number];
+export type SheetExtensionMutationAction = typeof sheetExtensionMutationActions[number];
+export type SheetExtensionRead = <T>(action: SheetExtensionReadAction, payload?: unknown) => Promise<T>;
+export type SheetExtensionMutation = (action: SheetExtensionMutationAction, payload: unknown, operationId: string) => Promise<void>;
+export function isSheetExtensionReadAction(value: unknown): value is SheetExtensionReadAction {
+  return typeof value === "string" && sheetExtensionReadActions.some(action => action === value);
+}
+/** Capability check only. Owner/admin authorization remains a server decision. */
+export function sheetExtensionMutationEnabled(action: string, snapshot: SheetSnapshot | null | undefined): boolean {
+  const features: Record<SheetExtensionMutationAction, keyof SheetSnapshot> = {
+    mutateRewards: "rewardsFeature", stageMigrationBatch: "migrationFeature", applyMigrationItem: "migrationFeature",
+    saveMetricGoals: "metricGoalsFeature", saveWorkJob: "salesWorkflowFeature", saveProposalPlan: "salesWorkflowFeature",
+    recordProposalSent: "salesWorkflowFeature", saveMatchReport: "salesWorkflowFeature", completeMatchEvidence: "storageEvidenceFeature",
+    saveIntroductionV2: "introductionV2Feature", saveIntroductionSettings: "introductionV2Feature", publishIntroductionV2:"introductionV2Feature",
+  };
+  return !!snapshot?.writesEnabled && Object.hasOwn(features, action) && snapshot[features[action as SheetExtensionMutationAction]] === true;
+}
 export type MutationResult = {
   snapshot: SheetSnapshot;
   credentials?: { id: string; password: string };
@@ -270,6 +298,7 @@ export function assertSnapshot(value: unknown): asserts value is SheetSnapshot {
       !object(value.counts) || typeof value.writesEnabled !== "boolean" ||
       (value.securityFeature !== undefined && typeof value.securityFeature !== "boolean") || (value.workspaceFeature !== undefined && typeof value.workspaceFeature !== "boolean") ||
       ["operationsFeature","monthlyGoalsFeature","teamWorkspaceFeature","candidateRegistrationFeature","migrationFeature","rewardsFeature"].some(key=>value[key]!==undefined&&typeof value[key]!=="boolean") ||
+      ["metricGoalsFeature","salesWorkflowFeature","introductionV2Feature","storageEvidenceFeature"].some(key=>value[key]!==undefined&&value[key]!==true) ||
       !Array.isArray(value.warnings) || value.warnings.some(w => typeof w !== "string") || typeof value.syncedAt !== "string" ||
       value.players.some(p => !object(p) || !strings(p, ["id", "name"]) || !p.id || !Number.isSafeInteger(p.target) || Number(p.target) < 1 ||
         !optionalStrings(p, ["team", "bio", "color"]) || (p.active!==undefined&&typeof p.active!=="boolean") || (p.sheetNames !== undefined && (!Array.isArray(p.sheetNames) || p.sheetNames.some(n => typeof n !== "string")))) ||
@@ -306,6 +335,7 @@ export function assertSnapshot(value: unknown): asserts value is SheetSnapshot {
     const fields=p.fields;
     return interviewStringFields.some(k=>typeof fields[k]!=="string")||!Array.isArray(fields.crmTools)||fields.crmTools.some(v=>!crmOptions.some(o=>o===v))||!Array.isArray(fields.chatTools)||fields.chatTools.some(v=>!chatOptions.some(o=>o===v))||(fields.pcEnvironment!==""&&!pcOptions.some(o=>o===fields.pcEnvironment))||!genderOptions.some(o=>o===fields.gender);
   })||new Set(s.candidateProfiles.map(p=>p.profileId)).size!==s.candidateProfiles.length))invalid("候補者の基本情報の形式または閲覧権限を確認できませんでした。");
+  if(s.candidateIntroductionV2!==undefined&&(s.introductionV2Feature!==true||!parseIntroductionV2SnapshotEntries(s.candidateIntroductionV2,s.records||[],s.self)))invalid("新しい候補者情報の形式または閲覧権限を確認できませんでした。");
   if (s.deletedCandidates !== undefined && (!Array.isArray(s.deletedCandidates) || s.deletedCandidates.some(r => !object(r) || !strings(r,["changeId","playerId","candidateName","deletedAt"]) || !r.changeId || !r.candidateName || !Array.isArray(r.companies) || r.companies.some(v => typeof v !== "string") || !Number.isSafeInteger(r.recordCount) || Number(r.recordCount)<1 || (s.self.role==="player"&&r.playerId!==s.self.playerId)))) invalid("削除済み候補者の形式または閲覧権限を確認できませんでした。");
   if (s.destination !== undefined && (!object(s.destination) || s.self.role !== "admin" || typeof s.destination.title !== "string" ||
       ![s.destination.matchingUrl, s.destination.kpiUrl].every(url => typeof url === "string" && /^https:\/\/docs\.google\.com\/spreadsheets\/d\/[A-Za-z0-9_-]+\/edit(?:\?gid=\d+(?:#gid=\d+)?|#gid=\d+)$/.test(url)))) {

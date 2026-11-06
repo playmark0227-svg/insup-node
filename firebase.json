@@ -3,6 +3,7 @@
     "rules": "firebase/firestore.rules",
     "indexes": "firebase/firestore.indexes.json"
   },
+  "storage": {"rules": "firebase/storage.rules"},
   "emulators": {
     "firestore": {"host": "127.0.0.1", "port": 8087},
     "ui": {"enabled": false},

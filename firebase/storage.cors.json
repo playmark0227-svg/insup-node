@@ -1,0 +1,8 @@
+[
+  {
+    "origin": ["https://insupnode.vifight.com", "https://playmark0227-svg.github.io"],
+    "method": ["PUT"],
+    "responseHeader": ["Content-Type", "Range"],
+    "maxAgeSeconds": 300
+  }
+]

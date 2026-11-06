@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { persistPendingSave, readPendingSaves, removePendingSave, replacePendingSave, pendingSaveResources, unlockPendingSaves, lockPendingSaves, purgeExpiredPendingSaves, PENDING_SAVE_TTL_MS, type PendingSave } from "../lib/pending-saves.ts";
 import type { SheetSnapshot } from "../lib/sheets-client.ts";
+import {blankIntroductionV2Profile,blankIntroductionCareer,parseIntroductionV2Profile} from "../lib/introduction-v2.ts";
 const endpoint = "https://script.google.com/macros/s/TEST_OUTBOX_ENDPOINT_123456/exec";
 const input = (): PendingSave => ({operationId:randomUUID(),action:"updateRecord",label:"秘密の候補者の変更",details:["メモ：非公開の原文"],payload:{recordId:"ROW-one",changes:{13:"非公開の原文"}},createdAt:Date.now(),attempted:false});
 const read = <T>(request: IDBRequest<T>):Promise<T> => new Promise((resolve,reject)=>{request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(request.error);});
@@ -52,6 +53,33 @@ test("invalid local inputs are rejected before being accepted as durable saves",
     await assert.rejects(persistPendingSave(endpoint,account,{...input(),...change} as PendingSave));
   }
   assert.deepEqual(await readPendingSaves(endpoint,account),[]);
+});
+
+test("long valid V2 drafts encrypt and reload completely without exposing raw candidate facts or weakening account isolation",async()=>{
+ const account=unlocked(randomUUID()),profile=blankIntroductionV2Profile("架空の長文確認候補者");
+ profile.careers=Array.from({length:6},(_,index)=>({...blankIntroductionCareer(`fictional-employer-${index}`),company:`架空の会社${index}`,period:"2020/4〜2022/3",duties:["架空の記録確認を担当。".repeat(400)],achievements:["本人申告：月間8件の架空実績。".repeat(50)]}));
+ profile.internalMemo="社内だけで保管する架空メモ。".repeat(200)+"末尾の原文も保存して復元する";
+ assert.ok(parseIntroductionV2Profile(profile));
+ const save:PendingSave={...input(),action:"saveIntroductionV2",payload:{recordId:"fictional-long-record-000001",profile,expectedVersion:""}};
+ const payloadLength=JSON.stringify(save.payload).length;assert.ok(payloadLength>32768);assert.ok(payloadLength<100000);
+ await persistPendingSave(endpoint,account,save);
+ const db=await open(),rawRows=await read(db.transaction("saves").objectStore("saves").getAll()),raw=rawRows.find(row=>row.id.endsWith(save.operationId));db.close();
+ assert.ok(raw.ciphertext.byteLength>32768);assert.doesNotMatch(JSON.stringify(raw),/架空|末尾|saveIntroductionV2|recordId|profile/);
+ const restart=await import(`../lib/pending-saves.ts?long-reload=${randomUUID()}`);
+ await assert.rejects(restart.readPendingSaves(endpoint,account),/ログインが必要/);unlocked(account,restart);
+ const restored=await restart.readPendingSaves(endpoint,account);assert.deepEqual(restored,[save]);
+ assert.deepEqual(await restart.readPendingSaves(endpoint,`${account}-other`),[]);assert.deepEqual(await restart.readPendingSaves(endpoint+"other",account),[]);
+ const attempted={...restored[0],attempted:true};await restart.persistPendingSave(endpoint,account,attempted);
+ const later=await import(`../lib/pending-saves.ts?long-attempted=${randomUUID()}`);unlocked(account,later);assert.deepEqual(await later.readPendingSaves(endpoint,account),[attempted]);
+ await later.removePendingSave(endpoint,account,save.operationId);assert.deepEqual(await readPendingSaves(endpoint,account),[]);
+});
+
+test("only V2 draft payloads have the larger outbox limit and oversized drafts are still rejected before storage",async()=>{
+ const account=unlocked(randomUUID()),payload={recordId:"fictional-limit-record",text:"架空の入力".repeat(7000)};
+ assert.ok(JSON.stringify(payload).length>32768);
+ for(const action of ["updateRecord","saveCandidateProfile","saveIntroductionSettings","saveWorkJob","completeMatchEvidence"]){await assert.rejects(persistPendingSave(endpoint,account,{...input(),action,payload}));}
+ await assert.rejects(persistPendingSave(endpoint,account,{...input(),action:"saveIntroductionV2",payload:{text:"x".repeat(400001)}}));
+ assert.deepEqual(await readPendingSaves(endpoint,account),[]);
 });
 
 test("related records and shared profiles are reserved together while independent candidates remain writable", () => {

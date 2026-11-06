@@ -4,19 +4,23 @@ import {Dialog,DialogContent,DialogDescription,DialogHeader,DialogTitle} from ".
 import {linkedCandidateProfile,type CandidateProfile} from "@/lib/candidate-intake";
 import {isUncertainWrite,type CandidateRecord} from "@/lib/sheets-client";
 import {parseTeamWorkspace,teamCommentsFor,teamJobStatuses,type TeamCandidatePublication,type TeamComment,type TeamJob,type TeamJobStatus,type TeamWorkspaceData,type SaveTeamJobInput} from "@/lib/team-workspace";
+import {composeIntroductionV2,parseIntroductionV2Profile,parseIntroductionV2Settings} from "@/lib/introduction-v2";
+import type {IntroductionV2SnapshotEntry} from "@/lib/introduction-v2-adapter";
 import "./team-workspace.css";
 
-export type TeamMutationAction="publishTeamCandidate"|"unpublishTeamCandidate"|"saveTeamComment"|"saveTeamJob";
+export type TeamMutationAction="publishIntroductionV2"|"publishTeamCandidate"|"unpublishTeamCandidate"|"saveTeamComment"|"saveTeamJob";
 export type TeamWorkspaceProps={
  identityKey:string;admin:boolean;selfId:string;active:boolean;canWrite:boolean;enabled:boolean;
  records:CandidateRecord[];profiles:CandidateProfile[];
+ introductionV2Enabled?:boolean;introductions?:IntroductionV2SnapshotEntry[];
+ onReadIntroductionV2?:(payload:{recordId:string})=>Promise<unknown>;onComposeIntroduction?:(recordId:string)=>void;
  onRead:()=>Promise<TeamWorkspaceData>;
  onSave:(action:TeamMutationAction,payload:unknown,operationId:string)=>Promise<void>;
  onDirtyChange?:(dirty:boolean)=>void;onPendingChange?:(pending:boolean)=>void;
  onOpenRecord?:(recordId:string)=>void;onPropose?:(job:TeamJob)=>void;
 };
 type CommentDraft={body:string;parentId:string;mentionIds:string[];mentionLabels:Record<string,string>};
-type SourcePreview={recordId:string;rowVersion:string;profileVersion:string;profileId:string;ownerId:string;candidateName:string;introduction:string;publicationId?:string;version?:string;published?:boolean};
+type SourcePreview={kind?:"v2"|"legacy";introductionVersion?:string;settingsVersion?:string;observedSnapshotVersion?:string;recordIds?:string[];reloadRequired?:boolean;recordId:string;rowVersion:string;profileVersion:string;profileId:string;ownerId:string;candidateName:string;introduction:string;publicationId?:string;version?:string;published?:boolean};
 type JobDraft=SaveTeamJobInput&{baseline:string};
 type PendingWrite={action:TeamMutationAction;payload:unknown;operationId:string;label:string;onCommitted:()=>void};
 type PendingState={label:string;inFlight:boolean;uncertain:boolean};
@@ -34,7 +38,7 @@ const noticeError=(error:unknown,fallback:string)=>error instanceof Error?error.
 /** A login change remounts every draft and discards late responses from the old session. */
 export function TeamWorkspace(props:TeamWorkspaceProps){return <TeamWorkspaceSession key={props.identityKey} {...props}/>;}
 
-export function TeamWorkspaceSession({identityKey,admin,selfId,active,canWrite,enabled,records,profiles,onRead,onSave,onDirtyChange,onPendingChange,onOpenRecord,onPropose}:TeamWorkspaceProps){
+export function TeamWorkspaceSession({identityKey,admin,selfId,active,canWrite,enabled,records,profiles,introductionV2Enabled=false,introductions=[],onReadIntroductionV2,onComposeIntroduction,onRead,onSave,onDirtyChange,onPendingChange,onOpenRecord,onPropose}:TeamWorkspaceProps){
  const [data,setData]=useState<TeamWorkspaceData|null>(null),[loading,setLoading]=useState(false),[readError,setReadError]=useState(""),[saveError,setSaveError]=useState(""),[notice,setNotice]=useState(""),[readAt,setReadAt]=useState("");
  const [tab,setTab]=useState<"candidates"|"jobs">("candidates"),[search,setSearch]=useState(""),[candidateView,setCandidateView]=useState<"all"|"mentions"|"withdrawn">("all"),[jobStatus,setJobStatus]=useState<TeamJobStatus|"all">("open");
  const [selectedCandidate,setSelectedCandidate]=useState<string|null>(null),[selectedJob,setSelectedJob]=useState<string|null>(null),[jobDraft,setJobDraft]=useState<JobDraft|null>(null),[jobEditorOpen,setJobEditorOpen]=useState(false),[discardJobConfirm,setDiscardJobConfirm]=useState(false);
@@ -42,13 +46,13 @@ export function TeamWorkspaceSession({identityKey,admin,selfId,active,canWrite,e
  const [publishOpen,setPublishOpen]=useState(false),[sourcePreview,setSourcePreview]=useState<SourcePreview|null>(null),[publicationConfirmed,setPublicationConfirmed]=useState(false),[withdrawConfirm,setWithdrawConfirm]=useState(false);
  const [commentDrafts,setCommentDrafts]=useState<Record<string,CommentDraft>>({}),[deleteComment,setDeleteComment]=useState<string|null>(null),[seenMentions,setSeenMentions]=useState<Set<string>>(()=>new Set());
  const [copiedUnavailableDraft,setCopiedUnavailableDraft]=useState<string|null>(null),[discardUnavailableDraft,setDiscardUnavailableDraft]=useState<string|null>(null),[recoveryError,setRecoveryError]=useState("");
- const [pendingState,setPendingState]=useState<PendingState|null>(null);
+ const [pendingState,setPendingState]=useState<PendingState|null>(null),[sourceLoading,setSourceLoading]=useState(false);const sourceSequence=useRef(0);
  const alive=useRef(true),session=useRef(identityKey),readSequence=useRef(0),reading=useRef(false),readEpoch=useRef(0),queuedRefresh=useRef(false),pending=useRef<PendingWrite|null>(null),writing=useRef(false),dataRef=useRef(data);
  const readLatest=useRef(onRead),saveLatest=useRef(onSave),dirtyListener=useRef(onDirtyChange),pendingListener=useRef(onPendingChange),pollBlocked=useRef(false);
  readLatest.current=onRead;saveLatest.current=onSave;dirtyListener.current=onDirtyChange;pendingListener.current=onPendingChange;session.current=identityKey;dataRef.current=data;
  const commentDirty=Object.values(commentDrafts).some(draft=>!!draft.body.trim()||draft.mentionIds.length>0);
  const jobDirty=!!jobDraft&&JSON.stringify(jobValues(jobDraft))!==jobDraft.baseline;
- const dirty=commentDirty||jobDirty||!!sourcePreview;
+ const dirty=commentDirty||jobDirty||!!sourcePreview||sourceLoading;
  const blocked=!!pendingState;
  pollBlocked.current=dirty||blocked||publishOpen||jobEditorOpen;
  useEffect(()=>{alive.current=true;return()=>{alive.current=false;readSequence.current++;dirtyListener.current?.(false);pendingListener.current?.(false);};},[]);
@@ -84,7 +88,7 @@ export function TeamWorkspaceSession({identityKey,admin,selfId,active,canWrite,e
    writing.current=false;const uncertain=isUncertainWrite(error);
    if(uncertain)setPendingState({label:job.label,inFlight:false,uncertain:true});else{pending.current=null;setPendingState(null);}
    setSaveError(noticeError(error,"保存できませんでした。入力は保持しています。"));
-   if(!uncertain&&error&&typeof error==="object"&&"code" in error&&error.code==="CONFLICT"){readEpoch.current++;void refreshLatest.current(true);}
+   if(!uncertain&&error&&typeof error==="object"&&"code" in error&&error.code==="CONFLICT"){if(job.action==="publishIntroductionV2"){setSourcePreview(previous=>previous?{...previous,reloadRequired:true}:previous);setPublicationConfirmed(false);}readEpoch.current++;void refreshLatest.current(true);}
   }
  }
  function mutate(action:TeamMutationAction,payload:unknown,label:string,onCommitted:()=>void){
@@ -92,20 +96,28 @@ export function TeamWorkspaceSession({identityKey,admin,selfId,active,canWrite,e
   void submit({action,payload:structuredClone(payload),operationId:crypto.randomUUID(),label,onCommitted});
  }
 
- const sources=records.flatMap(record=>{
+ const sources=records.flatMap<{record:CandidateRecord;profile:CandidateProfile|undefined;v2:IntroductionV2SnapshotEntry|undefined}>(record=>{
   if(!admin&&record.playerId!==selfId||data&&!data.players.some(player=>player.id===record.playerId&&player.role==="player"))return [];
+  const v2=introductionV2Enabled?introductions.find(item=>item.playerId===record.playerId&&item.recordIds.includes(record.recordId)&&item.draftKey===(record.profileId||record.recordId)):undefined;
   const profile=linkedCandidateProfile(profiles,record);
-  return profile?.introduction.trim()?[{record,profile}]:[];
- }).filter((source,index,list)=>list.findIndex(item=>item.profile.profileId===source.profile.profileId&&item.record.playerId===source.record.playerId)===index);
- function previewSource(recordId:string){
-  const source=sources.find(item=>item.record.recordId===recordId);setPublicationConfirmed(false);
-  if(!source){setSourcePreview(null);return;}
-  const existing=data?.candidates.find(item=>item.sourceProfileId===source.profile.profileId&&item.ownerId===source.record.playerId);
-  setSourcePreview({recordId,rowVersion:source.record.rowVersion,profileVersion:source.profile.version,profileId:source.profile.profileId,ownerId:source.record.playerId,candidateName:source.record.candidateName,introduction:source.profile.introduction,...(existing?{publicationId:existing.publicationId,version:existing.version,published:existing.published}:{})});
+  return v2?[{record,profile,v2}]:profile?.introduction.trim()?[{record,profile,v2:undefined}]:[];
+ }).filter((source,index,list)=>list.findIndex(item=>(item.v2?.draftKey||item.profile?.profileId)===(source.v2?.draftKey||source.profile?.profileId)&&item.record.playerId===source.record.playerId)===index);
+ const findSourcePublication=(preview:SourcePreview)=>data?.candidates.find(item=>item.ownerId===preview.ownerId&&(item.sourceProfileId===preview.profileId||preview.kind==="v2"&&!!item.sourceRecordId&&!!preview.recordIds?.includes(item.sourceRecordId)));
+ async function previewSource(recordId:string){
+  const source=sources.find(item=>item.record.recordId===recordId),serial=++sourceSequence.current,captured=identityKey;setPublicationConfirmed(false);setSaveError("");
+  if(!source){setSourcePreview(null);setSourceLoading(false);return;}
+  if(source.v2){
+   setSourceLoading(true);setSourcePreview(null);
+   try{if(!onReadIntroductionV2)throw new Error("紹介文V2の確認機能を更新してください。");const raw=await onReadIntroductionV2({recordId});if(!raw||typeof raw!=="object")throw new Error("最新の紹介文を取得できませんでした。");const response=raw as Record<string,unknown>,profile=parseIntroductionV2Profile(response.profile),settings=parseIntroductionV2Settings(response.settings);if(response.feature!==true||response.recordId!==recordId||response.draftKey!==source.v2.draftKey||response.playerId!==source.record.playerId||!profile||!settings||typeof response.version!=="string"||!response.version)throw new Error("保存済みの紹介文と担当者を確認できませんでした。");const document=composeIntroductionV2(profile,settings),introduction=`${document.headingLine}\n\n${document.internalBody}`;if(document.checks.some(check=>check.severity==="block"&&check.code!=="document-length")||Array.from(introduction).length>20000)throw new Error("共有前に紹介文V2の確認事項を修正してください。本文は削除していません。");if(!alive.current||session.current!==captured||serial!==sourceSequence.current)return;const preview:SourcePreview={kind:"v2",recordId,rowVersion:source.record.rowVersion,profileVersion:response.version,profileId:source.v2.draftKey,ownerId:source.record.playerId,candidateName:source.record.candidateName,introduction,introductionVersion:response.version,settingsVersion:settings.version==="initial"?"":settings.version,observedSnapshotVersion:source.v2.version,recordIds:source.v2.recordIds};const existing=findSourcePublication(preview);setSourcePreview({...preview,...(existing?{publicationId:existing.publicationId,version:existing.version,published:existing.published}:{})});}
+   catch(error){if(alive.current&&session.current===captured&&serial===sourceSequence.current)setSaveError(noticeError(error,"最新の紹介文を確認できませんでした。"));}
+   finally{if(alive.current&&session.current===captured&&serial===sourceSequence.current)setSourceLoading(false);}return;
+  }
+  if(!source.profile)return;const existing=data?.candidates.find(item=>item.sourceProfileId===source.profile!.profileId&&item.ownerId===source.record.playerId);
+  setSourcePreview({kind:"legacy",recordId,rowVersion:source.record.rowVersion,profileVersion:source.profile.version,profileId:source.profile.profileId,ownerId:source.record.playerId,candidateName:source.record.candidateName,introduction:source.profile.introduction,...(existing?{publicationId:existing.publicationId,version:existing.version,published:existing.published}:{})});
  }
  const sourceCurrent=sourcePreview?sources.find(source=>source.record.recordId===sourcePreview.recordId):undefined;
- const staleSource=!!sourcePreview&&(!sourceCurrent||sourceCurrent.record.rowVersion!==sourcePreview.rowVersion||sourceCurrent.profile.version!==sourcePreview.profileVersion||sourceCurrent.profile.introduction!==sourcePreview.introduction||sourceCurrent.record.candidateName!==sourcePreview.candidateName);
- const latestPublication=sourcePreview?data?.candidates.find(candidate=>candidate.sourceProfileId===sourcePreview.profileId&&candidate.ownerId===sourcePreview.ownerId):undefined;
+ const staleSource=!!sourcePreview&&(!sourceCurrent||sourceCurrent.record.rowVersion!==sourcePreview.rowVersion||sourceCurrent.record.candidateName!==sourcePreview.candidateName||(sourcePreview.kind==="v2"?!sourceCurrent.v2||![sourcePreview.observedSnapshotVersion,sourcePreview.introductionVersion].includes(sourceCurrent.v2.version):sourceCurrent.profile?.version!==sourcePreview.profileVersion||sourceCurrent.profile?.introduction!==sourcePreview.introduction)||!!sourcePreview.reloadRequired);
+ const latestPublication=sourcePreview?findSourcePublication(sourcePreview):undefined;
  const stalePublication=!!sourcePreview&&!!data&&(sourcePreview.publicationId!==latestPublication?.publicationId||sourcePreview.version!==latestPublication?.version||sourcePreview.published!==latestPublication?.published);
  const stalePreview=staleSource||stalePublication;
  const ownerName=(id:string)=>data?.players.find(player=>player.id===id)?.name||"以前の社内メンバー";
@@ -143,7 +155,7 @@ export function TeamWorkspaceSession({identityKey,admin,selfId,active,canWrite,e
  function publish(){
   if(!sourcePreview||!publicationConfirmed||stalePreview)return;
   const preview=sourcePreview;
-  mutate("publishTeamCandidate",{recordId:preview.recordId,rowVersion:preview.rowVersion,profileVersion:preview.profileVersion,...(preview.publicationId?{publicationId:preview.publicationId,version:preview.version}:{}),confirmPublication:true},`${preview.candidateName}の紹介文を社内共有`,()=>{setPublishOpen(false);setSourcePreview(null);setPublicationConfirmed(false);});
+  mutate(preview.kind==="v2"?"publishIntroductionV2":"publishTeamCandidate",{recordId:preview.recordId,rowVersion:preview.rowVersion,...(preview.kind==="v2"?{introductionVersion:preview.introductionVersion,settingsVersion:preview.settingsVersion}:{profileVersion:preview.profileVersion}),...(preview.publicationId?{publicationId:preview.publicationId,version:preview.version}:{}),confirmPublication:true},`${preview.candidateName}の紹介文を社内共有`,()=>{setPublishOpen(false);setSourcePreview(null);setPublicationConfirmed(false);});
  }
  function postComment(){
   if(!publication?.published||!composer.body.trim()||unavailableMentions.length)return;
@@ -182,10 +194,11 @@ export function TeamWorkspaceSession({identityKey,admin,selfId,active,canWrite,e
   <footer className="team-workspace-foot"><span>{readAt?`最終確認 ${dateLabel(readAt)}`:"まだ共有を取得していません"}</span><span>{dirty?"下書きを保持しています。保存前の入力があります。":"編集中でない間は30秒ごとに共有を確認"}</span></footer>
 
   {active&&publishOpen&&<Dialog open onOpenChange={open=>{if(!open)setPublishOpen(false);}}><DialogContent presentation="panel" className="team-panel"><DialogHeader><DialogTitle>保存済みの紹介文を社内共有</DialogTitle><DialogDescription>氏名と紹介文だけを、有効な社内メンバー全員へ共有します。内容を確認してから公開してください。</DialogDescription></DialogHeader><div className="team-panel-body">
-   <label>共有する候補者<select aria-label="社内共有する候補者" disabled={blocked} value={sourcePreview?.recordId||""} onChange={event=>previewSource(event.target.value)}><option value="">保存済みの紹介文がある候補者を選択</option>{sources.map(source=><option key={source.record.recordId} value={source.record.recordId}>{source.record.candidateName}{admin?` · ${ownerName(source.record.playerId)}`:""}</option>)}</select></label>
+   <label>共有する候補者<select aria-label="社内共有する候補者" disabled={blocked||sourceLoading} value={sourcePreview?.recordId||""} onChange={event=>previewSource(event.target.value)}><option value="">保存済みの紹介文がある候補者を選択</option>{sources.map(source=><option key={source.record.recordId} value={source.record.recordId}>{source.record.candidateName}{source.v2?" · 紹介文V2":" · 旧形式"}{admin?` · ${ownerName(source.record.playerId)}`:""}</option>)}</select></label>
+   {sourceLoading&&<p className="team-helper" role="status">最新の保存済み紹介文と共有設定で本文を確認しています…</p>}
    {!sources.length&&<p className="team-helper">{admin?"閲覧できる候補者":"あなたの候補者"}に保存済みの紹介文がありません。候補者の「基本情報・紹介文」で文章を確認・保存してから共有してください。</p>}
-   {sourcePreview&&<><article className="team-publication-preview" aria-label="社内共有する本文の確認"><h3>{sourcePreview.candidateName}</h3><div className="team-prose">{sourcePreview.introduction}</div></article><p className="team-helper">保存済み紹介文の写しを共有します。以後の基本情報の修正は、自動ではこの共有文へ反映しません。</p>{stalePreview&&<div className="team-error" role="alert"><p>{staleSource?"元の紹介文が更新されています。最新の内容を確認し直してください。":"社内の共有状態が更新されています。現在の本文と共有状態を確認し直してください。"}</p><button type="button" className="secondary-button" disabled={blocked} onClick={()=>previewSource(sourcePreview.recordId)}>{staleSource?"最新の紹介文で確認し直す":"最新の共有状態で確認し直す"}</button></div>}<label className="team-confirm-label"><input type="checkbox" checked={publicationConfirmed} disabled={blocked||stalePreview} onChange={event=>setPublicationConfirmed(event.target.checked)}/><span>この氏名と紹介文を、有効な社内メンバー全員へ公開することを確認しました。</span></label></>}
-  </div><div className="team-panel-actions"><button type="button" className="secondary-button" onClick={()=>setPublishOpen(false)}>閉じる・下書きを保持</button><button type="button" className="primary-button" disabled={!canWrite||blocked||!sourcePreview||!publicationConfirmed||stalePreview} onClick={publish}>{blocked?"保存を確認中…":sourcePreview?.publicationId?"確認した内容で共有を更新":"確認した内容を社内共有"}</button></div>{sourcePreview&&!blocked&&<button type="button" className="text-button" onClick={()=>{setSourcePreview(null);setPublicationConfirmed(false);setPublishOpen(false);}}>共有の下書きを破棄する</button>}</DialogContent></Dialog>}
+   {sourcePreview&&<><article className="team-publication-preview" aria-label="社内共有する本文の確認"><h3>{sourcePreview.candidateName}</h3><div className="team-prose">{sourcePreview.introduction}</div></article><p className="team-helper">{sourcePreview.kind==="v2"?"紹介文V2の保存済み原文から所定の書式で組み立てた本文です。非公開メモは含みません。":"旧形式の保存済み紹介文です。"}保存済み紹介文の写しを共有します。以後の基本情報の修正は、自動ではこの共有文へ反映しません。</p>{sourcePreview.kind!=="v2"&&introductionV2Enabled&&onComposeIntroduction&&<button type="button" className="secondary-button" disabled={blocked} onClick={()=>{setSourcePreview(null);setPublishOpen(false);onComposeIntroduction(sourcePreview.recordId);}}>紹介文V2で確認・保存する</button>}{stalePreview&&<div className="team-error" role="alert"><p>{staleSource?"元の紹介文が更新されています。最新の内容を確認し直してください。":"社内の共有状態が更新されています。現在の本文と共有状態を確認し直してください。"}</p><button type="button" className="secondary-button" disabled={blocked} onClick={()=>previewSource(sourcePreview.recordId)}>{staleSource?"最新の紹介文で確認し直す":"最新の共有状態で確認し直す"}</button></div>}<label className="team-confirm-label"><input type="checkbox" checked={publicationConfirmed} disabled={blocked||stalePreview} onChange={event=>setPublicationConfirmed(event.target.checked)}/><span>この氏名と紹介文を、有効な社内メンバー全員へ公開することを確認しました。</span></label></>}
+  </div><div className="team-panel-actions"><button type="button" className="secondary-button" onClick={()=>setPublishOpen(false)}>閉じる・下書きを保持</button><button type="button" className="primary-button" disabled={!canWrite||blocked||sourceLoading||!sourcePreview||!publicationConfirmed||stalePreview} onClick={publish}>{blocked?"保存を確認中…":sourcePreview?.publicationId?"確認した内容で共有を更新":"確認した内容を社内共有"}</button></div>{sourcePreview&&!blocked&&<button type="button" className="text-button" onClick={()=>{setSourcePreview(null);setPublicationConfirmed(false);setPublishOpen(false);}}>共有の下書きを破棄する</button>}</DialogContent></Dialog>}
 
   {active&&publication&&<Dialog open onOpenChange={open=>{if(!open)setSelectedCandidate(null);}}><DialogContent presentation="panel" className="team-panel"><DialogHeader><DialogTitle>{publication.candidateName}の社内共有</DialogTitle><DialogDescription>{ownerName(publication.ownerId)} · {publication.published?"共有中":"共有取り下げ"} · 更新 {dateLabel(publication.updatedAt)}</DialogDescription></DialogHeader><div className="team-panel-body">
    <article className="team-publication-preview"><h3>共有した紹介文</h3><div className="team-prose">{publication.introduction}</div></article>

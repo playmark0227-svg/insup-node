@@ -5,7 +5,7 @@ import { persistPendingSave, readPendingSaves, removePendingSave, replacePending
 import { correctionFields, correctedPayload, mutationDateErrors, type SaveCorrectionDraft } from "../lib/save-correction";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { initialPlayers, makeDemoActivities, type Activity } from "../lib/node-data";
-import { assertSnapshot, assertMutationReceipt, isUncertainWrite, sheetRequest, validateEndpoint, SheetApiError, type MutationResult, type MutationReceipt, type SheetSnapshot, type SheetPlayer, type InterviewAdvice, type InterviewAdviceState } from "../lib/sheets-client";
+import { assertSnapshot, assertMutationReceipt, isUncertainWrite, sheetRequest, validateEndpoint, SheetApiError, sheetExtensionMutationActions, isSheetExtensionReadAction, sheetExtensionMutationEnabled, type SheetExtensionReadAction, type SheetExtensionMutationAction, type MutationResult, type MutationReceipt, type SheetSnapshot, type SheetPlayer, type InterviewAdvice, type InterviewAdviceState } from "../lib/sheets-client";
 import { matchingFields } from "../lib/management-data";
 import { interviewFieldLabels, interviewStringFields } from "../lib/candidate-intake";
 import { assertWritingKitState, validateWritingPreferences, type WritingKitState, type WritingPreferences, type WritingStyle } from "../lib/writing-ai";
@@ -26,8 +26,8 @@ export type BackgroundSaveState = {
   details: string[]; error: string; uncertain: boolean; changeId?: string; intakeInput?: boolean; refreshing?: boolean; localSaved?: boolean; pendingCount?: number; editable?: boolean; waitingForConnection?: boolean;
 };
 type BackgroundJob = { state: BackgroundSaveState; payload: unknown; endpoint: string; token: string; generation: number; account: string; savedInput: PendingSave; resources: string[] };
-const extensionActions=new Set(["mutateRewards","stageMigrationBatch","applyMigrationItem"]);
-const backgroundActions = new Set(["mutateRewards","stageMigrationBatch","applyMigrationItem","saveCandidateProfile", "saveClient", "deleteCandidate", "updateRecord", "createCandidate", "cancelAchievement", "restoreChange", "saveActivity", "updateProfile", "updateStatus", "saveManagementRow", "saveInterviewReview"]);
+const extensionActions=new Set<string>(sheetExtensionMutationActions);
+const backgroundActions = new Set([...sheetExtensionMutationActions,"saveCandidateProfile", "saveClient", "deleteCandidate", "updateRecord", "createCandidate", "cancelAchievement", "restoreChange", "saveActivity", "updateProfile", "updateStatus", "saveManagementRow", "saveInterviewReview"]);
 // An open dialog or a focused field: background work must not change what someone is editing.
 const editing = () => typeof document !== "undefined" && !!(document.querySelector('[role="dialog"], [role="alertdialog"]') || document.activeElement?.matches('input, textarea, select, [contenteditable="true"]'));
 const readStorage = (storage: Storage, key: string) => { try { return storage.getItem(key); } catch { return null; } };
@@ -733,14 +733,15 @@ export function useSheetsConnection() {
     finally{if(isCurrent(teamGeneration)){mutationRunning.current=false;setBusy(false);resumeBackgroundLatest.current();}}
   };
 
-  const readExtension=async<T,>(action:"readRewards"|"readMigrationArchive",payload:unknown={}):Promise<T>=>{
+  const readExtension=async<T,>(action:SheetExtensionReadAction,payload:unknown={}):Promise<T>=>{
     if(!teamToken||!snapshot||!isCurrent(teamGeneration)||token.current!==teamToken)throw new SheetApiError("STALE_SESSION","ログイン状態が変わりました。画面を開き直してください。");
+    if(!isSheetExtensionReadAction(action))throw new SheetApiError("INVALID_ACTION","連携データの取得操作を確認してください。");
     try{const result=await sheetRequest<T>(endpoint,action,payload,{token:teamToken});if(!isCurrent(teamGeneration)||token.current!==teamToken)throw new SheetApiError("STALE_SESSION","ログイン状態が変わりました。");return result;}
     catch(error){if(isCurrent(teamGeneration)&&isExpired(error))expire(error);throw error;}
   };
-  const mutateExtension=async(action:"mutateRewards"|"stageMigrationBatch"|"applyMigrationItem",payload:unknown,operationId:string):Promise<void>=>{
+  const mutateExtension=async(action:SheetExtensionMutationAction,payload:unknown,operationId:string):Promise<void>=>{
     if(!teamToken||!snapshot||!isCurrent(teamGeneration)||token.current!==teamToken)throw new SheetApiError("STALE_SESSION","ログイン状態が変わりました。画面を開き直してください。");
-    if(!latestSnapshot.current?.writesEnabled||!(action==="mutateRewards"?latestSnapshot.current.rewardsFeature:latestSnapshot.current.migrationFeature))throw new SheetApiError("READ_ONLY","連携が更新されていないか、現在は閲覧のみです。");
+    if(!sheetExtensionMutationEnabled(action,latestSnapshot.current))throw new SheetApiError("READ_ONLY","連携が更新されていないか、現在は閲覧のみです。");
     if(mutationRunning.current||loginRunning.current)throw new SheetApiError("MUTATION_PENDING","右上の保存結果を確認してから操作してください。");
     await ensureOutbox();if(!isCurrent(teamGeneration)||token.current!==teamToken)throw new SheetApiError("STALE_SESSION","ログイン状態が変わりました。");
     const queued=backgroundQueue.current.find(job=>job.state.operationId===operationId);
@@ -775,7 +776,7 @@ export function useSheetsConnection() {
 }
 
 function saveLabel(action: string) {
-  return ({mutateRewards:"ポイント・特典の保存",stageMigrationBatch:"過去データの原文保管",applyMigrationItem:"過去データの登録",saveCandidateProfile:"候補者の基本情報",saveClient:"取引先の登録・編集",deleteCandidate:"候補者・提案の削除",updateRecord:"候補者の変更",createCandidate:"候補者の登録",cancelAchievement:"成果の取り消し",restoreChange:"変更の復元",saveActivity:"成果の登録",updateProfile:"プロフィール",updateStatus:"進捗の変更",saveManagementRow:"業務管理表",saveInterviewReview:"面談の振り返り"} as Record<string,string>)[action] || "変更";
+  return ({publishIntroductionV2:"紹介文を社内共有",saveMetricGoals:"月別・工程別目標の保存",saveWorkJob:"募集案件の保存",saveProposalPlan:"提案予定の保存",recordProposalSent:"提案送付の記録",saveMatchReport:"マッチング報告の保存",completeMatchEvidence:"合意確認資料の保存",saveIntroductionV2:"候補者の紹介文・確認事項",saveIntroductionSettings:"紹介文の共有設定",mutateRewards:"ポイント・特典の保存",stageMigrationBatch:"過去データの原文保管",applyMigrationItem:"過去データの登録",saveCandidateProfile:"候補者の基本情報",saveClient:"取引先の登録・編集",deleteCandidate:"候補者・提案の削除",updateRecord:"候補者の変更",createCandidate:"候補者の登録",cancelAchievement:"成果の取り消し",restoreChange:"変更の復元",saveActivity:"成果の登録",updateProfile:"プロフィール",updateStatus:"進捗の変更",saveManagementRow:"業務管理表",saveInterviewReview:"面談の振り返り"} as Record<string,string>)[action] || "変更";
 }
 function saveDetails(action: string, owned: unknown, snapshot: SheetSnapshot): string[] {
   const data = owned as Record<string, unknown>, detail: string[] = [];
