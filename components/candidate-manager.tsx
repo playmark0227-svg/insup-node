@@ -36,7 +36,7 @@ export function useManagementSave(onSave:ManagementMutation,live=true,background
    finally{running.current=false;setBusy(false);}
   }
   pending.current??={action,payload,id:crypto.randomUUID()};running.current=true;setBusy(true);setError("");
-  try{const job=pending.current,result=await onSave(job.action,job.payload,job.id);pending.current=null;setUncertain(false);if(result.changeId)setUndo(result.changeId);toast.success(action==="restoreChange"?"変更を元に戻しました":live?"スプレッドシートに反映しました":"サンプルに反映しました");return true;}
+  try{const job=pending.current,result=await onSave(job.action,job.payload,job.id);pending.current=null;setUncertain(false);if(result.changeId)setUndo(result.changeId);toast.success(action==="restoreChange"?"変更を元に戻しました":live?"変更を保存しました":"サンプルに反映しました");return true;}
   catch(e){const ambiguous=isUncertainWrite(e);setUncertain(ambiguous);if(!ambiguous)pending.current=null;setError(e instanceof Error?e.message:"保存できませんでした。");return false;}
   finally{running.current=false;setBusy(false);}
  }

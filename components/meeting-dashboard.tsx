@@ -130,9 +130,9 @@ export function MeetingDashboard({ players, period, periodLabel, countAt, onRegi
 
   return <section ref={dashboard} tabIndex={-1} onKeyDown={handleKeyDown} className={`meeting-dashboard ${meetingMode ? "is-presenting" : ""}`} aria-label="成果ミーティング" aria-busy={busy}>
     <div className="meeting-toolbar">
-      <div className="meeting-context"><span className="meeting-context-icon"><Presentation size={22}/></span><div><h2>成果ミーティング</h2><p>{players.length}名<span>·</span>{live ? "スプレッドシートの実績" : "サンプル実績"}{live && <><span>·</span><SyncedTime value={syncedAt}/></>}</p></div></div>
+      <div className="meeting-context"><span className="meeting-context-icon"><Presentation size={22}/></span><div><h2>成果ミーティング</h2><p>{players.length}名<span>·</span>{live ? "共有データの実績" : "サンプル実績"}{live && <><span>·</span><SyncedTime value={syncedAt}/></>}</p></div></div>
       <div className="meeting-actions">
-        {live && <button className="meeting-button" onClick={onRefresh} disabled={busy} aria-label="スプレッドシートから実績を更新"><RefreshCw size={16} className={busy ? "meeting-spin" : ""}/>{busy ? "更新中" : "更新"}</button>}
+        {live && <button className="meeting-button" onClick={onRefresh} disabled={busy} aria-label="最新の実績を取得"><RefreshCw size={16} className={busy ? "meeting-spin" : ""}/>{busy ? "更新中" : "更新"}</button>}
         <button className="meeting-button" onClick={downloadCsv} disabled={busy || !players.length || exportBlocked} title={exportBlocked ? "保存前の入力・同期・最新情報の確認が終わるとCSV保存できます" : `${periodTitle}の担当者別実績をCSVに保存`}><Download size={16}/>CSV保存</button>
         <button className={`meeting-button ${meetingMode ? "selected" : ""}`} aria-pressed={meetingMode} onClick={toggleMeetingMode}>{meetingMode ? <Minimize2 size={16}/> : <Maximize2 size={16}/>}会議用表示{meetingMode && "を終了"}</button>
       </div>
@@ -162,7 +162,7 @@ export function MeetingDashboard({ players, period, periodLabel, countAt, onRegi
       </div>
       <div className="meeting-board-purpose"><p>{display === "team" ? "全員の実績を見比べ、確認したい人の「発表」を開きます。" : "実績・前月差・提案目標を確認しながら、一人ずつ振り返ります。"}</p>{display === "person" && <span>← 前の人 / → 次の人</span>}{display === "team" && <span className="meeting-scroll-hint">横にスクロールして全項目を確認</span>}</div>
 
-      {!players.length ? <div className="meeting-empty"><strong>比較するプレイヤーがまだいません</strong><p>{live ? "プレイヤーを追加し、元シートの担当名を対応づけると、一人ずつ実績を確認できます。" : "プレイヤーを追加すると、一人ずつ実績を確認できます。"}</p>{onManagePlayers && <button className="meeting-button selected" onClick={onManagePlayers}>プレイヤー管理を開く<ChevronRight size={15}/></button>}</div> : <>
+      {!players.length ? <div className="meeting-empty"><strong>比較するプレイヤーがまだいません</strong><p>{live ? "プレイヤーを追加し、担当名の別名を確認すると、一人ずつ実績を確認できます。" : "プレイヤーを追加すると、一人ずつ実績を確認できます。"}</p>{onManagePlayers && <button className="meeting-button selected" onClick={onManagePlayers}>プレイヤー管理を開く<ChevronRight size={15}/></button>}</div> : <>
         {noPeriodActivity && <div className="meeting-empty-period"><div><strong>{periodTitle}の6項目はすべて0件です</strong><p>期間を切り替えるか、人材・進捗で各工程の日付を確認してください。ステータス変更だけでは実績に計上されません。</p></div>{onOpenRecords && <button className="meeting-button" onClick={onOpenRecords}>人材・進捗を確認<ChevronRight size={15}/></button>}</div>}
         {display === "team" ? <>
           <div className="meeting-table-scroll" role="region" aria-label="担当者別実績の比較表。横にスクロールできます" tabIndex={0}><table className="meeting-table"><caption className="meeting-sr-only">{periodTitle}のプレイヤー別6項目実績{month && "、前月差、月間提案目標"}</caption><thead><tr><th scope="col" className="meeting-player-heading">プレイヤー</th>{performanceMetrics.map(metric => <th scope="col" key={metric.stage}>{metric.label}<span className="meeting-column-unit">件{month && " / 前月差"}</span></th>)}{month && <th scope="col">提案目標<span className="meeting-column-unit">実績 / 目標・達成率</span></th>}<th scope="col"><span className="meeting-sr-only">発表画面を開く</span></th></tr></thead><tbody>{rows.map(row => {

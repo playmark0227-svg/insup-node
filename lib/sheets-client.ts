@@ -2,6 +2,7 @@ import {abortReason, createDeadlineSignal, isTimeoutSignal, throwIfAborted} from
 import { stages, type Activity, type Metric, type Player } from "./node-data.ts";
 import { interviewStringFields, crmOptions, chatOptions, pcOptions, genderOptions, type CandidateProfile } from "./candidate-intake.ts";
 import { validateWritingPreferences, type WritingPreferences } from './on-device-ai.ts';
+import { isFirestoreStorageBackend, type FirestoreStorageBackend } from "./storage-backend.ts";
 
 export type SheetPlayer = Player & { sheetNames?: string[] };
 export type Counts = Record<string, Record<string, Partial<Record<Metric, number>>>>;
@@ -10,7 +11,7 @@ export type CandidateRecord = { recordId: string; rowVersion: string; row: numbe
 export type ClientEntry = {id:string;name:string;active:boolean;version:string};
 export type ManagementCell = {column:number;value:string|number|boolean;display:string;kind:"text"|"date"|"time"|"number"|"percent"|"boolean";options:string[];readonly:boolean;note:string};
 export type ManagementRow = {row:number;version:string;cells:ManagementCell[]};
-export type ManagementTable = {sheetId:number;title:string;startRow:number;rowCount:number;columnCount:number;readonly:boolean;headers?:string[];rows:ManagementRow[]};
+export type ManagementTable = {sheetId:number;title:string;startRow:number;rowCount:number;columnCount:number;readonly:boolean;calculationReference?:boolean;headers?:string[];rows:ManagementRow[]};
 export type ManagementTableInfo = {sheetId:number;title:string;rowCount:number;columnCount:number};
 export type InterviewReview = {recordId:string;playerId:string;interviewDate:string;category:string;memo:string;nextAction:string;version:string;updatedAt:string};
 export type InterviewAdviceUsage = {userRemaining:number;teamRemaining:number;resetAt:string};
@@ -18,6 +19,8 @@ export type InterviewAdvice = {summary:string;actions:string[];count:number;gene
 export type InterviewAdviceState = {advice:InterviewAdvice|null;stale:boolean;count:number;usage:InterviewAdviceUsage;configured:boolean;pending:boolean};
 export type DeletedCandidate = {changeId:string;playerId:string;candidateName:string;deletedAt:string;companies:string[];recordCount:number};
 export type SheetSnapshot = {
+  /** Present only after the verified application-data cutover. Authentication stays unchanged. */
+  storageBackend?: FirestoreStorageBackend;
   /** Authenticated display-cache key; never persisted with the snapshot. */
   cacheAccess?: import("./snapshot-cache.ts").SnapshotCacheAccess;
   operationsFeature?: boolean;
@@ -79,7 +82,7 @@ export class SheetApiError extends Error {
 
 // A committed write may still have lost its response. Reuse its payload and ID.
 export function isUncertainWrite(error: unknown): boolean {
-  return !(error instanceof SheetApiError) || ["NETWORK", "TIMEOUT", "HTTP", "NOT_JSON", "INTERNAL", "API", "SHEET_WRITE_FAILED", "SHEET_READ_FAILED", "INVALID_RESPONSE"].includes(error.code);
+  return !(error instanceof SheetApiError) || ["NETWORK", "TIMEOUT", "HTTP", "NOT_JSON", "INTERNAL", "API", "SHEET_WRITE_FAILED", "SHEET_READ_FAILED", "FIRESTORE_WRITE_FAILED", "FIRESTORE_READ_FAILED", "INVALID_RESPONSE"].includes(error.code);
 }
 
 // Credentials go only to a deployed Apps Script endpoint, never to a URL query.
@@ -274,6 +277,7 @@ export function assertSnapshot(value: unknown): asserts value is SheetSnapshot {
         !a.id || !a.playerId || !stages.includes(a.stage as Activity["stage"]) || !/^\d{4}-\d{2}-\d{2}$/.test(String(a.date)) ||
         !optionalStrings(a, ["recordId", "rowVersion", "status", "probability", "interviewScheduledDate", "clientInterviewScheduledTime", "offerScheduledDate", "memo"]))) invalid();
   const s = value as unknown as SheetSnapshot;
+  if (s.storageBackend !== undefined && !isFirestoreStorageBackend(s.storageBackend)) invalid("保存先の情報を確認できませんでした。最新の接続状態を確認してください。");
   if(s.monthlyGoals!==undefined&&(!Array.isArray(s.monthlyGoals)||s.monthlyGoals.some(goal=>!object(goal)||!strings(goal,["playerId","month","version","updatedAt"])||!/^\d{4}-(0[1-9]|1[0-2])$/.test(String(goal.month))||!Number.isSafeInteger(goal.target)||Number(goal.target)<0||Number(goal.target)>9999||!goal.version||!s.players.some(p=>p.id===goal.playerId)||(s.self.role==="player"&&goal.playerId!==s.self.playerId))||new Set(s.monthlyGoals.map(g=>`${g.playerId}:${g.month}`)).size!==s.monthlyGoals.length))invalid("月別目標の形式または閲覧権限を確認できませんでした。");
   if (new Set(s.players.map(p => p.id)).size !== s.players.length ||
       Object.values(s.counts).some(people => !object(people) || Object.values(people).some(metrics => !object(metrics) ||
