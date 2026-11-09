@@ -1,7 +1,5 @@
-import { blankInterviewFields } from "./candidate-intake.ts";
-import { introductionEvidenceIssues } from "./introduction-review.ts";
 import { OnDeviceAiError, runOnDeviceStructuredTask, type OnDeviceAiOptions } from "./on-device-ai.ts";
-import { blankIntroductionV2Settings, composeIntroductionV2, introductionV2NarrativeFacts, markValidatedIntroductionNarrativeEdit,
+import { blankIntroductionV2Settings, composeIntroductionV2, introductionV2NarrativeFacts, validateIntroductionNarrativeEdit,
   parseIntroductionV2Profile, type IntroductionNarrativeEdit, type IntroductionV2Document, type IntroductionV2Profile, type IntroductionV2Settings } from "./introduction-v2.ts";
 
 export type IntroductionV2Generation = {
@@ -17,36 +15,10 @@ const task = "候補者の紹介文の一部分を、自然で読みやすい日
   "入力の項目ごとに一件、同じfactIdでtextを返してください。事実、否定、本人申告、未確認、希望、条件、数字、単位、期間はそのまま保持してください。" +
   "架電や提案などの業務内容と、本人が行った具体的な工夫だけを文章として整えます。" +
   "新しい会社名・商材・ツール・担当役割・成果・数値・評価・性格・能力を加えないでください。" +
+  "語順・助詞・内容語・ひらがなの固有名詞・数字と指標の対応を変えず、文末だけを自然な丁寧表現へ整えてください。時制と否定も保持してください。" +
   "見出し、あいさつ、総評、推薦、採用可否は書きません。書き換えの根拠がなければ原文のままで構いません。";
 
-const significantQualifiers = ["未確認", "不明", "確認中", "本人申告", "希望", "予定", "候補", "最大", "最小", "平均", "約", "以上", "以下", "未満", "目標"];
-/** Validation is scoped to one source atom, never the combined employment
- * history. A rejected atom reuses its original; other employers can still pass. */
-export function introductionV2NarrativeIssues(candidate: string, source: string, otherEmployerNames: readonly string[] = []): string[] {
-  const issues: string[] = [];
-  if (!candidate.trim() || Array.from(candidate).length > Math.max(400, Array.from(source).length * 3) || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(candidate)) issues.push("invalid-text");
-  const fields = { ...blankInterviewFields(), workHistory: source };
-  issues.push(...introductionEvidenceIssues(candidate, "", fields));
-  const normalized = (text: string) => text.normalize("NFKC").toLocaleLowerCase("ja");
-  const before = normalized(source), after = normalized(candidate);
-  for (const name of otherEmployerNames.map(value => value.trim()).filter(Boolean)) if (!source.includes(name) && candidate.includes(name)) issues.push("employer-mixed");
-  for (const identifier of candidate.match(/[A-Za-z][A-Za-z0-9.+-]{1,}/g) ?? []) if (!before.includes(identifier.toLowerCase())) issues.push("identifier-added");
-  for (const qualifier of significantQualifiers) if (source.includes(qualifier) && !candidate.includes(qualifier) && !(qualifier === "本人申告" && /本人から|本人による|との申告|と伺|とのこと/.test(candidate))) issues.push("qualification-removed");
-  // Metrics are renderer-owned. Keep the complete original numerical facts if
-  // an old free-text duty contains them instead of inviting model recalculation.
-  const sourceNumbers = source.normalize("NFKC").match(/\d[\d,]*(?:\.\d+)?/g) ?? [];
-  const candidateNumbers = candidate.normalize("NFKC").match(/\d[\d,]*(?:\.\d+)?/g) ?? [];
-  const key = (numbers: string[]) => numbers.map(value => value.replace(/,/g, "")).sort().join("|");
-  if (key(sourceNumbers) !== key(candidateNumbers)) issues.push("number-omitted-or-changed");
-  const inventedRoles = /リーダー|マネジメント|マネージャー|管理職|教育担当|研修担当|責任者|チームを牽引|部下|自動化|効率化|受注|成約|達成|改善率/g;
-  for (const term of candidate.match(inventedRoles) ?? []) if (!source.includes(term)) issues.push("role-or-result-added");
-  // A complete unrelated rewrite must not pass simply because it contains no
-  // numbers. Functional particles/endings may change; source content must remain.
-  const tokens = (value: string) => [...new Set(value.match(/[一-龠々]{2,}|[ァ-ヴー]{3,}|[A-Za-z]{2,}/g) ?? [])];
-  const sourceTokens = tokens(before), targetTokens = tokens(after);
-  if (sourceTokens.length && targetTokens.length && !sourceTokens.some(token => targetTokens.some(target => target.includes(token) || token.includes(target)))) issues.push("source-topic-lost");
-  return [...new Set(issues)];
-}
+export { introductionV2NarrativeIssues } from "./introduction-v2.ts";
 
 function readEdits(value: unknown): IntroductionNarrativeEdit[] | null {
   if (!value || typeof value !== "object" || Array.isArray(value) || !Object.hasOwn(value, "edits") || Object.keys(value).length !== 1) return null;
@@ -78,8 +50,7 @@ export async function generateIntroductionV2(raw: IntroductionV2Profile, setting
     for (const edit of candidates) {
       const source = sourceById.get(edit.factId);
       if (!source) continue;
-      const otherCompanies = profile.careers.filter(career => career.id !== source.careerId).map(career => career.company);
-      if (!introductionV2NarrativeIssues(edit.text, source.sourceText, otherCompanies).length) edits.push(markValidatedIntroductionNarrativeEdit(edit, source.sourceText));
+      if (validateIntroductionNarrativeEdit(edit, profile, settings)) edits.push(edit);
     }
     const changed = edits.filter(edit => edit.text !== sourceById.get(edit.factId)!.sourceText).length;
     if (!changed) return deterministic("確認済みの内容を規定の書式で整理しました。根拠を保てない書き換えは採用せず、該当部分の原文を残しています。");

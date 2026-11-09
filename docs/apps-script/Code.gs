@@ -90,14 +90,14 @@ function nodeUsesFirestore_(){return nodeStorageProvider_()==='firestore';}
 /* New workflows only use the signed, active Firebase destination. An explicit
  * separately registered verification copy remains usable for bounded tests;
  * deploying compatible code never initializes new tables on production Sheets. */
-var NODE_WORKFLOW_V2_ACTIONS=['readMetricGoals','saveMetricGoals','readSalesWorkflow','saveWorkJob','saveProposalPlan','recordProposalSent','saveMatchReport','readIntroductionV2','saveIntroductionV2','saveIntroductionSettings','publishIntroductionV2','beginMatchEvidence','completeMatchEvidence','readMatchEvidence'];
+var NODE_WORKFLOW_V2_ACTIONS=['readMetricGoals','saveMetricGoals','readSalesWorkflow','readMatchReportComments','saveWorkJob','saveProposalPlan','recordProposalSent','saveMatchReport','saveMatchReportComment','deleteMatchReportComment','readIntroductionV2','saveIntroductionV2','saveIntroductionSettings','publishIntroductionV2','beginMatchEvidence','completeMatchEvidence','readMatchEvidence'];
 function nodeWorkflowV2Verification_(config){var verification=props_().getProperty(NODE.verificationKey),destination=props_().getProperty(NODE.destinationKey);return !!(config.purpose==='verification'&&verification&&destination&&config.spreadsheetId===verification&&verification!==destination&&verification!==NODE.originalId&&destination!==NODE.originalId);}
 function nodeWorkflowV2Available_(config){
   config=config||config_();if(nodeWorkflowV2Verification_(config))return true;
   if(!nodeUsesFirestore_())return false;
   return firestoreMigrationReady_(config)===true;
 }
-function nodeStorageMutation_(action){return ['manageAccount','saveMonthlyTarget','saveActivity','updateStatus','updateProfile','createPlayer','updateRecord','deleteCandidate','cancelAchievement','restoreChange','saveManagementRow','createCandidate','saveInterviewReview','saveCandidateProfile','saveClient','saveWritingPreferences','publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards','saveMetricGoals','saveWorkJob','saveProposalPlan','recordProposalSent','saveMatchReport','saveIntroductionV2','saveIntroductionSettings','publishIntroductionV2','beginMatchEvidence','completeMatchEvidence'].indexOf(action)>=0;}
+function nodeStorageMutation_(action){return ['manageAccount','saveMonthlyTarget','saveActivity','updateStatus','updateProfile','createPlayer','updateRecord','deleteCandidate','cancelAchievement','restoreChange','saveManagementRow','createCandidate','saveInterviewReview','saveCandidateProfile','saveClient','saveWritingPreferences','publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards','saveMetricGoals','saveWorkJob','saveProposalPlan','recordProposalSent','saveMatchReport','saveMatchReportComment','deleteMatchReportComment','saveIntroductionV2','saveIntroductionSettings','publishIntroductionV2','beginMatchEvidence','completeMatchEvidence'].indexOf(action)>=0;}
 function nodeOpenBook_(config){if(!nodeUsesFirestore_())return SpreadsheetApp.openById(config.spreadsheetId);var book=firestoreOpenBook_(config);if(!firestoreMigrationReady_(config))fail_('NOT_CONFIGURED','Firebaseへの移行確認が完了していません。管理者が保存先を確認してください。');return book;}
 function nodeFlush_(){if(!nodeUsesFirestore_())SpreadsheetApp.flush();}
 function config_() {
@@ -193,7 +193,7 @@ function withLock_(fn, waitMs) {
  * read, and rejected requests do not count. NODE_AI_QUOTA still governs Gemini.
  * Writes are not budgeted here; their reads are serialized by the script lock. A replayed operation
  * that answers with a snapshot writes nothing, so it is charged to the snapshot budget. */
-var NODE_READ_BUCKETS = Object.freeze({ readMetricGoals:'table',readSalesWorkflow:'table',readIntroductionV2:'table',readMatchEvidence:'table',beginMatchEvidence:'upload',readRewards: 'table', readMigrationArchive:'table', readTeamWorkspace: 'table', snapshot: 'snapshot', resumeSession: 'snapshot', readInterviewAdvice: 'report', readWorkspaceInsights: 'report', analyzeInterviewReviews: 'report', analyzeWorkspaceInsights: 'report', auditSecurity: 'report', readAccountManagement:'report', readOperationHistory:'report', readDataExport:'export', managementTables: 'table', managementTable: 'table', readWritingKit: 'kit', readWritingPreferences: 'kit', generateWritingKit: 'kit' });
+var NODE_READ_BUCKETS = Object.freeze({ readMetricGoals:'table',readSalesWorkflow:'table',readMatchReportComments:'table',readIntroductionV2:'table',readMatchEvidence:'table',beginMatchEvidence:'upload',readRewards: 'table', readMigrationArchive:'table', readTeamWorkspace: 'table', snapshot: 'snapshot', resumeSession: 'snapshot', readInterviewAdvice: 'report', readWorkspaceInsights: 'report', analyzeInterviewReviews: 'report', analyzeWorkspaceInsights: 'report', auditSecurity: 'report', readAccountManagement:'report', readOperationHistory:'report', readDataExport:'export', managementTables: 'table', managementTable: 'table', readWritingKit: 'kit', readWritingPreferences: 'kit', generateWritingKit: 'kit' });
 var NODE_READ_LIMITS = Object.freeze({ upload:[8,60], snapshot: [40, 900], report: [20, 300], table: [40, 600], kit: [60, 1200], export:[2,10] });
 function readBudget_(id, action) {
   // id is always an ID the server already normalized (a session record or issueSession_), never request input.
@@ -246,6 +246,7 @@ function nodeHandle_(request) {
   if(action==='readMetricGoals')return readMetricGoals_(request);
   if(action==='saveMetricGoals')return saveMetricGoals_(request);
   if(action==='readSalesWorkflow')return readSalesWorkflow_(request);
+  if(action==='readMatchReportComments')return readMatchReportComments_(request);
   if(action==='readIntroductionV2')return readIntroductionV2_(request);
   if(action==='saveIntroductionV2')return saveIntroductionV2_(request);
   if(action==='saveIntroductionSettings')return saveIntroductionSettings_(request);
@@ -255,7 +256,7 @@ function nodeHandle_(request) {
   // touch only checks the session (idle and absolute limits) while a pending save pauses the polls.
   // deferred: the due refresh was not written (busy lock), so the client keeps the input to report again.
   if (action === 'touch') { var touched = authenticate_(request.token, false, passive); return passive ? { touched: false } : touched.touchDeferred ? { touched: false, deferred: true } : { touched: true }; }
-  if (['snapshot','logout','saveActivity','updateStatus','updateProfile','createPlayer','updateRecord','deleteCandidate','cancelAchievement','restoreChange','managementTables','managementTable','saveManagementRow','createCandidate','saveInterviewReview','saveCandidateProfile','saveClient','analyzeInterviewReviews','readInterviewAdvice','readWorkspaceInsights','analyzeWorkspaceInsights','readWritingKit','generateWritingKit','readWritingPreferences','saveWritingPreferences','publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards','saveWorkJob','saveProposalPlan','recordProposalSent','saveMatchReport','completeMatchEvidence'].indexOf(action) < 0) fail_('BAD_REQUEST', '対応していない操作です。');
+  if (['snapshot','logout','saveActivity','updateStatus','updateProfile','createPlayer','updateRecord','deleteCandidate','cancelAchievement','restoreChange','managementTables','managementTable','saveManagementRow','createCandidate','saveInterviewReview','saveCandidateProfile','saveClient','analyzeInterviewReviews','readInterviewAdvice','readWorkspaceInsights','analyzeWorkspaceInsights','readWritingKit','generateWritingKit','readWritingPreferences','saveWritingPreferences','publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards','saveWorkJob','saveProposalPlan','recordProposalSent','saveMatchReport','saveMatchReportComment','deleteMatchReportComment','completeMatchEvidence'].indexOf(action) < 0) fail_('BAD_REQUEST', '対応していない操作です。');
   if (action === 'readWritingKit') return readWritingKit_(request);
   if (action === 'generateWritingKit') return generateWritingKit_(request);
   if (action === 'readWritingPreferences') return readWritingPreferences_(request);
@@ -284,7 +285,7 @@ function nodeHandle_(request) {
     var user = authenticate_(request.token, action === 'logout', action === 'logout');
     if (action === 'logout') { props_().deleteProperty(sessionKey_(request.token)); return { loggedOut: true }; }
     var activity = request.payload && request.payload.activity;
-    var existingRow = ['saveWorkJob','saveProposalPlan','saveMatchReport','completeMatchEvidence','publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards','saveInterviewReview','saveCandidateProfile','saveClient','updateStatus','updateRecord','deleteCandidate','cancelAchievement'].indexOf(action) >= 0 || action === 'saveActivity' && activity && activity.recordId;
+    var existingRow = ['saveWorkJob','saveProposalPlan','saveMatchReport','saveMatchReportComment','deleteMatchReportComment','completeMatchEvidence','publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards','saveInterviewReview','saveCandidateProfile','saveClient','updateStatus','updateRecord','deleteCandidate','cancelAchievement'].indexOf(action) >= 0 || action === 'saveActivity' && activity && activity.recordId;
     // Existing-row edits only need named candidate rows. New rows still inspect
     // the entire template, preserving blank-row and formula protection.
     if(action==='applyMigrationItem'&&request.payload&&request.payload.mode==='candidate')existingRow=false;
@@ -313,6 +314,8 @@ function nodeHandle_(request) {
     if(action==='saveProposalPlan')plan=planProposalPlan_(store,user,payload);
     if(action==='recordProposalSent')plan=planProposalSent_(store,user,payload);
     if(action==='saveMatchReport')plan=planMatchReport_(store,user,payload);
+    if(action==='saveMatchReportComment')plan=planMatchReportComment_(store,user,payload);
+    if(action==='deleteMatchReportComment')plan=planDeleteMatchReportComment_(store,user,payload);
     if(action==='completeMatchEvidence')plan=planCompleteMatchEvidence_(store,user,payload);
     if (action === 'saveInterviewReview') plan = planInterviewReview_(store,user,payload);
     if (action === 'saveActivity') plan = planActivity_(store, user, payload.activity);
@@ -756,7 +759,7 @@ function manageAccount_(request) {
   });
 }
 function rowUpdateAccountActive_(sheetId,row,active){return {updateCells:{range:{sheetId:sheetId,startRowIndex:row-1,endRowIndex:row,startColumnIndex:8,endColumnIndex:9},rows:[{values:[cell_(active)]}],fields:'userEnteredValue'}};}
-var NODE_OPERATION_SUMMARIES=Object.freeze({publishIntroductionV2:'保存した紹介文を社内共有',saveMetricGoals:'7工程の月別目標を更新',saveWorkJob:'案件条件を更新',saveProposalPlan:'提案先の検討を保存',recordProposalSent:'会社への提案実績を記録',saveMatchReport:'マッチ報告を更新',saveIntroductionV2:'紹介文の基本情報・職歴を保存',saveIntroductionSettings:'紹介文の共通設定を更新',beginMatchEvidence:'合意資料の添付を開始',completeMatchEvidence:'合意資料を非公開保存',stageMigrationBatch:'過去データの原文を保管',applyMigrationItem:'過去データを業務データへ登録',mutateRewards:'ポイント・特典を更新',publishTeamCandidate:'候補者紹介文を社内共有',unpublishTeamCandidate:'候補者の社内共有を停止',saveTeamComment:'社内コメントを更新',saveTeamJob:'募集案件を更新',saveActivity:'実績日を登録',updateStatus:'進捗を更新',updateProfile:'プロフィール・目標を更新',createPlayer:'プレイヤーIDを発行',createCandidate:'候補者を登録',saveCandidateProfile:'候補者の基本情報を更新',saveClient:'取引先を更新',updateRecord:'候補者の進捗・実績を更新',deleteCandidate:'候補者・提案を削除',cancelAchievement:'実績を取り消し',restoreChange:'変更を復元',saveManagementRow:'管理表を更新',saveInterviewReview:'面談の振り返りを保存',manageAccount:'アカウントの利用状態を管理',saveMonthlyTarget:'月別目標を更新'});
+var NODE_OPERATION_SUMMARIES=Object.freeze({saveMatchReportComment:'マッチ報告のコメントを保存',deleteMatchReportComment:'マッチ報告のコメントを削除',publishIntroductionV2:'保存した紹介文を社内共有',saveMetricGoals:'7工程の月別目標を更新',saveWorkJob:'案件条件を更新',saveProposalPlan:'提案先の検討を保存',recordProposalSent:'会社への提案実績を記録',saveMatchReport:'マッチ報告を更新',saveIntroductionV2:'紹介文の基本情報・職歴を保存',saveIntroductionSettings:'紹介文の共通設定を更新',beginMatchEvidence:'合意資料の添付を開始',completeMatchEvidence:'合意資料を非公開保存',stageMigrationBatch:'過去データの原文を保管',applyMigrationItem:'過去データを業務データへ登録',mutateRewards:'ポイント・特典を更新',publishTeamCandidate:'候補者紹介文を社内共有',unpublishTeamCandidate:'候補者の社内共有を停止',saveTeamComment:'社内コメントを更新',saveTeamJob:'募集案件を更新',saveActivity:'実績日を登録',updateStatus:'進捗を更新',updateProfile:'プロフィール・目標を更新',createPlayer:'プレイヤーIDを発行',createCandidate:'候補者を登録',saveCandidateProfile:'候補者の基本情報を更新',saveClient:'取引先を更新',updateRecord:'候補者の進捗・実績を更新',deleteCandidate:'候補者・提案を削除',cancelAchievement:'実績を取り消し',restoreChange:'変更を復元',saveManagementRow:'管理表を更新',saveInterviewReview:'面談の振り返りを保存',manageAccount:'アカウントの利用状態を管理',saveMonthlyTarget:'月別目標を更新'});
 function readOperationHistory_(request) {
   var access=accountManagementStore_(request.token),store=access.store,payload=request.payload||{},limit=payload.limit===undefined?25:payload.limit,cursor=payload.cursor;
   if(!Number.isInteger(limit)||limit<1||limit>50||cursor!==undefined&&(!Number.isInteger(cursor)||cursor<2))fail_('VALIDATION','履歴の表示範囲を確認してください。');
@@ -1050,7 +1053,7 @@ function snapshotCacheAccess_(store,user) {
 }
 /* A stamp is only an authenticated cache validator, never a credential. Bump
  * this backend stamp when the full snapshot projection/meaning changes. */
-var NODE_FIRESTORE_SNAPSHOT_STAMP='node-firestore-snapshot-v1-20261106';
+var NODE_FIRESTORE_SNAPSHOT_STAMP='node-firestore-snapshot-v2-20261109-threads-narratives';
 function firestoreSnapshotVersion_(store,user,cacheAccess,preferences,evidenceEnabled,canWrite){
   if(!nodeUsesFirestore_())return '';
   var book=store.book,manifest=book&&book.manifest,pepper=props_().getProperty(NODE.pepperKey);
@@ -1079,7 +1082,7 @@ function buildSnapshot_(store, user) {
   var all = activities_(store);
   var snapshot={ self: { playerId: user.id, role: user.role }, players: store.players.filter(function (p) { return p.role === 'player' && (user.role==='admin'||p.active); }).map(function(player){return publicPlayer_(player,user);}), activities: all.filter(function (a) { return user.role === 'admin' || a.playerId === user.id; }), counts: countActivities_(all, store.players.filter(function(p){return user.role==='admin'||p.active;})), syncedAt: new Date().toISOString(), warnings: store.warnings.slice(), writesEnabled: store.schemaCompatible&&writesEnabled_(store.config) && store.book.getSpreadsheetTimeZone() === 'Asia/Tokyo' };
   snapshot.interviewReviews=readInterviewReviews_(store,user);
-  var workflowV2=nodeWorkflowV2Available_(store.config);if(workflowV2){snapshot.metricGoalsFeature=true;snapshot.salesWorkflowFeature=true;snapshot.introductionV2Feature=true;snapshot.candidateIntroductionV2=readIntroductionV2Profiles_(store,user);}snapshot.storageEvidenceFeature=workflowV2&&matchEvidenceFeature_()?true:undefined; snapshot.migrationFeature=true; snapshot.rewardsFeature=true; snapshot.candidateRegistrationFeature=true; snapshot.teamWorkspaceFeature=true; snapshot.intakeFeature=true; snapshot.candidateProfiles=readCandidateProfiles_(store,user); snapshot.clients=clientEntries_(store.book);
+  var workflowV2=nodeWorkflowV2Available_(store.config);if(workflowV2){snapshot.metricGoalsFeature=true;snapshot.salesWorkflowFeature=true;snapshot.matchReportCommentsFeature=true;snapshot.introductionV2Feature=true;snapshot.candidateIntroductionV2=readIntroductionV2Profiles_(store,user);}snapshot.storageEvidenceFeature=workflowV2&&matchEvidenceFeature_()?true:undefined; snapshot.migrationFeature=true; snapshot.rewardsFeature=true; snapshot.candidateRegistrationFeature=true; snapshot.teamWorkspaceFeature=true; snapshot.intakeFeature=true; snapshot.candidateProfiles=readCandidateProfiles_(store,user); snapshot.clients=clientEntries_(store.book);
   snapshot.deletionFeature=true; snapshot.deletedCandidates=deletedCandidates_(store,user);
   snapshot.writingFeature=true; snapshot.writingPreferences=writingPreferences_();
   snapshot.reviewFeature=true; snapshot.monthlyGoalsFeature=true; snapshot.monthlyGoals=readMonthlyGoals_(store,user);
@@ -1297,6 +1300,7 @@ function commit_(store, user, action, operationId, payloadHash, plan, token) {
   revalidateTeamPlan_(store,user,plan);
   revalidateRewardsPlan_(store,user,plan);
   revalidateSalesPlan_(store,user,plan);
+  revalidateMatchReportCommentsPlan_(store,user,plan);
   revalidateMatchEvidencePlan_(store,user,plan);
   if(token)snapshotActor_(store,token);
   Array.prototype.push.apply(requests, plan.requests || []);
@@ -1339,6 +1343,26 @@ function verifyNodeCompletionReadOnly() {
   if(stableJson_(config_())!==stableJson_(config))fail_('BUSY','接続設定が確認中に更新されました。もう一度確認してください。');
   assertManagedBook_(accounts.book);if(requireOwner_()!==owner)fail_('FORBIDDEN','確認中に実行者が変わりました。');
   Logger.log(JSON.stringify(result));return result;
+}
+/** Owner-only production readback. Synthetic renderer checks never write business data. */
+function verifyNodeMeetingCompletionReadOnly() {
+  var owner=requireOwner_(),config=config_();
+  if(!nodeUsesFirestore_()||!firestoreMigrationReady_(config))fail_('NOT_CONFIGURED','確認済みのFirebase保存先が必要です。');
+  try {
+    var store=readStore_({readOnly:true}),drafts=introductionV2Table_(store.book),comments=matchReportCommentTable_(store.book),engine=introductionV2Engine_();
+    assertManagedBook_(store.book);
+    var profile=engine.blankIntroductionV2Profile('架空の動作確認'),settings=engine.blankIntroductionV2Settings();
+    profile.careers=[Object.assign(engine.blankIntroductionCareer('owner-probe'),{company:'架空の確認会社',duties:['架電業務を担当。']})];
+    profile.internalMemo='共有しない検証メモ';
+    var edit={factId:'introduction:careers.owner-probe.duties.0',text:'架電業務を担当していました。'},saved=engine.withIntroductionNarrativeEdits(profile,settings,[edit]),loaded=engine.parseIntroductionV2Profile(JSON.parse(JSON.stringify(saved)));
+    var first=engine.composeIntroductionV2(saved,settings),restored=engine.composeIntroductionV2(loaded,settings);
+    if(first.internalBody!==restored.internalBody||first.client.text!==restored.client.text||restored.internalBody.indexOf(edit.text)<0||restored.internalBody.indexOf(profile.internalMemo)>=0||restored.client.text.indexOf(profile.internalMemo)>=0)fail_('VERIFICATION_FAILED','紹介文の保存・復元・非公開メモの除外を確認できませんでした。');
+    var hostile=engine.blankIntroductionV2Profile('架空の動作確認');hostile.careers=[Object.assign(engine.blankIntroductionCareer('owner-probe'),{company:'架空の確認会社',duties:['架電100件、メール20件。']})];
+    if(engine.validateIntroductionNarrativeEdit({factId:'introduction:careers.owner-probe.duties.0',text:'架電20件、メール100件。'},hostile,settings))fail_('VERIFICATION_FAILED','実績の対応関係の検査を確認できませんでした。');
+    if(stableJson_(config_())!==stableJson_(config)||requireOwner_()!==owner)fail_('BUSY','確認中に接続設定が変わりました。');
+    var result={verified:true,readOnly:true,storageProvider:'firestore',configUnchanged:true,activeAccounts:store.players.filter(function(p){return p.active;}).length,records:store.records.length,introductionDrafts:drafts.entries.length,reportComments:comments.entries.length,rendererRoundTrip:true,privateMemoExcluded:true,metricSwapRejected:true};
+    Logger.log(JSON.stringify(result));return result;
+  } finally { firestoreClose_(); }
 }
 function seedPlayers_() {
   var raw=props_().getProperty(NODE.seedPlayersKey),seeds;if(!raw)return [];
@@ -1430,8 +1454,8 @@ function probeReservation_(store,actorId,allowExpired) {
   return probe;
 }
 function guardProbeBusinessMutation_(store,user,action,payload) {
-  if(['saveMetricGoals','saveWorkJob','saveProposalPlan','recordProposalSent','saveMatchReport','saveIntroductionV2','saveIntroductionSettings','publishIntroductionV2','beginMatchEvidence','completeMatchEvidence','publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards','saveActivity','updateStatus','updateRecord','deleteCandidate','cancelAchievement','restoreChange','saveManagementRow','createCandidate','saveCandidateProfile','saveClient'].indexOf(action)<0)return;
-  if((['saveMetricGoals','saveWorkJob','saveProposalPlan','recordProposalSent','saveMatchReport','saveIntroductionV2','saveIntroductionSettings','publishIntroductionV2','beginMatchEvidence','completeMatchEvidence','publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards'].indexOf(action)>=0||action==='restoreChange'||action==='saveManagementRow'||action==='createCandidate'||action==='saveCandidateProfile'||action==='saveClient')&&probeReservation_(store,user.id,false))fail_('FORBIDDEN','検証専用アカウントにはこの操作は許可されていません。');
+  if(['saveMetricGoals','saveWorkJob','saveProposalPlan','recordProposalSent','saveMatchReport','saveMatchReportComment','deleteMatchReportComment','saveIntroductionV2','saveIntroductionSettings','publishIntroductionV2','beginMatchEvidence','completeMatchEvidence','publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards','saveActivity','updateStatus','updateRecord','deleteCandidate','cancelAchievement','restoreChange','saveManagementRow','createCandidate','saveCandidateProfile','saveClient'].indexOf(action)<0)return;
+  if((['saveMetricGoals','saveWorkJob','saveProposalPlan','recordProposalSent','saveMatchReport','saveMatchReportComment','deleteMatchReportComment','saveIntroductionV2','saveIntroductionSettings','publishIntroductionV2','beginMatchEvidence','completeMatchEvidence','publishTeamCandidate','unpublishTeamCandidate','saveTeamComment','saveTeamJob','stageMigrationBatch','applyMigrationItem','mutateRewards'].indexOf(action)>=0||action==='restoreChange'||action==='saveManagementRow'||action==='createCandidate'||action==='saveCandidateProfile'||action==='saveClient')&&probeReservation_(store,user.id,false))fail_('FORBIDDEN','検証専用アカウントにはこの操作は許可されていません。');
   var activity=payload.activity||{},recordId=action==='saveActivity'?activity.recordId:payload.recordId,record=recordId?findRecord_(store,recordId):null;
   var targetId=record?record.playerId:action==='saveActivity'?activity.playerId:null;
   var probe=probeReservation_(store,user.id,false),targetProbe=targetId&&targetId!==user.id?probeReservation_(store,targetId,false):null;
@@ -4311,6 +4335,72 @@ function planMatchReport_(store,user,payload){
 }
 function revalidateSalesPlan_(store,user,plan){if(plan.salesEvidence){if(typeof salesValidateEvidence_!=='function')fail_('FEATURE_UNAVAILABLE','証拠の確認を利用できません。');salesValidateEvidence_(store,user,plan.salesEvidence.ids,findRecord_(store,plan.salesEvidence.recordId));}}
 
+/* Private report discussions. Never copied to candidate publications or AI input.
+ * Dispatch readMatchReportComments_, planMatchReportComment_, planDeleteMatchReportComment_.
+ * commit_ must call revalidateMatchReportCommentsPlan_ before its final actor check.
+ * All mutations use the normal atomic batch / operation receipt path.
+ */
+var MATCH_REPORT_COMMENT_TAB='_NODE_match_report_comments';
+var MATCH_REPORT_COMMENT_HEADERS=['commentId','reportId','parentId','authorId','body','deleted','version','createdAt','updatedAt'];
+var MATCH_REPORT_COMMENT_PAGE_LIMIT=100;
+function matchReportCommentsMutationAction_(action){return ['saveMatchReportComment','deleteMatchReportComment'].indexOf(action)>=0;}
+function matchReportCommentObject_(value,keys){if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(function(k){return keys.indexOf(k)<0;}))fail_('VALIDATION','マッチ報告コメントの入力項目を確認してください。');return value;}
+function matchReportCommentTable_(book){
+ var state=intakeTable_(book,MATCH_REPORT_COMMENT_TAB,MATCH_REPORT_COMMENT_HEADERS),seen=Object.create(null);
+ state.entries=state.rows.map(function(row,index){return teamSchema_(function(){
+  var id=teamId_(row[0]);if(seen[id]||typeof row[5]!=='boolean')fail_('SCHEMA_MISMATCH','マッチ報告コメントのID・状態を確認してください。');seen[id]=true;
+  return {commentId:id,reportId:teamId_(row[1]),parentId:row[2]?teamId_(row[2]):'',authorId:teamAccount_(row[3]),body:teamText_(row[4],2000,true),deleted:row[5],version:teamId_(row[6]),createdAt:teamTime_(row[7]),updatedAt:teamTime_(row[8]),row:index+2};
+ });});
+ var byId=Object.create(null);state.entries.forEach(function(c){byId[c.commentId]=c;});
+ state.entries.forEach(function(c){if(c.parentId){var parent=byId[c.parentId];if(!parent||parent.reportId!==c.reportId||parent.row>=c.row)fail_('SCHEMA_MISMATCH','マッチ報告コメントの返信先を確認してください。');}});return state;
+}
+function matchReportCommentAccess_(store,user,reports,reportId){
+ teamId_(reportId);var report=reports.entries.find(function(r){return r.reportId===reportId;});
+ // Missing reports and removed business records never reveal retained comment prose.
+ if(!report)fail_('NOT_FOUND','マッチ報告が見つかりません。');
+ if(user.role!=='admin'&&report.ownerId!==user.id)fail_('FORBIDDEN','このマッチ報告のコメントは閲覧・変更できません。');
+ var record=findRecord_(store,report.recordId);if(!record||record.playerId!==report.ownerId||report.profileId&&(record.profileId||'')!==report.profileId)fail_('NOT_FOUND','マッチ報告の対象を確認できません。');
+ return {report:report,record:record};
+}
+function matchReportCommentPublic_(comment,user){return {commentId:comment.commentId,reportId:comment.reportId,parentId:comment.parentId,authorId:comment.authorId,body:comment.deleted?'':comment.body,deleted:comment.deleted,version:comment.version,createdAt:comment.createdAt,updatedAt:comment.updatedAt,canManage:user.role==='admin'||comment.authorId===user.id};}
+function matchReportCommentChecks_(plan,reports,state,access){salesTableCheck_(plan,SALES_MATCH_TAB,reports);teamTableCheck_(plan,MATCH_REPORT_COMMENT_TAB,MATCH_REPORT_COMMENT_HEADERS,state);addProfileRecordChecks_(plan,[access.record]);plan.matchReportCommentAccess={reportId:access.report.reportId,ownerId:access.report.ownerId,recordId:access.record.recordId};}
+function readMatchReportComments_(request){
+ var payload=matchReportCommentObject_(request.payload||{},['reportId','cursor','limit']),session=authenticate_(request.token,false,request.background===true),accounts=readAccountStore_(),user=activeActor_(accounts,session),store=readStore_({readOnly:true},accounts),reports=salesTable_(store.book,SALES_MATCH_TAB,'report'),access=matchReportCommentAccess_(store,user,reports,payload.reportId),state=matchReportCommentTable_(store.book),limit=payload.limit===undefined?50:payload.limit;
+ if(typeof limit!=='number'||!isFinite(limit)||Math.floor(limit)!==limit||limit<1||limit>MATCH_REPORT_COMMENT_PAGE_LIMIT)fail_('VALIDATION','コメントの取得件数は1〜100件で指定してください。');
+ var signature=hash_(stableJson_([access.report.reportId,state.fingerprint])),offset=0;
+ if(payload.cursor!==undefined&&payload.cursor!==''){
+  if(typeof payload.cursor!=='string'||payload.cursor.length>160||!/^\d{1,4}_[A-Za-z0-9_-]+$/.test(payload.cursor))fail_('VALIDATION','コメントの続きの取得位置を確認してください。');
+  var separator=payload.cursor.indexOf('_');offset=Number(payload.cursor.slice(0,separator));if(payload.cursor.slice(separator+1)!==signature)fail_('CONFLICT','コメントが更新されました。先頭から読み直してください。');
+ }
+ var all=state.entries.filter(function(c){return c.reportId===access.report.reportId;}).sort(function(a,b){return a.row-b.row;}),page=all.slice(offset,offset+limit);
+ if(offset>all.length)fail_('VALIDATION','コメントの続きの取得位置を確認してください。');
+ var pageIds=new Set(page.map(function(c){return c.commentId;})),parentIds=new Set(page.map(function(c){return c.parentId;}).filter(Boolean)),parents=all.filter(function(c){return parentIds.has(c.commentId)&&!pageIds.has(c.commentId);});
+ var result={feature:true,schemaVersion:1,reportId:access.report.reportId,comments:page.map(function(c){return matchReportCommentPublic_(c,user);}),parents:parents.map(function(c){return matchReportCommentPublic_(c,user);}),nextCursor:offset+page.length<all.length?String(offset+page.length)+'_'+signature:'',total:all.length,checkedAt:new Date().toISOString()},checks={};
+ matchReportCommentChecks_(checks,reports,state,access);revalidateManagementPlan_(store,user,checks);revalidateIntakePlan_(store,user,checks);snapshotActor_(store,request.token);return result;
+}
+function matchReportCommentPlan_(store,user,payload,deleting){
+ matchReportCommentObject_(payload,deleting?['reportId','commentId','version']:['reportId','commentId','version','parentId','body']);
+ if(payload.commentId!==undefined&&payload.commentId!=='')teamId_(payload.commentId);if(payload.parentId!==undefined&&payload.parentId!=='')teamId_(payload.parentId);
+ var actor=activeActor_({players:readPlayers_(store.playerSheet)},user),reports=salesTable_(store.book,SALES_MATCH_TAB,'report'),access=matchReportCommentAccess_(store,actor,reports,payload.reportId),state=matchReportCommentTable_(store.book),previous=payload.commentId?state.entries.find(function(c){return c.commentId===teamId_(payload.commentId);}):null;
+ if(payload.commentId&&!previous)fail_('NOT_FOUND','コメントが見つかりません。');if(deleting&&!previous)fail_('VALIDATION','削除するコメントを指定してください。');
+ if(previous){
+  if(previous.reportId!==access.report.reportId||actor.role!=='admin'&&previous.authorId!==actor.id)fail_('FORBIDDEN','このコメントを変更できません。');
+  if(payload.version!==previous.version)fail_('CONFLICT','コメントが更新されています。入力を保持して、最新版を確認してください。');
+  if(previous.deleted)fail_('VALIDATION','削除済みのコメントは編集・削除できません。');
+ }else if(payload.version!==undefined&&payload.version!=='')fail_('CONFLICT','新しいコメントに古いバージョンは指定できません。');
+ var parentId=payload.parentId===undefined?(previous?previous.parentId:''):payload.parentId?teamId_(payload.parentId):'';
+ if(previous&&parentId!==previous.parentId)fail_('VALIDATION','コメントの返信先は変更できません。');
+ if(parentId){var parent=state.entries.find(function(c){return c.commentId===parentId;});if(!parent||parent.reportId!==access.report.reportId||!previous&&parent.deleted)fail_('VALIDATION','同じマッチ報告の削除されていないコメントに返信してください。');}
+ var now=new Date().toISOString(),next={commentId:previous?previous.commentId:Utilities.getUuid(),reportId:access.report.reportId,parentId:parentId,authorId:previous?previous.authorId:actor.id,body:deleting?previous.body:teamText_(payload.body,2000,true),deleted:deleting,version:Utilities.getUuid(),createdAt:previous?previous.createdAt:now,updatedAt:now},plan={requests:[],result:{commentId:next.commentId,reportId:next.reportId}};
+ intakeWritePlan_(store,plan,MATCH_REPORT_COMMENT_TAB,MATCH_REPORT_COMMENT_HEADERS,state,previous?previous.row:state.rows.length+2,[next.commentId,next.reportId,next.parentId,next.authorId,next.body,next.deleted,next.version,next.createdAt,next.updatedAt]);matchReportCommentChecks_(plan,reports,state,access);if(previous)plan.matchReportCommentAccess.authorId=previous.authorId;return plan;
+}
+function planMatchReportComment_(store,user,payload){return matchReportCommentPlan_(store,user,payload,false);}
+function planDeleteMatchReportComment_(store,user,payload){return matchReportCommentPlan_(store,user,payload,true);}
+function revalidateMatchReportCommentsPlan_(store,user,plan){
+ if(!plan.matchReportCommentAccess)return;var check=plan.matchReportCommentAccess,actor=activeActor_({players:readPlayers_(store.playerSheet)},user);
+ if(actor.role!=='admin'&&(check.ownerId!==actor.id||check.authorId&&check.authorId!==actor.id))fail_('FORBIDDEN','このマッチ報告のコメントを変更できません。');
+}
+
 /* Generated from the shared introduction V2 renderer. Do not edit. */
 var NODE_INTRODUCTION_V2 = (function(exports) {
 	Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
@@ -4402,7 +4492,339 @@ var NODE_INTRODUCTION_V2 = (function(exports) {
 	}
 	//#endregion
 	//#region lib/introduction-review.ts
+	const numericText = (value) => value.normalize("NFKC").replace(/(\d),(?=\d{3}(?:\D|$))/g, "$1");
+	const ratePatterns = [
+		/(?:時給|(?:円|万円)\s*[\/／]\s*(?:時(?:間)?|h)|(?:時(?:間)?)\s*(?:単価|(?:あたり|当たり)(?=\s*(?:約)?\d[\d,]*\s*(?:円|万円)))|\/hour\b)/i,
+		/(?:日給|(?:円|万円)\s*[\/／]\s*日|日\s*(?:単価|(?:あたり|当たり)(?=\s*(?:約)?\d[\d,]*\s*(?:円|万円)))|日\s*\d[\d,]*\s*(?:円|万円)|\/day\b)/i,
+		/(?:月給|月額|(?:円|万円)\s*[\/／]\s*月|月\s*(?:単価|(?:あたり|当たり)(?=\s*(?:約)?\d[\d,]*\s*(?:円|万円)))|月\s*\d[\d,]*\s*(?:円|万円)|\/month\b)/i,
+		/(?:年収|年俸|(?:円|万円)\s*[\/／]\s*年|年\s*(?:単価|(?:あたり|当たり)(?=\s*(?:約)?\d[\d,]*\s*(?:円|万円)))|\/year\b)/i
+	];
 	const personalDetail = /(?:持病(?:で|が|の治療|を治療|あり|有り)|通院(?:しています|しております|しており|しているため|をしています|をしております|中です|予定です)|(?:毎週|定期的に|週\d+回|月\d+回)[^。\n]{0,8}通院|(?:家族|両親|親|父|母|祖父|祖母)の介護(?:で|のため|があり|中|をして|に伴|により|に専念|が必要|と両立|による)|(?:子ども|子供|お子様|息子|娘)(?:の|が)[^。\n]{0,10}(?:発熱|体調不良|送迎|通院|入院)(?:で|のため|があり|あり|への対応|によ|をして|をする|が必要|など|[：:]|$))/;
+	const rankMention = /(?:[0-9０-９一二三四五六七八九十]+\s*位|トップ|top\s*\d+|No[.．]?\s*[0-9０-９]+|ナンバーワン|首位)/i;
+	/** Preserve only uncertainty already written alongside a rank, never invent its
+	* period, comparison group, or a supposedly verified achievement. */
+	function introductionRankQualifications(value) {
+		if (!rankMention.test(value)) return [];
+		return [...new Set(value.split(/[。\n]/).map((part) => part.trim()).filter((part) => /(?:未確認|不明|確認中|要確認)/.test(part) && /(?:期間|時期|比較|人数|対象|名中|人中)/.test(part)))];
+	}
+	function missingIntroductionRankQualification(body, qualifications) {
+		if (!rankMention.test(body) || !qualifications.length) return false;
+		const retained = introductionRankQualifications(body).join("\n"), source = qualifications.join("\n");
+		return /期間|時期/.test(source) && !/期間|時期/.test(retained) || /比較|人数|対象|名中|人中/.test(source) && !/比較|人数|対象|名中|人中/.test(retained);
+	}
+	function kanjiNumber(value) {
+		const digits = {
+			〇: 0,
+			零: 0,
+			一: 1,
+			二: 2,
+			三: 3,
+			四: 4,
+			五: 5,
+			六: 6,
+			七: 7,
+			八: 8,
+			九: 9
+		}, units = {
+			十: 10,
+			百: 100,
+			千: 1e3
+		};
+		if (!/[十百千]/.test(value)) return Number([...value].map((char) => digits[char]).join(""));
+		let number = 0, digit = 0;
+		for (const char of value) if (char in digits) digit = digits[char];
+		else {
+			number += (digit || 1) * units[char];
+			digit = 0;
+		}
+		return number + digit;
+	}
+	const evidenceText = (text) => numericText(text).replace(/\bB2([BC])\b/gi, "Bto$1").replace(/[〇零一二三四五六七八九十百千]+(?=\s*(?:年|か月|ヶ月|ケ月|月|週間?|日|時間|件|通|本|回|コール|アポ|社|人|円|位|代|%|パーセント))/g, (value) => String(kanjiNumber(value)));
+	const numbers = (text) => new Set((evidenceText(text).replace(/(?<!\d)1\s*(?:日|週間?|か月|ヶ月|ケ月|時間|年)\s*(?:あたり|当たり|につき)|[\/／]\s*1\s*(?:日|週間?|か月|ヶ月|ケ月|月|時間|年)/g, "").match(/\d+(?:\.\d+)?/g) || []).map((value) => String(Number(value))));
+	const factualFields = (fields) => Object.entries(fields).filter(([key]) => ![
+		"attendanceConcerns",
+		"additionalNotes",
+		"interviewMemo",
+		"selfReflection",
+		"interviewAdvice"
+	].includes(key)).map(([, value]) => Array.isArray(value) ? value.join(" ") : value).join("\n");
+	const tools = [
+		"Salesforce",
+		"kintone",
+		"HubSpot",
+		"Excel",
+		"Word",
+		"PowerPoint",
+		"Chatwork",
+		"Slack",
+		"MacBook",
+		"Windows",
+		"Claude",
+		"ChatGPT",
+		"Photoshop",
+		"Illustrator"
+	];
+	function timeQuantities(text) {
+		const result = /* @__PURE__ */ new Set(), value = numericText(text);
+		for (const match of value.matchAll(/(?<![\d年月日])(週|月|日)(?:間)?\s*(\d+(?:\.\d+)?)\s*(時間|h|日)|(?<!\d)(\d+(?:\.\d+)?)\s*(時間|h)\s*[\/／]\s*(週|月|日)/gi)) result.add(`${match[1] || match[6]}:${Number(match[2] || match[4])}:${/^(?:時間|h)$/i.test(match[3] || match[5]) ? "hours" : "days"}`);
+		return result;
+	}
+	const periodPatterns = [
+		["day", /(?:1\s*日\s*(?:あたり|当たり|につき)|日次|日間|毎日|日ごと|(?<![\d年月])日(?=\s*(?:約|およそ|最大|最高|最多|平均|目標|実績|\d))|[\/／]\s*(?:1\s*)?日)/],
+		["week", /(?:1\s*週間?\s*(?:あたり|当たり|につき)|週次|週間|毎週|週ごと|週(?=\s*(?:約|およそ|最大|最高|最多|平均|目標|実績|\d))|[\/／]\s*(?:1\s*)?週)/],
+		["month", /(?:1\s*(?:か月|ヶ月|ケ月)\s*(?:あたり|当たり|につき)|月次|月間|毎月|月ごと|(?<![\d年])月(?=\s*(?:約|およそ|最大|最高|最多|平均|目標|実績|\d))|[\/／]\s*(?:1\s*)?月)/],
+		["year", /(?:1\s*年\s*(?:あたり|当たり|につき)|年次|年間|毎年|年ごと|(?<!\d)年(?=\s*(?:約|およそ|最大|最高|最多|平均|目標|実績|\d))|[\/／]\s*(?:1\s*)?年)/],
+		["hour", /(?:1\s*時間\s*(?:あたり|当たり|につき)|時間(?:あたり|当たり)|[\/／]\s*(?:1\s*)?(?:時間|時|h\b))/i]
+	];
+	const metricPatterns = [
+		["call", /架電|発信|コール|テレアポ|電話営業/],
+		["appointment", /(?<!テレ)アポ(?:イント)?(?!インター)|商談設定|商談獲得/],
+		["contract", /成約|受注|契約獲得/],
+		["meeting", /商談(?!設定|獲得)|面談/],
+		["sales", /売上|売り上げ/],
+		["achievement-rate", /達成率/]
+	];
+	const uniqueMarker = (text, patterns) => {
+		const found = patterns.filter(([, pattern]) => pattern.test(text)).map(([key]) => key);
+		return found.length === 1 ? found[0] : null;
+	};
+	function metricQualifier(text) {
+		const limited = [
+			["maximum", /最大|最多|最高/],
+			["average", /平均|アベレージ/],
+			["target", /(?:目標|ノルマ)(?!達成|比|に対)/]
+		].filter(([, pattern]) => pattern.test(text));
+		return limited.length === 1 ? limited[0][0] : limited.length ? null : /実績|実際/.test(text) ? "actual" : null;
+	}
+	function companyMentions(text) {
+		const result = [];
+		const pattern = new RegExp(`(?:株式会社|有限会社|合同会社)[^\\s、,。;；:：（）()【】〈〉■「」]{1,40}?(?=(?:で(?:は|の)?(?=[\\s、,]|月|日|週|年|1|最大|平均|目標|実績|架電|営業|法人|個人|新規|既存|テレアポ|コール|電話|Bto|toB|成約|受注|勤務|担当|\\d)|に(?:て|おいて|勤務|所属|入社)|の(?:勤務|営業|実績)|[\\s、,。;；:：（）()【】〈〉■「」]|$))|(?<![A-Za-z0-9])[A-Za-z][A-Za-z0-9-]{0,24}社(?![A-Za-z])`, "g");
+		for (const match of text.matchAll(pattern)) result.push({
+			start: match.index,
+			name: match[0]
+		});
+		for (const match of text.matchAll(/(?:^|[\n\s、,。:：■「])([^\s、,。:：（）()【】〈〉■「」]{1,30}(?:株式会社|有限会社|合同会社))/g)) if (!result.some((item) => item.name === match[1] && Math.abs(item.start - match.index) < 2)) result.push({
+			start: match.index + match[0].indexOf(match[1]),
+			name: match[1]
+		});
+		return result.sort((a, b) => a.start - b.start);
+	}
+	function metricClaims(raw) {
+		const text = evidenceText(raw), matches = [...text.matchAll(/(\d+(?:\.\d+)?)\s*(件|通|本|回|人|社|%|パーセント|コール|アポイント|アポ(?!インター))/g)], companies = companyMentions(text), result = [];
+		for (let index = 0; index < matches.length; index++) {
+			const match = matches[index], start = match.index, end = start + match[0].length;
+			const sentenceStart = Math.max(text.lastIndexOf("。", start - 1), text.lastIndexOf("\n", start - 1), text.lastIndexOf(";", start - 1), text.lastIndexOf("；", start - 1)) + 1;
+			const nextStop = text.slice(end).search(/[。\n;；]/), sentenceEnd = nextStop < 0 ? text.length : end + nextStop;
+			const previousEnd = index && matches[index - 1].index >= sentenceStart ? matches[index - 1].index + matches[index - 1][0].length : sentenceStart;
+			const nextStart = matches[index + 1]?.index ?? text.length;
+			const before = text.slice(previousEnd, start).split(/[、,]/).at(-1) ?? "";
+			const after = text.slice(end, Math.min(sentenceEnd, nextStart)).split(/[、,]/)[0];
+			const local = before + match[0] + after, sentence = text.slice(sentenceStart, sentenceEnd);
+			const period = uniqueMarker(local, periodPatterns) ?? uniqueMarker(sentence, periodPatterns);
+			const metric = match[2] === "コール" ? "call" : /^アポ/.test(match[2]) ? "appointment" : uniqueMarker(local, metricPatterns) ?? uniqueMarker(sentence, metricPatterns);
+			const summaryStart = [...text.slice(0, start).matchAll(/【(?:総評|まとめ|基本情報|稼働[^】]*)】/g)].at(-1)?.index ?? -1;
+			const company = companies.filter((item) => item.start < start && item.start > summaryStart).at(-1)?.name ?? null;
+			const meaning = companies.reduce((value, item) => value.replaceAll(item.name, ""), local);
+			const approximate = /(?:(?<!成|契)約|およそ)\s*(?:(?:日|月|週|年|時間)(?:間)?\s*)?$/.test(before) || /^\s*(?:程度|ほど|前後)/.test(after);
+			const unit = match[2] === "コール" || /^アポ/.test(match[2]) ? "件" : match[2] === "パーセント" ? "%" : match[2];
+			result.push({
+				value: String(Number(match[1])),
+				unit,
+				period,
+				metric,
+				qualifier: metricQualifier(meaning),
+				approximate,
+				company
+			});
+		}
+		return result;
+	}
+	function metricEvidenceIssues(draft, sources) {
+		const known = sources.flatMap(metricClaims), knownNumbers = numbers(sources.join("\n")), issues = [];
+		for (const claim of metricClaims(draft)) {
+			let candidates = known.filter((source) => source.value === claim.value && (source.unit === claim.unit || source.metric === "call" && claim.metric === "call" && ["件", "通"].includes(source.unit) && ["件", "通"].includes(claim.unit)));
+			if (!candidates.length) {
+				if (knownNumbers.has(claim.value)) issues.push("metric-context-changed");
+				continue;
+			}
+			if (claim.company && candidates.some((source) => source.company)) {
+				const own = candidates.filter((source) => source.company === claim.company);
+				if (!own.length) {
+					issues.push("company-metric-changed");
+					continue;
+				}
+				candidates = own;
+			}
+			if (claim.metric && candidates.some((source) => source.metric)) {
+				const sameMetric = candidates.filter((source) => !source.metric || source.metric === claim.metric);
+				if (!sameMetric.length) {
+					issues.push("metric-context-changed");
+					continue;
+				}
+				candidates = sameMetric;
+			}
+			const samePeriod = candidates.filter((source) => source.period === claim.period);
+			if (!samePeriod.length && candidates.some((source) => source.period || claim.period)) {
+				issues.push("metric-period-changed");
+				continue;
+			}
+			if (samePeriod.length) candidates = samePeriod;
+			if (!candidates.some((source) => (source.qualifier === claim.qualifier || !source.qualifier && claim.qualifier === "actual") && (!source.approximate || claim.approximate))) issues.push("metric-qualifier-changed");
+		}
+		return issues;
+	}
+	const escapePattern = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	function experiencePolarity(text, subject) {
+		let negative = false, positive = false;
+		const pattern = new RegExp(escapePattern(subject), "gi");
+		for (const match of text.matchAll(pattern)) {
+			const tail = text.slice(match.index + match[0].length).split(/[。\n、,;；]/)[0].slice(0, 65);
+			const before = text.slice(Math.max(0, match.index - 16), match.index);
+			if (/^(?:(?:の|での|を|は|について|に関して|[・:：\s])*)(?:(?:使用|利用|実務|操作|営業|業務|担当|活用)(?:の)?)?(?:経験(?:は|が|[：:\s])*(?:ない|なし|ありません)|未経験|未使用|なし|ありません|を?使ったこと(?:は|が)?(?:ない|なし|ありません)|を?使用したこと(?:は|が)?(?:ない|なし|ありません))/.test(tail) || /^(?:(?:の|を|は|[・:：\s])*)(?:使用|利用|操作|活用)(?:経験)?(?:は|が)?(?:ない|なし|未経験|できない|ありません|できません)/.test(tail)) negative = true;
+			else if (!/未確認|確認中|要確認|不明|経験を確認|経験の確認|使えるか|利用できるか/.test(tail)) {
+				if (/^(?:(?:の|での|を|は|について|[・:：\s])*)(?:(?:使用|利用|実務|操作|営業|業務|担当|活用)(?:の)?)?(?:経験(?:が|は|を)?(?:ある|あり|あります|持|有)|経験者|を?使(?:え|用)|を?(?:使った|使用した)こと(?:が|は)?(?:ある|あり)|を?使用|を?利用|を?活用|を?担当|が?使える|が?使用できる|が?利用できる|に?対応(?:可能|でき))/.test(tail) || /^(?:(?:を|が|は|[・:：\s])*)(?:使用|利用|活用|操作)(?:でき|可能|して|経験|あり)/.test(tail) || /(?:使用可能|利用可能|経験あり|経験済み|使用ツール|利用ツール)[：:\s]*$/.test(before)) positive = true;
+			}
+		}
+		return {
+			negative,
+			positive
+		};
+	}
+	function negatedExperienceIssues(draft, sources) {
+		const subjects = [
+			...tools,
+			"法人営業",
+			"個人営業",
+			"BtoB営業",
+			"toB営業",
+			"BtoC営業",
+			"toC営業",
+			"テレアポ",
+			"営業"
+		];
+		const canonical = (text) => evidenceText(text).replace(/\bBto([BC])\b/gi, "to$1");
+		for (const subject of subjects) {
+			const key = canonical(subject), states = sources.map(canonical).map((value) => experiencePolarity(key === "営業" ? value.replace(/(?:法人|個人|to[BC])営業/g, "") : value, key));
+			if (!states.some((state) => state.negative) || states.some((state) => state.positive)) continue;
+			const target = canonical(draft);
+			if (experiencePolarity(key === "営業" ? target.replace(/(?:法人|個人|to[BC])営業/g, "") : target, key).positive) return true;
+		}
+		const texts = sources.map(canonical), crmStates = texts.map((text) => experiencePolarity(text, "CRM"));
+		if (crmStates.some((state) => state.negative) && !crmStates.some((state) => state.positive)) {
+			for (const tool of [
+				"Salesforce",
+				"kintone",
+				"HubSpot"
+			]) if (experiencePolarity(canonical(draft), tool).positive && !texts.some((text) => experiencePolarity(text, tool).positive)) return true;
+		}
+		return false;
+	}
+	function experienceDurations(raw) {
+		const text = evidenceText(raw), companies = companyMentions(text), claims = [];
+		for (const match of text.matchAll(/(?<![\d.年月])(\d+(?:\.\d+)?)\s*(年(?:間)?|か月|ヶ月|ケ月|カ月|ヵ月)(半)?(?![\d年月日])/g)) {
+			if (Number(match[1]) > 100 || /^\s*(?:あたり|当たり|につき)/.test(text.slice(match.index + match[0].length)) || /[\/／]\s*$/.test(text.slice(0, match.index))) continue;
+			const boundary = [...text.slice(0, match.index).matchAll(/【[^】]+】/g)].at(-1)?.index ?? -1;
+			const company = companies.filter((item) => item.start < match.index && item.start > boundary).at(-1)?.name ?? null;
+			const before = text.slice(Math.max(0, match.index - 12), match.index), after = text.slice(match.index + match[0].length);
+			const approximate = /(?:約|およそ|概ね)\s*$/.test(before) || /^\s*(?:程度|ほど|前後)/.test(after);
+			const limit = after.match(/^\s*(以上|以下|未満|超)/)?.[1] ?? before.match(/(最大|最長|最低|最短)\s*$/)?.[1] ?? null;
+			claims.push({
+				quantity: String(Number(match[1])),
+				unit: match[2].startsWith("年") ? "year" : "month",
+				half: !!match[3],
+				company,
+				approximate,
+				limit
+			});
+		}
+		return claims;
+	}
+	function changedExperiencePeriod(draft, sources) {
+		const known = sources.flatMap(experienceDurations);
+		return experienceDurations(draft).some((claim) => {
+			let candidates = known.filter((source) => source.quantity === claim.quantity && source.unit === claim.unit && source.half === claim.half);
+			if (claim.company && candidates.some((source) => source.company)) candidates = candidates.filter((source) => source.company === claim.company);
+			return !candidates.some((source) => (!source.approximate || claim.approximate) && source.limit === claim.limit);
+		});
+	}
+	function unsupportedAchievement(draft, source) {
+		return [
+			[/(?:研修|講習|講座)(?:を)?(?:受講|修了)|(?:研修|講習|講座)で(?:の)?(?:実績|受賞|成績)/, /研修|講習|講座/],
+			[/(?:資格|免許)(?:を)?(?:取得|保有|持って)|(?:認定資格|有資格者)/, /資格|免許|認定/],
+			[/(?:受賞|表彰)(?:歴|経験|され|を受け|実績|があり)|(?:賞|表彰)を(?:受|獲得)/, /受賞|表彰|賞を|賞に/],
+			[/(?:管理職|マネージャー|部長|課長|リーダー)(?:として|を(?:担当|経験|務め)|の経験|経験)/, /管理職|マネージャー|部長|課長|リーダー/]
+		].some(([claim, evidence]) => claim.test(draft) && !evidence.test(source));
+	}
+	/** Concrete additions observed in small-model introductions. Only explicit
+	* source claims can support these outcomes; ordinary work is not their proof. */
+	function unsupportedNarrativeAssessment(draft, source) {
+		if (/(?:今後|将来|これから)[^。\n]{0,50}(?:貢献|寄与|活躍|期待)|(?:貢献|寄与|活躍)(?:すること|できること)?(?:が|を)?(?:期待|見込)|(?:貢献|寄与|活躍)できる(?:可能性|と考え|と思い)/.test(draft)) return true;
+		return [
+			/長け(?:て|る)/,
+			/秀で(?:て|る)/,
+			/卓越(?:した|する)/,
+			/高度な能力/,
+			/高度なスキル/,
+			/高い能力/,
+			/高い専門性/,
+			/高い適応力/,
+			/顧客満足(?:度)?[^。\n]{0,12}(?:向上|改善)/,
+			...[
+				"課題(?:の|を)?解決",
+				"チーム",
+				"組織",
+				"事業",
+				"売上",
+				"利益",
+				"成果",
+				"業績",
+				"生産性"
+			].map((topic) => new RegExp(`${topic}[^。\\n]{0,20}(?:貢献|寄与)`))
+		].some((pattern) => pattern.test(draft) && !pattern.test(source));
+	}
+	/** Conservative, deterministic checks for material inventions; this is not a factual guarantee. */
+	function introductionEvidenceIssues(draft, candidateName, prepared, memo = "") {
+		const source = [
+			candidateName,
+			factualFields(prepared),
+			memo
+		].join("\n"), knownNumbers = numbers(source), issues = introductionContentIssues(draft);
+		const sourceParts = [...Object.entries(prepared).filter(([key]) => ![
+			"attendanceConcerns",
+			"additionalNotes",
+			"interviewMemo",
+			"selfReflection",
+			"interviewAdvice"
+		].includes(key)).map(([, value]) => Array.isArray(value) ? value.join(" ") : value), memo];
+		if ([...numbers(draft)].some((value) => !knownNumbers.has(value))) issues.push("source-number");
+		const lower = source.toLowerCase();
+		if (tools.some((tool) => draft.toLowerCase().includes(tool.toLowerCase()) && !lower.includes(tool.toLowerCase()))) issues.push("source-tool");
+		if (prepared.availableFrom.trim() && /(?:稼働|就業|勤務)(?:を)?(?:開始済み|開始しています|開始しました|開始した|中です|中である)/.test(draft) && !/(?:稼働|就業|勤務)(?:を)?(?:開始済み|開始しています|開始しました|開始した|中です|中である)/.test(source)) issues.push("availability-as-start");
+		const knownTime = timeQuantities([
+			source,
+			prepared.monthlyHours ? `月${prepared.monthlyHours}` : "",
+			prepared.daysPerWeek ? `週${prepared.daysPerWeek}` : ""
+		].join("\n"));
+		if ([...timeQuantities(draft)].some((quantity) => !knownTime.has(quantity))) issues.push("time-unit-changed");
+		if ([
+			"正社員",
+			"契約社員",
+			"派遣社員",
+			"業務委託",
+			"アルバイト",
+			"パート"
+		].some((term) => draft.includes(term) && !source.includes(term))) issues.push("employment-type");
+		for (const pattern of ratePatterns) if (pattern.test(numericText(draft)) && !pattern.test(numericText(source))) issues.push("rate-unit-changed");
+		if (/本人申告/.test(source) && !/(?:本人申告|本人による|本人から|と伺|と聞|とのこと|との申告)/.test(draft) && /(?:経験|担当|実績|達成|勤務)/.test(draft)) issues.push("self-report-removed");
+		issues.push(...metricEvidenceIssues(draft, sourceParts));
+		if (negatedExperienceIssues(draft, sourceParts)) issues.push("experience-negation-changed");
+		if (changedExperiencePeriod(draft, sourceParts)) issues.push("experience-period-changed");
+		if (unsupportedAchievement(draft, source)) issues.push("source-achievement");
+		if (unsupportedNarrativeAssessment(draft, source)) issues.push("source-assessment");
+		const rankQualifications = sourceParts.flatMap(introductionRankQualifications);
+		if (draft.split(/【[^】\n]+】|(?:^|\n)[\t ]*(?:#{1,6}[\t ]+|\*\*)[^\n]+/).some((part) => missingIntroductionRankQualification(part, rankQualifications))) issues.push("rank-scope-removed");
+		return [...new Set(issues)];
+	}
 	/** Apply the same content boundary to a model draft or a manually polished candidate. */
 	function introductionContentIssues(draft) {
 		const issues = [];
@@ -4777,6 +5199,11 @@ var NODE_INTRODUCTION_V2 = (function(exports) {
 			}
 			result.careers.push(career);
 		}
+		if (value.narrativeEdits !== void 0) {
+			const revision = parseIntroductionNarrativeRevision(value.narrativeEdits);
+			if (!revision) return null;
+			result.narrativeEdits = revision;
+		}
 		return unicodeLength(JSON.stringify(result)) <= 1e5 ? result : null;
 	}
 	function parseIntroductionV2Settings(value) {
@@ -4827,8 +5254,9 @@ var NODE_INTRODUCTION_V2 = (function(exports) {
 	/** Not an authentication hash. A compact local freshness key avoids putting
 	* private notes into document metadata as literal JSON. */
 	function introductionV2SourceKey(profile, settings, clientId = "") {
+		const { narrativeEdits: _revision, ...original } = profile;
 		const source = JSON.stringify([
-			profile,
+			original,
 			settings,
 			clientId
 		]);
@@ -4867,7 +5295,7 @@ var NODE_INTRODUCTION_V2 = (function(exports) {
 		});
 		return facts;
 	}
-	function composeIntroductionV2(raw, rawSettings = blankIntroductionV2Settings(), clientId = "", now = /* @__PURE__ */ new Date(), edits = []) {
+	function composeIntroductionV2(raw, rawSettings = blankIntroductionV2Settings(), clientId = "", now = /* @__PURE__ */ new Date(), edits) {
 		const profile = parseIntroductionV2Profile(raw), settings = parseIntroductionV2Settings(rawSettings);
 		if (!profile || !settings) throw new Error("紹介文の入力または設定の形式を確認してください。原文は保持してください。");
 		const checks = [], questions = [], factRefs = [];
@@ -4906,18 +5334,22 @@ var NODE_INTRODUCTION_V2 = (function(exports) {
 			});
 			return normalized.value.trim();
 		};
-		const narrative = new Map(introductionV2NarrativeFacts(profile).map((item) => [item.factId, item]));
-		const acceptedEdits = /* @__PURE__ */ new Map();
-		for (const edit of edits) {
-			const source = narrative.get(edit.factId);
-			if (source && edit.text.trim() === source.sourceText) acceptedEdits.set(edit.factId, edit.text.trim());
-			else if (source && isValidatedIntroductionNarrativeEdit(edit, source.sourceText)) acceptedEdits.set(edit.factId, edit.text.trim());
+		const selectedEdits = edits ?? getStoredIntroductionNarrativeEdits(profile, settings);
+		if (edits === void 0 && profile.narrativeEdits && !isIntroductionNarrativeRevisionCurrent(profile, settings)) checks.push({
+			code: "narrative-stale",
+			severity: "review",
+			message: "原文または共有設定が変わったため、以前の整文を使わず原文を表示しています。必要に応じて整え直して保存してください。"
+		});
+		const acceptedEdits = /* @__PURE__ */ new Map(), seenEdits = /* @__PURE__ */ new Set();
+		for (const edit of selectedEdits) {
+			if (!seenEdits.has(edit.factId) && validateIntroductionNarrativeEdit(edit, profile, settings)) acceptedEdits.set(edit.factId, edit.text.trim());
 			else checks.push({
 				code: "narrative-rejected",
 				severity: "review",
 				sourceRef: edit.factId,
 				message: "根拠を確認できなかった文章は、その項目の原文を使っています。"
 			});
+			seenEdits.add(edit.factId);
 		}
 		const narrativeValue = (path, value) => {
 			const original = fixed(path, value);
@@ -5194,17 +5626,139 @@ var NODE_INTRODUCTION_V2 = (function(exports) {
 		});
 		return checks;
 	}
-	const validatedNarrativeEdits = /* @__PURE__ */ new WeakMap();
-	function markValidatedIntroductionNarrativeEdit(edit, original) {
-		validatedNarrativeEdits.set(edit, {
-			original,
-			text: edit.text
-		});
-		return edit;
+	/** Exact shape/size checking prevents a stored whole-document or private-field
+	* payload from being smuggled into the atom revision. Legacy profiles omit it. */
+	function parseIntroductionNarrativeRevision(value) {
+		if (!record(value) || Object.keys(value).sort().join("|") !== "edits|schemaVersion|settingsVersion|sourceKey|templateVersion" || value.schemaVersion !== 1 || !text(value.templateVersion, 200) || !text(value.settingsVersion, 200) || !text(value.sourceKey, 80) || !/^v2:[a-f0-9]+$/.test(value.sourceKey) || !Array.isArray(value.edits) || value.edits.length > 60) return null;
+		const edits = [], seen = /* @__PURE__ */ new Set();
+		for (const edit of value.edits) {
+			if (!record(edit) || Object.keys(edit).sort().join("|") !== "factId|text" || !text(edit.factId, 300) || !text(edit.text) || !edit.text.trim() || seen.has(edit.factId)) return null;
+			seen.add(edit.factId);
+			edits.push({
+				factId: edit.factId,
+				text: edit.text.trim()
+			});
+		}
+		const revision = {
+			schemaVersion: 1,
+			templateVersion: value.templateVersion,
+			sourceKey: value.sourceKey,
+			settingsVersion: value.settingsVersion,
+			edits
+		};
+		return unicodeLength(JSON.stringify(revision)) <= 6e4 ? revision : null;
 	}
-	function isValidatedIntroductionNarrativeEdit(edit, original) {
-		const checked = validatedNarrativeEdits.get(edit);
-		return checked?.original === original && checked.text === edit.text;
+	const significantNarrativeQualifiers = [
+		"未確認",
+		"不明",
+		"確認中",
+		"本人申告",
+		"希望",
+		"予定",
+		"候補",
+		"最大",
+		"最小",
+		"平均",
+		"約",
+		"以上",
+		"以下",
+		"未満",
+		"目標"
+	];
+	function introductionV2NarrativeIssues(candidate, source, otherEmployerNames = []) {
+		const issues = [];
+		if (!candidate.trim() || unicodeLength(candidate) > Math.max(400, unicodeLength(source) * 3) || !text(candidate)) issues.push("invalid-text");
+		issues.push(...introductionEvidenceIssues(candidate, "", {
+			...blankInterviewFields(),
+			workHistory: source
+		}));
+		const normalize = (value) => value.normalize("NFKC").replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g, "").toLocaleLowerCase("ja");
+		const before = normalize(source), after = normalize(candidate);
+		for (const name of otherEmployerNames.map((value) => value.trim()).filter(Boolean)) if (!before.includes(normalize(name)) && after.includes(normalize(name))) issues.push("employer-mixed");
+		for (const identifier of candidate.match(/[A-Za-z][A-Za-z0-9.+-]{1,}/g) ?? []) if (!before.includes(identifier.toLowerCase())) issues.push("identifier-added");
+		for (const qualifier of significantNarrativeQualifiers) if (before.includes(qualifier) && !after.includes(qualifier) && !(qualifier === "本人申告" && /本人から|本人による|との申告|と伺|とのこと/.test(candidate))) issues.push("qualification-removed");
+		const numberKey = (value) => (normalize(value).match(/\d[\d,]*(?:\.\d+)?/g) ?? []).map((item) => item.replace(/,/g, "")).join("|");
+		if (numberKey(source) !== numberKey(candidate)) issues.push("number-omitted-or-changed");
+		const negationScopes = (value) => {
+			const scopes = [];
+			for (const clause of normalize(value).split(/[。！？!?\n、,;；]/)) for (const match of clause.matchAll(/おりませんでした|おりません|おらず|おらない|いませんでした|いません|ありませんでした|ありません|ませんでした|ません|なかった|ない|なく|なし|せず|できず|未経験|未対応|未実施|未使用|不可|除く|以外/g)) {
+				const context = clause.slice(0, match.index).match(/[一-龠々]{1,}|[ァ-ヴー]{2,}|[a-z]{2,}|\d+/g) ?? [];
+				scopes.push(context.join("|"));
+			}
+			return scopes.join("\n");
+		};
+		if (negationScopes(source) !== negationScopes(candidate)) issues.push("negation-changed");
+		const wordingParts = (value) => normalize(value).replace(/[^\S\n]/g, "").trim().replace(/。$/, "").split(/([。！？!?\n、,;；])/);
+		const ending = (value) => {
+			const negative = value.replace(/(?:しておりませんでした|していませんでした|しておらなかった)$/, "していなかった").replace(/(?:しておりません|していません|しておらず|しておらない)$/, "していない").replace(/(?:しませんでした)$/, "しなかった").replace(/(?:しません|せず)$/, "しない");
+			const past = negative.match(/([一-龠々ァ-ヴー])(?:しておりました|していました|していた|しました|した)$/);
+			if (past) return {
+				base: negative.slice(0, past.index + 1),
+				tense: "past"
+			};
+			const present = negative.match(/([一-龠々ァ-ヴー])(?:しております|しています|している|します|する)$/);
+			if (present) return {
+				base: negative.slice(0, present.index + 1),
+				tense: "present"
+			};
+			return {
+				base: negative,
+				tense: "unspecified"
+			};
+		};
+		const sourceParts = wordingParts(source), candidateParts = wordingParts(candidate);
+		if (sourceParts.length !== candidateParts.length || sourceParts.some((part, index) => {
+			if (index % 2) return part !== candidateParts[index];
+			const original = ending(part), edited = ending(candidateParts[index]);
+			return original.base !== edited.base || original.tense !== "unspecified" && original.tense !== edited.tense;
+		})) issues.push("source-wording-changed");
+		for (const term of candidate.match(/リーダー|マネジメント|マネージャー|管理職|教育担当|研修担当|責任者|チームを牽引|部下|自動化|効率化|受注|成約|達成|改善率/g) ?? []) if (!source.includes(term)) issues.push("role-or-result-added");
+		const tokens = (value) => [...new Set(value.match(/[一-龠々]{2,}|[ァ-ヴー]{3,}|[A-Za-z]{2,}/g) ?? [])];
+		const sourceTokens = tokens(before), targetTokens = tokens(after);
+		if (targetTokens.some((token) => !before.includes(token))) issues.push("source-content-added");
+		if (sourceTokens.some((token) => !after.includes(token) && !targetTokens.join("").includes(token))) issues.push("source-content-omitted");
+		return [...new Set(issues)];
+	}
+	/** Atom relationship, every factual qualifier and sensitive values are checked
+	* on the server too. No native-engine capability is accepted as proof. */
+	function validateIntroductionNarrativeEdit(edit, profile, settings = blankIntroductionV2Settings()) {
+		if (!record(edit) || Object.keys(edit).sort().join("|") !== "factId|text" || !text(edit.factId, 300) || !text(edit.text)) return false;
+		const source = introductionV2NarrativeFacts(profile).find((fact) => fact.factId === edit.factId);
+		if (!source) return false;
+		const companies = profile.careers.filter((career) => career.id !== source.careerId).map((career) => career.company);
+		return !introductionV2NarrativeIssues(edit.text, source.sourceText, companies).length && !inspectIntroductionV2ClientText(edit.text, profile, settings).some((check) => check.severity === "block");
+	}
+	function isIntroductionNarrativeRevisionCurrent(profile, settings) {
+		const revision = profile.narrativeEdits;
+		return !!revision && revision.templateVersion === "2026-11-06" && revision.settingsVersion === settings.version && revision.sourceKey === introductionV2SourceKey(profile, settings) && revision.edits.every((edit) => validateIntroductionNarrativeEdit(edit, profile, settings));
+	}
+	function getStoredIntroductionNarrativeEdits(profile, settings) {
+		return isIntroductionNarrativeRevisionCurrent(profile, settings) ? profile.narrativeEdits.edits.map((edit) => ({ ...edit })) : [];
+	}
+	function withoutIntroductionNarrativeEdits(profile) {
+		const { narrativeEdits: _revision, ...original } = profile;
+		return original;
+	}
+	function withIntroductionNarrativeEdits(profile, settings, edits) {
+		const original = withoutIntroductionNarrativeEdits(profile), seen = /* @__PURE__ */ new Set();
+		if (edits.length > 60 || edits.some((edit) => seen.has(edit.factId) || (seen.add(edit.factId), !validateIntroductionNarrativeEdit(edit, original, settings)))) throw new Error("整文の根拠を確認できませんでした。原文は保持されています。");
+		const revision = parseIntroductionNarrativeRevision({
+			schemaVersion: 1,
+			templateVersion: introductionV2Version,
+			sourceKey: introductionV2SourceKey(original, settings),
+			settingsVersion: settings.version,
+			edits
+		});
+		if (!revision) throw new Error("整文が保存上限を超えています。原文は保持されています。");
+		const parsed = parseIntroductionV2Profile({
+			...original,
+			narrativeEdits: revision
+		});
+		if (!parsed) throw new Error("紹介文が保存上限を超えています。原文は保持されています。");
+		return parsed;
+	}
+	function markValidatedIntroductionNarrativeEdit(edit, _original) {
+		return edit;
 	}
 	/** Suggestion only: the caller asks the user to confirm the derived total.
 	* Inclusive month ranges are merged so overlapping jobs are not double-counted. */
@@ -5244,14 +5798,18 @@ var NODE_INTRODUCTION_V2 = (function(exports) {
 	exports.compareIntroductionV2Bodies = compareIntroductionV2Bodies;
 	exports.composeIntroductionV2 = composeIntroductionV2;
 	exports.formatIntroductionRate = formatIntroductionRate;
+	exports.getStoredIntroductionNarrativeEdits = getStoredIntroductionNarrativeEdits;
 	exports.inspectIntroductionV2ClientText = inspectIntroductionV2ClientText;
 	exports.introductionV2FromLegacy = introductionV2FromLegacy;
 	exports.introductionV2Headings = introductionV2Headings;
 	exports.introductionV2MaxLength = introductionV2MaxLength;
 	exports.introductionV2NarrativeFacts = introductionV2NarrativeFacts;
+	exports.introductionV2NarrativeIssues = introductionV2NarrativeIssues;
 	exports.introductionV2SourceKey = introductionV2SourceKey;
 	exports.introductionV2Version = introductionV2Version;
+	exports.isIntroductionNarrativeRevisionCurrent = isIntroductionNarrativeRevisionCurrent;
 	exports.markValidatedIntroductionNarrativeEdit = markValidatedIntroductionNarrativeEdit;
+	exports.parseIntroductionNarrativeRevision = parseIntroductionNarrativeRevision;
 	exports.parseIntroductionRate = parseIntroductionRate;
 	exports.parseIntroductionV2Profile = parseIntroductionV2Profile;
 	exports.parseIntroductionV2Settings = parseIntroductionV2Settings;
@@ -5260,6 +5818,9 @@ var NODE_INTRODUCTION_V2 = (function(exports) {
 	exports.resolveIntroductionSource = resolveIntroductionSource;
 	exports.suggestIntroductionExperienceTotal = suggestIntroductionExperienceTotal;
 	exports.validIntroductionRate = validIntroductionRate;
+	exports.validateIntroductionNarrativeEdit = validateIntroductionNarrativeEdit;
+	exports.withIntroductionNarrativeEdits = withIntroductionNarrativeEdits;
+	exports.withoutIntroductionNarrativeEdits = withoutIntroductionNarrativeEdits;
 	return exports;
 })({});
 
@@ -5287,7 +5848,14 @@ function planIntroductionV2_(store,actor,payload){
  guardProbeBusinessMutation_(store,actor,'saveIntroductionV2',payload);writingObject_(payload,['recordId','profile','expectedVersion']);var recordId=shortText_(payload.recordId,200,true),access=introductionV2Access_(store,actor,recordId),expected=introductionV2Version_(payload.expectedVersion),engine=introductionV2Engine_(),profile=engine.parseIntroductionV2Profile(payload.profile);
  if(!profile)fail_('VALIDATION','紹介文の入力形式・文字数・職歴の重複IDを確認してください。原文は保持されています。');if(!introductionV2NameMatches_(profile.candidateName,access.record.name))fail_('VALIDATION','紹介文の氏名が候補者名と一致していません。氏名の訂正は候補者情報で行ってから保存してください。');
  var state=introductionV2Table_(store.book),previous=state.entries.find(function(e){return e.draftKey===access.draftKey;});if(previous&&previous.playerId!==access.record.playerId)fail_('FORBIDDEN','紹介文の担当者が一致しません。');if((previous?previous.version:'')!==expected)fail_('CONFLICT','紹介文の入力情報が更新されています。入力を保持し、最新の内容と比較してください。');
- var settings=introductionSettingsTable_(store.book);try{engine.composeIntroductionV2(profile,currentIntroductionSettings_(settings),'',new Date());}catch(_){fail_('VALIDATION','紹介文を組み立てられません。入力を確認してください。');}
+ var settings=introductionSettingsTable_(store.book),currentSettings=currentIntroductionSettings_(settings);
+ // Older clients omit the optional revision. Preserve a still-current reviewed
+ // revision only when their original profile and all settings are identical.
+ // A current empty edits revision is the explicit reset operation.
+ if(!profile.narrativeEdits&&previous&&previous.profile.narrativeEdits&&engine.isIntroductionNarrativeRevisionCurrent(previous.profile,currentSettings)&&engine.introductionV2SourceKey(profile,currentSettings)===engine.introductionV2SourceKey(previous.profile,currentSettings))profile.narrativeEdits=previous.profile.narrativeEdits;
+ if(profile.narrativeEdits&&!engine.isIntroductionNarrativeRevisionCurrent(profile,currentSettings))fail_('VALIDATION','整文の根拠・原文・共有設定が一致しません。最新の原文で確認し直して保存してください。');
+ if(profile.narrativeEdits&&!profile.narrativeEdits.edits.length)delete profile.narrativeEdits;
+ try{engine.composeIntroductionV2(profile,currentSettings,'',new Date());}catch(_){fail_('VALIDATION','紹介文を組み立てられません。入力を確認してください。');}
  var version=random256_(),now=new Date().toISOString(),plan={requests:[],result:{recordId:recordId,draftKey:access.draftKey}},targetKey=access.draftKey;
  if(!access.record.profileId){
   // Establish only the stable relationship used by existing proposal flows. The
@@ -5334,7 +5902,8 @@ function planPublishIntroductionV2_(store,actor,payload){
  var access=introductionV2Access_(store,actor,shortText_(payload.recordId,200,true)),record=access.record;if(probeReservation_(store,actor.id,false)||probeReservation_(store,record.playerId,false))fail_('FORBIDDEN','検証専用アカウントの候補者は社内共有できません。');checkVersion_(record,payload.rowVersion);if(!store.players.some(function(p){return p.id===record.playerId&&p.role==='player'&&p.active;}))fail_('FORBIDDEN','有効な担当者の候補者だけ社内共有できます。');
  var drafts=introductionV2Table_(store.book),draft=drafts.entries.find(function(entry){return entry.draftKey===access.draftKey&&entry.playerId===record.playerId;});if(!draft||draft.version!==payload.introductionVersion)fail_('CONFLICT','最新の紹介文V2の入力情報を保存・確認してから共有してください。');if(!introductionV2NameMatches_(draft.profile.candidateName,record.name))fail_('CONFLICT','紹介文の氏名と候補者名が一致しません。候補者情報を確認してください。');
  var settingsState=introductionSettingsTable_(store.book),settings=currentIntroductionSettings_(settingsState),settingsVersion=settings.version==='initial'?'':settings.version;if(payload.settingsVersion!==settingsVersion)fail_('CONFLICT','紹介文の共有設定が変わりました。最新の本文を確認し直してください。');
- var engine=introductionV2Engine_(),document=engine.composeIntroductionV2(draft.profile,settings,'',new Date()),text=document.headingLine+'\n\n'+document.internalBody;
+ var engine=introductionV2Engine_();if(draft.profile.narrativeEdits&&!engine.isIntroductionNarrativeRevisionCurrent(draft.profile,settings))fail_('CONFLICT','原文または共有設定が変わりました。紹介文で現在の原文または整文を確認して保存してから共有してください。');
+ var document=engine.composeIntroductionV2(draft.profile,settings,'',new Date()),text=document.headingLine+'\n\n'+document.internalBody;
  if(document.checks.some(function(check){return check.severity==='block'&&check.code!=='document-length';})||engine.inspectIntroductionV2ClientText(text,draft.profile,settings).some(function(check){return check.severity==='block';}))fail_('VALIDATION','社内共有できない内容が紹介文に含まれています。非公開メモ・禁止語・個人事情を確認してください。');
  var marker=introductionV2PublicationMarker_(access.draftKey),introduction=teamIntroductionText_(text,marker),state=teamCandidateTable_(store.book),previous=payload.publicationId?teamPublication_(state,payload.publicationId):null,relatedRecords=store.records.filter(function(r){return (r.profileId||r.recordId)===access.draftKey&&r.playerId===record.playerId;}).map(function(r){return r.recordId;});
  function sameSource(p){return p.ownerId===record.playerId&&(p.sourceProfileId===marker||!!record.profileId&&p.sourceProfileId===record.profileId&&relatedRecords.indexOf(p.sourceRecordId)>=0);}
@@ -5457,12 +6026,14 @@ function workflowDataExport_(store,actor){
  var settingHeaders=['id','json0','json1','json2','json3','json4','json5','json6','json7','json8','json9','version','updatedAt','actorId'];
  var drafts=table('_NODE_introduction_v2',draftHeaders,typeof introductionV2Table_==='function'?introductionV2Table_:null);
  var settings=table('_NODE_introduction_settings',settingHeaders,typeof introductionSettingsTable_==='function'?introductionSettingsTable_:null);
+ var comments=table('_NODE_match_report_comments',['commentId','reportId','parentId','authorId','body','deleted','version','createdAt','updatedAt'],typeof matchReportCommentTable_==='function'?matchReportCommentTable_:null);
  var evidence=table('_NODE_match_evidence',['id','body','version','updatedAt'],typeof matchEvidenceTable_==='function'?matchEvidenceTable_:null);
  function body(entry){var out=Object.assign({},entry);delete out.row;return out;}
  var evidenceFields=['evidenceId','ownerId','recordId','profileId','kind','mime','size','status','generation','createdAt','expiresAt','completedAt','version','updatedAt'];
  var data={feature:true,schemaVersion:1,scope:'all-saved-private-workflows',
   metricGoals:metric.entries.map(function(entry){var out=body(entry);out.actorId=metric.rows[entry.row-2][7];return out;}),
   salesWorkflow:{jobs:jobs.entries.map(body),plans:plans.entries.map(body),reports:reports.entries.map(body)},
+  matchReportComments:{schemaVersion:1,comments:comments.entries.map(function(entry){return {commentId:entry.commentId,reportId:entry.reportId,parentId:entry.parentId,authorId:entry.authorId,body:entry.deleted?'':entry.body,deleted:entry.deleted,version:entry.version,createdAt:entry.createdAt,updatedAt:entry.updatedAt};})},
   introductionV2:{drafts:drafts.entries.map(function(entry){return {draftKey:entry.draftKey,playerId:entry.playerId,profile:entry.profile,version:entry.version,updatedAt:entry.updatedAt,actorId:drafts.rows[entry.row-2][14]};}),settings:settings.entries.map(function(entry){return {id:'shared',settings:entry.settings,version:entry.version,updatedAt:entry.updatedAt,actorId:settings.rows[entry.row-2][13]};})},
   matchEvidence:{scope:'metadata-only',files:evidence.entries.map(function(entry){var out={};evidenceFields.forEach(function(key){if(!Object.prototype.hasOwnProperty.call(entry,key))fail_('SCHEMA_MISMATCH','合意資料の書き出し項目が不足しています。');out[key]=entry[key];});return out;})}
  };

@@ -14,6 +14,29 @@
 .sales-search{display:flex!important;align-items:center;gap:7px;flex:1;min-width:220px;border:1px solid #c9ddec;border-radius:8px;background:white;padding-left:12px}
 .sales-search input{border:0!important;min-width:0}
 .sales-help,.sales-workspace small{font-size:12px;color:#6685a1;line-height:1.65}
+.sales-job-filters{display:grid;gap:12px}
+.sales-filter-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:18px}
+.sales-filter-heading h3{font-size:16px}
+.sales-filter-heading p{font-size:12px;color:#60809a;margin:5px 0}
+.sales-filter-heading>button{flex-shrink:0}
+.sales-filter-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px 16px;align-items:end}
+.sales-filter-grid .sales-search{grid-column:span 3;min-width:0;margin:10px 0}
+.sales-filter-grid .sales-search input{width:100%;padding:11px 12px}
+.sales-filter-grid label{margin:5px 0}
+.sales-filter-number{display:flex;align-items:center;gap:8px;min-width:0}
+.sales-filter-number>input{flex:1;width:60px!important}
+.sales-filter-number>span{font-size:12px;white-space:nowrap;font-weight:400}
+.sales-filter-number>select{width:auto!important;flex-shrink:0;padding-left:8px!important;padding-right:8px!important}
+.sales-filter-options{display:flex;gap:12px 20px;align-items:center;flex-wrap:wrap}
+.sales-filter-options .sales-check{font-size:12px;margin:3px 0}
+.sales-filter-options>button{font-size:12px}
+.sales-filter-result{border-top:1px solid #dce7ef;padding-top:10px}
+.sales-filter-result p{margin:0 0 4px;font-size:13px}
+.sales-filter-result strong{font-size:19px;color:#1b628f}
+.sales-job-create{justify-content:flex-end;margin-top:-8px}
+.sales-job.is-selected{outline:2px solid #2597d3;outline-offset:1px}
+.sales-unknown-condition{background:#fff5df;color:#866019;padding:7px 9px;border-radius:5px;font-size:12px;margin:0!important}
+.sales-comparison-actions{flex-wrap:wrap}
 .sales-jobs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
 .sales-job{display:flex;flex-direction:column;gap:9px}
 .sales-job>header,.sales-job>footer{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
@@ -75,5 +98,10 @@
 .sales-evidence>span{font-size:11px;color:#53758f}
 @keyframes sales-slide-in{from{transform:translateX(30px);opacity:0}to{transform:translateX(0);opacity:1}}
 @media(prefers-reduced-motion:reduce){.sales-drawer{animation:none}}
-@media(max-width:1000px){.sales-jobs{grid-template-columns:1fr}.sales-heading{flex-wrap:wrap}.sales-plan-list>article{align-items:flex-start;flex-wrap:wrap}.sales-plan-actions{max-width:100%;justify-content:flex-start}}
+@media(max-width:1000px){.sales-jobs{grid-template-columns:1fr}.sales-heading{flex-wrap:wrap}.sales-plan-list>article{align-items:flex-start;flex-wrap:wrap}.sales-plan-actions{max-width:100%;justify-content:flex-start}.sales-filter-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.sales-filter-grid .sales-search{grid-column:1/-1}}
 @media(max-width:620px){.sales-workspace .card{padding:17px}.sales-heading,.sales-proposals>header,.sales-report-create{flex-direction:column;align-items:stretch}.sales-tabs button{padding:12px;font-size:12px}.sales-job dl,.sales-form-grid,.sales-destination-picker{grid-template-columns:1fr}.sales-job>footer{align-items:flex-start;flex-direction:column}.sales-job>footer>div{flex-wrap:wrap}.sales-drawer{inset:0;margin:0;width:100%;height:100dvh;max-height:100dvh;border-radius:0;border:0}.sales-drawer-body{padding-left:18px;padding-right:18px}.sales-sticky-actions{margin-left:-18px;margin-right:-18px;padding:14px 18px}.sales-price{grid-template-columns:1fr 1fr}.sales-price label:first-of-type{grid-column:1/-1}.sales-report-list>article,.sales-pool>article{align-items:flex-start;flex-wrap:wrap}}
+
+.sales-report-actions{display:flex;align-items:center;justify-content:flex-end;gap:10px;flex-wrap:wrap;flex-shrink:0}
+@media(max-width:620px){.sales-filter-grid{grid-template-columns:1fr}.sales-filter-grid .sales-search{grid-column:auto}.sales-filter-heading{flex-wrap:wrap;gap:7px}.sales-filter-options{align-items:flex-start;flex-direction:column;gap:12px}.sales-filter-number>input{width:100%!important}.sales-comparison-actions{align-items:stretch;flex-direction:column}.sales-comparison-actions>button{white-space:normal;text-align:center}.sales-report-actions{justify-content:flex-start}}
+
+.sales-comparison{scroll-margin-top:20px}

@@ -5,6 +5,7 @@ import { normalizeIntroductionValue, introductionStartDateState } from "../lib/i
 import { blankIntroductionCareer, blankIntroductionV2Profile, blankIntroductionV2Settings, composeIntroductionV2,
   compareIntroductionV2Bodies, introductionV2FromLegacy, introductionV2SourceKey, inspectIntroductionV2ClientText,
   parseIntroductionV2Profile, parseIntroductionV2Settings, parseIntroductionRate, suggestIntroductionExperienceTotal,
+  withIntroductionNarrativeEdits, getStoredIntroductionNarrativeEdits, withoutIntroductionNarrativeEdits, validateIntroductionNarrativeEdit,
   type IntroductionV2Profile } from "../lib/introduction-v2.ts";
 import { generateIntroductionV2, introductionV2NarrativeIssues } from "../lib/introduction-v2-ai.ts";
 
@@ -172,6 +173,9 @@ test("the narrative guard is employer-specific and protects every numerical or u
   assert.ok(introductionV2NarrativeIssues("Salesforceで架電業務を担当。", "架電業務を担当。").length);
   assert.ok(introductionV2NarrativeIssues("リーダーとして架電業務を担当。", "架電業務を担当。").length);
   assert.ok(introductionV2NarrativeIssues("優秀な人材であり採用すべきです。", "架電業務を担当。").length);
+  assert.ok(introductionV2NarrativeIssues("架電業務を担当していました。", "架電業務を担当していない。").includes("negation-changed"));
+  assert.deepEqual(introductionV2NarrativeIssues("架電業務を担当していません。", "架電業務を担当していない。"), []);
+  assert.ok(introductionV2NarrativeIssues("メールを担当せず、架電を担当した。", "架電を担当せず、メールを担当した。").includes("negation-changed"));
 });
 
 test("an unavailable native model yields a usable factual fallback and honestly names its method", async () => {
@@ -209,4 +213,100 @@ test("invisible formatting cannot bypass a configured private term", () => {
   const profile = fixture(), settings = blankIntroductionV2Settings(); settings.blockedTerms = ["共有禁止"];
   assert.ok(inspectIntroductionV2ClientText("共有\u200b禁止の内容", profile, settings).some(check => check.code === "blocked-term"));
   assert.ok(inspectIntroductionV2ClientText("持\u200b病の治療をしています", profile, settings).some(check => check.code === "source-private-detail"));
+});
+
+
+test("reviewed prose survives JSON storage on a device without AI in both output variants", async () => {
+  const original = fixture(), settings = blankIntroductionV2Settings();
+  settings.clients = [{ id: "recipient", name: "架空宛先", mentions: ["@確認済み"], rate: { amount: "2400", unit: "hour", tax: "exclusive" } }];
+  const edit = { factId: "introduction:careers.employer-a.duties.0", text: "架電業務を担当していました。" };
+  const saved = withIntroductionNarrativeEdits(original, settings, [edit]);
+  assert.deepEqual(withoutIntroductionNarrativeEdits(saved), original);
+  const loaded = parseIntroductionV2Profile(JSON.parse(JSON.stringify(saved)))!;
+  assert.deepEqual(getStoredIntroductionNarrativeEdits(loaded, settings), [edit]);
+  const before = composeIntroductionV2(saved, settings, "recipient"), after = composeIntroductionV2(loaded, settings, "recipient");
+  assert.equal(after.internalBody, before.internalBody); assert.equal(after.client.text, before.client.text);
+  assert.match(after.internalBody, /架電業務を担当していました。/); assert.match(after.client.text, /架電業務を担当していました。/);
+  assert.equal(introductionV2SourceKey(saved, settings), introductionV2SourceKey(original, settings));
+  const prior = Object.getOwnPropertyDescriptor(globalThis, "LanguageModel");
+  try { Object.defineProperty(globalThis, "LanguageModel", { configurable: true, value: undefined }); assert.equal((await generateIntroductionV2(loaded, settings, "recipient")).document.client.text, after.client.text); }
+  finally { if (prior) Object.defineProperty(globalThis, "LanguageModel", prior); else Reflect.deleteProperty(globalThis, "LanguageModel"); }
+});
+
+test("source, settings and template changes exclude stale prose without deleting originals or blocking the read", () => {
+  const profile = fixture(), settings = blankIntroductionV2Settings(), edit = { factId: "introduction:careers.employer-a.duties.0", text: "架電業務を担当していました。" };
+  const saved = withIntroductionNarrativeEdits(profile, settings, [edit]);
+  const changed = structuredClone(saved); changed.careers[0].duties[0] = "架電業務の事前確認を担当。";
+  for (const [p, s] of [[changed, settings], [saved, { ...settings, version: "changed" }], [saved, { ...settings, blockedTerms: ["new-word"] }], [{ ...saved, narrativeEdits: { ...saved.narrativeEdits!, templateVersion: "old-template" } }, settings]] as const) {
+    assert.ok(parseIntroductionV2Profile(p)); const doc = composeIntroductionV2(p, s);
+    assert.equal(getStoredIntroductionNarrativeEdits(p, s).length, 0); assert.ok(doc.checks.some(check => check.code === "narrative-stale")); assert.doesNotMatch(doc.internalBody, /担当していました/);
+  }
+  assert.deepEqual(withoutIntroductionNarrativeEdits(saved), profile);
+});
+
+test("stored atoms reject private values, other careers, changed units, inventions and malformed envelopes", () => {
+  const profile = fixture(), settings = blankIntroductionV2Settings(), id = "introduction:careers.employer-a.duties.0";
+  const invalid = [
+    { factId: "introduction:careers.someone-else.duties.0", text: "架電業務を担当していました。" },
+    { factId: id, text: "架電業務を担当。社内限定の原稿確認メモ" },
+    { factId: id, text: "架空秘密会社で架電業務を担当。" },
+    { factId: id, text: "架電業務を担当していました。", internalMemo: "hidden" },
+    { factId: id, text: "架電業務を担当。".repeat(1000) },
+  ];
+  for (const edit of invalid) { assert.equal(validateIntroductionNarrativeEdit(edit, profile, settings), false); assert.throws(() => withIntroductionNarrativeEdits(profile, settings, [edit])); }
+  profile.careers[0].duties[0] = "本人申告：月120件の架電業務を担当。";
+  assert.equal(validateIntroductionNarrativeEdit({ factId: id, text: "本人申告：月120時間の架電業務を担当。" }, profile, settings), false);
+  const good = { factId: id, text: profile.careers[0].duties[0] };
+  const saved = withIntroductionNarrativeEdits(profile, settings, [good]);
+  assert.equal(parseIntroductionV2Profile({ ...saved, narrativeEdits: { ...saved.narrativeEdits, finalText: "whole body" } }), null);
+  assert.equal(parseIntroductionV2Profile({ ...saved, narrativeEdits: { ...saved.narrativeEdits, edits: [good, good] } }), null);
+  assert.throws(() => withIntroductionNarrativeEdits(profile, settings, [good, good]));
+});
+
+test("an explicit empty revision restores source prose and remains distinct from an old client payload", () => {
+  const profile = fixture(), settings = blankIntroductionV2Settings(), edit = { factId: "introduction:careers.employer-a.duties.0", text: "架電業務を担当していました。" };
+  const saved = withIntroductionNarrativeEdits(profile, settings, [edit]), reset = withIntroductionNarrativeEdits(saved, settings, []);
+  assert.ok(reset.narrativeEdits); assert.deepEqual(reset.narrativeEdits.edits, []);
+  assert.equal(composeIntroductionV2(reset, settings).internalBody, composeIntroductionV2(profile, settings).internalBody);
+  assert.deepEqual(withoutIntroductionNarrativeEdits(reset), profile);
+  assert.notEqual(JSON.stringify(saved), JSON.stringify(reset));
+});
+
+test("narrative validation preserves complete fact relationships, hiragana names, negative scope and explicit tense", () => {
+  const cases = [
+    ["架電しませんでした。", "架電しました。"],
+    ["架電を担当しておりません。", "架電を担当していました。"],
+    ["架電を担当しておらず、メールを担当。", "架電を担当しており、メールを担当。"],
+    ["架電を担当していませんでした。", "架電を担当していました。"],
+    ["架電100件、メール20件。", "架電20件、メール100件。"],
+    ["架電を10日、メールを20日担当。", "架電を20日、メールを10日担当。"],
+    ["架電は担当、メールは同僚。", "架電は同僚、メールは担当。"],
+    ["架電を担当。", "架電を担当。あおい社で担当。"],
+    ["あおい社で架電を担当。", "あかね社で架電を担当。"],
+    ["架電を担当。", "架電を担当。すごくよい。"],
+    ["架電を担当する。", "架電を担当しました。"],
+    ["架電を担当した。", "架電を担当しています。"],
+    ["架電を担当していない。", "架電を担当していなかった。"],
+    ["架電を担当する予定。", "架電を担当する予定でした。"],
+  ];
+  for (const [source, candidate] of cases) {
+    const profile = fixture(); profile.careers[0].duties = [source];
+    const edit = { factId: "introduction:careers.employer-a.duties.0", text: candidate };
+    assert.equal(validateIntroductionNarrativeEdit(edit, profile), false, `${source} → ${candidate}`);
+    assert.throws(() => withIntroductionNarrativeEdits(profile, blankIntroductionV2Settings(), [edit]));
+    const rendered = composeIntroductionV2(profile, blankIntroductionV2Settings(), "", new Date(), [edit]);
+    assert.ok(rendered.internalBody.includes(source)); assert.ok(rendered.checks.some(check => check.code === "narrative-rejected"));
+  }
+  for (const [source, candidate] of [
+    ["架電を担当。", "架電を担当していました。"],
+    ["架電を担当した。", "架電を担当しました。"],
+    ["架電を担当する。", "架電を担当しています。"],
+    ["架電を担当していない。", "架電を担当していません。"],
+    ["架電を担当していなかった。", "架電を担当していませんでした。"],
+    ["架電100件、メール20件を担当。", "架電100件、メール20件を担当していました。"],
+    ["あおい社で架電を担当。", "あおい社で架電を担当していました。"],
+  ]) {
+    const profile = fixture(); profile.careers[0].duties = [source];
+    assert.equal(validateIntroductionNarrativeEdit({ factId: "introduction:careers.employer-a.duties.0", text: candidate }, profile), true, `${source} → ${candidate}`);
+  }
 });

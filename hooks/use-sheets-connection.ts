@@ -805,7 +805,7 @@ export function useSheetsConnection() {
 }
 
 function saveLabel(action: string) {
-  return ({publishIntroductionV2:"紹介文を社内共有",saveMetricGoals:"月別・工程別目標の保存",saveWorkJob:"募集案件の保存",saveProposalPlan:"提案予定の保存",recordProposalSent:"提案送付の記録",saveMatchReport:"マッチング報告の保存",completeMatchEvidence:"合意確認資料の保存",saveIntroductionV2:"候補者の紹介文・確認事項",saveIntroductionSettings:"紹介文の共有設定",mutateRewards:"ポイント・特典の保存",stageMigrationBatch:"過去データの原文保管",applyMigrationItem:"過去データの登録",saveCandidateProfile:"候補者の基本情報",saveClient:"取引先の登録・編集",deleteCandidate:"候補者・提案の削除",updateRecord:"候補者の変更",createCandidate:"候補者の登録",cancelAchievement:"成果の取り消し",restoreChange:"変更の復元",saveActivity:"成果の登録",updateProfile:"プロフィール",updateStatus:"進捗の変更",saveManagementRow:"業務管理表",saveInterviewReview:"面談の振り返り"} as Record<string,string>)[action] || "変更";
+  return ({saveMatchReportComment:"マッチ報告のコメント",deleteMatchReportComment:"マッチ報告コメントの削除",publishIntroductionV2:"紹介文を社内共有",saveMetricGoals:"月別・工程別目標の保存",saveWorkJob:"募集案件の保存",saveProposalPlan:"提案予定の保存",recordProposalSent:"提案送付の記録",saveMatchReport:"マッチング報告の保存",completeMatchEvidence:"合意確認資料の保存",saveIntroductionV2:"候補者の紹介文・確認事項",saveIntroductionSettings:"紹介文の共有設定",mutateRewards:"ポイント・特典の保存",stageMigrationBatch:"過去データの原文保管",applyMigrationItem:"過去データの登録",saveCandidateProfile:"候補者の基本情報",saveClient:"取引先の登録・編集",deleteCandidate:"候補者・提案の削除",updateRecord:"候補者の変更",createCandidate:"候補者の登録",cancelAchievement:"成果の取り消し",restoreChange:"変更の復元",saveActivity:"成果の登録",updateProfile:"プロフィール",updateStatus:"進捗の変更",saveManagementRow:"業務管理表",saveInterviewReview:"面談の振り返り"} as Record<string,string>)[action] || "変更";
 }
 function saveDetails(action: string, owned: unknown, snapshot: SheetSnapshot): string[] {
   const data = owned as Record<string, unknown>, detail: string[] = [];

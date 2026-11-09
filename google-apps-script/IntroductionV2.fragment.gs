@@ -22,7 +22,14 @@ function planIntroductionV2_(store,actor,payload){
  guardProbeBusinessMutation_(store,actor,'saveIntroductionV2',payload);writingObject_(payload,['recordId','profile','expectedVersion']);var recordId=shortText_(payload.recordId,200,true),access=introductionV2Access_(store,actor,recordId),expected=introductionV2Version_(payload.expectedVersion),engine=introductionV2Engine_(),profile=engine.parseIntroductionV2Profile(payload.profile);
  if(!profile)fail_('VALIDATION','紹介文の入力形式・文字数・職歴の重複IDを確認してください。原文は保持されています。');if(!introductionV2NameMatches_(profile.candidateName,access.record.name))fail_('VALIDATION','紹介文の氏名が候補者名と一致していません。氏名の訂正は候補者情報で行ってから保存してください。');
  var state=introductionV2Table_(store.book),previous=state.entries.find(function(e){return e.draftKey===access.draftKey;});if(previous&&previous.playerId!==access.record.playerId)fail_('FORBIDDEN','紹介文の担当者が一致しません。');if((previous?previous.version:'')!==expected)fail_('CONFLICT','紹介文の入力情報が更新されています。入力を保持し、最新の内容と比較してください。');
- var settings=introductionSettingsTable_(store.book);try{engine.composeIntroductionV2(profile,currentIntroductionSettings_(settings),'',new Date());}catch(_){fail_('VALIDATION','紹介文を組み立てられません。入力を確認してください。');}
+ var settings=introductionSettingsTable_(store.book),currentSettings=currentIntroductionSettings_(settings);
+ // Older clients omit the optional revision. Preserve a still-current reviewed
+ // revision only when their original profile and all settings are identical.
+ // A current empty edits revision is the explicit reset operation.
+ if(!profile.narrativeEdits&&previous&&previous.profile.narrativeEdits&&engine.isIntroductionNarrativeRevisionCurrent(previous.profile,currentSettings)&&engine.introductionV2SourceKey(profile,currentSettings)===engine.introductionV2SourceKey(previous.profile,currentSettings))profile.narrativeEdits=previous.profile.narrativeEdits;
+ if(profile.narrativeEdits&&!engine.isIntroductionNarrativeRevisionCurrent(profile,currentSettings))fail_('VALIDATION','整文の根拠・原文・共有設定が一致しません。最新の原文で確認し直して保存してください。');
+ if(profile.narrativeEdits&&!profile.narrativeEdits.edits.length)delete profile.narrativeEdits;
+ try{engine.composeIntroductionV2(profile,currentSettings,'',new Date());}catch(_){fail_('VALIDATION','紹介文を組み立てられません。入力を確認してください。');}
  var version=random256_(),now=new Date().toISOString(),plan={requests:[],result:{recordId:recordId,draftKey:access.draftKey}},targetKey=access.draftKey;
  if(!access.record.profileId){
   // Establish only the stable relationship used by existing proposal flows. The
@@ -69,7 +76,8 @@ function planPublishIntroductionV2_(store,actor,payload){
  var access=introductionV2Access_(store,actor,shortText_(payload.recordId,200,true)),record=access.record;if(probeReservation_(store,actor.id,false)||probeReservation_(store,record.playerId,false))fail_('FORBIDDEN','検証専用アカウントの候補者は社内共有できません。');checkVersion_(record,payload.rowVersion);if(!store.players.some(function(p){return p.id===record.playerId&&p.role==='player'&&p.active;}))fail_('FORBIDDEN','有効な担当者の候補者だけ社内共有できます。');
  var drafts=introductionV2Table_(store.book),draft=drafts.entries.find(function(entry){return entry.draftKey===access.draftKey&&entry.playerId===record.playerId;});if(!draft||draft.version!==payload.introductionVersion)fail_('CONFLICT','最新の紹介文V2の入力情報を保存・確認してから共有してください。');if(!introductionV2NameMatches_(draft.profile.candidateName,record.name))fail_('CONFLICT','紹介文の氏名と候補者名が一致しません。候補者情報を確認してください。');
  var settingsState=introductionSettingsTable_(store.book),settings=currentIntroductionSettings_(settingsState),settingsVersion=settings.version==='initial'?'':settings.version;if(payload.settingsVersion!==settingsVersion)fail_('CONFLICT','紹介文の共有設定が変わりました。最新の本文を確認し直してください。');
- var engine=introductionV2Engine_(),document=engine.composeIntroductionV2(draft.profile,settings,'',new Date()),text=document.headingLine+'\n\n'+document.internalBody;
+ var engine=introductionV2Engine_();if(draft.profile.narrativeEdits&&!engine.isIntroductionNarrativeRevisionCurrent(draft.profile,settings))fail_('CONFLICT','原文または共有設定が変わりました。紹介文で現在の原文または整文を確認して保存してから共有してください。');
+ var document=engine.composeIntroductionV2(draft.profile,settings,'',new Date()),text=document.headingLine+'\n\n'+document.internalBody;
  if(document.checks.some(function(check){return check.severity==='block'&&check.code!=='document-length';})||engine.inspectIntroductionV2ClientText(text,draft.profile,settings).some(function(check){return check.severity==='block';}))fail_('VALIDATION','社内共有できない内容が紹介文に含まれています。非公開メモ・禁止語・個人事情を確認してください。');
  var marker=introductionV2PublicationMarker_(access.draftKey),introduction=teamIntroductionText_(text,marker),state=teamCandidateTable_(store.book),previous=payload.publicationId?teamPublication_(state,payload.publicationId):null,relatedRecords=store.records.filter(function(r){return (r.profileId||r.recordId)===access.draftKey&&r.playerId===record.playerId;}).map(function(r){return r.recordId;});
  function sameSource(p){return p.ownerId===record.playerId&&(p.sourceProfileId===marker||!!record.profileId&&p.sourceProfileId===record.profileId&&relatedRecords.indexOf(p.sourceRecordId)>=0);}

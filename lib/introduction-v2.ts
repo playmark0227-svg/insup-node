@@ -1,5 +1,5 @@
-import { normalizeInterviewFields, unicodeLength, type InterviewFields } from "./candidate-intake.ts";
-import { introductionContentIssues } from "./introduction-review.ts";
+import { blankInterviewFields, normalizeInterviewFields, unicodeLength, type InterviewFields } from "./candidate-intake.ts";
+import { introductionContentIssues, introductionEvidenceIssues } from "./introduction-review.ts";
 import { introductionStartDateState, normalizeIntroductionValue, type IntroductionNormalizationField } from "./introduction-normalization.ts";
 
 export const introductionV2Version = "2026-11-06";
@@ -22,6 +22,8 @@ export type IntroductionV2Profile = {
   schemaVersion: 2; candidateName: string; source: string; basic: IntroductionV2Basic;
   careers: IntroductionCareer[]; experienceTotal: string; tips: string[]; tools: string[];
   interviewAvailability: string; internalMemo: string;
+  /** Reviewed, atom-scoped prose; source fields above are always retained. */
+  narrativeEdits?: IntroductionNarrativeRevision;
 };
 export type IntroductionClientSettings = { id: string; name: string; mentions: string[]; rate?: IntroductionRate };
 export type IntroductionV2Settings = {
@@ -33,6 +35,7 @@ export type IntroductionV2Question = { id: string; field: string; label: string;
 export type IntroductionFactRef = { id: string; path: string; value: string; original: string };
 /** Model edits can only decorate an identified, source-owned narrative atom. */
 export type IntroductionNarrativeEdit = { factId: string; text: string };
+export type IntroductionNarrativeRevision = { schemaVersion: 1; templateVersion: string; sourceKey: string; settingsVersion: string; edits: IntroductionNarrativeEdit[] };
 export type IntroductionV2Document = {
   schemaVersion: 2; templateVersion: string; headingLine: string; internalBody: string;
   client: { clientId: string; mentions: string; greeting: string; recommendation: string; closing: string; body: string; text: string };
@@ -96,6 +99,11 @@ export function parseIntroductionV2Profile(value: unknown): IntroductionV2Profil
     for (const key of ["duties", "achievements", "tips"] as const) { if (!list(item[key])) return null; career[key] = [...item[key]]; }
     result.careers.push(career);
   }
+  if (value.narrativeEdits !== undefined) {
+    const revision = parseIntroductionNarrativeRevision(value.narrativeEdits);
+    if (!revision) return null;
+    result.narrativeEdits = revision;
+  }
   return unicodeLength(JSON.stringify(result)) <= 100_000 ? result : null;
 }
 export function parseIntroductionV2Settings(value: unknown): IntroductionV2Settings | null {
@@ -119,7 +127,8 @@ export function formatIntroductionRate(rate: IntroductionRate): string {
 /** Not an authentication hash. A compact local freshness key avoids putting
  * private notes into document metadata as literal JSON. */
 export function introductionV2SourceKey(profile: IntroductionV2Profile, settings: IntroductionV2Settings, clientId = ""): string {
-  const source = JSON.stringify([profile, settings, clientId]); let a = 2166136261, b = 0x9e3779b9;
+  const { narrativeEdits: _revision, ...original } = profile;
+  const source = JSON.stringify([original, settings, clientId]); let a = 2166136261, b = 0x9e3779b9;
   for (const char of source) { const code = char.codePointAt(0)!; a = Math.imul(a ^ code, 16777619); b = Math.imul(b ^ code, 2246822519); }
   return `v2:${(a >>> 0).toString(16)}${(b >>> 0).toString(16)}`;
 }
@@ -139,7 +148,7 @@ export function introductionV2NarrativeFacts(profile: IntroductionV2Profile): Ar
   return facts;
 }
 
-export function composeIntroductionV2(raw: IntroductionV2Profile, rawSettings: IntroductionV2Settings = blankIntroductionV2Settings(), clientId = "", now = new Date(), edits: readonly IntroductionNarrativeEdit[] = []): IntroductionV2Document {
+export function composeIntroductionV2(raw: IntroductionV2Profile, rawSettings: IntroductionV2Settings = blankIntroductionV2Settings(), clientId = "", now = new Date(), edits?: readonly IntroductionNarrativeEdit[]): IntroductionV2Document {
   const profile = parseIntroductionV2Profile(raw), settings = parseIntroductionV2Settings(rawSettings);
   if (!profile || !settings) throw new Error("紹介文の入力または設定の形式を確認してください。原文は保持してください。");
   const checks: IntroductionV2Check[] = [], questions: IntroductionV2Question[] = [], factRefs: IntroductionFactRef[] = [];
@@ -150,16 +159,15 @@ export function composeIntroductionV2(raw: IntroductionV2Profile, rawSettings: I
     if (normalized.value.trim()) factRefs.push({ id: factId(path), path, value: normalized.value, original: rawValue });
     return normalized.value.trim();
   };
-  // Edits must be prevalidated by the native engine. The ordinary renderer is
-  // also a public boundary: do not let a caller bypass its source checks.
-  const narrative = new Map(introductionV2NarrativeFacts(profile).map(item => [item.factId, item]));
-  const acceptedEdits = new Map<string, string>();
-  for (const edit of edits) {
-    const source = narrative.get(edit.factId);
-    if (source && edit.text.trim() === source.sourceText) acceptedEdits.set(edit.factId, edit.text.trim());
-    // A validated token records the original exact evidence; see the AI module.
-    else if (source && isValidatedIntroductionNarrativeEdit(edit, source.sourceText)) acceptedEdits.set(edit.factId, edit.text.trim());
+  // Persisted prose is untrusted JSON. Revalidate it using the same source-atom
+  // evidence checks used for fresh native model output, including after reload.
+  const selectedEdits = edits ?? getStoredIntroductionNarrativeEdits(profile, settings);
+  if (edits === undefined && profile.narrativeEdits && !isIntroductionNarrativeRevisionCurrent(profile, settings)) checks.push({ code: "narrative-stale", severity: "review", message: "原文または共有設定が変わったため、以前の整文を使わず原文を表示しています。必要に応じて整え直して保存してください。" });
+  const acceptedEdits = new Map<string, string>(), seenEdits = new Set<string>();
+  for (const edit of selectedEdits) {
+    if (!seenEdits.has(edit.factId) && validateIntroductionNarrativeEdit(edit, profile, settings)) acceptedEdits.set(edit.factId, edit.text.trim());
     else checks.push({ code: "narrative-rejected", severity: "review", sourceRef: edit.factId, message: "根拠を確認できなかった文章は、その項目の原文を使っています。" });
+    seenEdits.add(edit.factId);
   }
   const narrativeValue = (path: string, value: string) => { const original = fixed(path, value); return acceptedEdits.get(factId(path)) ?? original; };
   const name = fixed("candidateName", profile.candidateName);
@@ -274,13 +282,104 @@ export function inspectIntroductionV2ClientText(value: string, profile: Introduc
   return checks;
 }
 
-// An in-memory capability only. Native model output cannot manufacture it and
-// persisted arbitrary JSON cannot bypass revalidation after a reload.
-const validatedNarrativeEdits = new WeakMap<IntroductionNarrativeEdit, { original: string; text: string }>();
-export function markValidatedIntroductionNarrativeEdit(edit: IntroductionNarrativeEdit, original: string): IntroductionNarrativeEdit {
-  validatedNarrativeEdits.set(edit, { original, text: edit.text }); return edit;
+/** Exact shape/size checking prevents a stored whole-document or private-field
+ * payload from being smuggled into the atom revision. Legacy profiles omit it. */
+export function parseIntroductionNarrativeRevision(value: unknown): IntroductionNarrativeRevision | null {
+  if (!record(value) || Object.keys(value).sort().join("|") !== "edits|schemaVersion|settingsVersion|sourceKey|templateVersion" || value.schemaVersion !== 1 || !text(value.templateVersion, 200) || !text(value.settingsVersion, 200) || !text(value.sourceKey, 80) || !/^v2:[a-f0-9]+$/.test(value.sourceKey) || !Array.isArray(value.edits) || value.edits.length > 60) return null;
+  const edits: IntroductionNarrativeEdit[] = [], seen = new Set<string>();
+  for (const edit of value.edits) {
+    if (!record(edit) || Object.keys(edit).sort().join("|") !== "factId|text" || !text(edit.factId, 300) || !text(edit.text) || !edit.text.trim() || seen.has(edit.factId)) return null;
+    seen.add(edit.factId); edits.push({ factId: edit.factId, text: edit.text.trim() });
+  }
+  const revision: IntroductionNarrativeRevision = { schemaVersion: 1, templateVersion: value.templateVersion, sourceKey: value.sourceKey, settingsVersion: value.settingsVersion, edits };
+  return unicodeLength(JSON.stringify(revision)) <= 60_000 ? revision : null;
 }
-function isValidatedIntroductionNarrativeEdit(edit: IntroductionNarrativeEdit, original: string): boolean { const checked = validatedNarrativeEdits.get(edit); return checked?.original === original && checked.text === edit.text; }
+const significantNarrativeQualifiers = ["未確認", "不明", "確認中", "本人申告", "希望", "予定", "候補", "最大", "最小", "平均", "約", "以上", "以下", "未満", "目標"];
+export function introductionV2NarrativeIssues(candidate: string, source: string, otherEmployerNames: readonly string[] = []): string[] {
+  const issues: string[] = [];
+  if (!candidate.trim() || unicodeLength(candidate) > Math.max(400, unicodeLength(source) * 3) || !text(candidate)) issues.push("invalid-text");
+  issues.push(...introductionEvidenceIssues(candidate, "", { ...blankInterviewFields(), workHistory: source }));
+  const normalize = (value: string) => value.normalize("NFKC").replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g, "").toLocaleLowerCase("ja");
+  const before = normalize(source), after = normalize(candidate);
+  for (const name of otherEmployerNames.map(value => value.trim()).filter(Boolean)) if (!before.includes(normalize(name)) && after.includes(normalize(name))) issues.push("employer-mixed");
+  for (const identifier of candidate.match(/[A-Za-z][A-Za-z0-9.+-]{1,}/g) ?? []) if (!before.includes(identifier.toLowerCase())) issues.push("identifier-added");
+  for (const qualifier of significantNarrativeQualifiers) if (before.includes(qualifier) && !after.includes(qualifier) && !(qualifier === "本人申告" && /本人から|本人による|との申告|と伺|とのこと/.test(candidate))) issues.push("qualification-removed");
+  const numberKey = (value: string) => (normalize(value).match(/\d[\d,]*(?:\.\d+)?/g) ?? []).map(item => item.replace(/,/g, "")).join("|");
+  if (numberKey(source) !== numberKey(candidate)) issues.push("number-omitted-or-changed");
+  // Negation must stay attached to the same source clause, including verbs not
+  // covered by the broader career/tool evidence guard (e.g. 架電していない).
+  const negationScopes = (value: string) => {
+    const scopes: string[] = [];
+    for (const clause of normalize(value).split(/[。！？!?\n、,;；]/)) for (const match of clause.matchAll(/おりませんでした|おりません|おらず|おらない|いませんでした|いません|ありませんでした|ありません|ませんでした|ません|なかった|ない|なく|なし|せず|できず|未経験|未対応|未実施|未使用|不可|除く|以外/g)) {
+      const context = clause.slice(0, match.index).match(/[一-龠々]{1,}|[ァ-ヴー]{2,}|[a-z]{2,}|\d+/g) ?? [];
+      scopes.push(context.join("|"));
+    }
+    return scopes.join("\n");
+  };
+  if (negationScopes(source) !== negationScopes(candidate)) issues.push("negation-changed");
+  // A bag of words/numbers cannot prove who did what, nor which metric owns a
+  // quantity. Require the complete source wording in the same order, including
+  // hiragana names, particles, units, negation and clause boundaries. The only
+  // source-to-edit freedom is an explicit, tense-preserving polite ending.
+  // When the source is a bare action noun, either descriptive ending is allowed.
+  // Anything more ambitious falls back to the unmodified original atom.
+  const wordingParts = (value: string) => normalize(value).replace(/[^\S\n]/g, "").trim().replace(/。$/, "").split(/([。！？!?\n、,;；])/);
+  const ending = (value: string): { base: string; tense: "past" | "present" | "unspecified" } => {
+    const negative = value
+      .replace(/(?:しておりませんでした|していませんでした|しておらなかった)$/, "していなかった")
+      .replace(/(?:しておりません|していません|しておらず|しておらない)$/, "していない")
+      .replace(/(?:しませんでした)$/, "しなかった")
+      .replace(/(?:しません|せず)$/, "しない");
+    const past = negative.match(/([一-龠々ァ-ヴー])(?:しておりました|していました|していた|しました|した)$/);
+    if (past) return { base: negative.slice(0, past.index! + 1), tense: "past" };
+    const present = negative.match(/([一-龠々ァ-ヴー])(?:しております|しています|している|します|する)$/);
+    if (present) return { base: negative.slice(0, present.index! + 1), tense: "present" };
+    return { base: negative, tense: "unspecified" };
+  };
+  const sourceParts = wordingParts(source), candidateParts = wordingParts(candidate);
+  if (sourceParts.length !== candidateParts.length || sourceParts.some((part, index) => {
+    if (index % 2) return part !== candidateParts[index];
+    const original = ending(part), edited = ending(candidateParts[index]);
+    return original.base !== edited.base || original.tense !== "unspecified" && original.tense !== edited.tense;
+  })) issues.push("source-wording-changed");
+  const inventedRoles = /リーダー|マネジメント|マネージャー|管理職|教育担当|研修担当|責任者|チームを牽引|部下|自動化|効率化|受注|成約|達成|改善率/g;
+  for (const term of candidate.match(inventedRoles) ?? []) if (!source.includes(term)) issues.push("role-or-result-added");
+  // Restrict lexical content as well as numbers. Only vetted endings may change;
+  // a new Japanese company, tool, role, or omitted source fact must fail closed.
+  const tokens = (value: string) => [...new Set(value.match(/[一-龠々]{2,}|[ァ-ヴー]{3,}|[A-Za-z]{2,}/g) ?? [])];
+  const sourceTokens = tokens(before), targetTokens = tokens(after);
+  if (targetTokens.some(token => !before.includes(token))) issues.push("source-content-added");
+  if (sourceTokens.some(token => !after.includes(token) && !targetTokens.join("").includes(token))) issues.push("source-content-omitted");
+  return [...new Set(issues)];
+}
+/** Atom relationship, every factual qualifier and sensitive values are checked
+ * on the server too. No native-engine capability is accepted as proof. */
+export function validateIntroductionNarrativeEdit(edit: unknown, profile: IntroductionV2Profile, settings: IntroductionV2Settings = blankIntroductionV2Settings()): edit is IntroductionNarrativeEdit {
+  if (!record(edit) || Object.keys(edit).sort().join("|") !== "factId|text" || !text(edit.factId, 300) || !text(edit.text)) return false;
+  const source = introductionV2NarrativeFacts(profile).find(fact => fact.factId === edit.factId);
+  if (!source) return false;
+  const companies = profile.careers.filter(career => career.id !== source.careerId).map(career => career.company);
+  return !introductionV2NarrativeIssues(edit.text, source.sourceText, companies).length && !inspectIntroductionV2ClientText(edit.text, profile, settings).some(check => check.severity === "block");
+}
+export function isIntroductionNarrativeRevisionCurrent(profile: IntroductionV2Profile, settings: IntroductionV2Settings): boolean {
+  const revision = profile.narrativeEdits;
+  return !!revision && revision.templateVersion === introductionV2Version && revision.settingsVersion === settings.version && revision.sourceKey === introductionV2SourceKey(profile, settings) && revision.edits.every(edit => validateIntroductionNarrativeEdit(edit, profile, settings));
+}
+export function getStoredIntroductionNarrativeEdits(profile: IntroductionV2Profile, settings: IntroductionV2Settings): IntroductionNarrativeEdit[] {
+  return isIntroductionNarrativeRevisionCurrent(profile, settings) ? profile.narrativeEdits!.edits.map(edit => ({ ...edit })) : [];
+}
+export function withoutIntroductionNarrativeEdits(profile: IntroductionV2Profile): IntroductionV2Profile { const { narrativeEdits: _revision, ...original } = profile; return original; }
+export function withIntroductionNarrativeEdits(profile: IntroductionV2Profile, settings: IntroductionV2Settings, edits: readonly IntroductionNarrativeEdit[]): IntroductionV2Profile {
+  const original = withoutIntroductionNarrativeEdits(profile), seen = new Set<string>();
+  if (edits.length > 60 || edits.some(edit => seen.has(edit.factId) || (seen.add(edit.factId), !validateIntroductionNarrativeEdit(edit, original, settings)))) throw new Error("整文の根拠を確認できませんでした。原文は保持されています。");
+  const revision = parseIntroductionNarrativeRevision({ schemaVersion: 1, templateVersion: introductionV2Version, sourceKey: introductionV2SourceKey(original, settings), settingsVersion: settings.version, edits });
+  if (!revision) throw new Error("整文が保存上限を超えています。原文は保持されています。");
+  const parsed = parseIntroductionV2Profile({ ...original, narrativeEdits: revision });
+  if (!parsed) throw new Error("紹介文が保存上限を超えています。原文は保持されています。");
+  return parsed;
+}
+// Kept for existing callers. It grants no trust: compose always revalidates.
+export function markValidatedIntroductionNarrativeEdit(edit: IntroductionNarrativeEdit, _original: string): IntroductionNarrativeEdit { return edit; }
 
 /** Suggestion only: the caller asks the user to confirm the derived total.
  * Inclusive month ranges are merged so overlapping jobs are not double-counted. */

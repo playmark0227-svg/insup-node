@@ -29,12 +29,14 @@ function workflowDataExport_(store,actor){
  var settingHeaders=['id','json0','json1','json2','json3','json4','json5','json6','json7','json8','json9','version','updatedAt','actorId'];
  var drafts=table('_NODE_introduction_v2',draftHeaders,typeof introductionV2Table_==='function'?introductionV2Table_:null);
  var settings=table('_NODE_introduction_settings',settingHeaders,typeof introductionSettingsTable_==='function'?introductionSettingsTable_:null);
+ var comments=table('_NODE_match_report_comments',['commentId','reportId','parentId','authorId','body','deleted','version','createdAt','updatedAt'],typeof matchReportCommentTable_==='function'?matchReportCommentTable_:null);
  var evidence=table('_NODE_match_evidence',['id','body','version','updatedAt'],typeof matchEvidenceTable_==='function'?matchEvidenceTable_:null);
  function body(entry){var out=Object.assign({},entry);delete out.row;return out;}
  var evidenceFields=['evidenceId','ownerId','recordId','profileId','kind','mime','size','status','generation','createdAt','expiresAt','completedAt','version','updatedAt'];
  var data={feature:true,schemaVersion:1,scope:'all-saved-private-workflows',
   metricGoals:metric.entries.map(function(entry){var out=body(entry);out.actorId=metric.rows[entry.row-2][7];return out;}),
   salesWorkflow:{jobs:jobs.entries.map(body),plans:plans.entries.map(body),reports:reports.entries.map(body)},
+  matchReportComments:{schemaVersion:1,comments:comments.entries.map(function(entry){return {commentId:entry.commentId,reportId:entry.reportId,parentId:entry.parentId,authorId:entry.authorId,body:entry.deleted?'':entry.body,deleted:entry.deleted,version:entry.version,createdAt:entry.createdAt,updatedAt:entry.updatedAt};})},
   introductionV2:{drafts:drafts.entries.map(function(entry){return {draftKey:entry.draftKey,playerId:entry.playerId,profile:entry.profile,version:entry.version,updatedAt:entry.updatedAt,actorId:drafts.rows[entry.row-2][14]};}),settings:settings.entries.map(function(entry){return {id:'shared',settings:entry.settings,version:entry.version,updatedAt:entry.updatedAt,actorId:settings.rows[entry.row-2][13]};})},
   matchEvidence:{scope:'metadata-only',files:evidence.entries.map(function(entry){var out={};evidenceFields.forEach(function(key){if(!Object.prototype.hasOwnProperty.call(entry,key))fail_('SCHEMA_MISMATCH','合意資料の書き出し項目が不足しています。');out[key]=entry[key];});return out;})}
  };
