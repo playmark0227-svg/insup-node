@@ -23,12 +23,12 @@ export type OnDeviceAiOptions = { signal?: AbortSignal; timeoutMs?: number; prep
 export type OnDeviceAiErrorCode = "UNAVAILABLE" | "ABORTED" | "TIMEOUT" | "INVALID_INPUT" | "INVALID_RESPONSE" | "MODEL_ERROR" | "LENGTH_LIMIT";
 
 const errorMessages: Record<OnDeviceAiErrorCode, string> = {
-  UNAVAILABLE: "この端末・ブラウザでは端末内AIを利用できません。対応するPC版Chromeでお試しください。入力内容は残っています。",
+  UNAVAILABLE: "このブラウザではAIを利用できません。対応するPC版Chromeでお試しください。入力内容は残っています。",
   ABORTED: "AIの処理を中止しました。入力内容は残っています。",
   TIMEOUT: "AIの準備または生成に時間がかかっています。処理を中止しました。入力内容は残っています。",
   INVALID_INPUT: "AIに使用する入力や文章設定を確認してください。長い場合は参考文章やメモを短くしてお試しください。入力原文は残っています。",
   INVALID_RESPONSE: "AIの出力を確認できませんでした。元の文章と入力内容は残っています。",
-  MODEL_ERROR: "端末内AIを実行できませんでした。元の文章と入力内容は残っています。",
+  MODEL_ERROR: "AIの処理を完了できませんでした。元の文章と入力内容は残っています。",
   LENGTH_LIMIT: "基本情報・使用ツール・面談候補が文章の上限に収まりません。入力は残っています。長い説明を短くするか、文章の長さを標準にしてください。",
 };
 
@@ -38,7 +38,7 @@ export class OnDeviceAiError extends Error {
   readonly evidenceIssues?: readonly string[];
   constructor(code: OnDeviceAiErrorCode, phase?: "preparation" | "generation", evidenceIssues?:readonly string[]) {
     super(code === "TIMEOUT" && phase === "preparation"
-      ? "AIモデルの準備に時間がかかったため、待機を終了しました。入力原文は残っています。再度作成するとChromeの準備状況を確認して進められます。"
+      ? "AIの準備に時間がかかったため中止しました。入力内容は残っています。もう一度お試しください。"
       : errorMessages[code]);
     this.name = "OnDeviceAiError"; this.code = code; this.phase = phase;
     if(evidenceIssues)this.evidenceIssues=[...evidenceIssues];

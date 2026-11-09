@@ -529,7 +529,7 @@ test("preparation is stopped at ten minutes and a session arriving after timeout
   await clock.advance(1);
   const result = await outcome;
   assert.ok(code("TIMEOUT")(result.error)); assert.equal(result.error.phase, "preparation");
-  assert.match(result.error.message, /Chromeの準備状況/); assert.equal(calls.create[0].signal.aborted, true);
+  assert.match(result.error.message, /もう一度お試しください/); assert.equal(calls.create[0].signal.aborted, true);
   assert.equal(clock.pending.size, 0); assert.equal(JSON.stringify(source), before);
   ready.resolve({ prompt: async () => { prompts++; return "{}"; }, destroy() { destroyed++; } }); await flushTasks();
   assert.equal(prompts, 0); assert.equal(destroyed, 1);

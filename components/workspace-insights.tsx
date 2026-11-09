@@ -159,8 +159,8 @@ export function WorkspaceInsights({ snapshot, period, businessDay, live, enabled
       <p className="insight-source-note">GoogleのAIへ送るのは件数・目標・理由の分類です。候補者の氏名や詳細メモは送りません。2つのタブで同じ整理を使います。</p>
       <div className="insight-metrics">{aggregate.metrics.map(metric => <div key={metric.key}><span>{insightMetrics.find(item => item.key === metric.key)?.label}</span><strong>{metric.count}<small>件</small></strong>{metric.previousCount !== null && <small>{period.length === 7 ? "前月" : "前日"} {metric.previousCount}件</small>}</div>)}</div>
       <p className="panel-note">各工程に入力された日付の件数です。前月・前日はその期間全体の件数で、同じ候補者の移行率ではありません。確認対象は今日時点の全期間の進捗です。</p>
-      {!live && <p className="insight-notice">サンプルではAIを生成しません。スプレッドシート接続後に、記録された成果を使って作成できます。</p>}
-      {live && !enabled && <p className="insight-notice">このAI機能はまだ連携されていません。管理者がGoogle側の連携を更新すると利用できます。</p>}
+      {!live && <p className="insight-notice">お試し画面ではAIを利用できません。ログイン後、実績をもとに提案を作成できます。</p>}
+      {live && !enabled && <p className="insight-notice">現在、AIの提案を利用できません。時間をおいてお試しください。</p>}
       {live && enabled && !hasData && <p className="insight-notice">この期間の実績、または確認対象の進捗が記録されると、AIで整理できます。</p>}
       {state?.configured === false && <p className="insight-notice">AIの接続設定がまだ完了していません。確認対象の一覧と成果の数字は利用できます。</p>}
       {state?.pending && !running && <p className="insight-notice" role="status">この集計を別の画面で作成中です。少し待って「保存済みの整理を再取得」を押してください。</p>}
@@ -172,7 +172,7 @@ export function WorkspaceInsights({ snapshot, period, businessDay, live, enabled
         {tab === "coach" ? <ol className="insight-priorities">{advice.priorities.map((priority, index) => <li key={index}><span>{index + 1}</span><div><h4>{priority.title}</h4><p>{priority.action}</p><small>根拠：{workspaceEvidenceLabel(priority.evidenceKey, advice.aggregate)}</small></div></li>)}</ol> : <><h4>{admin ? "会議で確認すること" : "面談前に確認すること"}</h4>{advice.meetingQuestions.length ? <ol className="insight-questions">{advice.meetingQuestions.map((question, index) => <li key={index}>{question}</li>)}</ol> : <p className="panel-note">この集計からの追加の確認事項はありません。個別の案件条件は進捗画面で確認してください。</p>}<p className="insight-notice">{admin ? "評価は数字だけで決めず、担当案件の条件と本人への確認を含めて判断してください。" : "この提案は成果の集計から作成しています。個別の候補者やクライアントの条件は、進捗画面の記録で確認してください。"}</p><button className="text-button" onClick={() => setTab("coach")}>優先する行動も確認する<ArrowUpRight size={15} /></button></>}
         {tab === "coach" && <div className="insight-next"><div><strong>提案を、実際の対応につなげる</strong><p>{firstTask ? `まずは「${firstTask.title}」など、記録に根拠がある確認対象から対応できます。` : "今日の確認対象を見直したり、準備タブから確認事項をコピーできます。"}AIの提案で記録が自動更新されることはありません。</p></div><button className="secondary-button" onClick={() => setTab("tasks")}>確認対象へ戻る<ArrowUpRight size={16} /></button></div>}
       </div> : !reading && !running && <div className="insight-empty insight-ai-empty"><MessageSquareText size={25} /><h3>{errors[period] ? "保存済みの整理を取得できていません" : state?.pending ? "AIの整理を作成しています" : "保存済みのAIの整理はありません"}</h3><p>{errors[period] ? "上の再取得ボタンから確認できます。先に個別の記録を確認することもできます。" : state?.pending ? "少し待ってから「作成済みか確認」を押してください。" : "ボタンを押すと、行動の優先順と会議・面談の確認事項をまとめて作成します。"}</p><button className="secondary-button" onClick={() => setTab("tasks")}>先に確認対象を見る<ArrowUpRight size={15} /></button></div>}
-      <details className="insight-privacy"><summary>AIに送る情報と、提案の扱い</summary><p>AIに送るのは、6項目の成果の件数、月間提案目標、確認対象の件数、振り返り理由の分類と件数です。氏名、会社名、連絡先、詳細メモ、担当者ID、候補者の行データは送りません。プレイヤーは本人の集計だけが対象です。</p><p>同じ集計の結果は保存して再利用します。生成はGoogleの無料枠とアプリの回数制限の範囲内で行います。無料枠に送った入力はGoogleのサービス改善に利用される場合があります。</p><p>AIは優先する行動や確認事項を提案します。成果の変更、連絡の送信、採否・人事評価は実行しません。提案は記録と実際の状況を確認してから使ってください。</p></details>
+      <details className="insight-privacy"><summary>AIに送る情報と、提案の扱い</summary><p>AIに送るのは、成果の件数、月間提案目標、確認対象の件数、振り返り理由の分類と件数です。氏名、会社名、連絡先、詳細メモ、担当者ID、候補者の詳細情報は送りません。プレイヤーは本人の集計だけが対象です。</p><p>同じ集計の結果は保存して再利用します。生成はGoogleの無料枠とアプリの回数制限の範囲内で行います。無料枠に送った入力はGoogleのサービス改善に利用される場合があります。</p><p>AIは優先する行動や確認事項を提案します。成果の変更、連絡の送信、採否・人事評価は実行しません。提案は記録と実際の状況を確認してから使ってください。</p></details>
     </section>}
   </div>;
 }

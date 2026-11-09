@@ -35,16 +35,16 @@ test('saved reviewed text loads without invoking AI and copy matches the persist
 });
 
 test('generating prose marks dirty, save retains atoms, reload stays identical, reset and undo preserve originals',async()=>{
- const h=harness();h.render();await h.settle();await h.click('端末内AIで文章を整える');await h.settle();assert.equal(h.dirty.at(-1),true);
+ const h=harness();h.render();await h.settle();await h.click('AIで文章を整える');await h.settle();assert.equal(h.dirty.at(-1),true);
  const preview=h.find('textarea','社内共有用の紹介文').props.value;h.click('紹介文を保存');await h.settle();assert.equal(h.dirty.at(-1),false);assert.deepEqual(h.calls[0].payload.profile.narrativeEdits.edits,[edit]);assert.equal(h.find('textarea','社内共有用の紹介文').props.value,preview);
- h.click('整文を外して原文に戻す');await h.settle();assert.equal(h.dirty.at(-1),true);assert.doesNotMatch(h.find('textarea','社内共有用の紹介文').props.value,/担当していました/);
+ h.click('元の文章に戻す');await h.settle();assert.equal(h.dirty.at(-1),true);assert.doesNotMatch(h.find('textarea','社内共有用の紹介文').props.value,/担当していました/);
  h.click('保存済みの紹介文へ戻す');await h.settle();assert.equal(h.dirty.at(-1),false);assert.equal(h.find('textarea','社内共有用の紹介文').props.value,preview);
  h.change('textarea','intro-v2-careers.fixture-company.duties','架電業務の事前確認を担当。');h.click('紹介文を保存');await h.settle();assert.equal(h.server().profile.narrativeEdits,undefined);assert.equal(h.server().profile.careers[0].duties[0],'架電業務の事前確認を担当。');assert.equal(h.calls[1].payload.profile.narrativeEdits.edits.length,0);
 });
 
 test('an uncertain save retries the identical ID and atom revision and keeps the preview while waiting',async()=>{
- const h=harness();h.render();await h.settle();await h.click('端末内AIで文章を整える');await h.settle();const preview=h.find('textarea','社内共有用の紹介文').props.value;
- h.failNext(new SheetApiError('NETWORK','保存結果が不明です。'));h.click('紹介文を保存');await h.settle();assert.match(h.text(),/同じ保存IDで再試行/);assert.equal(h.find('textarea','社内共有用の紹介文').props.value,preview);h.click('同じ保存IDで再試行');await h.settle();assert.equal(h.calls[0].id,h.calls[1].id);assert.deepEqual(h.calls[0].payload,h.calls[1].payload);assert.equal(h.find('textarea','社内共有用の紹介文').props.value,preview);
+ const h=harness();h.render();await h.settle();await h.click('AIで文章を整える');await h.settle();const preview=h.find('textarea','社内共有用の紹介文').props.value;
+ h.failNext(new SheetApiError('NETWORK','保存結果が不明です。'));h.click('紹介文を保存');await h.settle();assert.match(h.text(),/保存をもう一度確認/);assert.equal(h.find('textarea','社内共有用の紹介文').props.value,preview);h.click('保存をもう一度確認');await h.settle();assert.equal(h.calls[0].id,h.calls[1].id);assert.deepEqual(h.calls[0].payload,h.calls[1].payload);assert.equal(h.find('textarea','社内共有用の紹介文').props.value,preview);
 });
 
 test('job context selects exactly one registered client and never converts job budget into a rate',async()=>{

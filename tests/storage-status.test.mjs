@@ -13,14 +13,14 @@ const props = { backend: { kind: "firestore", projectId: "fictional-insup-node",
 
 test("Firebase connection UI cannot redirect users to a legacy endpoint editor or spreadsheet", () => {
   const tree = exports.StorageStatus(props), all = nodes(tree), body = text(tree);
-  assert.match(body, /Firebase（Cloud Firestore）/);
+  assert.match(body, /データの保存・同期/);
+  assert.doesNotMatch(body, /Firebase|Firestore|プロジェクト|移行/);
   assert.match(body, /クラウドに保存・同期/);
   assert.equal(all.some(n => ["input", "textarea", "form", "a"].includes(n.type)), false);
   assert.equal(body.includes(props.backend.projectId), false);
   assert.equal(body.includes("スプレッドシート"), false);
   const admin = text(exports.StorageStatus({ ...props, admin: true }));
-  assert.match(admin, /fictional-insup-node/);
-  assert.match(admin, /スプレッドシートは移行元/);
+  assert.doesNotMatch(admin, /fictional-insup-node|スプレッドシート|Firebase|Firestore|移行/);
 });
 
 test("a cached or read-only connection cannot appear as a current writable Firebase connection", () => {

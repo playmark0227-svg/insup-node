@@ -140,7 +140,14 @@ export function assertMutationReceipt(value: unknown, operationId: string): asse
 export class SheetApiError extends Error {
   code: string;
   constructor(code: string, message: string) {
-    super(message);
+    const technical = /Firestore|Firebase|Apps Script|_NODE_|OAuth|CORS|GCS|スキーマ|プロトコル|JSON|連携コード/.test(message);
+    const businessDetail = ["VALIDATION", "INVALID_DATE", "CONFLICT", "FORBIDDEN", "NOT_FOUND", "WRITES_DISABLED", "READ_ONLY", "RATE_LIMITED"].includes(code);
+    const uncertainSave = ["INTERNAL", "FIRESTORE_WRITE_FAILED", "SHEET_WRITE_FAILED", "INVALID_RESPONSE", "NETWORK", "TIMEOUT", "HTTP"].includes(code) && /保存|書き込|同期/.test(message);
+    super(technical && !businessDetail
+      ? uncertainSave
+        ? "保存結果を確認できませんでした。入力は保持しています。右上の保存状況から、同じ内容で保存結果を確認してください。"
+        : "データを確認できませんでした。時間をおいてもう一度お試しください。解決しない場合は管理者にお問い合わせください。"
+      : message.replace(/紹介文V2/g, "紹介文"));
     this.code = code;
     this.name = "SheetApiError";
   }
@@ -155,11 +162,11 @@ export function isUncertainWrite(error: unknown): boolean {
 export function validateEndpoint(value: string): string {
   let url: URL;
   try { url = new URL(value.trim()); }
-  catch { throw new SheetApiError("INVALID_ENDPOINT", "Apps ScriptのウェブアプリURL（/exec）を入力してください。"); }
+  catch { throw new SheetApiError("INVALID_ENDPOINT", "管理者から案内された正しい接続先を入力してください。"); }
   if (url.protocol !== "https:" || url.hostname !== "script.google.com" ||
       !/^\/macros\/s\/[A-Za-z0-9_-]{20,}\/exec$/.test(url.pathname) ||
       url.port || url.username || url.password || url.search || url.hash) {
-    throw new SheetApiError("INVALID_ENDPOINT", "Apps ScriptのウェブアプリURL（/exec）を入力してください。");
+    throw new SheetApiError("INVALID_ENDPOINT", "管理者から案内された正しい接続先を入力してください。");
   }
   return url.href;
 }
@@ -206,32 +213,32 @@ async function recoverContent(url: string, signal: AbortSignal): Promise<{ respo
       if (attempt > 0) throw error;
     }
   }
-  throw new SheetApiError("NETWORK", "Googleからの応答を取得できませんでした。");
+  throw new SheetApiError("NETWORK", "応答を取得できませんでした。通信状態を確認してください。");
 }
 
 function connectionError(action: string, timedOut: boolean): SheetApiError {
   if (["generateWritingKit", "readWritingKit"].includes(action)) return new SheetApiError(timedOut ? "TIMEOUT" : "NETWORK", timedOut
-    ? "AI文章構成の応答が45秒以内に届きませんでした。入力内容は残っています。保存済みの構成を再取得して確認してください。"
+    ? "文章の作成に時間がかかっています。入力内容は残っています。保存済みの構成を再取得して確認してください。"
     : "AI文章構成の通信が途中で切れました。入力内容は残っています。接続を確認し、保存済みの構成を再取得してください。");
   if (["analyzeWorkspaceInsights", "readWorkspaceInsights"].includes(action)) return new SheetApiError(timedOut ? "TIMEOUT" : "NETWORK", timedOut
-    ? "AI分析の応答が45秒以内に届きませんでした。成果データはそのままです。保存済みの分析を再取得してください。"
+    ? "AI分析に時間がかかっています。成果データはそのままです。保存済みの分析を再取得してください。"
     : "AI分析の通信が途中で切れました。成果データはそのままです。接続を確認して保存済みの分析を再取得してください。");
   if (["analyzeInterviewReviews","readInterviewAdvice"].includes(action)) return new SheetApiError(timedOut?"TIMEOUT":"NETWORK",timedOut
-    ? "改善案の応答が45秒以内に届きませんでした。理由の記録は保存済みです。「保存済みの改善案を再取得」で結果を確認できます。"
+    ? "改善案の作成に時間がかかっています。理由の記録は保存済みです。「保存済みの改善案を再取得」で結果を確認できます。"
     : "改善案の通信が途中で切れました。理由の記録は保存済みです。接続を確認して改善案を再取得してください。");
   if (timedOut) {
     const message = action === "login"
-      ? "ログインの応答が45秒以内に届きませんでした。IDとパスワードはそのままで、もう一度ログインしてください。"
+      ? "ログインに時間がかかっています。IDとパスワードはそのままで、もう一度ログインしてください。"
       : action === "snapshot" || action === "health"
-        ? "Googleからのデータ取得が45秒以内に完了しませんでした。通信状態を確認して再取得してください。"
-        : "Googleの応答が45秒以内に届きませんでした。保存結果を確認できないため、同じ内容で再試行してください。";
+        ? "データの取得に時間がかかっています。通信状態を確認して再取得してください。"
+        : "保存結果の確認に時間がかかっています。保存結果を確認できないため、同じ内容で再試行してください。";
     return new SheetApiError("TIMEOUT", message);
   }
   const message = action === "login"
     ? "ログインの通信が途中で切れました。通信状態を確認し、同じIDとパスワードでもう一度ログインしてください。"
     : action === "snapshot" || action === "health"
-      ? "Googleからデータを取得できませんでした。通信状態を確認して再取得してください。"
-      : "Googleとの応答を確認できませんでした。入力は残っています。接続を確認し、同じ内容で再試行してください。";
+      ? "データを取得できませんでした。通信状態を確認して再取得してください。"
+      : "通信の応答を確認できませんでした。入力は残っています。接続を確認し、同じ内容で再試行してください。";
   return new SheetApiError("NETWORK", message);
 }
 
@@ -280,7 +287,7 @@ export async function sheetRequest<T>(
             await waitForRetry(signal, 750);
             continue;
           }
-          throw new SheetApiError("HTTP", `Googleからの応答を確認できませんでした（${response.status}）。`);
+          throw new SheetApiError("HTTP", "通信の応答を確認できませんでした。時間をおいて再度お試しください。");
         }
         // Body streaming can fail after fetch resolves; it shares the same deadline
         // and recovery policy as the initial connection.
@@ -289,11 +296,11 @@ export async function sheetRequest<T>(
         let envelope: { ok?: boolean; data?: T; error?: { code?: string; message?: string } };
         try { envelope = JSON.parse(responseBody); }
         catch {
-          throw new SheetApiError("NOT_JSON", "連携用の応答が返りませんでした。Google側のウェブアプリ公開設定とURLを確認してください。");
+          throw new SheetApiError("NOT_JSON", "接続先の応答を確認できませんでした。時間をおいて再度お試しください。");
         }
         if (envelope?.ok !== true) {
           throw new SheetApiError(typeof envelope?.error?.code === "string" && envelope.error.code ? envelope.error.code : "API",
-            typeof envelope?.error?.message === "string" && envelope.error.message ? envelope.error.message : "スプレッドシートへの操作に失敗しました。");
+            typeof envelope?.error?.message === "string" && envelope.error.message ? envelope.error.message : "操作を完了できませんでした。もう一度お試しください。");
         }
         if (!Object.hasOwn(envelope, "data")) throw new SheetApiError("INVALID_RESPONSE", "連携先から正しいデータを取得できませんでした。");
         return envelope.data as T;
@@ -328,7 +335,7 @@ export function assertSnapshot(value: unknown): asserts value is SheetSnapshot {
   const object = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
   const strings = (v: Record<string, unknown>, names: string[]) => names.every(name => typeof v[name] === "string");
   const optionalStrings = (v: Record<string, unknown>, names: string[]) => names.every(name => v[name] === undefined || typeof v[name] === "string");
-  const invalid = (message = "連携データの形式が正しくありません。Google側の連携コードを更新してください。") => {
+  const invalid = (message = "データを確認できませんでした。画面を再読み込みし、解決しない場合は管理者にお問い合わせください。") => {
     throw new SheetApiError("INVALID_RESPONSE", message);
   };
   if (!object(value) || "snapshotUnchanged" in value || !object(value.self) || typeof value.self.role !== "string" || !["admin", "player"].includes(value.self.role) ||
