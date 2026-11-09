@@ -6,7 +6,7 @@ import { useUnsavedChangesWarning } from "./unsaved-work";
 import "./metric-goals.css";
 
 export type MetricGoalsProps = {
-  identityKey: string; enabled: boolean; canWrite: boolean; admin: boolean; selfPlayerId: string; currentMonth?: string;
+  identityKey: string; active?: boolean; refreshRevision?: string; enabled: boolean; canWrite: boolean; admin: boolean; selfPlayerId: string; currentMonth?: string;
   onRead: (payload: { month: string }) => Promise<unknown>;
   /** Resolve only after the encrypted outbox confirms the exact operation. */
   onSave: (payload: MetricGoalPayload, operationId: string) => Promise<unknown>;
@@ -22,41 +22,48 @@ function draftPayload(draft: Draft): MetricGoalPayload { return { ...draft.paylo
 function validDraft(draft: Draft): boolean { const payload = draftPayload(draft); return goalMetrics.every(metric => validGoalTarget(payload.targets[metric])) && validGoalDailyBasis(payload.dailyBasis, payload.customBusinessDays, payload.month); }
 const draftChanged = (draft: Draft) => !validDraft(draft) || payloadKey(draftPayload(draft)) !== draft.original;
 export function MetricGoals(props: MetricGoalsProps) { return <MetricGoalsSession key={props.identityKey} {...props}/>; }
-function MetricGoalsSession({ enabled, canWrite, admin, selfPlayerId, currentMonth = goalTokyoDay().slice(0, 7), onRead, onSave, onChanged, onDirtyChange, onPendingChange }: MetricGoalsProps) {
-  const [month, setMonth] = useState(currentMonth), [ownerId, setOwnerId] = useState(selfPlayerId), [data, setData] = useState<MetricGoalsData | null>(null), [drafts, setDrafts] = useState<Record<string, Draft>>({}), [pending, setPending] = useState<Pending | null>(null), [sending, setSending] = useState(false), [loading, setLoading] = useState(false), [error, setError] = useState(""), [notice, setNotice] = useState(""), [conflictKey, setConflictKey] = useState("");
-  const alive = useRef(true), readSequence = useRef(0), reading = useRef(false), saving = useRef(false), activeMonth = useRef(month), readRef = useRef(onRead), previousMonth = useRef(currentMonth); activeMonth.current = month; readRef.current = onRead;
+function MetricGoalsSession({ identityKey, active = true, refreshRevision = "", enabled, canWrite, admin, selfPlayerId, currentMonth = goalTokyoDay().slice(0, 7), onRead, onSave, onChanged, onDirtyChange, onPendingChange }: MetricGoalsProps) {
+  const [month, setMonth] = useState(currentMonth), [ownerId, setOwnerId] = useState(selfPlayerId), [storedData, setData] = useState<MetricGoalsData | null>(null), [drafts, setDrafts] = useState<Record<string, Draft>>({}), [pending, setPending] = useState<Pending | null>(null), [sending, setSending] = useState(false), [loading, setLoading] = useState(false), [error, setError] = useState(""), [notice, setNotice] = useState(""), [conflictKey, setConflictKey] = useState("");
+  const alive = useRef(true), readSequence = useRef(0), reading = useRef(false), saving = useRef(false), pendingOperation = useRef<Pending|null>(null), activeMonth = useRef(month), readRef = useRef(onRead), previousMonth = useRef(currentMonth); activeMonth.current = month; readRef.current = onRead;
+  const readScope = JSON.stringify([identityKey, admin, selfPlayerId, refreshRevision]), scopeRef = useRef(readScope), previousScope = useRef(readScope), activity = useRef({enabled,active}), cache = useRef<Record<string,{value:MetricGoalsData;at:number}>>({}),dataScope=useRef("");scopeRef.current=readScope;activity.current={enabled,active};
+  const data=dataScope.current===readScope?storedData:null;
   const dirty = Object.values(drafts).some(draftChanged), unsettled = !!pending || sending;
   useUnsavedChangesWarning(dirty || unsettled);
   useEffect(() => { alive.current = true; return () => { alive.current = false; readSequence.current++; }; }, []);
   useEffect(() => { onDirtyChange?.(dirty); return () => onDirtyChange?.(false); }, [dirty, onDirtyChange]);
   useEffect(() => { onPendingChange?.(unsettled); return () => onPendingChange?.(false); }, [unsettled, onPendingChange]);
   useEffect(() => { const last = previousMonth.current; previousMonth.current = currentMonth; if (last !== currentMonth && month === last && !dirty && !unsettled) setMonth(currentMonth); }, [currentMonth, month, dirty, unsettled]);
-  async function load(targetMonth = activeMonth.current) {
-    if (!enabled || saving.current || reading.current) return;
-    const sequence = ++readSequence.current; reading.current = true; setLoading(true); setError("");
-    try { const next = await readRef.current({ month: targetMonth }); assertMetricGoalsData(next, targetMonth); if (!alive.current || sequence !== readSequence.current || activeMonth.current !== targetMonth) return; setData(next); setOwnerId(previous => next.players.some(player => player.id === previous && (admin || player.id === selfPlayerId)) ? previous : admin ? next.players.find(player => player.active)?.id ?? next.players[0]?.id ?? "" : selfPlayerId); }
-    catch (e) { if (alive.current && sequence === readSequence.current && activeMonth.current === targetMonth) setError(e instanceof Error ? e.message : "月別目標を取得できませんでした。"); }
-    finally { reading.current = false; if (alive.current && sequence === readSequence.current) { setLoading(false); if (activeMonth.current !== targetMonth) void load(activeMonth.current); } }
+  useEffect(() => { if (previousScope.current === readScope && enabled) return; previousScope.current = readScope; readSequence.current++; reading.current = false; cache.current = {}; setData(null); setLoading(false); }, [readScope, enabled]);
+  async function load(targetMonth = activeMonth.current, force = false) {
+    if (!activity.current.enabled || !activity.current.active || saving.current || pendingOperation.current) return;
+    const stored = cache.current[targetMonth];
+    if (!force && stored && Date.now() - stored.at < 30_000) {dataScope.current=scopeRef.current;setData(stored.value); return; }
+    if (reading.current) return;
+    const sequence = ++readSequence.current, scope = scopeRef.current; reading.current = true; setLoading(true); setError("");
+    const current = () => alive.current && sequence === readSequence.current && scope === scopeRef.current && activity.current.enabled;
+    try { const next = await readRef.current({ month: targetMonth }); assertMetricGoalsData(next, targetMonth); if (!current()) return; cache.current[targetMonth] = {value:next,at:Date.now()}; const keys=Object.keys(cache.current);if(keys.length>12)delete cache.current[keys.sort((a,b)=>cache.current[a].at-cache.current[b].at)[0]];if(activeMonth.current!==targetMonth)return;dataScope.current=scope;setData(next); setOwnerId(previous => next.players.some(player => player.id === previous && (admin || player.id === selfPlayerId)) ? previous : admin ? next.players.find(player => player.active)?.id ?? next.players[0]?.id ?? "" : selfPlayerId); }
+    catch (e) { if (current() && activeMonth.current === targetMonth) setError(e instanceof Error ? e.message : "月別目標を取得できませんでした。"); }
+    finally { if (alive.current && sequence === readSequence.current) { reading.current = false; setLoading(false); if (activeMonth.current !== targetMonth && activity.current.active) void load(activeMonth.current); } }
   }
-  useEffect(() => { void load(month); }, [month, enabled, unsettled]);
+  useEffect(() => { void load(month); }, [month, enabled, active, readScope]);
   const ready = data?.month === month ? data : null, owner = ready?.players.find(player => player.id === ownerId), key = keyFor(ownerId, month), saved = ready ? resolveMetricGoal(ready, ownerId, month) : null, draft = drafts[key] ?? (saved ? draftFrom(saved) : null), changed = !!draft && draftChanged(draft), canEdit = !!owner && (admin || owner.id === selfPlayerId && owner.active), blocked = !enabled || !canWrite || !canEdit || !!pending || sending || !ready;
   function edit(change: (value: Draft) => Draft) { if (!draft || blocked) return; setDrafts(previous => ({ ...previous, [key]: change(previous[key] ?? draft) })); setNotice(""); setError(""); }
   function undo(targetKey = key) { setDrafts(previous => { const next = { ...previous }; delete next[targetKey]; return next; }); setConflictKey(""); setError(""); }
   async function execute(operation: Pending) {
-    if (saving.current) return; saving.current = true; setSending(true); setPending(operation); setError(""); setNotice("");
+    if (saving.current) return; saving.current = true; setSending(true); setPending(operation);pendingOperation.current=operation; setError(""); setNotice("");cache.current={};readSequence.current++;reading.current=false;let reload=false;
     try {
       const receipt = await onSave(operation.payload, operation.id);
       if (receipt !== undefined && (!receipt || typeof receipt !== "object" || !("committed" in receipt) || receipt.committed !== true || !("operationId" in receipt) || receipt.operationId !== operation.id)) throw Object.assign(new Error("保存結果を確認できませんでした。入力は残っています。保存状況を再確認してください。"), { code: "INTERNAL" });
-      if (!alive.current) return; undo(operation.key); setPending(null); setData(null); setNotice("目標を保存しました。最新の実績を取得しています。"); onChanged?.();
+      if (!alive.current) return;reload=true; undo(operation.key); setPending(null);pendingOperation.current=null; setData(null); setNotice("目標を保存しました。最新の実績を取得しています。"); onChanged?.();
     } catch (e) {
       if (!alive.current) return; const code = e && typeof e === "object" && "code" in e ? String(e.code) : "", conflict = ["CONFLICT", "VERSION_CONFLICT"].includes(code), uncertain = !conflict && isUncertainWrite(e);
-      if (!uncertain) setPending(null); if (conflict) setConflictKey(operation.key); setError(e instanceof Error ? e.message : "目標を保存できませんでした。入力は保持しています。");
-    } finally { saving.current = false; if (alive.current) setSending(false); }
+      if (!uncertain) {setPending(null);pendingOperation.current=null;reload=true;} if (conflict) setConflictKey(operation.key); setError(e instanceof Error ? e.message : "目標を保存できませんでした。入力は保持しています。");
+    } finally { saving.current = false; if (alive.current) {setSending(false);if(reload)void load(activeMonth.current,true);} }
   }
   function save() { if (!draft || blocked || !validDraft(draft) || conflictKey === key) return; void execute({ id: crypto.randomUUID(), payload: draftPayload(draft), key }); }
   function adoptVersions() { if (!draft || !saved || conflictKey !== key) return; const payload = { ...draftPayload(draft), expectedVersion: saved.expectedVersion, expectedProposalVersion: saved.expectedProposalVersion }; setDrafts(previous => ({ ...previous, [key]: { ...draft, payload } })); setConflictKey(""); setError(""); }
   return <section className="metric-goals" aria-label="7工程の月別目標と達成率">
-    <header className="metric-goals-header"><div><h2><CalendarDays size={21}/>月別目標・日々の進捗</h2><p>実績は各工程を行った日で集計します。合格と双方のマッチは別の成果です。</p></div><div className="metric-goals-actions"><label>対象月<input type="month" aria-label="7工程目標の対象月" min="1900-01" max="2100-12" value={month} onChange={event => { if (validMetricGoalMonth(event.target.value)) setMonth(event.target.value); }}/></label><button type="button" className="secondary-button" onClick={() => setMonth(currentMonth)}>当月</button><button type="button" className="secondary-button" disabled={!enabled || loading || unsettled} onClick={() => void load()}>{loading ? <LoaderCircle size={15} className="metric-goals-spin"/> : <RefreshCw size={15}/>}最新を取得</button></div></header>
+    <header className="metric-goals-header"><div><h2><CalendarDays size={21}/>月別目標・日々の進捗</h2><p>実績は各工程を行った日で集計します。合格と双方のマッチは別の成果です。</p></div><div className="metric-goals-actions"><label>対象月<input type="month" aria-label="7工程目標の対象月" min="1900-01" max="2100-12" value={month} onChange={event => { if (validMetricGoalMonth(event.target.value)) setMonth(event.target.value); }}/></label><button type="button" className="secondary-button" onClick={() => setMonth(currentMonth)}>当月</button><button type="button" className="secondary-button" disabled={!enabled || loading || unsettled} onClick={() => void load(activeMonth.current,true)}>{loading ? <LoaderCircle size={15} className="metric-goals-spin"/> : <RefreshCw size={15}/>}最新を取得</button></div></header>
     {!enabled && <p className="info-box">現在、月別目標を利用できません。時間をおいて、もう一度開いてください。</p>}
     {notice && <p className="metric-goals-notice" role="status"><CheckCircle2 size={16}/>{notice}</p>}
     {error && <p className="form-error" role="alert">{error}</p>}

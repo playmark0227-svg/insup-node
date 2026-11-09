@@ -9,6 +9,7 @@ import "./background-save-status.css";
 export type BackgroundSaveInfo = {
  operationId:string; action:string; label:string; status:"saving"|"saved"|"failed";
  error:string; uncertain:boolean; details:string[]; changeId?:string; intakeInput?:boolean;refreshing?:boolean;localSaved?:boolean;pendingCount?:number;editable?:boolean;waitingForConnection?:boolean;
+ candidateName?:string;queueItems?:{operationId:string;candidateName?:string;label:string;status:"local"|"syncing"|"queued"|"waiting"|"failed"}[];
 };
 
 export function BackgroundSaveStatus({save,onRetry,onDismiss,onUndo,onCopyIntakeInput,onReadCorrection,onCorrect}:{save:BackgroundSaveInfo|null;onRetry:()=>void;onDismiss:()=>void|Promise<void>;onUndo?:(changeId:string,label:string)=>void|Promise<void>;onCopyIntakeInput?:()=>string;onReadCorrection?:(operationId:string)=>SaveCorrectionDraft;onCorrect?:(operationId:string,values:Record<string,string>)=>Promise<void>}) {
@@ -30,17 +31,22 @@ export function BackgroundSaveStatus({save,onRetry,onDismiss,onUndo,onCopyIntake
  if(!save)return null;
  const saving=save.status==="saving",saved=save.status==="saved";
  const waiting=saving&&save.waitingForConnection;
- const title=saving?waiting?"端末に保存済み・接続待ち":save.localSaved?`端末に保存済み・同期中${(save.pendingCount||0)>1?` ${save.pendingCount}件`:""}`:"端末へ保存中…":saved?save.refreshing?"保存済み・表示を更新中":"保存しました":save.uncertain?"保存結果を要確認":"保存できませんでした";
+ const title=saving?waiting?"端末に保存済み・接続待ち":save.localSaved?"端末に保存済み・同期中":"端末へ保存中…":saved?save.refreshing?"保存済み・表示を更新中":"保存しました":save.uncertain?"保存結果を要確認":"保存できませんでした";
+ const count=save.queueItems?.length||save.pendingCount||0;
+ const context=count>1?`${count}件`:save.candidateName;
+ const triggerTitle=context?`${context} · ${title}`:title;
+ const queueStatus={local:"端末へ保存中",syncing:"同期中",queued:"順番待ち",waiting:"接続待ち",failed:"要確認"};
  const Icon=waiting?WifiOff:saving?LoaderCircle:saved?CheckCircle2:AlertCircle;
  const dismiss=async()=>{try{await onDismiss();setOpen(false);}catch(error){toast.error(error instanceof Error?error.message:"保存状態を確認してください。");}};
  return <div ref={container} className={`background-save background-save-${save.status}`}>
-  <span className="background-save-announcement" role="status" aria-live="polite" aria-atomic="true">{save.label}：{title}</span>
-  <button ref={trigger} type="button" className="background-save-trigger" aria-expanded={open} aria-controls={panelId} aria-label={`${title} 保存状況を確認`} onClick={()=>setOpen(value=>!value)}>
-   <Icon size={17} className={saving&&!waiting?"background-save-spinner":""}/><span>{title}</span><ChevronDown size={13}/>
+  <span className="background-save-announcement" role="status" aria-live="polite" aria-atomic="true">{save.label}：{triggerTitle}</span>
+  <button ref={trigger} type="button" className="background-save-trigger" aria-expanded={open} aria-controls={panelId} aria-label={`${triggerTitle} 保存状況を確認`} onClick={()=>setOpen(value=>!value)}>
+   <Icon size={17} className={saving&&!waiting?"background-save-spinner":""}/><span>{triggerTitle}</span><ChevronDown size={13}/>
   </button>
   {open&&<section id={panelId} aria-label="保存状況" className={`background-save-panel${draft?.operationId===save.operationId?" is-correcting":""}`}>
    <div className="background-save-heading"><div><Icon size={19} className={saving&&!waiting?"background-save-spinner":""}/><strong>{title}</strong></div><button type="button" aria-label="保存状況を閉じる" onClick={()=>{setOpen(false);trigger.current?.focus();}}><X size={17}/></button></div>
-   <p className="background-save-label">{save.label}</p>
+   <p className="background-save-label">{save.candidateName&&<>{save.candidateName} · </>}{save.label}</p>
+   {!!save.queueItems?.length&&<div className="background-save-queue"><p>保存の状況<span>{save.queueItems.length}件</span></p><ul aria-label="候補者ごとの保存状況">{save.queueItems.map(item=><li key={item.operationId}><div><strong>{item.candidateName||item.label}</strong>{item.candidateName&&<span>{item.label}</span>}</div><span className={`background-save-queue-status is-${item.status}`}>{queueStatus[item.status]}</span></li>)}</ul>{save.queueItems.some(item=>item.status==="failed")&&<p className="background-save-queue-notice">先頭の保存を下のメニューで確認すると、次の保存へ進みます。</p>}</div>}
    <p className="background-save-help">{waiting?"入力はこの端末に保存済みです。インターネットに接続すると、自動で保存先への同期を再開します。接続中の別画面へ移動しても入力は保持されます。":saving&&!save.localSaved?"この端末のブラウザへ入力を保存しています。":saving?"入力はこの端末のブラウザに保存済みです。保存先へ順番に自動同期しています。別の候補者の入力や画面の移動を続けられます。":saved?save.refreshing?"保存先への同期は完了しました。最新の表示へ更新しています。入力中の内容はそのまま保持します。":"保存先への同期と、アプリの表示更新が完了しました。":save.uncertain?"通信が途切れ、保存結果を確認できませんでした。保存内容は保持しています。同じ内容で再試行して、重複を防ぎながら結果を確認してください。":save.editable?"入力は端末に残っています。このメニュー内で間違った項目を修正して再保存できます。":"保存内容は保持しています。理由を確認して再試行してください。"}</p>
    {!saved&&!draft&&<p className="background-save-help">{saving?"同じ候補者・項目の再編集とログアウトは、同期完了後にできます。実績の数字は保存先への反映後に更新します。":"入力は端末に残っています。右上から同じ内容で再試行できます。"}</p>}
    {save.error&&<p className="background-save-error" role="alert">{draft&&"前回のエラー："}{save.error}</p>}

@@ -197,6 +197,13 @@ export async function replacePendingSave(endpoint:string,account:string,operatio
 export function pendingSaveResources(action: string, payload: unknown, snapshot: SheetSnapshot): string[] {
   const data = payload as Record<string, unknown>;
   if (["restoreChange","stageMigrationBatch","applyMigrationItem"].includes(action)) return ["*"];
+  if(action==="saveIntroductionSettings")return ["*"];
+  if(action==="saveMetricGoals")return [`metric-goals:${data.playerId}:${data.month}`];
+  if(action==="saveWorkJob")return [`work-job:${data.jobId||`${data.company}:${data.title}`}`];
+  if(action==="saveTeamJob")return [`team-job:${data.jobId||`${data.company}:${data.title}`}`];
+  if(action==="saveTeamComment")return [`team-publication:${data.publicationId}`];
+  if(action==="unpublishTeamCandidate")return [`team-publication:${data.publicationId}`];
+  if(action==="completeMatchEvidence")return [`evidence:${data.evidenceId}`];
   if(action==="mutateRewards")return ["rewards:ledger"];
   if(["saveMatchReportComment","deleteMatchReportComment"].includes(action))return typeof data.reportId==="string"?[`match-report:${data.reportId}`]:["*"];
   if (action === "saveManagementRow") return [`management:${data.sheetId}:${data.row}`];
@@ -206,6 +213,7 @@ export function pendingSaveResources(action: string, payload: unknown, snapshot:
   if (action === "updateProfile") return [`player:${body.id}`];
   const ids = [body.recordId, ...(Array.isArray(data.targets) ? data.targets.map(target => (target as {recordId?:string})?.recordId) : [])].filter((id): id is string => typeof id === "string");
   const resources = ids.map(id => `record:${id}`);
+  if(["publishTeamCandidate","publishIntroductionV2"].includes(action)&&typeof data.publicationId==="string")resources.push(`team-publication:${data.publicationId}`);
   if(action==="saveMatchReport"&&typeof data.reportId==="string")resources.push(`match-report:${data.reportId}`);
   for (const id of ids) {
     const record = snapshot.records?.find(record => record.recordId === id);
