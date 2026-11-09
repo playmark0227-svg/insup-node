@@ -70,7 +70,7 @@ test("opening another requested proposal retains the first proposal's unsaved re
   h.memo().props.onChange({ target: { value: "架空の確認済み事実。曜日の条件を再確認する。" } });
   h.render({ initialRecordId: "B", initialRecordRequest: 2 }); assert.match(h.selected(), /架空候補者B/);
   h.choose("A"); assert.equal(h.memo().props.value, "架空の確認済み事実。曜日の条件を再確認する。");
-  assert.equal(h.calls.save.length, 0); assert.match(h.text(), /まだ保存先には保存していません/); h.unmount();
+  assert.equal(h.calls.save.length, 0); assert.match(h.text(), /下書き · 未保存/); h.unmount();
 });
 
 test("the empty review editor offers a concrete first proposal without starting AI or saving", () => {

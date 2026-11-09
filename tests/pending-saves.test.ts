@@ -114,7 +114,7 @@ test("drafts cannot be decrypted after logout or with another account secret", a
   await assert.rejects(readPendingSaves(endpoint,account),error=>error instanceof Error&&!/秘密|非公開/.test(error.message));
   unlockPendingSaves(endpoint,account,secret);
   assert.deepEqual(await readPendingSaves(endpoint,account),[save]);
-  assert.throws(()=>unlockPendingSaves(endpoint,account,undefined),/Google側/);
+  assert.throws(()=>unlockPendingSaves(endpoint,account,undefined),/一時保存を利用できません/);
 });
 
 test("expired drafts are removed on read and by the sign-in-free purge", async () => {

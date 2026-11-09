@@ -54,7 +54,7 @@ async function scopeFor(endpoint: string, account: string): Promise<string> {
 
 /** Hold the server-issued account secret in memory for this signed-in session only. */
 export function unlockPendingSaves(endpoint: string, account: string, secret: unknown): void {
-  if (typeof secret !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(secret)) throw new Error("端末の一時保存を使うにはGoogle側の連携コードの更新が必要です。管理者に連絡してください。");
+  if (typeof secret !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(secret)) throw new Error("この端末で一時保存を利用できません。入力を控えて管理者にお問い合わせください。");
   secrets.set(`${endpoint}|${account}`, secret);
 }
 /** Forget every secret and derived key, e.g. on logout or session expiry. */

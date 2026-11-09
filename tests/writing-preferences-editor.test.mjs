@@ -101,7 +101,7 @@ test("switching identities aborts an extraction and cannot apply another account
 });
 
 test("the already registered standard needs no import and read-only settings cannot save a preview", async () => {
-  const h = harness(); await flush(); assert.match(h.text(), /以前共有いただいた紹介文の構成を標準登録済み/);
+  const h = harness(); await flush(); assert.match(h.text(), /全プレイヤーの文章作成に使用/);
   assert.equal(h.calls.extract.length, 0); h.change(reference); h.click("参考文から書式案を作る"); await flush();
   h.render({ disabled: true }); assert.equal(h.button(saveLabel).props.disabled, true); assert.equal(h.calls.save.length, 0); h.unmount();
 });

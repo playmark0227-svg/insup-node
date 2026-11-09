@@ -180,7 +180,7 @@ test("the narrative guard is employer-specific and protects every numerical or u
 
 test("an unavailable native model yields a usable factual fallback and honestly names its method", async () => {
   const prior = Object.getOwnPropertyDescriptor(globalThis, "LanguageModel");
-  try { Object.defineProperty(globalThis, "LanguageModel", { configurable: true, value: undefined }); const result = await generateIntroductionV2(fixture()); assert.equal(result.method, "deterministic"); assert.equal(result.appliedCount, 0); assert.match(result.notice, /AIによる文章生成は行っていません/); assert.ok(result.document.internalBody.includes("月間120件架電")); }
+  try { Object.defineProperty(globalThis, "LanguageModel", { configurable: true, value: undefined }); const result = await generateIntroductionV2(fixture()); assert.equal(result.method, "deterministic"); assert.equal(result.appliedCount, 0); assert.match(result.notice, /AIを利用できないため/); assert.ok(result.document.internalBody.includes("月間120件架電")); }
   finally { if (prior) Object.defineProperty(globalThis, "LanguageModel", prior); else Reflect.deleteProperty(globalThis, "LanguageModel"); }
 });
 

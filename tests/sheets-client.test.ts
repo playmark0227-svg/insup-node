@@ -322,7 +322,7 @@ test("a caller's login deadline is an actionable timeout rather than a user canc
     return new Promise<Response>((_resolve,reject) => init?.signal?.addEventListener("abort",() => reject(init.signal?.reason),{once:true}));
   });
   const pending = sheetRequest(endpoint,"login",{},{signal:caller.signal});
-  const checked = assert.rejects(pending,(error: unknown) => error instanceof SheetApiError && error.code === "TIMEOUT" && error.message.includes("45秒") && error.message.includes("ログイン"));
+  const checked = assert.rejects(pending,(error: unknown) => error instanceof SheetApiError && error.code === "TIMEOUT" && error.message.includes("時間がかかっています") && error.message.includes("ログイン"));
   await flushMicrotasks(); caller.abort(new DOMException("Login deadline expired","TimeoutError"));
   await checked; assert.equal(calls,1);
 });
@@ -338,7 +338,7 @@ test("a shared login deadline also caps the following snapshot request", async t
   });
   const auth = await sheetRequest<{token:string}>(endpoint,"login",{},{signal:caller.signal});
   const pending = sheetRequest(endpoint,"snapshot",{},{signal:caller.signal,token:auth.token});
-  const checked = assert.rejects(pending,(error: unknown) => error instanceof SheetApiError && error.code === "TIMEOUT" && error.message.includes("データ取得") && error.message.includes("45秒"));
+  const checked = assert.rejects(pending,(error: unknown) => error instanceof SheetApiError && error.code === "TIMEOUT" && error.message.includes("データの取得") && error.message.includes("時間がかかっています"));
   await flushMicrotasks(); caller.abort(new DOMException("Shared deadline expired","TimeoutError"));
   await checked; assert.equal(calls,2); assert.equal(timeoutCalls,2);
 });
@@ -393,7 +393,7 @@ test("a body-stream deadline is a timeout and cannot replay a login or write", a
     Object.defineProperty(response,"text",{value:async () => { deadline.abort(new DOMException("Deadline expired","TimeoutError")); throw deadline.signal.reason; }});
     return response;
   });
-  await assert.rejects(() => sheetRequest(endpoint,"login"), (error: unknown) => error instanceof SheetApiError && error.code === "TIMEOUT" && error.message.includes("45秒") && error.message.includes("ログイン"));
+  await assert.rejects(() => sheetRequest(endpoint,"login"), (error: unknown) => error instanceof SheetApiError && error.code === "TIMEOUT" && error.message.includes("時間がかかっています") && error.message.includes("ログイン"));
   assert.equal(calls,1);
 });
 
@@ -453,7 +453,7 @@ test("malformed API error fields are never exposed as non-string error messages"
   t.mock.method(globalThis,"fetch",async () => new Response(JSON.stringify({ok:false,error:{code:{secret:"bad"},message:{token:"private"}}})));
   await assert.rejects(() => sheetRequest(endpoint,"login"), (error:unknown) => {
     assert.ok(error instanceof SheetApiError); assert.equal(error.code,"API");
-    assert.equal(error.message,"スプレッドシートへの操作に失敗しました。"); return true;
+    assert.equal(error.message,"操作を完了できませんでした。もう一度お試しください。"); return true;
   });
 });
 
@@ -558,7 +558,7 @@ for (const action of ["analyzeInterviewReviews","readInterviewAdvice"]) test(`${
   const pending = sheetRequest(endpoint,action,{period:"2026-10"});
   const checked = assert.rejects(pending,(error:unknown) => {
     assert.ok(error instanceof SheetApiError); assert.equal(error.code,"TIMEOUT");
-    assert.match(error.message,/改善案.*45秒/); assert.match(error.message,/理由の記録は保存済み/); assert.match(error.message,/保存済みの改善案を再取得/);
+    assert.match(error.message,/改善案.*時間がかかっています/); assert.match(error.message,/理由の記録は保存済み/); assert.match(error.message,/保存済みの改善案を再取得/);
     assert.doesNotMatch(error.message,/保存結果を確認できない|同じ内容で再試行/);
     return true;
   });

@@ -81,7 +81,7 @@ test("cloud AI receives only the style enum; its candidate draft needs explicit 
   assert.deepEqual(h.calls.generate, [["standard"]]); assert.deepEqual(h.calls.read, [["standard"]]);
   assert.equal(h.calls.applied.length, 0);
   pending.resolve(state(kit)); await flush();
-  assert.match(h.text(), /共通書式＋端末内の表記整理/);
+  assert.match(h.text(), /共通書式で作成した下書き/);
   assert.match(h.text(), /本人申告の営業経験/); assert.equal(h.calls.applied.length, 0);
   h.click("この文章を使う"); assert.equal(h.calls.applied.length, 0);
   h.click("現在の文章を残す"); assert.equal(h.calls.applied.length, 0);
@@ -112,9 +112,9 @@ test("cancelled cloud responses are ignored and the component does not lock navi
 
 test("switching candidate/account remounts private notes and rejects previous model results", async () => {
   const pending = deferred(), h = harness({ availability: "available", deviceCoaching: () => pending.promise }); await flush();
-  h.click("端末AI対応するPCブラウザ"); h.click("面談準備・振り返り");
+  h.click("AIで仕上げる対応するPCブラウザ"); h.click("面談準備・振り返り");
   h.change("-memo", "前のアカウントだけのメモ"); h.change("-reflection", "前のアカウントだけの反省");
-  h.click("端末AIで次の対応を作成");
+  h.click("AIで次の対応を作成");
   const signal = h.calls.deviceCoaching[0][1].signal;
   h.render({ identityKey: "account-two:candidate-two", candidateName: "次の架空候補者", memo: "次のメモ" }); await flush();
   assert.equal(signal.aborted, true);
@@ -127,8 +127,8 @@ test("switching candidate/account remounts private notes and rejects previous mo
 });
 
 test("an unavailable device AI never falls back to sending private content to the cloud", async () => {
-  const h = harness({ availability: "unavailable" }); await flush(); h.click("端末AI対応するPCブラウザ");
-  assert.match(h.text(), /この端末・ブラウザでは端末AIを利用できません/);
+  const h = harness({ availability: "unavailable" }); await flush(); h.click("AIで仕上げる対応するPCブラウザ");
+  assert.match(h.text(), /このブラウザではAIを利用できません/);
   assert.equal(h.button("文章をAIで整理・仕上げる").props.disabled, true);
   assert.equal(h.calls.generate.length, 0); assert.equal(h.calls.deviceIntroduction.length, 0);
   h.unmount();
@@ -153,9 +153,9 @@ test("saved preferences apply to successive candidates without any daily referen
 
 test("device coaching uses an immutable source snapshot with the user's own reflection", async () => {
   const pending = deferred(), h = harness({ availability: "available", deviceCoaching: () => pending.promise }); await flush();
-  h.click("端末AI対応するPCブラウザ"); h.click("面談準備・振り返り");
+  h.click("AIで仕上げる対応するPCブラウザ"); h.click("面談準備・振り返り");
   h.change("-memo", "初めに確認した希望条件"); h.change("-reflection", "最後まで質問を聞けなかった");
-  h.click("端末AIで次の対応を作成"); h.change("-memo", "生成中に追加したメモ");
+  h.click("AIで次の対応を作成"); h.change("-memo", "生成中に追加したメモ");
   const input = h.calls.deviceCoaching[0][0];
   assert.equal(input.memo, "初めに確認した希望条件"); assert.equal(input.selfReflection, "最後まで質問を聞けなかった");
   assert.equal(input.profile.workHistory, "本人申告の営業経験");
@@ -227,10 +227,10 @@ test("approved coaching enters a separate save field and that field never makes 
 test("supported desktop AI is the initial choice but model preparation still needs an explicit click", async () => {
   for (const availability of ["available", "downloadable", "downloading"]) {
     const h = harness({ availability }); await flush();
-    assert.equal(h.button("端末AI対応するPCブラウザ").props["aria-pressed"], true);
+    assert.equal(h.button("AIで仕上げる対応するPCブラウザ").props["aria-pressed"], true);
     assert.equal(h.button("書式で下書きPC・スマートフォン").props["aria-pressed"], false);
     assert.equal(h.calls.deviceIntroduction.length, 0); assert.equal(h.calls.generate.length, 0);
-    h.click(availability === "available" ? "文章をAIで整理・仕上げる" : "モデルを準備して作成"); await flush();
+    h.click(availability === "available" ? "文章をAIで整理・仕上げる" : "AIを準備して作成"); await flush();
     assert.equal(h.calls.deviceIntroduction.length, 1); assert.equal(h.calls.generate.length, 0);
     assert.equal(h.calls.deviceIntroduction[0][1].preparationTimeoutMs, 600000);
     assert.equal(h.calls.deviceIntroduction[0][1].timeoutMs, 120000);
@@ -241,11 +241,11 @@ test("supported desktop AI is the initial choice but model preparation still nee
 test("a delayed capability result never replaces the user's selected AI method", async () => {
   for (const [choice, resolved] of [["structure", "available"], ["device", "unavailable"]]) {
     const pending = deferred(), h = harness({ availabilityPromise: pending.promise }); await flush();
-    h.click(choice === "structure" ? "書式で下書きPC・スマートフォン" : "端末AI対応するPCブラウザ");
+    h.click(choice === "structure" ? "書式で下書きPC・スマートフォン" : "AIで仕上げる対応するPCブラウザ");
     pending.resolve(resolved); await flush();
-    assert.equal(h.button(choice === "structure" ? "書式で下書きPC・スマートフォン" : "端末AI対応するPCブラウザ").props["aria-pressed"], true);
+    assert.equal(h.button(choice === "structure" ? "書式で下書きPC・スマートフォン" : "AIで仕上げる対応するPCブラウザ").props["aria-pressed"], true);
     if (choice === "structure") { h.click("書式を取得して下書き"); await flush(); assert.equal(h.calls.generate.length, 1); assert.equal(h.calls.deviceIntroduction.length, 0); }
-    else { assert.equal(h.button("文章をAIで整理・仕上げる").props.disabled, true); assert.match(h.text(), /この端末・ブラウザでは端末AIを利用できません/); }
+    else { assert.equal(h.button("文章をAIで整理・仕上げる").props.disabled, true); assert.match(h.text(), /このブラウザではAIを利用できません/); }
     h.unmount();
   }
 });
@@ -255,28 +255,28 @@ test("a late capability check cannot switch methods after a user has already sta
   await flush(); h.click("書式を取得して下書き"); capability.resolve("available"); await flush();
   assert.equal(h.button("書式で下書きPC・スマートフォン").props["aria-pressed"], true);
   writing.resolve(state(kit)); await flush();
-  assert.match(h.text(), /共通書式＋端末内の表記整理/); assert.equal(h.calls.deviceIntroduction.length, 0); h.unmount();
+  assert.match(h.text(), /共通書式で作成した下書き/); assert.equal(h.calls.deviceIntroduction.length, 0); h.unmount();
 });
 
 test("model preparation timeout keeps edited notes and offers a retry without implying the download is still running", async () => {
   const pending = deferred(), h = harness({ availability: "downloadable", deviceIntroduction: (_input, options) => {
     options.onProgress({ phase: "downloading", downloadProgress: .42 }); return pending.promise;
   } }); await flush();
-  assert.match(h.text(), /準備に数分かかることがあります/); assert.match(h.text(), /途中でキャンセルできます/);
-  h.click("モデルを準備して作成"); await flush();
+  assert.match(h.text(), /準備に数分かかる場合があります/); assert.match(h.text(), /途中で中止できます/);
+  h.click("AIを準備して作成"); await flush();
   assert.ok(nodes(h.render()).some(node => node.type === "progress" && node.props.value === .42));
   h.click("面談準備・振り返り"); h.change("-memo", "モデル準備中に追記した原文");
   pending.reject({ code: "TIMEOUT", phase: "preparation" }); await flush();
-  assert.match(h.text(), /待機を終了しました/); assert.match(h.text(), /Chromeの準備状況を確認して進められます/);
+  assert.match(h.text(), /準備に時間がかかったため中止しました/); assert.match(h.text(), /もう一度お試しください/);
   assert.doesNotMatch(h.text(), /ダウンロードを継続しています|バックグラウンドでダウンロード/);
   assert.ok(nodes(h.render()).some(node => node.type === "textarea" && node.props.value === "モデル準備中に追記した原文"));
   assert.equal(h.calls.applied.length, 0); assert.equal(h.calls.generate.length, 0);
-  assert.equal(h.button("モデルを準備して作成").props.disabled, false); h.unmount();
+  assert.equal(h.button("AIを準備して作成").props.disabled, false); h.unmount();
 });
 
 test("generation timeout has a distinct safe message and leaves the existing introduction untouched", async () => {
   const h = harness({ availability: "available", deviceCoaching: () => Promise.reject({ code: "TIMEOUT", phase: "generation" }) }); await flush();
-  h.click("面談準備・振り返り"); h.click("端末AIで次の対応を作成"); await flush();
+  h.click("面談準備・振り返り"); h.click("AIで次の対応を作成"); await flush();
   assert.equal(h.calls.deviceCoaching[0][1].preparationTimeoutMs, 600000);
   assert.equal(h.calls.deviceCoaching[0][1].timeoutMs, 120000);
   assert.match(h.text(), /文章の作成に時間がかかったため中止しました/); assert.match(h.text(), /入力内容と現在の文章は残っています/);
@@ -360,7 +360,7 @@ test('editing a candidate is explicit, reversible and not replaced by another au
 });
 
 test('record formatting and length limits are described without claiming a model rewrote the profile',async()=>{
- const h=harness({deviceIntroduction:async()=>({draft:'【基本情報】\n氏名：架空の候補者',method:'record-format'})});await flush();h.click('文章をAIで整理・仕上げる');await flush();assert.match(h.text(),/入力情報から作成（経歴の入力でAIが紹介文を仕上げます）/);h.unmount();
+ const h=harness({deviceIntroduction:async()=>({draft:'【基本情報】\n氏名：架空の候補者',method:'record-format'})});await flush();h.click('文章をAIで整理・仕上げる');await flush();assert.match(h.text(),/入力情報から作成した下書き/);h.unmount();
  const limited=harness({deviceIntroduction:async()=>{throw {code:'LENGTH_LIMIT'};}});await flush();limited.click('文章をAIで整理・仕上げる');await flush();assert.match(limited.text(),/氏名・条件を省略せず/);assert.match(limited.text(),/元の入力と現在の紹介文は残っています/);assert.equal(limited.calls.applied.length,0);limited.unmount();
 });
 

@@ -12,18 +12,19 @@ const text = tree => tree == null || typeof tree === "boolean" ? "" : typeof tre
 const destination = { title: "fictional-private-book-title", matchingUrl: "https://docs.google.com/spreadsheets/d/fictional-private-book/edit?gid=1", kpiUrl: "https://docs.google.com/spreadsheets/d/fictional-private-book/edit?gid=2" };
 const props = { endpoint: "https://script.google.com/macros/s/fictional-server/exec", mode: "live", busy: false, error: "", connected: false, warnings: [], destination, onConnect: async () => {}, onRefresh: async () => {} };
 
-test("before authentication the connection server is editable without claiming a verified data provider", () => {
+test("the customer connection screen shows login help without technical setup controls", () => {
   const tree = exports.SheetConnectionPanel(props), body = text(tree), all = nodes(tree);
-  assert.match(body, /データ連携/);
-  assert.match(body, /接続サーバーURL/);
-  assert.ok(all.some(n => n.type === "Input" && n.props.value === props.endpoint));
+  assert.match(body, /接続状況/);
+  assert.match(body, /IDとパスワードでログイン/);
+  assert.equal(all.some(n => n.type === "Input" || n.type === "form"), false);
+  assert.doesNotMatch(body, /接続サーバーURL|APIキー|コード/);
   assert.equal(body.includes("スプレッドシート"), false);
   assert.equal(body.includes("Firebase"), false);
   assert.equal(body.includes("fictional-private-book-title"), false);
   assert.equal(all.some(n => n.type === "a"), false);
 });
 
-test("legacy destination references and migration instructions require an authenticated administrator", () => {
+test("only authenticated administrators see business reference links, never developer instructions", () => {
   for (const options of [{ connected: false, admin: true }, { connected: true, admin: false }]) {
     const tree = exports.SheetConnectionPanel({ ...props, ...options });
     assert.equal(nodes(tree).some(n => n.type === "a"), false);
@@ -31,7 +32,6 @@ test("legacy destination references and migration instructions require an authen
   }
   const admin = exports.SheetConnectionPanel({ ...props, connected: true, admin: true });
   const urls = nodes(admin).filter(n => n.type === "a").map(n => n.props.href);
-  assert.deepEqual(Array.from(urls), ["./apps-script/SETUP.md", "./apps-script/Code.gs", destination.matchingUrl, destination.kpiUrl]);
-  assert.match(text(admin), /未同期の入力と保存結果を先に確認/);
-  assert.match(text(admin), /保存IDを保って確認/);
+  assert.deepEqual(Array.from(urls), [destination.matchingUrl, destination.kpiUrl]);
+  assert.doesNotMatch(text(admin), /保存ID|サーバーのコード|設定手順|APIキー/);
 });

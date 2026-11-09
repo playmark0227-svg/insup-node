@@ -170,7 +170,7 @@ export function useSheetsConnection() {
         if (!response.ok) throw new Error("接続設定を取得できませんでした。画面を再読み込みしてください。");
         const manifest = await response.json();
         if (manifest.endpoint) { target = validateEndpoint(manifest.endpoint); pinnedEndpoint.current = target; }
-        else if (import.meta.env.PROD) throw new Error("公開アプリの接続設定が未設定です。管理者に確認してください。");
+        else if (import.meta.env.PROD) throw new Error("現在アプリに接続できません。管理者にお問い合わせください。");
       } catch (e) {
         if (isCurrent(g)) {
           setMode("live"); setPlayers([]); setActivities([]);
@@ -234,13 +234,13 @@ export function useSheetsConnection() {
     let target: string;
     try { target = validateEndpoint(value); }
     catch (e) { setError(e instanceof Error ? e.message : "接続先を確認してください。"); throw e; }
-    if (pinnedEndpoint.current && target !== pinnedEndpoint.current) throw new Error("公開アプリの接続先は固定されています。変更は管理者が公開設定から行ってください。");
+    if (pinnedEndpoint.current && target !== pinnedEndpoint.current) throw new Error("指定された接続先を使用してください。変更が必要な場合は管理者にお問い合わせください。");
     loginRunning.current = false;
     const {controller, g} = beginLoad(null);
     try {
       const health = await sheetRequest<{configured: boolean}>(target, "health", {}, {signal: controller.signal});
       if (!isCurrent(g)) return;
-      if (!health.configured) throw new Error("Google側の初期設定が完了していません。");
+      if (!health.configured) throw new Error("現在このアプリを利用できません。管理者にお問い合わせください。");
       clearSession(); setEndpoint(target); setMode("live");
       writeStorage(localStorage, ENDPOINT_KEY, target);
     } catch (e) { if (isCurrent(g)) { setError(e instanceof Error ? e.message : "接続できませんでした。"); throw e; } }
@@ -426,7 +426,7 @@ export function useSheetsConnection() {
 
   const mutate = async (action: string, payload: unknown, operationId: string) => {
     if (!snapshot || !token.current) throw new Error("ログインしてください。");
-    if (!snapshot.writesEnabled) throw new Error("現在は読み取り接続です。管理者が書き込みを有効にしてから登録してください。");
+    if (!snapshot.writesEnabled) throw new Error("現在は閲覧のみ利用できます。登録・編集については管理者にお問い合わせください。");
     if (loginRunning.current) throw new Error("ログインの確認が完了するまでお待ちください。");
     if (mutationRunning.current || hasPendingBackground()) throw new SheetApiError("MUTATION_PENDING", "右上の保存結果を確認してから、次の変更を保存してください。");
     mutationRunning.current = true; const g = generation.current;
@@ -485,7 +485,7 @@ export function useSheetsConnection() {
       if (data && "snapshot" in data) { assertSnapshot(data.snapshot); applySnapshot(data.snapshot); }
       else { assertMutationReceipt(data, job.state.operationId); updateAfterCommit = true; }
       await removePendingSave(job.endpoint, job.account, job.state.operationId).catch(() => {
-        if (isCurrent(job.generation)) setSyncError("シートへの保存は完了しました。端末に残る同期履歴は次回の接続時に再確認します。");
+        if (isCurrent(job.generation)) setSyncError("保存は完了しました。次回の接続時に保存状況を再確認します。");
       });
       if (!isCurrent(job.generation) || backgroundQueue.current[0] !== job) return;
       job.state = {...job.state, status:"saved", changeId:data.changeId, intakeInput:false, refreshing:updateAfterCommit};
@@ -497,7 +497,7 @@ export function useSheetsConnection() {
       if (isExpired(e)) { clearSession(); setError("ログインの有効期限が切れました。入力はこの端末に残っています。再ログインすると未同期の入力を確認できます。"); return; }
       job.state = {...job.state, status:"failed", error:e instanceof Error?e.message:"保存結果を確認できませんでした。", uncertain:wasUncertain||posted&&isUncertainWrite(e),editable:!!latestSnapshot.current&&correctionFields(job.state.action,job.payload,latestSnapshot.current).length>0};
       if(extensionActions.has(job.state.action)){
-        extensionWaiters.current.get(job.state.operationId)?.reject(wasUncertain&&!isUncertainWrite(e)?new SheetApiError("INTERNAL",`前回の保存結果はまだ未確認です。入力と同じ保存IDを保持しています。${e instanceof Error?e.message:"接続状態を確認してください。"}`):e);extensionWaiters.current.delete(job.state.operationId);
+        extensionWaiters.current.get(job.state.operationId)?.reject(wasUncertain&&!isUncertainWrite(e)?new SheetApiError("INTERNAL",`前回の保存結果はまだ未確認です。入力は保持しています。${e instanceof Error?e.message:"接続状態を確認してください。"}`):e);extensionWaiters.current.delete(job.state.operationId);
         if(!job.state.uncertain){await removePendingSave(job.endpoint,job.account,job.state.operationId);if(isCurrent(job.generation)&&backgroundQueue.current[0]===job){backgroundQueue.current.shift();backgroundJob.current=null;}}
       }
       publishQueue();
@@ -538,13 +538,13 @@ export function useSheetsConnection() {
   const submitMutation = async (action: string, payload: unknown, operationId: string, label?: string): Promise<void> => {
     const current = latestSnapshot.current;
     if (!current || !token.current || mutationGeneration !== generation.current) throw new SheetApiError("UNAUTHENTICATED", "ログインしてください。");
-    if (!current.writesEnabled) throw new SheetApiError("READ_ONLY", "現在は読み取り接続です。");
+    if (!current.writesEnabled) throw new SheetApiError("READ_ONLY", "現在は閲覧のみ利用できます。");
     if (loginRunning.current || busy) throw new SheetApiError("MUTATION_PENDING", "ログインと画面の取得が完了してから保存してください。");
     if (!backgroundActions.has(action)) throw new SheetApiError("INVALID_ACTION", "この操作は専用の設定画面から実行してください。");
     let owned: unknown;
     try { owned = JSON.parse(JSON.stringify(payload)); } catch { throw new SheetApiError("INVALID_PAYLOAD", "入力内容を確認してください。"); }
     if (!operationId || !owned || typeof owned !== "object") throw new SheetApiError("INVALID_PAYLOAD", "入力内容を確認してください。");
-    if(action==="createCandidate"&&Object.hasOwn(owned,"fields")&&!current.candidateRegistrationFeature)throw new SheetApiError("FEATURE_UNAVAILABLE","一括登録の連携更新が必要です。入力を残したまま接続状態を確認してください。");
+    if(action==="createCandidate"&&Object.hasOwn(owned,"fields")&&!current.candidateRegistrationFeature)throw new SheetApiError("FEATURE_UNAVAILABLE","現在この登録方法を利用できません。入力を控えて管理者にお問い合わせください。");
     const dateErrors=mutationDateErrors(action,owned);
     if(Object.keys(dateErrors).length)throw new SheetApiError("INVALID_DATE",Object.values(dateErrors)[0]);
     const g=generation.current, savedToken=token.current, account=`${current.self.role}:${current.self.playerId}`;
@@ -594,7 +594,7 @@ export function useSheetsConnection() {
   };
   const correctBackgroundSave = async (operationId:string,values:Record<string,string>):Promise<void> => {
     const {job,current}=correctionJob(operationId);
-    if(!current.writesEnabled)throw new SheetApiError("READ_ONLY","現在は読み取り接続です。");
+    if(!current.writesEnabled)throw new SheetApiError("READ_ONLY","現在は閲覧のみ利用できます。");
     const owned=correctedPayload(job.state.action,job.payload,values,current),resources=pendingSaveResources(job.state.action,owned,current);
     if(backgroundQueue.current.slice(1).some(other=>resources.includes("*")||other.resources.includes("*")||other.resources.some(key=>resources.includes(key))))throw new SheetApiError("MUTATION_PENDING","修正先の候補者・項目に別の未同期の入力があります。そちらの同期後に修正してください。");
     const nextId=crypto.randomUUID(),input:PendingSave={...job.savedInput,operationId:nextId,payload:owned,details:saveDetails(job.state.action,owned,current),attempted:false};
@@ -775,7 +775,7 @@ export function useSheetsConnection() {
     await ensureOutbox();if(!isCurrent(teamGeneration)||token.current!==teamToken)throw new SheetApiError("STALE_SESSION","ログイン状態が変わりました。");
     const queued=backgroundQueue.current.find(job=>job.state.operationId===operationId);
     if(hasPendingBackground()&&(!queued||backgroundQueue.current[0]!==queued))throw new SheetApiError("MUTATION_PENDING","右上の保存結果を確認してから操作してください。");
-    if(queued&&(queued.state.action!==action||JSON.stringify(queued.payload)!==JSON.stringify(payload)))throw new SheetApiError("OPERATION_CONFLICT","同じ保存IDを別の内容に使うことはできません。");
+    if(queued&&(queued.state.action!==action||JSON.stringify(queued.payload)!==JSON.stringify(payload)))throw new SheetApiError("OPERATION_CONFLICT","前の保存が完了してから内容を変更してください。");
     if(extensionWaiters.current.has(operationId))throw new SheetApiError("MUTATION_PENDING","この保存を確認中です。");
     let resolve!:()=>void,reject!:(error:unknown)=>void;const done=new Promise<void>((yes,no)=>{resolve=yes;reject=no;});
     // Attach a handler before asynchronous local persistence can reject the waiter.

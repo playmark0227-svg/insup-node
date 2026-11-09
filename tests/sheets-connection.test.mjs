@@ -192,8 +192,8 @@ test("an old backend without an outbox key blocks new saves but can log out with
   const draft={operationId:"legacy_pending_operation",action:"updateStatus",payload:{recordId:"one",status:"提案"},label:"以前の保存",details:[],createdAt:Date.now(),attempted:true};
   const h=harness(call=>call.action==="snapshot"?legacySnapshot:{loggedOut:true},{storedToken:token,pendingSaves:[draft]});
   await flush();h.render();await flush();
-  assert.match(h.render().syncError,/Google側/);
-  await assert.rejects(h.render().submitMutation("updateStatus",{recordId:"two",status:"提案"},"new_pending_operation"),/Google側/);
+  assert.match(h.render().syncError,/一時保存を利用できません/);
+  await assert.rejects(h.render().submitMutation("updateStatus",{recordId:"two",status:"提案"},"new_pending_operation"),/一時保存を利用できません/);
   assert.equal(h.calls.length,1,"No save is sent without the server's outbox key");
   const before=h.locks.count;
   await h.render().logout();await flush();
@@ -387,7 +387,7 @@ test("published endpoint ignores a stale local override and rejects credential r
   const h=harness(call=>call.action==="login"?{token,snapshot}:snapshot,{storedEndpoint:otherEndpoint});
   await flush();
   assert.equal(h.render().endpoint,endpoint);
-  await assert.rejects(()=>h.render().connect(otherEndpoint),/固定/);
+  await assert.rejects(()=>h.render().connect(otherEndpoint),/指定された接続先/);
   assert.equal(h.calls.length,0);
   await h.render().login("ND-001","private-password");
   assert.ok(h.calls.every(call=>call.target===endpoint));
@@ -428,7 +428,7 @@ test("empty published configuration never falls back to a local endpoint or stor
   const h=harness(()=>snapshot,{production:true,manifestEndpoint:"",storedEndpoint:otherEndpoint,storedToken:token});
   await flush();assert.equal(h.calls.length,0);assert.equal(h.render().mode,"live");
   assert.equal(h.render().snapshot,null);assert.equal(h.render().authenticated,false);
-  assert.match(h.render().error,/未設定/);h.unmount();
+  assert.match(h.render().error,/管理者にお問い合わせ/);h.unmount();
 });
 
 test("generic API password ambiguity also signs out without replay",async()=>{

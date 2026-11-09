@@ -82,10 +82,10 @@ function harness(options = {}) {
 
 test("unsupported browsers keep useful record lookup clearly separate from AI", async () => {
   const h = harness({ availability: "unavailable" }); await flush();
-  assert.equal(h.button("端末内AI").props.disabled, true);
+  assert.equal(h.button("AIに相談").props.disabled, true);
   h.change("提案先ごとの進捗は？"); h.submit(); await flush();
   assert.equal(h.calls.device.length, 0); assert.equal(h.calls.facts.length, 1);
-  assert.match(h.text(), /登録情報から確認（AI未使用）/);
+  assert.match(h.text(), /登録情報から確認/);
   assert.match(h.text(), /架空会社A|架空会社B/);
   assert.match(h.text(), /対応するPC版Chrome/);
   assert.equal(h.assistant().length, 1); h.unmount();
@@ -94,7 +94,7 @@ test("unsupported browsers keep useful record lookup clearly separate from AI", 
 test("opening checks capability without inference and device answers retain their exact source", async () => {
   const h = harness(); await flush();
   assert.equal(h.calls.device.length, 0);
-  assert.equal(h.button("端末内AI").props["aria-pressed"], true);
+  assert.equal(h.button("AIに相談").props["aria-pressed"], true);
   h.change("現在の状況を教えて"); h.submit(); await flush();
   assert.equal(h.calls.device.length, 1); assert.equal(h.calls.facts.length, 0);
   assert.equal(h.calls.device[0][0].question, "現在の状況を教えて");
@@ -187,11 +187,11 @@ test("a native record-check response is labelled accurately and retains record c
   h.change("何か入れるべき情報ある？"); h.submit(); await flush();
   assert.equal(h.calls.device.length, 1); assert.equal(h.calls.facts.length, 0);
   const message = h.assistant()[0];
-  assert.equal(text(nodes(message).find(node => node.type === "strong")), "入力内容のチェック（AI未使用）");
+  assert.equal(text(nodes(message).find(node => node.type === "strong")), "入力内容のチェック");
   assert.match(text(message), /参照した記録（1）/); assert.match(text(message), /架空会社B/);
   assert.doesNotMatch(text(message), /架空会社A|sourceIds|record-b/);
   h.click("コピー"); await flush();
-  assert.equal(h.calls.copied[0], `${answer}\n\n参照：架空会社B · 面談 2026-10-01 · 記録行 3`);
+  assert.equal(h.calls.copied[0], `${answer}\n\n参照：架空会社B · 面談 2026-10-01`);
   assert.doesNotMatch(h.calls.copied[0], /sourceIds|record-b/); h.unmount();
 });
 
@@ -202,7 +202,7 @@ test("the missing-information suggestion asks a useful input question directly i
   h.click("追加入力したほうがいい情報は？"); await flush();
   assert.equal(h.calls.facts.length, 1); assert.equal(h.calls.device.length, 0);
   assert.equal(h.calls.facts[0][1], "追加入力したほうがいい情報は？");
-  assert.match(text(h.assistant()[0]), /入力内容のチェック（AI未使用）/); h.unmount();
+  assert.match(text(h.assistant()[0]), /入力内容のチェック/); h.unmount();
 });
 
 test("purpose-based suggestions explain their output and keep missing information separate from a summary", async () => {
@@ -254,7 +254,7 @@ test("the reported missing-information question returns specific checks rather t
   h.change("何か入れるべき情報ある？"); h.submit(); await flush();
   assert.equal(h.calls.device.length, 0); assert.equal(h.calls.facts.length, 1);
   const message = h.assistant()[0], body = nodes(message).find(node => node.props.className === "candidate-chat-answer");
-  assert.match(text(message), /入力内容のチェック（AI未使用）/);
+  assert.match(text(message), /入力内容のチェック/);
   assert.match(text(body), /希望単価/); assert.match(text(body), /時給・月額・件単価/);
   assert.match(text(body), /実績/); assert.match(text(body), /対象期間/);
   assert.match(text(body), /希望時間帯/); assert.match(text(body), /確認する質問/);
@@ -273,7 +273,7 @@ test("short follow-ups pass the preceding user intent to the real record helper"
   assert.equal(history[1].role, "assistant");
   assert.equal(history.some(message => message.role === "user" && message.content === "他には？"), false);
   const reply = h.assistant()[1]; assert.ok(reply);
-  assert.match(text(reply), /入力内容のチェック（AI未使用）/);
+  assert.match(text(reply), /入力内容のチェック/);
   assert.match(text(reply), /確認する質問/); assert.doesNotMatch(text(reply), /その項目に対応する記録は見つかりません/); h.unmount();
 });
 
@@ -303,7 +303,7 @@ test("switching a failed native question to record lookup does not duplicate tha
   assert.equal(h.calls.device.length, 1); assert.equal(h.calls.facts.length, 1);
   assert.equal(h.calls.facts[0][1], "何か入れるべき情報ある？");
   assert.equal(h.calls.facts[0][2].length, 0);
-  assert.match(text(h.assistant()[0]), /入力内容のチェック（AI未使用）/);
+  assert.match(text(h.assistant()[0]), /入力内容のチェック/);
   assert.match(text(h.assistant()[0]), /希望単価/); h.unmount();
 });
 
@@ -386,7 +386,7 @@ test("unexpected model errors never expose raw details and allow a clearly label
   assert.doesNotMatch(h.text(), /secret-token|private\.example|internal/);
   h.click("登録情報で確認"); await flush();
   assert.equal(h.calls.device.length, 1); assert.equal(h.calls.facts.length, 1);
-  assert.match(h.text(), /登録情報から確認（AI未使用）/);
+  assert.match(h.text(), /登録情報から確認/);
   assert.equal(h.assistant().length, 1); h.unmount();
 });
 

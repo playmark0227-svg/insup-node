@@ -38,13 +38,13 @@ export async function generateIntroductionV2(raw: IntroductionV2Profile, setting
   if (!profile) throw new OnDeviceAiError("INVALID_INPUT");
   const fallback = composeIntroductionV2(profile, settings, clientId), facts = introductionV2NarrativeFacts(profile);
   const deterministic = (notice: string): IntroductionV2Generation => ({ document: fallback, method: "deterministic", edits: [], appliedCount: 0, preservedCount: facts.length, notice });
-  if (!facts.length) return deterministic("確認済みの入力を規定の書式で整理しました。文章の根拠となる業務内容や具体的な工夫は、確認項目から追記できます。");
+  if (!facts.length) return deterministic("入力内容を紹介文にまとめました。業務内容や工夫を追記すると、より詳しく紹介できます。");
   try {
     // Do not send candidate identity, conditions, private notes, prices, company
     // settings or another person's facts. The native runner never uses fetch.
     const output = await runOnDeviceStructuredTask(task, { atoms: facts.slice(0, 60) }, schema, options, 3_000);
     const candidates = readEdits(output);
-    if (!candidates) return deterministic("端末内AIの出力形式を確認できなかったため、原文を規定の書式で整理しました。入力は保持されています。");
+    if (!candidates) return deterministic("AIで文章を整えられなかったため、元の入力から紹介文を作成しました。");
     const sourceById = new Map(facts.map(fact => [fact.factId, fact]));
     const edits: IntroductionNarrativeEdit[] = [];
     for (const edit of candidates) {
@@ -53,14 +53,14 @@ export async function generateIntroductionV2(raw: IntroductionV2Profile, setting
       if (validateIntroductionNarrativeEdit(edit, profile, settings)) edits.push(edit);
     }
     const changed = edits.filter(edit => edit.text !== sourceById.get(edit.factId)!.sourceText).length;
-    if (!changed) return deterministic("確認済みの内容を規定の書式で整理しました。根拠を保てない書き換えは採用せず、該当部分の原文を残しています。");
+    if (!changed) return deterministic("入力内容を紹介文にまとめました。意味が変わる可能性のある箇所は、元の文章を残しています。");
     const document = composeIntroductionV2(profile, settings, clientId, new Date(), edits);
     return { document, method: "on-device", edits, appliedCount: changed, preservedCount: facts.length - changed,
-      notice: `端末内AIで${changed}項目の文章を整理しました。会社・期間・実績の数字は原文を保持しています。共有前に確認してください。` };
+      notice: `${changed}項目の文章を整えました。共有前に内容をご確認ください。` };
   } catch (error) {
     if (error instanceof OnDeviceAiError && error.code === "ABORTED") throw error;
     return deterministic(error instanceof OnDeviceAiError && error.code === "UNAVAILABLE"
-      ? "この端末では端末内AIを利用できないため、確認済みの情報を規定の書式で整理しました。AIによる文章生成は行っていません。"
-      : "端末内AIでの文章整理を完了できなかったため、原文を規定の書式で整理しました。入力は保持されています。");
+      ? "この端末ではAIを利用できないため、元の入力から紹介文を作成しました。"
+      : "AIで文章を整えられなかったため、元の入力から紹介文を作成しました。");
   }
 }

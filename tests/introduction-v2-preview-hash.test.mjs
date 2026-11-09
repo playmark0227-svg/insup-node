@@ -8,5 +8,5 @@ test('browser preview digest matches the server UTF-8 SHA-256 base64url format w
  assert.notEqual(await introductionPreviewHash('本文\n改行'),await introductionPreviewHash('本文\r\n改行'));assert.notEqual(await introductionPreviewHash('１００件'),await introductionPreviewHash('100件'));await assert.rejects(()=>introductionPreviewHash('😀'.repeat(20001)),/20,000/);
 });
 test('a device without a secure digest gets an actionable error and no fallback confirmation hash',async()=>{
- const previous=Object.getOwnPropertyDescriptor(globalThis,'crypto');try{Object.defineProperty(globalThis,'crypto',{configurable:true,value:undefined});await assert.rejects(()=>introductionPreviewHash('保存済みの本文'),/一致を確認できません/);}finally{if(previous)Object.defineProperty(globalThis,'crypto',previous);else Reflect.deleteProperty(globalThis,'crypto');}
+ const previous=Object.getOwnPropertyDescriptor(globalThis,'crypto');try{Object.defineProperty(globalThis,'crypto',{configurable:true,value:undefined});await assert.rejects(()=>introductionPreviewHash('保存済みの本文'),/共有内容を確認できません/);}finally{if(previous)Object.defineProperty(globalThis,'crypto',previous);else Reflect.deleteProperty(globalThis,'crypto');}
 });
