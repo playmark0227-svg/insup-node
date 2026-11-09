@@ -36,6 +36,9 @@ export type IntroductionFactRef = { id: string; path: string; value: string; ori
 /** Model edits can only decorate an identified, source-owned narrative atom. */
 export type IntroductionNarrativeEdit = { factId: string; text: string };
 export type IntroductionNarrativeRevision = { schemaVersion: 1; templateVersion: string; sourceKey: string; settingsVersion: string; edits: IntroductionNarrativeEdit[] };
+/** previewHash binds a modern client's exact displayed text. Legacy raw-only
+ * publications can omit it; reviewed narrative publications cannot. */
+export type IntroductionV2PublicationPayload = { recordId: string; rowVersion: string; introductionVersion: string; settingsVersion: string; previewHash?: string; publicationId?: string; version?: string; confirmPublication: true };
 export type IntroductionV2Document = {
   schemaVersion: 2; templateVersion: string; headingLine: string; internalBody: string;
   client: { clientId: string; mentions: string; greeting: string; recommendation: string; closing: string; body: string; text: string };

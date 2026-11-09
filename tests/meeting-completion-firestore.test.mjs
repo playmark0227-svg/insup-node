@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {randomUUID} from 'node:crypto';
 import {createRestFixture,emulatorOrigin,plain} from './helpers/firestore-emulator.mjs';
+import {introductionPreviewHash} from '../lib/introduction-preview-hash.ts';
 import {blankIntroductionCareer,blankIntroductionV2Profile,composeIntroductionV2,withIntroductionNarrativeEdits} from '../lib/introduction-v2.ts';
 const target=process.env.NODE_FIRESTORE_EMULATOR_URL;
 const ok=value=>{assert.equal(value.ok,true,JSON.stringify(value));return plain(value.data);};
@@ -19,7 +20,7 @@ test('meeting completion prose and private report threads persist through real F
  };
  receipt('createCandidate',{playerId:'ND-001',candidateName:'架空保存確認候補',company:'架空先行会社',position:'アポインター',interviewDate:'2026-11-05',profileVersion:'',fields:{workHistory:'架空の担当業務',interviewMemo:'旧入力だけに残す架空私的メモ'},introduction:'旧形式で確認した架空の紹介文'});
  let record=snapshot().records.find(row=>row.candidateName==='架空保存確認候補'),saved,publication,report,parent,reply;
- await t.test('reviewed narrative saves and reloads identical source-owned prose, renders both variants and publishes the exact saved internal preview',()=>{
+ await t.test('reviewed narrative saves and reloads identical source-owned prose, renders both variants and publishes the exact saved internal preview',async()=>{
   const empty=ok(f.api('readIntroductionV2',{recordId:record.recordId})),settings={...empty.settings,sources:['架空紹介元'],clients:[{id:'fixture-client',name:'架空提示会社',mentions:['@架空確認宛先'],rate:{amount:'2400',unit:'hour',tax:'exclusive'}}]};
   receipt('saveIntroductionSettings',{settings,expectedVersion:''},'admin');const current=ok(f.api('readIntroductionV2',{recordId:record.recordId}));
   const source=blankIntroductionV2Profile(record.candidateName);source.source='架空紹介元';source.basic.desiredRate={amount:'2000',unit:'hour',tax:'exclusive'};source.internalMemo='この候補者だけの非公開確認メモ';source.careers=[{...blankIntroductionCareer('fixture-career'),company:'架空営業会社',product:'架空法人サービス',period:'2024/04〜2025/03',salesStyle:'BtoB テレアポ',duties:['架電業務を担当。'],tips:['架電前に企業情報を確認した。'],achievements:['2025年3月に10件のアポイント（本人申告）']}];
@@ -32,7 +33,7 @@ test('meeting completion prose and private report threads persist through real F
   denied(f.api('readIntroductionV2',{recordId:record.recordId},'other'),'FORBIDDEN');
   const browser=composeIntroductionV2(saved.profile,saved.settings,'fixture-client',new Date('2026-11-06T01:00:00Z')),server=h.context.NODE_INTRODUCTION_V2.composeIntroductionV2(saved.profile,saved.settings,'fixture-client',new h.context.Date());
   assert.equal(browser.internalBody,server.internalBody);assert.equal(browser.client.text,server.client.text);assert.match(browser.internalBody,/架電業務を担当していました/);assert.match(browser.client.text,/@架空確認宛先/);assert.match(browser.client.text,/2,400円／時（税抜）/);assert.equal(browser.client.text.includes(source.internalMemo),false);
-  record=snapshot().records.find(row=>row.recordId===record.recordId);const publishPayload={recordId:record.recordId,rowVersion:record.rowVersion,introductionVersion:saved.version,settingsVersion:saved.settings.version,confirmPublication:true},publishId=randomUUID();receipt('publishIntroductionV2',publishPayload,'player',publishId);const publishedCommits=f.commits();receipt('publishIntroductionV2',publishPayload,'player',publishId);assert.equal(f.commits(),publishedCommits);
+  record=snapshot().records.find(row=>row.recordId===record.recordId);const publishPayload={recordId:record.recordId,rowVersion:record.rowVersion,introductionVersion:saved.version,settingsVersion:saved.settings.version,previewHash:await introductionPreviewHash(browser.headingLine+'\n\n'+browser.internalBody),confirmPublication:true},publishId=randomUUID();const oldPayload={...publishPayload};delete oldPayload.previewHash;denied(f.api('publishIntroductionV2',oldPayload,'player',randomUUID(),{responseMode:'receipt'}),'CONFLICT');denied(f.api('publishIntroductionV2',{...publishPayload,previewHash:await introductionPreviewHash(browser.headingLine+'\n\n'+browser.internalBody+'違う本文')},'player',randomUUID(),{responseMode:'receipt'}),'CONFLICT');receipt('publishIntroductionV2',publishPayload,'player',publishId);const publishedCommits=f.commits();receipt('publishIntroductionV2',publishPayload,'player',publishId);assert.equal(f.commits(),publishedCommits);
   const team=ok(f.api('readTeamWorkspace',{},'other'));publication=team.candidates.find(row=>row.candidateName===record.candidateName);assert.ok(publication);assert.equal(publication.introduction,browser.headingLine+'\n\n'+browser.internalBody);assert.equal(publication.introduction.includes(source.internalMemo),false);assert.equal('profile'in publication,false);atomic(publishId,edit.text);
   // The original, independent legacy profile remains in durable storage too.
   const legacy=snapshot().candidateProfiles.find(row=>row.profileId===record.profileId);assert.equal(legacy.introduction,'旧形式で確認した架空の紹介文');assert.equal(legacy.fields.interviewMemo,'旧入力だけに残す架空私的メモ');assert.equal(f.source(),original);
