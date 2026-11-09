@@ -1,6 +1,8 @@
 .background-save{position:relative;flex-shrink:0}
 .topbar:has(.background-save){position:sticky;top:0;z-index:45;gap:12px}
 .background-save-trigger{display:flex;align-items:center;gap:7px;min-height:36px;padding:0 10px;border:1px solid #c7e4fb;border-radius:7px;background:#edf8ff;color:#0870c6;font-size:12px;font-weight:600;white-space:nowrap}
+.background-save-trigger>span{max-width:280px;overflow:hidden;text-overflow:ellipsis}
+.background-save-trigger>svg{flex-shrink:0}
 .background-save-saved .background-save-trigger{background:#f0faf6;border-color:#cbe9dc;color:#277457}
 .background-save-failed .background-save-trigger{background:#fff5ed;border-color:#efd3bc;color:#9b501d}
 .background-save-announcement{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
@@ -12,6 +14,18 @@
 .background-save-heading>button{display:flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:5px;color:#688299}
 .background-save-heading>button:hover{background:#edf5fb}
 .background-save-label{font-size:13px;font-weight:600;margin-top:10px!important;overflow-wrap:anywhere}
+.background-save-queue{margin-top:13px;padding:11px 12px;background:#f5f9fd;border:1px solid #e0ebf5;border-radius:7px}
+.background-save-queue>p:first-child{display:flex;justify-content:space-between;gap:10px;margin:0!important;font-size:12px;font-weight:600;color:#426889}
+.background-save-queue>p:first-child>span{color:#6a829a;font-weight:500}
+.background-save-queue ul{list-style:none;margin:8px 0 0;padding:0;max-height:190px;overflow:auto}
+.background-save-queue li{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:47px;padding:7px 0;border-top:1px solid #e1ebf4}
+.background-save-queue li>div{display:grid;gap:3px;min-width:0}
+.background-save-queue li strong{font-size:12px;font-weight:600;color:#24486d;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.background-save-queue li>div>span{font-size:10px;color:#6a829a;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.background-save-queue-status{flex-shrink:0;padding:3px 6px;border-radius:4px;background:#e9eff5;color:#637a91;font-size:10px;font-weight:600;white-space:nowrap}
+.background-save-queue-status.is-syncing{background:#dff1ff;color:#0870c6}
+.background-save-queue-status.is-failed,.background-save-queue-status.is-waiting{background:#fff0df;color:#9b501d}
+.background-save-queue .background-save-queue-notice{margin:8px 0 0!important;font-size:11px;line-height:1.7;color:#8b5d32}
 .background-save-help{font-size:12px;line-height:1.8;margin-top:10px!important;color:#536f8b}
 .background-save-error{background:#fff5ed;border:1px solid #f1dece;border-radius:6px;padding:10px;font-size:12px;line-height:1.7;margin-top:12px!important;overflow-wrap:anywhere;color:#8b4d24}
 .background-save-details{margin-top:13px;padding-top:12px;border-top:1px solid #e0eaf3;font-size:12px;line-height:1.8}
@@ -45,5 +59,6 @@
 @keyframes background-save-spin{to{transform:rotate(360deg)}}
 @media(max-width:767px){.topbar-right.has-background-save{gap:8px}.topbar-right.has-background-save .preview-chip{display:none}.topbar:has(.background-save) .breadcrumbs{min-width:0}.topbar:has(.background-save) .breadcrumbs strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.background-save-trigger{gap:5px;padding:0 7px;font-size:11px}.background-save-trigger>svg:last-child{display:none}.background-save-panel{position:fixed;top:69px;right:12px;width:370px;max-width:calc(100vw - 24px);max-height:calc(100dvh - 160px)}.background-save-actions .primary-button{width:100%;min-height:42px}}
 @media(max-width:380px){.topbar-right.has-background-save>button{display:none}.background-save-trigger{padding:0 6px}}
+@media(max-width:767px){.background-save-trigger>span{max-width:180px}}
 @media(max-width:767px){.background-save-panel,.background-save-panel.is-correcting{left:12px;right:12px;width:auto;max-width:none}}
 @media(prefers-reduced-motion:reduce){.background-save-spinner{animation:none}}

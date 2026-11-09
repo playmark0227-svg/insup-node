@@ -65,3 +65,50 @@ test('company introduction requires a selected candidate, and report replies kee
  h.click('マッチ報告');h.click('コメント・返信');assert.equal(discussions.length,1);assert.equal(discussions[0].reportId,report.reportId);
  h.render({reportCommentsEnabled:false});assert.equal(h.button('コメント・返信'),undefined);
 });
+
+test('returning to the same sales view reuses a recent verified read while manual refresh always checks again',async t=>{
+ let now=1_000_000;t.mock.method(Date,'now',()=>now);const h=harness();h.render();await h.settle();assert.equal(h.readCount(),1);
+ for(let n=0;n<10;n++){h.render({active:false});h.render({active:true});await h.settle();}
+ assert.equal(h.readCount(),1);
+ h.click('最新を取得');await h.settle();assert.equal(h.readCount(),2);
+ now+=30_001;h.render({active:false});h.render({active:true});await h.settle();assert.equal(h.readCount(),3);
+});
+
+test('sales period switches restore recent month data without repeating a request and a revision immediately hides previous data',async()=>{
+ const h=harness();h.data.jobs.push({...sales.blankWorkJob(),jobId:'job_00000000000000001',company:'前の範囲の架空案件',title:'確認済みの案件'});h.render();await h.settle();h.click('提案先の検討');
+ const initialPeriod=h.readCalls[0].period;h.change('input','会社別提案件数の月','2026-09');await h.settle();assert.equal(h.readCount(),2);
+ h.change('input','会社別提案件数の月',initialPeriod);await h.settle();assert.equal(h.readCount(),2);
+ let finish;const current=h.render({refreshRevision:'changed',onRead:()=>new Promise(resolve=>{finish=resolve;})});assert.doesNotMatch(text(current),/前の範囲の架空案件/);
+ h.render({identityKey:'session-b',enabled:false});finish({...h.data,period:initialPeriod});await h.settle();assert.doesNotMatch(text(h.render()),/前の範囲の架空案件/);
+});
+
+test('an unfinished first sales read is shared across repeated view changes and enabling cannot restore a late disabled result',async()=>{
+ let count=0,finish;const h=harness({onRead:()=>{count++;return new Promise(resolve=>{finish=resolve;});}});h.render();h.render({active:false});h.render({active:true});h.render({active:false});h.render({active:true});assert.equal(count,1);
+ h.render({enabled:false});finish({...h.data,period:'2026-11',jobs:[{...sales.blankWorkJob(),company:'無効化後の古い案件',title:'表示しない'}]});await h.settle();assert.doesNotMatch(text(h.render()),/無効化後の古い案件/);
+ h.render({enabled:true});assert.equal(count,2);assert.doesNotMatch(text(h.render()),/無効化後の古い案件/);
+});
+
+test('a confirmed sales save releases the editor while refreshed list data is still pending',async()=>{
+ let count=0,finish;const h=harness({onRead:payload=>{count++;return count===1?Promise.resolve({...h.data,period:payload.period}):new Promise(resolve=>{finish=resolve;});}});h.render();await h.settle();h.click('提案先の検討');h.change('select','提案予定の候補者',h.records[0].recordId);h.labelChange('会社を自由入力','保存済み架空会社');
+ h.all().find(n=>n.type==='form').props.onSubmit({preventDefault(){}});await h.settle();assert.equal(h.pending.at(-1),false);assert.match(text(h.render()),/保存しました/);assert.equal(h.find('select','提案予定の候補者').props.disabled,false);
+ h.labelChange('会社を自由入力','再取得中の次の入力');h.render();assert.equal(h.dirty.at(-1),true);finish({...h.data,period:'2026-11'});await h.settle();const label=h.all().find(n=>n.type==='label'&&text(n).startsWith('会社を自由入力'));assert.equal(nodes(label).find(n=>n.type==='input').props.value,'再取得中の次の入力');
+});
+
+test('a cached current period stays selected when an older month request completes later',async()=>{
+ let count=0,finish;const h=harness({onRead:payload=>{count++;return count===1?Promise.resolve({...h.data,period:payload.period}):new Promise(resolve=>{finish=()=>resolve({...h.data,period:payload.period,companyCounts:[{company:'遅れて届く前月',planned:0,sent:1}]});});}});h.render();await h.settle();const initialPeriod=h.find('input','会社別提案件数の月')?.props.value||new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Tokyo',year:'numeric',month:'2-digit'}).format(new Date());h.click('提案先の検討');
+ h.change('input','会社別提案件数の月','2026-09');h.render();h.change('input','会社別提案件数の月',initialPeriod);h.render();assert.equal(count,2);assert.equal(h.find('input','会社別提案件数の月').props.disabled,false);finish();await h.settle();assert.doesNotMatch(text(h.render()),/遅れて届く前月/);assert.match(text(h.render()),new RegExp(initialPeriod+'の実績'));
+});
+
+test('a sales job drawer closes during a pending save while its same-ID retry and draft survive navigation',async()=>{
+ let finish,attempt=0;const h=harness({admin:true,onSave:(command,id)=>{h.calls.push({command:copy(command),id});return attempt++===0?new Promise((_resolve,reject)=>{finish=()=>reject(new SheetApiError('NETWORK','保存結果は未確認です。'));}):Promise.resolve();}});h.render();await h.settle();h.click('案件を登録');h.labelChange('会社名','通信待ちの架空法人');h.labelChange('案件名・募集職種','保持する架空案件');h.render();h.all().find(n=>n.type==='form'&&n.props['aria-label']==='案件の登録・編集').props.onSubmit({preventDefault(){}});h.render();assert.equal(h.calls.length,1);assert.equal(h.pending.at(-1),true);
+ const drawer=h.all().find(n=>typeof n.type==='function'&&n.props.title==='案件を登録');assert.equal(drawer.props.blocked,true);drawer.props.onClose();h.render();assert.equal(h.all().some(n=>typeof n.type==='function'&&n.props.title==='案件を登録'),false);assert.equal(h.dirty.at(-1),true);assert.doesNotMatch(text(h.render()),/保存しました/);
+ h.render({active:false});h.render({active:true});h.click('提案先の検討');h.render();assert.equal(h.calls.length,1);finish();await h.settle();h.click('保存状況を再確認');await h.settle();assert.deepEqual(h.calls[0],h.calls[1]);assert.equal(h.calls[1].command.payload.title,'保持する架空案件');assert.equal(h.pending.at(-1),false);
+});
+
+test('a report drawer closes during its save without clearing the submitted comment or repeating the request',async()=>{
+ let finish;const own=record('record_00000000000001','架空あおい');own.values[1]='架空法人';const h=harness({records:[own],onSave:(command,id)=>{h.calls.push({command:copy(command),id});return new Promise(resolve=>{finish=resolve;});}});h.render();await h.settle();h.click('マッチ報告');h.change('select','マッチ報告の提案',own.recordId);h.click('報告を作成・確認');h.labelChange('コメント・確認事項','保存待ちの確認事項');h.render();h.all().find(n=>n.type==='form'&&n.props['aria-label']==='マッチ成立の報告').props.onSubmit({preventDefault(){}});h.render();const drawer=h.all().find(n=>typeof n.type==='function'&&n.props.title==='マッチ成立の報告');assert.equal(drawer.props.blocked,true);drawer.props.onClose();h.render({active:false});h.render({active:true});h.click('案件リスト');h.render();assert.equal(h.calls.length,1);assert.equal(h.calls[0].command.payload.comment,'保存待ちの確認事項');assert.equal(h.pending.at(-1),true);assert.equal(h.dirty.at(-1),true);assert.doesNotMatch(text(h.render()),/保存しました/);finish();await h.settle();assert.equal(h.calls.length,1);assert.equal(h.pending.at(-1),false);assert.match(text(h.render()),/保存しました/);
+});
+
+test('a multi-company proposal batch continues exactly once per destination while its view is hidden',async()=>{
+ const completions=[],h=harness({onSave:(command,id)=>{h.calls.push({command:copy(command),id});return new Promise(resolve=>completions.push(resolve));}});h.data.jobs.push({...sales.blankWorkJob(),jobId:'job_00000000000000001',company:'複数先A',title:'架空案件A'},{...sales.blankWorkJob(),jobId:'job_00000000000000002',company:'複数先B',title:'架空案件B'});h.render();await h.settle();h.click('提案先の検討');h.change('select','提案予定の候補者',h.records[0].recordId);h.labelChange('複数先A',true);h.render();h.labelChange('複数先B',true);h.render();h.all().find(n=>n.type==='form').props.onSubmit({preventDefault(){}});h.render();assert.equal(h.calls.length,1);h.render({active:false});completions[0]();await h.settle();assert.equal(h.calls.length,2);assert.equal(h.calls[0].command.payload.company,'複数先A');assert.equal(h.calls[1].command.payload.company,'複数先B');assert.notEqual(h.calls[0].id,h.calls[1].id);assert.equal(h.pending.at(-1),true);completions[1]();await h.settle();h.render({active:true});assert.equal(h.calls.length,2);assert.equal(h.pending.at(-1),false);assert.match(text(h.render()),/保存しました/);
+});

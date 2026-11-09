@@ -8,6 +8,7 @@ export {validSnapshotCacheAccess,type SnapshotCacheAccess} from './snapshot-cach
 export const SNAPSHOT_CACHE_TTL_MS=7*24*60*60*1000;
 export const SNAPSHOT_CACHE_MAX_BYTES=1_000_000;
 export const SNAPSHOT_CACHE_READ_TIMEOUT_MS=250;
+export const SNAPSHOT_CACHE_HINT_TIMEOUT_MS=50;
 const DB_NAME='insup.node.display-cache.v1';
 export const SNAPSHOT_CACHE_MAX_ACCOUNTS=20;
 let opened:Promise<IDBDatabase>|undefined;
@@ -38,12 +39,51 @@ function database():Promise<IDBDatabase>{
 const result=<T,>(request:IDBRequest<T>)=>new Promise<T>((resolve,reject)=>{request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(new Error('CACHE_UNAVAILABLE'));});
 const complete=(tx:IDBTransaction)=>new Promise<void>((resolve,reject)=>{tx.oncomplete=()=>resolve();tx.onabort=tx.onerror=()=>reject(new Error('CACHE_UNAVAILABLE'));});
 const bytes=(value:string)=>new TextEncoder().encode(value);
-async function identity(endpoint:string,access:SnapshotCacheAccess):Promise<string>{const digest=await crypto.subtle.digest('SHA-256',bytes(`${endpoint}|${access.self.role}|${access.self.playerId}`));return Array.from(new Uint8Array(digest),b=>b.toString(16).padStart(2,'0')).join('');}
+async function accountIdentity(endpoint:string,role:SnapshotCacheAccess['self']['role'],playerId:string):Promise<string>{const digest=await crypto.subtle.digest('SHA-256',bytes(`${endpoint}|${role}|${playerId}`));return Array.from(new Uint8Array(digest),b=>b.toString(16).padStart(2,'0')).join('');}
+async function identity(endpoint:string,access:SnapshotCacheAccess):Promise<string>{return accountIdentity(endpoint,access.self.role,access.self.playerId);}
 async function keyFor(id:string,access:SnapshotCacheAccess):Promise<CryptoKey>{
  const material=await crypto.subtle.importKey('raw',bytes(access.secret),'HKDF',false,['deriveKey']);
  return crypto.subtle.deriveKey({name:'HKDF',hash:'SHA-256',salt:bytes(access.scope),info:bytes(`insup-node-display-cache-v1|${id}`)},material,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
 }
 type CachedRow={id:string;scope:string;v:1;savedAt:number;expiresAt:number;iv:Uint8Array<ArrayBuffer>;ciphertext:ArrayBuffer};
+/** An untrusted pre-login hint only. It exposes neither cached content nor a key,
+ * and can only choose how the normal authenticated login fetches current data.
+ * A separate short-lived connection cannot stall the authenticated cache path. */
+export function hasSnapshotCache(endpoint:string,accountId:string,current=()=>true,signal?:AbortSignal):Promise<boolean>{
+ return new Promise(resolve=>{
+  let settled=false,db:IDBDatabase|undefined;
+  const finish=(value:boolean)=>{if(settled)return;settled=true;clearTimeout(timer);signal?.removeEventListener('abort',aborted);db?.close();let active=false;try{active=current();}catch{}resolve(value&&!signal?.aborted&&active);};
+  const aborted=()=>finish(false),timer=setTimeout(()=>finish(false),SNAPSHOT_CACHE_HINT_TIMEOUT_MS);
+  const active=()=>!settled&&!signal?.aborted&&current();
+  signal?.addEventListener('abort',aborted,{once:true});
+  try{
+   if(!active()||typeof indexedDB==='undefined'||!globalThis.crypto?.subtle||typeof endpoint!=='string'||!endpoint||endpoint.length>2048||typeof accountId!=='string'){finish(false);return;}
+   const id=accountId.trim().toUpperCase();if(!/^[A-Z0-9_-]{1,100}$/.test(id)){finish(false);return;}
+   void accountIdentity(endpoint,id==='ADMIN'?'admin':'player',id).then(key=>{
+    try{
+     if(!active()){finish(false);return;}
+     const request=indexedDB.open(DB_NAME,1);
+     request.onupgradeneeded=()=>{try{request.transaction?.abort();}catch{}finish(false);};
+     request.onerror=request.onblocked=()=>finish(false);
+     request.onsuccess=()=>{
+      if(settled){request.result.close();return;}
+      db=request.result;
+      try{
+       if(!active()||!db.objectStoreNames.contains('snapshots')){finish(false);return;}
+       const tx=db.transaction('snapshots','readonly'),read=tx.objectStore('snapshots').get(key);
+       tx.onerror=tx.onabort=()=>finish(false);
+       read.onerror=()=>finish(false);
+       read.onsuccess=()=>{
+        const row=read.result as CachedRow|undefined,now=Date.now();
+        finish(!!row&&row.id===key&&row.v===1&&typeof row.scope==='string'&&/^[A-Za-z0-9_-]{43}$/.test(row.scope)&&Number.isSafeInteger(row.savedAt)&&Number.isSafeInteger(row.expiresAt)&&row.savedAt<=now&&row.expiresAt>now&&row.expiresAt===row.savedAt+SNAPSHOT_CACHE_TTL_MS&&row.iv instanceof Uint8Array&&row.iv.length===12&&row.ciphertext instanceof ArrayBuffer&&row.ciphertext.byteLength>=16&&row.ciphertext.byteLength<=SNAPSHOT_CACHE_MAX_BYTES+32);
+       };
+      }catch{finish(false);}
+     };
+    }catch{finish(false);}
+   },()=>finish(false));
+  }catch{finish(false);}
+ });
+}
 export async function persistSnapshotCache(endpoint:string,access:SnapshotCacheAccess,snapshot:SheetSnapshot,current=()=>true):Promise<void>{
  if(!validSnapshotCacheAccess(access)||!current()||snapshot.self.role!==access.self.role||snapshot.self.playerId!==access.self.playerId)return;
  const projected=projectSnapshotForCache(snapshot),body=JSON.stringify(projected);if(bytes(body).length>SNAPSHOT_CACHE_MAX_BYTES)return;

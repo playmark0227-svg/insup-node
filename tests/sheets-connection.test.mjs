@@ -37,7 +37,7 @@ async function flush() { for (let i=0; i<35; i++) await Promise.resolve(); }
 
 // Execute the actual hook against a small deterministic hook runtime. This
 // exposes races and state restoration without adding a browser/test dependency.
-function harness(handle, {storedToken, malformedSession, deadlineController, makeDeadline, browser, manifestEndpoint=endpoint, storedEndpoint=endpoint, manifestFailure=false, production=false, pendingSaves=[], persistLocal, replaceLocal, readLocal, cacheRead, cachePersist, storedCacheAvailable=false} = {}) {
+function harness(handle, {storedToken, malformedSession, deadlineController, makeDeadline, browser, manifestEndpoint=endpoint, storedEndpoint=endpoint, manifestFailure=false, production=false, pendingSaves=[], persistLocal, replaceLocal, readLocal, cacheRead, cachePersist, cacheHint=false, storedCacheAvailable=false} = {}) {
   const slots = [], effects = [], calls = [];
   let cursor = 0, stateUpdates = 0;
   const localStorage = storage({[ENDPOINT_KEY]:storedEndpoint});
@@ -70,22 +70,23 @@ function harness(handle, {storedToken, malformedSession, deadlineController, mak
     removePendingSave:async(_endpoint,_account,id)=>{pendingStore.delete(id);},
     unlockPendingSaves:(_endpoint,_account,secret)=>{unlocks.push(secret);unlockRealPendingSaves(_endpoint,_account,secret);},lockPendingSaves:()=>{locks.count++;lockRealPendingSaves();},purgeExpiredPendingSaves:async()=>0};
   const unlocks=[],locks={count:0};
-  const cacheReads=[],cacheWrites=[];
+  const cacheReads=[],cacheWrites=[],cacheHints=[];
   const cacheApi={validSnapshotCacheAccess,purgeSnapshotCache:async()=>undefined,
+    hasSnapshotCache:async(target,accountId,current,signal)=>{cacheHints.push({target,accountId,signal});return typeof cacheHint==="function"?cacheHint(target,accountId,current,signal):cacheHint;},
     readSnapshotCache:async(target,access,current)=>{cacheReads.push({target,access});return cacheRead?cacheRead(target,access,current):null;},
     persistSnapshotCache:async(target,access,value,current)=>{if(current()){const data=projectSnapshotForCache(value);cacheWrites.push({target,access,value:data});if(cachePersist)await cachePersist(target,access,data,current);}}};
   const exports={};
   const timeoutDurations=[];
   const deadlineSignals=AbortSignal;
   const deadlineApi={createDeadlineSignal:(ms,sources=[])=>{if(deadlineController||makeDeadline)timeoutDurations.push(ms);return (makeDeadline||createDeadlineSignal)(ms,deadlineController?[...sources,deadlineController.signal]:sources);},isTimeoutSignal,throwIfAborted,abortReason};
-  const context=vm.createContext({exports,module:{exports},AbortController,AbortSignal:deadlineSignals,JSON,Error,localStorage,sessionStorage,TEST_PRODUCTION:production,crypto,
+  const context=vm.createContext({exports,module:{exports},AbortController,AbortSignal:deadlineSignals,JSON,Error,localStorage,sessionStorage,TEST_PRODUCTION:production,crypto,structuredClone,
     ...(browser || {}),
     fetch:async()=>{if(manifestFailure)throw new Error("設定取得失敗");return {ok:true,json:async()=>({endpoint:manifestEndpoint})};},
     require:name=>name==="react" ? react : name.includes("storage-backend") ? {storageBackendOf} : name.includes("snapshot-cache") ? cacheApi : name.includes("abort-signal") ? deadlineApi : name.includes("save-correction") ? {correctionFields,correctedPayload,mutationDateErrors} : name.includes("pending-saves") ? pendingApi : name.includes("node-data") ? {initialPlayers:[player],makeDemoActivities:()=>[]} : name.includes("management-data") ? {matchingFields} : name.includes("candidate-intake") ? {interviewFieldLabels,interviewStringFields} : name.includes("writing-ai") ? {assertWritingKitState,validateWritingPreferences} : {assertSnapshot,validSnapshotVersion,mergeSnapshotUnchanged,assertMutationReceipt,isUncertainWrite,validateEndpoint,SheetApiError,sheetRequest,sheetExtensionMutationActions,isSheetExtensionReadAction,sheetExtensionMutationEnabled}});
   vm.runInContext(source,context);
   const render = () => {cursor=0; const result=exports.useSheetsConnection(); while(effects.length) effects.shift()(); return result;};
   render();
-  return {calls,pendingStore,cacheReads,cacheWrites,localStorage,sessionStorage,timeoutDurations,render,unlocks,locks,updates:()=>stateUpdates,unmount:()=>slots.forEach(slot=>slot.cleanup?.())};
+  return {calls,pendingStore,cacheReads,cacheWrites,cacheHints,localStorage,sessionStorage,timeoutDurations,render,unlocks,locks,updates:()=>stateUpdates,unmount:()=>slots.forEach(slot=>slot.cleanup?.())};
 }
 
 test("a token is persisted before data loads and no submitted password is stored",async()=>{
@@ -98,7 +99,7 @@ test("a token is persisted before data loads and no submitted password is stored
   assert.equal(h.render().snapshot,null); assert.equal(h.render().busy,true);
   assert.equal(JSON.parse(h.sessionStorage.getItem(SESSION_KEY)).token,token);
   assert.ok(!JSON.stringify([...h.sessionStorage.values,...h.localStorage.values]).includes("only-a-test-password"));
-  assert.equal(h.calls[0].payload.sessionOnly,true);
+  assert.equal(h.calls[0].payload.sessionOnly,false);
   assert.equal(h.calls[1].action,"snapshot"); assert.equal(h.calls[1].options.token,token);
   assert.equal(h.calls[1].options.signal,h.calls[0].options.signal);
   pendingSnapshot.resolve(snapshot); await pending;
@@ -262,7 +263,7 @@ test("changing the endpoint cancels pending authentication and cannot apply its 
 test("unmount aborts in-flight authentication and ignores all later state updates",async()=>{
   const response=deferred();
   const h=harness(()=>response.promise);
-  await flush(); const pending=h.render().login("ND-001","only-a-test-password");
+  await flush(); const pending=h.render().login("ND-001","only-a-test-password");await flush();
   h.unmount(); const updates=h.updates();
   assert.equal(h.calls[0].options.signal.aborted,true);
   response.resolve({token,snapshot}); await pending;
@@ -332,7 +333,7 @@ for (const method of ["analyzeReviews","readAdvice"]) test(`${method} transient 
 function autoSyncBrowser() {
   let now=0, serial=0;
   const timers=new Map(), listeners=new Map();
-  const document={visibilityState:'visible',activeElement:null,editorOpen:false,querySelector(){return this.editorOpen?{}:null;},addEventListener:(n,f)=>listeners.set(n,f),removeEventListener:n=>listeners.delete(n)};
+  const document={visibilityState:'visible',activeElement:null,editorOpen:false,nativeDialogOpen:false,querySelector(selector){return this.editorOpen||this.nativeDialogOpen&&/dialog\[open\]/.test(selector)?{}:null;},addEventListener:(n,f)=>listeners.set(n,f),removeEventListener:n=>listeners.delete(n)};
   const navigator={onLine:true};
   const window={addEventListener:(n,f)=>listeners.set(n,f),removeEventListener:n=>listeners.delete(n)};
   return {document,navigator,window,Date:{now:()=>now},setTimeout:(fn,delay)=>{const id=++serial;timers.set(id,{fn,delay});return id;},clearTimeout:id=>timers.delete(id),timers,listeners,
@@ -1165,32 +1166,32 @@ test('late operational, regular and password saves cannot release a new session 
 const displayGrant=(self={playerId:player.id,role:'player'})=>({version:1,self,scope:'S'.repeat(43),secret:'D'.repeat(43),expiresAt:Date.now()+3600000});
 test('warm login authenticates before reading cache and resolves with read-only shared totals while live data is pending',async()=>{
  const auth=deferred(),fresh=deferred(),access=displayGrant(),cached=projectSnapshotForCache(snapshot),savedAt=Date.now()-1000;
- const h=harness(call=>call.action==='login'?auth.promise:fresh.promise,{cacheRead:async()=>({snapshot:cached,savedAt})});await flush();
+ const h=harness(call=>call.action==='login'?auth.promise:fresh.promise,{cacheHint:true,cacheRead:async()=>({snapshot:cached,savedAt})});await flush();
  const pending=h.render().login('ND-001','only-test-password');await flush();assert.equal(h.cacheReads.length,0);assert.equal(h.render().snapshot,null);
- auth.resolve({token,cacheAccess:access});await pending;const showing=h.render();assert.equal(showing.snapshotSource,'cache');assert.equal(showing.cachedAt,savedAt);assert.equal(showing.busy,false);assert.equal(showing.syncing,true);assert.equal(showing.snapshot.writesEnabled,false);assert.deepEqual(showing.snapshot.records,[]);assert.equal(h.cacheReads.length,1);assert.equal(h.calls[1].action,'snapshot');assert.equal(h.unlocks.length,0);
+ auth.resolve({token,cacheAccess:access});await pending;assert.equal(h.calls[0].payload.sessionOnly,true);const showing=h.render();assert.equal(showing.snapshotSource,'cache');assert.equal(showing.cachedAt,savedAt);assert.equal(showing.busy,false);assert.equal(showing.syncing,true);assert.equal(showing.snapshot.writesEnabled,false);assert.deepEqual(showing.snapshot.records,[]);assert.equal(h.cacheReads.length,1);assert.equal(h.calls[1].action,'snapshot');assert.equal(h.unlocks.length,0);
  await assert.rejects(showing.submitMutation('updateRecord',{recordId:'r',changes:{13:'no'}},crypto.randomUUID()),{code:'READ_ONLY'});
  fresh.resolve({...snapshot,cacheAccess:access});await flush();const live=h.render();assert.equal(live.snapshotSource,'live');assert.equal(live.cachedAt,null);assert.equal(live.snapshot.writesEnabled,true);assert.equal(h.unlocks.at(-1),snapshot.outboxKey);assert.equal(h.cacheWrites.length,1);assert.equal(h.cacheWrites[0].value.outboxKey,undefined);h.unmount();
 });
 test('a cached display stays explicitly read-only on live network failure and manual refresh can recover it',async()=>{
- let fail=true;const access=displayGrant(),h=harness(call=>call.action==='login'?{token,cacheAccess:access}:fail?Promise.reject(new SheetApiError('NETWORK','network')):{...snapshot,cacheAccess:access},{cacheRead:async()=>({snapshot:projectSnapshotForCache(snapshot),savedAt:Date.now()-1000})});await flush();await h.render().login('ND-001','password');await flush();
+ let fail=true;const access=displayGrant(),h=harness(call=>call.action==='login'?{token,cacheAccess:access}:fail?Promise.reject(new SheetApiError('NETWORK','network')):{...snapshot,cacheAccess:access},{cacheHint:true,cacheRead:async()=>({snapshot:projectSnapshotForCache(snapshot),savedAt:Date.now()-1000})});await flush();await h.render().login('ND-001','password');await flush();
  assert.equal(h.render().snapshotSource,'cache');assert.equal(h.render().snapshot.writesEnabled,false);assert.match(h.render().syncError,/前回|再試行/);assert.equal(h.unlocks.length,0);
  fail=false;await h.render().refresh();assert.equal(h.render().snapshotSource,'live');assert.equal(h.render().snapshot.writesEnabled,true);h.unmount();
 });
 test('malformed, expired, foreign and absent cache grants never unlock a previous account display',async()=>{
  for(const access of [undefined,{...displayGrant(),expiresAt:Date.now()-1},{...displayGrant(),secret:'bad'},displayGrant({playerId:'ND-002',role:'player'})]){
-  const fresh=deferred(),h=harness(call=>call.action==='login'?{token,...(access?{cacheAccess:access}:{})}:fresh.promise,{cacheRead:async()=>({snapshot:projectSnapshotForCache(snapshot),savedAt:Date.now()})});await flush();const login=h.render().login('ND-001','password');await flush();assert.equal(h.cacheReads.length,0);assert.equal(h.render().snapshot,null);fresh.resolve(snapshot);await login;assert.equal(h.render().snapshotSource,'live');h.unmount();
+  const fresh=deferred(),h=harness(call=>call.action==='login'?{token,...(access?{cacheAccess:access}:{})}:fresh.promise,{cacheHint:true,cacheRead:async()=>({snapshot:projectSnapshotForCache(snapshot),savedAt:Date.now()})});await flush();const login=h.render().login('ND-001','password');await flush();assert.equal(h.cacheReads.length,0);assert.equal(h.render().snapshot,null);fresh.resolve(snapshot);await login;assert.equal(h.render().snapshotSource,'live');h.unmount();
  }
 });
 test('issued-password and failed logins never read display cache or persist a cache decryption key',async()=>{
- const access=displayGrant();for(const type of ['issued','wrong']){const h=harness(call=>{if(call.action==='login'){if(type==='wrong')throw new SheetApiError('INVALID_CREDENTIALS','wrong');return {token,cacheAccess:access,mustChangePassword:true};}throw new Error('Business read must not occur');},{cacheRead:async()=>{throw new Error('Cache must not open');}});await flush();try{await h.render().login('ND-001','private-password');}catch{}assert.equal(h.cacheReads.length,0);assert.equal(h.render().snapshot,null);const disk=JSON.stringify([...h.sessionStorage.values,...h.localStorage.values]);assert.ok(!disk.includes(access.secret));assert.ok(!disk.includes('private-password'));h.unmount();}
+ const access=displayGrant();for(const type of ['issued','wrong']){const h=harness(call=>{if(call.action==='login'){if(type==='wrong')throw new SheetApiError('INVALID_CREDENTIALS','wrong');return {token,cacheAccess:access,mustChangePassword:true};}throw new Error('Business read must not occur');},{cacheHint:true,cacheRead:async()=>{throw new Error('Cache must not open');}});await flush();try{await h.render().login('ND-001','private-password');}catch{}assert.equal(h.cacheReads.length,0);assert.equal(h.render().snapshot,null);const disk=JSON.stringify([...h.sessionStorage.values,...h.localStorage.values]);assert.ok(!disk.includes(access.secret));assert.ok(!disk.includes('private-password'));h.unmount();}
 });
 test('restored cache-capable sessions are freshly checked before cache opens and legacy sessions keep their old restore path',async()=>{
  const access=displayGrant(),fresh=deferred(),h=harness(call=>call.action==='resumeSession'?{cacheAccess:access}:fresh.promise,{storedToken:token,storedCacheAvailable:true,cacheRead:async()=>({snapshot:projectSnapshotForCache(snapshot),savedAt:Date.now()-1000})});await flush();assert.equal(h.calls[0].action,'resumeSession');assert.equal(h.render().snapshotSource,'cache');assert.equal(h.calls[1].action,'snapshot');assert.equal(h.calls[1].target,endpoint);fresh.resolve({...snapshot,cacheAccess:access});await flush();assert.equal(h.render().snapshotSource,'live');h.unmount();
  const denied=harness(()=>{throw new SheetApiError('UNAUTHENTICATED','revoked');},{storedToken:token,storedCacheAvailable:true,cacheRead:async()=>{throw new Error('must not read');}});await flush();assert.equal(denied.cacheReads.length,0);assert.equal(denied.render().snapshot,null);assert.equal(denied.render().authenticated,false);denied.unmount();
 });
 test('logout during cache decryption and late first reads cannot populate another login or rewrite cache',async()=>{
- const access=displayGrant(),cache=deferred(),fresh=deferred(),h=harness(call=>call.action==='login'?{token,cacheAccess:access}:call.action==='logout'?{loggedOut:true}:fresh.promise,{cacheRead:async()=>cache.promise});await flush();const login=h.render().login('ND-001','password');await flush();await h.render().logout();cache.resolve({snapshot:projectSnapshotForCache(snapshot),savedAt:Date.now()});await login;assert.equal(h.render().snapshot,null);assert.equal(h.render().snapshotSource,null);assert.equal(h.cacheWrites.length,0);h.unmount();
- const first=deferred(),otherToken='another-test-token-12345678901234567890123456789';let attempts=0;const j=harness(call=>call.action==='login'?{token:attempts++?otherToken:token,cacheAccess:access}:call.action==='logout'?{loggedOut:true}:call.options.token===token?first.promise:{...snapshot,cacheAccess:access},{cacheRead:async()=>({snapshot:projectSnapshotForCache(snapshot),savedAt:Date.now()})});await flush();await j.render().login('ND-001','password');await flush();await j.render().logout();await j.render().login('ND-001','password');await flush();const writes=j.cacheWrites.length;first.resolve({...snapshot,cacheAccess:access});await flush();assert.equal(j.cacheWrites.length,writes);assert.equal(JSON.parse(j.sessionStorage.getItem(SESSION_KEY)).token,otherToken);j.unmount();
+ const access=displayGrant(),cache=deferred(),fresh=deferred(),h=harness(call=>call.action==='login'?{token,cacheAccess:access}:call.action==='logout'?{loggedOut:true}:fresh.promise,{cacheHint:true,cacheRead:async()=>cache.promise});await flush();const login=h.render().login('ND-001','password');await flush();await h.render().logout();cache.resolve({snapshot:projectSnapshotForCache(snapshot),savedAt:Date.now()});await login;assert.equal(h.render().snapshot,null);assert.equal(h.render().snapshotSource,null);assert.equal(h.cacheWrites.length,0);h.unmount();
+ const first=deferred(),otherToken='another-test-token-12345678901234567890123456789';let attempts=0;const j=harness(call=>call.action==='login'?{token:attempts++?otherToken:token,cacheAccess:access}:call.action==='logout'?{loggedOut:true}:call.options.token===token?first.promise:{...snapshot,cacheAccess:access},{cacheHint:true,cacheRead:async()=>({snapshot:projectSnapshotForCache(snapshot),savedAt:Date.now()})});await flush();await j.render().login('ND-001','password');await flush();await j.render().logout();await j.render().login('ND-001','password');await flush();const writes=j.cacheWrites.length;first.resolve({...snapshot,cacheAccess:access});await flush();assert.equal(j.cacheWrites.length,writes);assert.equal(JSON.parse(j.sessionStorage.getItem(SESSION_KEY)).token,otherToken);j.unmount();
 });
 
 const teamSnapshot={...snapshot,teamWorkspaceFeature:true};
@@ -1227,23 +1228,26 @@ test('a team write callback rechecks the latest permissions within the same logi
  }
 });
 
-test('team writes wait for background saves instead of racing their receipt and preserve the queued input',async()=>{
- const background=deferred(),operation='background-before-team';
+test('an independent team input queues locally behind a background save without racing its receipt',async()=>{
+ const background=deferred(),operation='background-before-team',payload={publicationId:'fictional-publication-one',body:'next comment'};
  const h=harness(call=>call.action==='snapshot'?teamSnapshot:call.action==='updateRecord'?background.promise:{committed:true,operationId:call.options.operationId},{storedToken:token});await flush();
  await h.render().submitMutation('updateRecord',{recordId:'one',changes:{13:'original queued input'}},operation);await flush();
- const before=h.calls.length;
- await assert.rejects(h.render().mutateTeam('saveTeamComment',{body:'next comment'},'team-after-background'),{code:'MUTATION_PENDING'});
- assert.equal(h.calls.length,before);assert.equal(h.pendingStore.get(operation).payload.changes[13],'original queued input');
- background.resolve({committed:true,operationId:operation});await flush();
- await h.render().mutateTeam('saveTeamComment',{body:'next comment'},'team-after-background');
- assert.equal(h.pendingStore.size,0);assert.equal(h.calls.filter(call=>call.action==='updateRecord').length,1);assert.equal(h.calls.filter(call=>call.action==='saveTeamComment').length,1);h.unmount();
+ const before=h.calls.length;let teamDone=false;
+ const saving=h.render().mutateTeam('saveTeamComment',payload,'team-after-background').then(()=>{teamDone=true;});await flush();
+ assert.equal(h.calls.length,before);assert.equal(teamDone,false);assert.equal(h.render().busy,false);assert.equal(h.pendingStore.size,2);
+ assert.equal(h.pendingStore.get(operation).payload.changes[13],'original queued input');assert.deepEqual(h.pendingStore.get('team-after-background').payload,payload);
+ assert.equal(h.render().isPendingMutation('saveTeamComment',payload),true);assert.equal(h.render().isPendingMutation('saveTeamComment',{publicationId:'another-publication'}),false);
+ await assert.rejects(h.render().mutateTeam('saveTeamComment',{...payload,body:'overlapping input'},'team-overlapping-input'),{code:'MUTATION_PENDING'});
+ await assert.rejects(h.render().logout(),{code:'MUTATION_PENDING'});
+ background.resolve({committed:true,operationId:operation});await saving;await flush();
+ assert.equal(teamDone,true);assert.equal(h.pendingStore.size,0);assert.equal(h.calls.filter(call=>call.action==='updateRecord').length,1);assert.equal(h.calls.filter(call=>call.action==='saveTeamComment').length,1);h.unmount();
 });
 
 test('a stale background callback during a team save retains its local input and starts the queued save after the team receipt',async()=>{
  const team=deferred(),operation='background-after-team';
  const h=harness(call=>call.action==='snapshot'?teamSnapshot:call.action==='saveTeamComment'?team.promise:{committed:true,operationId:call.options.operationId},{storedToken:token});await flush();
  const previousBackgroundCallback=h.render().submitMutation;
- const saving=h.render().mutateTeam('saveTeamComment',{body:'first comment'},'team-before-background');
+ const saving=h.render().mutateTeam('saveTeamComment',{body:'first comment'},'team-before-background');await flush();
  await previousBackgroundCallback('updateRecord',{recordId:'one',changes:{13:'retained later input'}},operation);
  await flush();assert.equal(h.calls.filter(call=>call.action==='updateRecord').length,0,'No overlapping network write');
  assert.equal(h.pendingStore.get(operation).payload.changes[13],'retained later input');assert.equal(h.pendingStore.get(operation).attempted,false);
@@ -1274,8 +1278,9 @@ test('late team responses after unmount cannot publish private reads or update h
  }
 });
 
-test('an expired old team read and a late team write cannot release a new login mutation mutex',async()=>{
+test('late previous-login responses cannot confirm a rehydrated team save or bypass its explicit same-ID retry',async()=>{
  const oldWrite=deferred(),oldRead=deferred(),newWrite=deferred(),freshToken=token+'-new-team';
+ const oldPayload={publicationId:'old-publication',body:'old input'},newPayload={publicationId:'new-publication',body:'new input'};
  const h=harness(call=>{
   if(call.action==='snapshot')return teamSnapshot;
   if(call.action==='login')return {token:freshToken,snapshot:teamSnapshot};
@@ -1283,13 +1288,19 @@ test('an expired old team read and a late team write cannot release a new login 
   if(call.action==='saveTeamComment')return call.options.operationId==='old-team-save'?oldWrite.promise:newWrite.promise;
   throw new Error('Unexpected action '+call.action);
  },{storedToken:token});await flush();
- const read=h.render().readTeamWorkspace().catch(error=>error),old=h.render().mutateTeam('saveTeamComment',{body:'old input'},'old-team-save').catch(error=>error);
+ const read=h.render().readTeamWorkspace().catch(error=>error),old=h.render().mutateTeam('saveTeamComment',oldPayload,'old-team-save').catch(error=>error);await flush();
+ assert.equal(h.pendingStore.get('old-team-save').attempted,true);
  oldRead.reject(new SheetApiError('UNAUTHENTICATED','Old team session expired'));await read;await flush();assert.equal(h.render().authenticated,false);
- await h.render().login('ND-001','test-new-login-password');const current=h.render().mutateTeam('saveTeamComment',{body:'new input'},'new-team-save');
+ await h.render().login('ND-001','test-new-login-password');await flush();
+ const current=h.render().mutateTeam('saveTeamComment',newPayload,'new-team-save');await flush();
  try{
   oldWrite.resolve({committed:true,operationId:'old-team-save'});const stale=await old;await flush();assert.equal(stale.code,'STALE_SESSION');
-  assert.equal(h.render().busy,true);await assert.rejects(h.render().mutateTeam('saveTeamComment',{body:'third input'},'third-team-save'),{code:'MUTATION_PENDING'});
-  assert.equal(h.calls.filter(call=>call.options.operationId==='third-team-save').length,0);
+  assert.equal(h.render().busy,false);assert.equal(h.pendingStore.size,2);assert.equal(h.pendingStore.get('new-team-save').attempted,false);
+  assert.equal(h.calls.filter(call=>call.options.operationId==='new-team-save').length,0,'The previous login response cannot resume this login queue');
+  await assert.rejects(h.render().mutateTeam('saveTeamComment',{...newPayload,body:'third input'},'third-team-save'),{code:'MUTATION_PENDING'});
+  h.render().retryBackgroundSave();await flush();
+  const retried=h.calls.filter(call=>call.options.operationId==='old-team-save');assert.equal(retried.length,2);assert.deepEqual(retried[0].payload,retried[1].payload);assert.equal(retried[1].options.token,freshToken);
+  assert.equal(h.calls.filter(call=>call.options.operationId==='new-team-save').length,1);
  }finally{newWrite.resolve({committed:true,operationId:'new-team-save'});await current;h.unmount();}
 });
 
@@ -1316,7 +1327,7 @@ test('new extension writes require their own capability and retain identity-boun
 test('evidence upload setup uses the identity-bound read transport without entering the outbox',async()=>{
  const upload={uploadId:'fictional-upload-id',operationId:'fictional-upload-operation'},response={uploadUrl:'https://storage.googleapis.com/fictional-only'};
  const h=harness(call=>call.action==='snapshot'?workflowExtensionSnapshot:response,{storedToken:token});await flush();
- assert.equal(await h.render().readExtension('beginMatchEvidence',upload),response);const call=h.calls.find(call=>call.action==='beginMatchEvidence');assert.equal(call.options.token,token);assert.deepEqual(call.payload,upload);assert.equal(h.pendingStore.size,0);
+ assert.deepEqual(await h.render().readExtension('beginMatchEvidence',upload),response);const call=h.calls.find(call=>call.action==='beginMatchEvidence');assert.equal(call.options.token,token);assert.deepEqual(call.payload,upload);assert.equal(h.pendingStore.size,0);
  await assert.rejects(h.render().readExtension('changePassword',{}),{code:'INVALID_ACTION'});h.unmount();
 });
 
@@ -1363,14 +1374,15 @@ test('known extension validation failures release the outbox and allow a correct
  invalid=false;await h.render().mutateExtension('mutateRewards',{...extensionPayload,reason:'修正して確認した理由'},'extension-corrected-operation');await flush();assert.equal(h.pendingStore.size,0);assert.equal(h.calls.filter(call=>call.action==='mutateRewards').length,2);h.unmount();
 });
 
-test('uncertain extension results block other foreground APIs and a different extension operation',async()=>{
+test('uncertain extension results block foreground administration while independent encrypted input can queue without posting',async()=>{
  const h=harness(call=>{if(call.action==='snapshot')return extensionSnapshot;throw new SheetApiError('NETWORK','確定不明');},{storedToken:token});await flush();
  await assert.rejects(h.render().mutateExtension('mutateRewards',extensionPayload,'extension-blocking-operation'),{code:'NETWORK'});await flush();const before=h.calls.length;
  await assert.rejects(h.render().mutate('updateStatus',{recordId:'one',status:'提案'},'extension-following-business'),{code:'MUTATION_PENDING'});
  await assert.rejects(h.render().mutateOperational('manageAccount',{command:'unused'},'extension-following-account'),{code:'MUTATION_PENDING'});
- await assert.rejects(h.render().mutateTeam('saveTeamComment',{body:'must remain in editor'},'extension-following-team'),{code:'MUTATION_PENDING'});
+ const team=h.render().mutateTeam('saveTeamComment',{publicationId:'independent-publication',body:'retained independent input'},'extension-following-team').catch(error=>error);await flush();
  await assert.rejects(h.render().mutateExtension('stageMigrationBatch',{entries:[]},'extension-following-migration'),{code:'MUTATION_PENDING'});
- assert.equal(h.calls.length,before);assert.equal(h.pendingStore.size,1);assert.deepEqual(h.pendingStore.get('extension-blocking-operation').payload,extensionPayload);h.unmount();
+ assert.equal(h.calls.length,before);assert.equal(h.pendingStore.size,2);assert.equal(h.pendingStore.get('extension-following-team').attempted,false);assert.deepEqual(h.pendingStore.get('extension-blocking-operation').payload,extensionPayload);
+ await assert.rejects(h.render().logout(),{code:'MUTATION_PENDING'});h.unmount();assert.equal((await team).code,'STALE_SESSION');
 });
 
 test('extension callbacks from a previous actor cannot submit with a new session or alter its state',async()=>{
@@ -1420,7 +1432,7 @@ test('only passive background reads of this session full Firestore snapshot send
 
 test('a restored display cache never sends a stamp before the first complete network snapshot',async()=>{
  const full=conditionalSnapshot(),fresh=deferred();let reads=0;
- const h=harness(call=>call.action==='login'?{token,cacheAccess:full.cacheAccess}:++reads===1?fresh.promise:conditionalReceipt(full),{cacheRead:async()=>({snapshot:{...projectSnapshotForCache(full),snapshotVersion:full.snapshotVersion},savedAt:Date.now()-1000})});
+ const h=harness(call=>call.action==='login'?{token,cacheAccess:full.cacheAccess}:++reads===1?fresh.promise:conditionalReceipt(full),{cacheHint:true,cacheRead:async()=>({snapshot:{...projectSnapshotForCache(full),snapshotVersion:full.snapshotVersion},savedAt:Date.now()-1000})});
  await flush();await h.render().login(player.id,'private-test-password');await flush();assert.equal(h.render().snapshotSource,'cache');assert.deepEqual(Object.keys(h.calls[1].payload),[]);
  fresh.resolve(full);await flush();assert.equal(h.render().snapshotSource,'live');assert.equal(h.render().snapshot.records,full.records);
  await h.render().refresh(true);assert.equal(h.calls[2].payload.ifSnapshotVersion,full.snapshotVersion);h.unmount();
@@ -1495,4 +1507,235 @@ test('a retained refresh callback cannot send a new endpoint session to the old 
  await h.render().logout();await h.render().connect(otherEndpoint);await h.render().login(player.id,'private-test-password');const count=h.calls.length;
  assert.equal(await previous(true),undefined);assert.equal(h.calls.length,count);
  await h.render().refresh(true);assert.equal(h.calls.at(-1).target,otherEndpoint);assert.equal(h.calls.at(-1).options.token,token+'-new-endpoint');h.unmount();
+});
+
+
+test('a cold login receives current data in one authenticated request and keeps its new cache grant for a later visit',async()=>{
+ const access=displayGrant(),full={...snapshot,cacheAccess:access};
+ const h=harness(call=>{if(call.action==='login')return {token,snapshot:full};throw new Error('A second data request is unnecessary');});await flush();
+ await h.render().login('ND-001','never-persist-this-password');await flush();
+ assert.equal(h.calls.length,1);assert.equal(h.calls[0].action,'login');assert.equal(h.calls[0].payload.sessionOnly,false);assert.equal(h.calls[0].payload.cacheSnapshot,true);
+ assert.equal(h.cacheHints.length,1);assert.equal(h.cacheHints[0].target,endpoint);assert.equal(h.cacheHints[0].accountId,'ND-001');assert.equal(h.cacheReads.length,0);
+ assert.equal(h.render().snapshot,full);assert.equal(h.render().snapshotSource,'live');assert.equal(h.render().busy,false);assert.equal(h.cacheWrites.length,1);
+ const stored=JSON.parse(h.sessionStorage.getItem(SESSION_KEY));assert.equal(stored.cacheAvailable,true);assert.equal(stored.token,token);
+ const disk=JSON.stringify([...h.sessionStorage.values,...h.localStorage.values]);assert.equal(disk.includes(access.secret),false);assert.equal(disk.includes('never-persist-this-password'),false);h.unmount();
+});
+
+test('an untrusted positive cache hint cannot display data or authenticate before a valid login response',async()=>{
+ const auth=deferred(),fresh=deferred(),access=displayGrant();
+ const h=harness(call=>call.action==='login'?auth.promise:fresh.promise,{cacheHint:true,cacheRead:async()=>null});await flush();
+ const loggingIn=h.render().login('ND-001','not-a-stored-password');await flush();
+ assert.equal(h.calls.length,1);assert.equal(h.calls[0].payload.sessionOnly,true);assert.equal(h.render().authenticated,false);assert.equal(h.render().snapshot,null);assert.equal(h.cacheReads.length,0);
+ auth.resolve({token,cacheAccess:access});await flush();assert.equal(h.render().authenticated,true);assert.equal(h.render().snapshot,null);assert.equal(h.cacheReads.length,1);assert.equal(h.calls[1].action,'snapshot');assert.equal(h.calls[1].options.token,token);
+ fresh.resolve({...snapshot,cacheAccess:access});await loggingIn;assert.equal(h.render().snapshotSource,'live');assert.equal(h.render().snapshot.writesEnabled,true);h.unmount();
+});
+
+test('logout during the optional cache hint sends no password or late login request',async()=>{
+ const hint=deferred();const h=harness(()=>{throw new Error('No credential request after logout');},{cacheHint:async()=>hint.promise});await flush();
+ const pending=h.render().login('ND-001','never-send-after-cancellation');await flush();assert.equal(h.cacheHints.length,1);assert.equal(h.calls.length,0);
+ await h.render().logout();hint.resolve(true);await pending;assert.equal(h.calls.length,0);assert.equal(h.render().authenticated,false);assert.equal(h.render().snapshot,null);assert.equal(h.sessionStorage.getItem(SESSION_KEY),null);assert.equal(h.cacheReads.length,0);h.unmount();
+});
+
+test('identical overlapping extension reads use one request but return separate data and do not retain a result cache',async()=>{
+ const response=deferred(),reply={profile:{candidateName:'本人だけの架空候補者',careers:[{company:'架空会社'}]}};
+ const h=harness(call=>call.action==='snapshot'?workflowExtensionSnapshot:response.promise,{storedToken:token});await flush();
+ const first=h.render().readExtension('readIntroductionV2',{recordId:'same-record'}),second=h.render().readExtension('readIntroductionV2',{recordId:'same-record'});await flush();
+ assert.equal(h.calls.filter(c=>c.action==='readIntroductionV2').length,1);response.resolve(reply);const [a,b]=await Promise.all([first,second]);
+ assert.deepEqual(a,reply);assert.deepEqual(b,reply);assert.notEqual(a,b);a.profile.candidateName='caller-local edit';assert.equal(b.profile.candidateName,reply.profile.candidateName);
+ await h.render().readExtension('readIntroductionV2',{recordId:'same-record'});assert.equal(h.calls.filter(c=>c.action==='readIntroductionV2').length,2,'Completed reads are not cached or reused');h.unmount();
+});
+
+test('upload-session creation is never deduplicated even for identical concurrent input',async()=>{
+ const response=deferred(),h=harness(call=>call.action==='snapshot'?workflowExtensionSnapshot:response.promise,{storedToken:token});await flush();
+ const input={recordId:'evidence-record',uploadId:'same-upload-id',kind:'candidate',mime:'image/png',size:100};
+ const first=h.render().readExtension('beginMatchEvidence',input),second=h.render().readExtension('beginMatchEvidence',input);await flush();
+ assert.equal(h.calls.filter(c=>c.action==='beginMatchEvidence').length,2);assert.equal(h.pendingStore.size,0);response.resolve({uploadUrl:'https://storage.googleapis.com/fake-one-time-capability'});await Promise.all([first,second]);h.unmount();
+});
+
+test('extension-read sharing separates payloads snapshot revisions and login identities',async()=>{
+ const replies=[],read=()=>{const next=deferred();replies.push(next);return next.promise;};
+ const provider={kind:'firestore',projectId:'insup-node-test',migratedAt:'2026-11-06T01:00:00.000Z'},firstSnapshot={...workflowExtensionSnapshot,storageBackend:provider,snapshotVersion:'V'.repeat(43)},secondSnapshot={...workflowExtensionSnapshot,storageBackend:provider,snapshotVersion:'W'.repeat(43)},nextToken=token+'-separate-reader';let active=firstSnapshot;
+ const h=harness(call=>call.action==='snapshot'?active:call.action==='logout'?{}:call.action==='login'?{token:nextToken,snapshot:secondSnapshot}:read(),{storedToken:token});await flush();
+ const oldApi=h.render(),a=oldApi.readExtension('readIntroductionV2',{recordId:'a'}),b=h.render().readExtension('readIntroductionV2',{recordId:'b'});await flush();assert.equal(replies.length,2);
+ active=secondSnapshot;await h.render().refresh();const c=h.render().readExtension('readIntroductionV2',{recordId:'a'});await flush();assert.equal(replies.length,3,'A different authorized snapshot cannot join the old read');
+ await h.render().logout();const staleResults=[a,b,c].map(p=>p.catch(error=>error));await h.render().login('ADMIN','separate-login-password');
+ const d=h.render().readExtension('readIntroductionV2',{recordId:'a'});await flush();assert.equal(replies.length,4);
+ await assert.rejects(oldApi.readExtension('readIntroductionV2',{recordId:'a'}),{code:'STALE_SESSION'});assert.equal(replies.length,4);
+ replies.slice(0,3).forEach(p=>p.resolve({body:'previous-session private record'}));for(const result of await Promise.all(staleResults))assert.equal(result.code,'STALE_SESSION');
+ replies[3].resolve({body:'current-session record'});assert.deepEqual(await d,{body:'current-session record'});assert.equal(h.render().snapshot,secondSnapshot);h.unmount();
+});
+
+test('a delayed extension save lets another resource queue without sending it early or announcing server success',async()=>{
+ const first=deferred(),second=deferred(),responses={intro:first,metric:second};
+ const h=harness(call=>call.action==='snapshot'?workflowExtensionSnapshot:call.action==='saveIntroductionV2'?responses.intro.promise:call.action==='saveMetricGoals'?responses.metric.promise:{ok:true},{storedToken:token});await flush();
+ const introPayload={recordId:'slow-introduction-record',profile:{candidateName:'架空候補者'},expectedVersion:''},metricPayload={playerId:'ND-002',month:'2026-11',targets:{}};
+ let introDone=false,metricDone=false;
+ const intro=h.render().mutateExtension('saveIntroductionV2',introPayload,'slow-introduction-operation').then(()=>{introDone=true;});await flush();
+ const metric=h.render().mutateExtension('saveMetricGoals',metricPayload,'independent-metric-operation').then(()=>{metricDone=true;});await flush();
+ assert.equal(h.render().busy,false);assert.equal(introDone,false);assert.equal(metricDone,false);assert.equal(h.pendingStore.size,2);assert.equal(h.pendingStore.get('independent-metric-operation').attempted,false);
+ assert.equal(h.calls.filter(c=>c.action==='saveMetricGoals').length,0);assert.equal(h.render().isPendingMutation('updateRecord',{recordId:'slow-introduction-record'}),true);assert.equal(h.render().isPendingMutation('updateRecord',{recordId:'another-record'}),false);
+ await assert.rejects(h.render().mutateExtension('saveIntroductionV2',introPayload,'overlapping-introduction-operation'),{code:'MUTATION_PENDING'});
+ first.resolve({committed:true,operationId:'slow-introduction-operation'});await intro;await flush();assert.equal(introDone,true);assert.equal(metricDone,false);assert.equal(h.calls.filter(c=>c.action==='saveMetricGoals').length,1);
+ second.resolve({committed:true,operationId:'independent-metric-operation'});await metric;await flush();assert.equal(metricDone,true);assert.equal(h.pendingStore.size,0);assert.equal(h.render().hasPendingSave,false);h.unmount();
+});
+
+test('the queue callback fires only after durable local acceptance while the server acknowledgement is still pending',async()=>{
+ const local=deferred(),remote=deferred(),events=[];
+ const h=harness(call=>call.action==='snapshot'?workflowExtensionSnapshot:remote.promise,{storedToken:token,persistLocal:input=>input.attempted?undefined:local.promise});await flush();
+ let committed=false;
+ const save=h.render().mutateExtension('saveIntroductionV2',{recordId:'queued-callback-record',profile:{candidateName:'架空候補'},expectedVersion:''},'queued-callback-operation',()=>events.push('queued')).then(()=>{committed=true;});await flush();
+ assert.deepEqual(events,[]);assert.equal(h.pendingStore.size,0);assert.equal(h.calls.filter(c=>c.action==='saveIntroductionV2').length,0);assert.equal(committed,false);
+ local.resolve();await flush();
+ assert.deepEqual(events,['queued']);assert.equal(h.pendingStore.size,1);assert.equal(h.render().backgroundSave.localSaved,true);assert.equal(h.render().backgroundSave.status,'saving');assert.equal(committed,false);assert.equal(h.render().busy,false);
+ assert.equal(h.calls.filter(c=>c.action==='saveIntroductionV2').length,1);
+ remote.resolve({committed:true,operationId:'queued-callback-operation'});await save;await flush();assert.equal(committed,true);assert.deepEqual(events,['queued']);assert.equal(h.pendingStore.size,0);h.unmount();
+});
+
+test('a failed display callback cannot reject or discard an accepted encrypted save',async()=>{
+ const remote=deferred();let calls=0,committed=false;
+ const h=harness(call=>call.action==='snapshot'?workflowExtensionSnapshot:remote.promise,{storedToken:token});await flush();
+ const save=h.render().mutateExtension('saveIntroductionV2',{recordId:'display-callback-record',profile:{candidateName:'架空候補'},expectedVersion:''},'display-callback-operation',()=>{calls++;throw new Error('The view was already closed');}).then(()=>{committed=true;});await flush();
+ assert.equal(calls,1);assert.equal(committed,false);assert.equal(h.pendingStore.size,1);assert.equal(h.render().backgroundSave.status,'saving');assert.equal(h.calls.filter(c=>c.action==='saveIntroductionV2').length,1);
+ remote.resolve({committed:true,operationId:'display-callback-operation'});await save;await flush();assert.equal(committed,true);assert.equal(h.pendingStore.size,0);assert.equal(h.render().backgroundSave.status,'saved');h.unmount();
+});
+
+test('an old login cannot close a newer editor through a queue callback arriving after local persistence',async()=>{
+ const local=deferred(),freshToken=token+'-queue-callback-login';let queued=0;
+ const h=harness(call=>{
+  if(call.action==='snapshot')return workflowExtensionSnapshot;
+  if(call.action==='readIntroductionV2')throw new SheetApiError('UNAUTHENTICATED','The old login expired');
+  if(call.action==='login')return {token:freshToken,snapshot:workflowExtensionSnapshot};
+  throw new Error('The previous login must not transmit its save');
+ },{storedToken:token,persistLocal:()=>local.promise});await flush();
+ const previous=h.render(),save=previous.mutateExtension('saveIntroductionV2',{recordId:'late-callback-record',profile:{candidateName:'架空候補'},expectedVersion:''},'late-callback-operation',()=>{queued++;}).catch(error=>error);await flush();
+ assert.equal(queued,0);assert.equal(h.pendingStore.size,0);
+ await assert.rejects(previous.readExtension('readIntroductionV2',{recordId:'expire-the-old-login'}),{code:'UNAUTHENTICATED'});assert.equal(h.render().authenticated,false);
+ await h.render().login('ADMIN','not-a-stored-password');const latest=h.render(),updates=h.updates();assert.equal(latest.authenticated,true);
+ local.resolve();assert.equal((await save).code,'STALE_SESSION');await flush();assert.equal(queued,0);assert.equal(h.updates(),updates);
+ assert.equal(JSON.parse(h.sessionStorage.getItem(SESSION_KEY)).token,freshToken);assert.equal(h.calls.filter(c=>c.action==='saveIntroductionV2').length,0);h.unmount();
+});
+
+
+test('automatic refresh also respects an open native work dialog before replacing its input baseline',async()=>{
+ const browser=autoSyncBrowser();let reads=0;
+ const h=harness(call=>{if(call.action==='snapshot'){reads++;return snapshot;}return {};},{storedToken:token,browser});await flush();h.render();
+ browser.document.nativeDialogOpen=true;await browser.advance();assert.equal(reads,1,'A native dialog is an editing surface even without an explicit role attribute');
+ browser.document.nativeDialogOpen=false;await browser.advance();assert.equal(reads,2);assert.equal(h.render().busy,false);h.unmount();
+});
+
+test('a late old-login local failure cannot remove a same-ID receipt waiter belonging to the new login',async()=>{
+ const oldLocal=deferred(),remote=deferred(),freshToken=token+'-same-operation-retry';let localAttempts=0,queued=0;
+ const payload={recordId:'same-operation-candidate',profile:{candidateName:'架空候補'},expectedVersion:''},operation='same-operation-across-login';
+ const h=harness(call=>{
+  if(call.action==='snapshot')return workflowExtensionSnapshot;
+  if(call.action==='readIntroductionV2')throw new SheetApiError('UNAUTHENTICATED','Old login expired');
+  if(call.action==='login')return {token:freshToken,snapshot:workflowExtensionSnapshot};
+  return remote.promise;
+ },{storedToken:token,persistLocal:()=>++localAttempts===1?oldLocal.promise:undefined});await flush();
+ const old=h.render().mutateExtension('saveIntroductionV2',payload,operation,()=>{throw Error('Old callback must not run');}).catch(error=>error);await flush();
+ await assert.rejects(h.render().readExtension('readIntroductionV2',{recordId:'check-login'}),{code:'UNAUTHENTICATED'});await h.render().login('ADMIN','not-persisted-password');await flush();
+ const current=h.render().mutateExtension('saveIntroductionV2',payload,operation,()=>{queued++;});await flush();assert.equal(queued,1);assert.equal(h.calls.filter(c=>c.action==='saveIntroductionV2').length,1);
+ oldLocal.reject(new Error('Old local write failed'));assert.match((await old).message,/Old local write failed/);await flush();assert.equal(h.render().hasPendingSave,true);assert.equal(queued,1);
+ remote.resolve({committed:true,operationId:operation});await current;await flush();assert.equal(h.render().hasPendingSave,false);assert.equal(h.pendingStore.size,0);assert.equal(JSON.parse(h.sessionStorage.getItem(SESSION_KEY)).token,freshToken);h.unmount();
+});
+
+test('foreground administration and known password failures resume independent durable input without parallel writes',async()=>{
+ for(const path of ['operational-success','operational-validation','regular-success','regular-validation','password-validation']){
+  const foreground=deferred(),remote=deferred(),admin={...snapshot,self:{playerId:'ADMIN',role:'admin'}};
+  const h=harness(call=>{
+   if(call.action==='snapshot')return admin;
+   if(['manageAccount','createPlayer','changePassword'].includes(call.action))return foreground.promise;
+   if(call.action==='updateRecord')return remote.promise;
+   throw new Error('Unexpected test action '+call.action);
+  },{storedToken:token});await flush();
+  const previous=h.render(),submit=previous.submitMutation;
+  const request=path.startsWith('operational')?previous.mutateOperational('manageAccount',{command:'update'},'foreground-operation'):path.startsWith('regular')?previous.mutate('createPlayer',{name:'架空の担当'},'foreground-operation'):previous.changePassword('old-test-password','new-test-password');
+  const observed=request.catch(error=>error);await flush();assert.equal(h.render().busy,true,path);
+  await submit('updateRecord',{recordId:'independent-from-foreground',changes:{13:'暗号化して保持した修正'}},'candidate-after-foreground');await flush();
+  assert.equal(h.pendingStore.size,1,path);assert.equal(h.pendingStore.get('candidate-after-foreground').attempted,false,path);
+  assert.equal(h.calls.filter(call=>call.action==='updateRecord').length,0,'No background POST before the foreground request completes: '+path);
+  await assert.rejects(h.render().logout(),{code:'MUTATION_PENDING'},path);
+  if(path.endsWith('validation'))foreground.reject(new SheetApiError('VALIDATION','入力を確認してください'));
+  else foreground.resolve(path.startsWith('regular')?{snapshot:admin}:{managed:true});
+  const result=await observed;await flush();
+  if(path.endsWith('validation'))assert.equal(result.code,'VALIDATION',path);
+  assert.equal(h.render().busy,false,path);assert.equal(h.render().hasPendingSave,true,path);
+  assert.equal(h.calls.filter(call=>call.action==='updateRecord').length,1,'The accepted durable input resumes once after releasing the foreground mutex: '+path);
+  assert.equal(h.pendingStore.get('candidate-after-foreground').attempted,true,path);
+  assert.equal(h.render().backgroundSave.status,'saving',path);
+  remote.resolve({committed:true,operationId:'candidate-after-foreground'});await flush();
+  assert.equal(h.render().hasPendingSave,false,path);assert.equal(h.pendingStore.size,0,path);h.unmount();
+ }
+});
+
+test('a foreground expiry or password session invalidation cannot resume queued input under the old login',async()=>{
+ for(const path of ['operational-expired','regular-expired','password-changed','password-uncertain']){
+  const foreground=deferred(),admin={...snapshot,self:{playerId:'ADMIN',role:'admin'}};
+  const h=harness(call=>{
+   if(call.action==='snapshot')return admin;
+   if(['manageAccount','createPlayer','changePassword'].includes(call.action))return foreground.promise;
+   throw new Error('An invalidated login must not transmit its queued candidate');
+  },{storedToken:token});await flush();
+  const previous=h.render(),submit=previous.submitMutation;
+  const request=path.startsWith('operational')?previous.mutateOperational('manageAccount',{},'expiring-foreground'):path.startsWith('regular')?previous.mutate('createPlayer',{},'expiring-foreground'):previous.changePassword('old-test-password','new-test-password');
+  const observed=request.catch(error=>error);await flush();
+  await submit('updateRecord',{recordId:'not-transmitted-after-expiry',changes:{13:'端末に保持した修正'}},'queued-before-session-invalidation');await flush();
+  if(path==='password-changed')foreground.resolve({changed:true});
+  else foreground.reject(new SheetApiError(path==='password-uncertain'?'NETWORK':'UNAUTHENTICATED','The foreground login is no longer valid'));
+  await observed;await flush();
+  assert.equal(h.render().authenticated,false,path);assert.equal(h.render().snapshot,null,path);assert.equal(h.sessionStorage.getItem(SESSION_KEY),null,path);
+  assert.equal(h.calls.filter(call=>call.action==='updateRecord').length,0,path);
+  assert.equal(h.pendingStore.size,1,path);assert.equal(h.pendingStore.get('queued-before-session-invalidation').attempted,false,path);h.unmount();
+ }
+});
+
+test('resuming after a foreground acknowledgement never retries an uncertain head or sends the following queued input',async()=>{
+ const foreground=deferred(),admin={...snapshot,self:{playerId:'ADMIN',role:'admin'}};
+ const h=harness(call=>{
+  if(call.action==='snapshot')return admin;
+  if(call.action==='manageAccount')return foreground.promise;
+  if(call.action==='updateRecord')throw new SheetApiError('NETWORK','保存結果は未確認です');
+  throw new Error('Unexpected test action '+call.action);
+ },{storedToken:token});await flush();
+ const previous=h.render(),foregroundSave=previous.mutateOperational('manageAccount',{},'before-uncertain-head');
+ await previous.submitMutation('updateRecord',{recordId:'uncertain-first-record',changes:{13:'最初の修正'}},'uncertain-head-after-foreground');
+ await previous.submitMutation('updateRecord',{recordId:'independent-second-record',changes:{13:'次の修正'}},'unsent-after-foreground');await flush();
+ assert.equal(h.calls.filter(call=>call.action==='updateRecord').length,0);
+ foreground.resolve({managed:true});await foregroundSave;await flush();h.render();await flush();
+ assert.equal(h.calls.filter(call=>call.action==='updateRecord').length,1);assert.equal(h.render().backgroundSave.status,'failed');assert.equal(h.render().backgroundSave.uncertain,true);
+ assert.equal(h.pendingStore.size,2);assert.equal(h.pendingStore.get('uncertain-head-after-foreground').attempted,true);assert.equal(h.pendingStore.get('unsent-after-foreground').attempted,false);
+ await assert.rejects(h.render().logout(),{code:'MUTATION_PENDING'});h.unmount();
+});
+
+test('the save queue identifies each candidate from the authorized snapshot without copying private draft fields',async()=>{
+ const first=deferred(),second=deferred();let firstAttempts=0;
+ const record=(id,name,row)=>({recordId:id,rowVersion:'row-v1',row,playerId:player.id,candidateName:name,source:'',values:Array(26).fill('PRIVATE_RECORD_TEXT'),formulaColumns:[]});
+ const current={...workflowExtensionSnapshot,records:[record('queue-candidate-a','架空候補者A',2),record('queue-candidate-b','架空候補者B',3)]};
+ const h=harness(call=>{
+  if(call.action==='snapshot')return current;
+  if(call.options.operationId==='queue-named-first')return ++firstAttempts===1?first.promise:{committed:true,operationId:call.options.operationId};
+  if(call.options.operationId==='queue-named-second')return second.promise;
+  throw new Error('Unexpected test action '+call.action);
+ },{storedToken:token});await flush();
+ await h.render().submitMutation('saveIntroductionV2',{recordId:'queue-candidate-a',profile:{candidateName:'UNTRUSTED_DRAFT_NAME',introduction:'PRIVATE_INTRODUCTION',fee:'PRIVATE_FEE'}},'queue-named-first','PRIVATE_CUSTOM_LABEL');await flush();
+ assert.equal(h.render().backgroundSave.candidateName,'架空候補者A');
+ assert.deepEqual(h.render().backgroundSave.queueItems.map(item=>[item.candidateName,item.status]),[['架空候補者A','syncing']]);
+ await h.render().submitMutation('saveIntroductionV2',{recordId:'queue-candidate-b',profile:{candidateName:'ANOTHER_UNTRUSTED_NAME',notes:'PRIVATE_NOTES'}},'queue-named-second');await flush();
+ const display=h.render().backgroundSave;
+ assert.equal(display.pendingCount,2);assert.equal(display.candidateName,'架空候補者A');
+ assert.deepEqual(display.queueItems.map(item=>[item.candidateName,item.status]),[['架空候補者A','syncing'],['架空候補者B','queued']]);
+ assert.doesNotMatch(JSON.stringify(display.queueItems),/PRIVATE_|UNTRUSTED/);assert.equal(h.calls.filter(call=>call.options.operationId==='queue-named-second').length,0);
+ first.reject(new SheetApiError('NETWORK','結果を確認できません'));await flush();
+ assert.deepEqual(h.render().backgroundSave.queueItems.map(item=>item.status),['failed','queued']);assert.equal(h.calls.filter(call=>call.options.operationId==='queue-named-second').length,0);
+ h.render().retryBackgroundSave();await flush();
+ assert.deepEqual(h.render().backgroundSave.queueItems.map(item=>[item.candidateName,item.status]),[['架空候補者B','syncing']]);
+ second.resolve({committed:true,operationId:'queue-named-second'});await flush();assert.equal(h.render().hasPendingSave,false);assert.deepEqual(h.render().backgroundSave.queueItems||[],[]);h.unmount();
+});
+
+test('an unresolved record uses a fixed operation label and cannot expose a draft-supplied candidate name',async()=>{
+ const remote=deferred(),h=harness(call=>call.action==='snapshot'?workflowExtensionSnapshot:remote.promise,{storedToken:token});await flush();
+ await h.render().submitMutation('saveIntroductionV2',{recordId:'not-in-this-authorized-snapshot',profile:{candidateName:'PRIVATE_DRAFT_NAME',introduction:'PRIVATE_DRAFT_TEXT'}},'queue-unresolved-record','PRIVATE_CALLER_LABEL');await flush();
+ const info=h.render().backgroundSave;
+ assert.equal(info.candidateName,undefined);assert.equal(info.queueItems.length,1);assert.equal(info.queueItems[0].candidateName,undefined);assert.equal(info.queueItems[0].label,'候補者の紹介文・確認事項');assert.doesNotMatch(JSON.stringify(info.queueItems),/PRIVATE_/);
+ remote.resolve({committed:true,operationId:'queue-unresolved-record'});await flush();await h.render().logout();assert.equal(h.render().backgroundSave,null);h.unmount();
 });
