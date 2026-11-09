@@ -105,7 +105,7 @@ function validate(save: PendingSave): void {
   if (!save || !/^[A-Za-z0-9_-]{16,128}$/.test(save.operationId) || typeof save.action !== "string" ||
       typeof save.label !== "string" || !Array.isArray(save.details) || save.details.some(value => typeof value !== "string") ||
       !Number.isFinite(save.createdAt) || typeof save.attempted !== "boolean" || !save.payload || typeof save.payload !== "object" ||
-      JSON.stringify(save.payload).length > 32768) throw storageError();
+      JSON.stringify(save.payload).length > (save.action === "saveIntroductionV2" ? 400000 : 32768)) throw storageError();
 }
 async function sealed(key: CryptoKey, scope: string, save: PendingSave): Promise<EncryptedSave> {
   const id = `${scope}:${save.operationId}`, iv = crypto.getRandomValues(new Uint8Array(12));

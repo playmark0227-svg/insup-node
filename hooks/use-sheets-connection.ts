@@ -5,7 +5,8 @@ import { persistPendingSave, readPendingSaves, removePendingSave, replacePending
 import { correctionFields, correctedPayload, mutationDateErrors, type SaveCorrectionDraft } from "../lib/save-correction";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { initialPlayers, makeDemoActivities, type Activity } from "../lib/node-data";
-import { assertSnapshot, assertMutationReceipt, isUncertainWrite, sheetRequest, validateEndpoint, SheetApiError, type MutationResult, type MutationReceipt, type SheetSnapshot, type SheetPlayer, type InterviewAdvice, type InterviewAdviceState } from "../lib/sheets-client";
+import {storageBackendOf} from "../lib/storage-backend";
+import { assertSnapshot, validSnapshotVersion, mergeSnapshotUnchanged, assertMutationReceipt, isUncertainWrite, sheetRequest, validateEndpoint, SheetApiError, sheetExtensionMutationActions, isSheetExtensionReadAction, sheetExtensionMutationEnabled, type SheetExtensionReadAction, type SheetExtensionMutationAction, type MutationResult, type MutationReceipt, type SheetSnapshot, type SnapshotUnchanged, type SheetPlayer, type InterviewAdvice, type InterviewAdviceState } from "../lib/sheets-client";
 import { matchingFields } from "../lib/management-data";
 import { interviewFieldLabels, interviewStringFields } from "../lib/candidate-intake";
 import { assertWritingKitState, validateWritingPreferences, type WritingKitState, type WritingPreferences, type WritingStyle } from "../lib/writing-ai";
@@ -26,8 +27,8 @@ export type BackgroundSaveState = {
   details: string[]; error: string; uncertain: boolean; changeId?: string; intakeInput?: boolean; refreshing?: boolean; localSaved?: boolean; pendingCount?: number; editable?: boolean; waitingForConnection?: boolean;
 };
 type BackgroundJob = { state: BackgroundSaveState; payload: unknown; endpoint: string; token: string; generation: number; account: string; savedInput: PendingSave; resources: string[] };
-const extensionActions=new Set(["mutateRewards","stageMigrationBatch","applyMigrationItem"]);
-const backgroundActions = new Set(["mutateRewards","stageMigrationBatch","applyMigrationItem","saveCandidateProfile", "saveClient", "deleteCandidate", "updateRecord", "createCandidate", "cancelAchievement", "restoreChange", "saveActivity", "updateProfile", "updateStatus", "saveManagementRow", "saveInterviewReview"]);
+const extensionActions=new Set<string>(sheetExtensionMutationActions);
+const backgroundActions = new Set([...sheetExtensionMutationActions,"saveCandidateProfile", "saveClient", "deleteCandidate", "updateRecord", "createCandidate", "cancelAchievement", "restoreChange", "saveActivity", "updateProfile", "updateStatus", "saveManagementRow", "saveInterviewReview"]);
 // An open dialog or a focused field: background work must not change what someone is editing.
 const editing = () => typeof document !== "undefined" && !!(document.querySelector('[role="dialog"], [role="alertdialog"]') || document.activeElement?.matches('input, textarea, select, [contenteditable="true"]'));
 const readStorage = (storage: Storage, key: string) => { try { return storage.getItem(key); } catch { return null; } };
@@ -78,6 +79,7 @@ export function useSheetsConnection() {
   const correctionRunning = useRef<string|null>(null);
   const outboxLoad = useRef<{generation:number;promise:Promise<void>} | null>(null);
   const latestSnapshot = useRef(snapshot); latestSnapshot.current = snapshot;
+  const liveSnapshotBinding=useRef<{snapshot:SheetSnapshot;endpoint:string;token:string;generation:number}|null>(null);
   const hasPendingBackground = () => backgroundQueue.current.length > 0 || admissions.current > 0;
   const token = useRef("");
   const pinnedEndpoint = useRef("");
@@ -125,6 +127,7 @@ export function useSheetsConnection() {
     sourceRef.current="live";setSnapshotSource("live");setCachedAt(null);
     const access=validSnapshotCacheAccess(data.cacheAccess)?data.cacheAccess:null;cacheAccessRef.current=access;
     const cacheGeneration=generation.current;latestSnapshot.current=data;
+    liveSnapshotBinding.current={snapshot:data,endpoint:pinnedEndpoint.current||cacheEndpoint.current,token:token.current,generation:cacheGeneration};
     if(access)void persistSnapshotCache(pinnedEndpoint.current||cacheEndpoint.current,access,data,()=>isCurrent(cacheGeneration)&&sourceRef.current==="live"&&cacheAccessRef.current===access&&latestSnapshot.current===data&&!mutationRunning.current&&!hasPendingBackground()).catch(()=>undefined);
     latestSnapshot.current = data; setSnapshot(data); setPlayers(data.players); setActivities(data.activities); setError(""); setSyncError("");
     const job = backgroundJob.current;
@@ -134,7 +137,7 @@ export function useSheetsConnection() {
   }, []);
 
   const applyCachedSnapshot=(cached:{snapshot:SheetSnapshot;savedAt:number})=>{
-    sourceRef.current="cache";setSnapshotSource("cache");setCachedAt(cached.savedAt);
+    sourceRef.current="cache";setSnapshotSource("cache");setCachedAt(cached.savedAt);liveSnapshotBinding.current=null;
     latestSnapshot.current=cached.snapshot;setSnapshot(cached.snapshot);setPlayers(cached.snapshot.players);setActivities([]);setError("");setSyncError("");
   };
 
@@ -144,7 +147,7 @@ export function useSheetsConnection() {
     generation.current++; token.current = "";
     ++requestVersion.current;
     writeStorage(sessionStorage, SESSION_KEY, null);
-    lockPendingSaves();cacheAccessRef.current=null;sourceRef.current=null;setSnapshotSource(null);setCachedAt(null);
+    lockPendingSaves();cacheAccessRef.current=null;sourceRef.current=null;liveSnapshotBinding.current=null;setSnapshotSource(null);setCachedAt(null);
     setAuthenticated(false); setLoadPhase(null); setSyncing(false); setSyncError("");
     setSnapshot(null); latestSnapshot.current=null; setPlayers([]); setActivities([]); setCredentials(null); setMustChangePassword(false); setBusy(false); setLocalSaving(false);
     backgroundJob.current = null; backgroundQueue.current = []; outboxLoad.current = null; mutationRunning.current = false; setBackgroundSave(null);
@@ -222,7 +225,7 @@ export function useSheetsConnection() {
       extensionWaiters.current.forEach(waiter=>waiter.reject(new SheetApiError("STALE_SESSION","画面が閉じられました。保存結果は再ログイン後に確認してください。")));extensionWaiters.current.clear();
       mounted.current = false; ++generation.current; ++requestVersion.current;
       activeRequest.current?.abort(); activeRequest.current = null; loginRunning.current = false;
-      backgroundJob.current = null; backgroundQueue.current = []; outboxLoad.current = null;cacheAccessRef.current=null;sourceRef.current=null;
+      backgroundJob.current = null; backgroundQueue.current = []; outboxLoad.current = null;cacheAccessRef.current=null;sourceRef.current=null;liveSnapshotBinding.current=null;
     };
   }, [applySnapshot, beginLoad, clearSession, finishLoad, isCurrent]);
 
@@ -303,6 +306,8 @@ export function useSheetsConnection() {
 
   const refresh = async (background = false): Promise<boolean | undefined> => {
     if (!token.current || mutationRunning.current || hasPendingBackground() || loginRunning.current || refreshRunning.current || activeRequest.current) return;
+    const refreshEndpoint=pinnedEndpoint.current||cacheEndpoint.current;
+    if(!refreshEndpoint||(endpoint&&endpoint!==refreshEndpoint))return;
     // Avoid changing an editor's baseline or row revision while someone types,
     // including an editor opened while this request was already in flight.
     if (background && sourceRef.current!=="cache" && editing()) return;
@@ -312,11 +317,35 @@ export function useSheetsConnection() {
     activeRequest.current = controller;
     setSyncing(true);
     if (!background) { setBusy(true); setLoadPhase("loading"); setError(""); }
+    const savedToken=token.current,baseline=latestSnapshot.current,binding=liveSnapshotBinding.current;
+    // A display-cache projection has no private records. Only this session's complete network
+    // snapshot can prove that retaining the current data is safe; manual reads always fetch all data.
+    const conditional=!!(background&&passive&&sourceRef.current==="live"&&baseline&&binding?.snapshot===baseline&&
+      binding.endpoint===refreshEndpoint&&binding.token===savedToken&&binding.generation===g&&storageBackendOf(baseline)&&
+      validSnapshotVersion(baseline.snapshotVersion)&&validSnapshotCacheAccess(baseline.cacheAccess)&&baseline.cacheAccess===cacheAccessRef.current&&
+      baseline.cacheAccess.self.playerId===baseline.self.playerId&&baseline.cacheAccess.self.role===baseline.self.role);
+    const mayApply=()=>isCurrent(g)&&version===requestVersion.current&&token.current===savedToken&&!mutationRunning.current&&!hasPendingBackground()&&
+      (!background||sourceRef.current==="cache"||!editing());
+    const unchanged=(value:unknown)=>!!value&&typeof value==="object"&&"snapshotUnchanged" in value;
+    const requestSnapshot=(payload:unknown)=>sheetRequest<SheetSnapshot|SnapshotUnchanged>(refreshEndpoint,"snapshot",payload,{token:savedToken,signal:controller.signal,...(passive?{background:true}:{})});
     try {
-      const data = await sheetRequest<SheetSnapshot>(endpoint, "snapshot", {}, {token: token.current, signal: controller.signal, ...(passive ? {background: true} : {})});
+      let data=await requestSnapshot(conditional?{ifSnapshotVersion:baseline!.snapshotVersion}:{});
+      if(unchanged(data)){
+        if(!mayApply())return undefined;
+        try{
+          if(!conditional||!baseline||sourceRef.current!=="live"||latestSnapshot.current!==baseline||liveSnapshotBinding.current!==binding)throw new SheetApiError("INVALID_RESPONSE","同期の確認結果を確認できませんでした。");
+          data=mergeSnapshotUnchanged(data,baseline);
+        }catch{
+          // Do not attach a changed grant to retained private data. Retry one complete read first,
+          // and leave dirty forms and encrypted pending saves untouched if that read also fails.
+          liveSnapshotBinding.current=null;
+          data=await requestSnapshot({});
+          if(unchanged(data))throw new SheetApiError("INVALID_RESPONSE","最新のデータを確認できませんでした。再取得してください。");
+        }
+      }
       // A server that could not record the activity (busy lock) says so; the next poll reports the input again.
       if (!passive && data?.activityDeferred !== true) report(seen);
-      if (isCurrent(g) && version === requestVersion.current && (!background || sourceRef.current==="cache" || !editing())) { applySnapshot(data); setSyncError(""); }
+      if (mayApply()) { applySnapshot(data); setSyncError(""); }
       return true;
     } catch (e) {
       if (isCurrent(g) && version === requestVersion.current) {
@@ -733,14 +762,15 @@ export function useSheetsConnection() {
     finally{if(isCurrent(teamGeneration)){mutationRunning.current=false;setBusy(false);resumeBackgroundLatest.current();}}
   };
 
-  const readExtension=async<T,>(action:"readRewards"|"readMigrationArchive",payload:unknown={}):Promise<T>=>{
+  const readExtension=async<T,>(action:SheetExtensionReadAction,payload:unknown={}):Promise<T>=>{
     if(!teamToken||!snapshot||!isCurrent(teamGeneration)||token.current!==teamToken)throw new SheetApiError("STALE_SESSION","ログイン状態が変わりました。画面を開き直してください。");
+    if(!isSheetExtensionReadAction(action))throw new SheetApiError("INVALID_ACTION","連携データの取得操作を確認してください。");
     try{const result=await sheetRequest<T>(endpoint,action,payload,{token:teamToken});if(!isCurrent(teamGeneration)||token.current!==teamToken)throw new SheetApiError("STALE_SESSION","ログイン状態が変わりました。");return result;}
     catch(error){if(isCurrent(teamGeneration)&&isExpired(error))expire(error);throw error;}
   };
-  const mutateExtension=async(action:"mutateRewards"|"stageMigrationBatch"|"applyMigrationItem",payload:unknown,operationId:string):Promise<void>=>{
+  const mutateExtension=async(action:SheetExtensionMutationAction,payload:unknown,operationId:string):Promise<void>=>{
     if(!teamToken||!snapshot||!isCurrent(teamGeneration)||token.current!==teamToken)throw new SheetApiError("STALE_SESSION","ログイン状態が変わりました。画面を開き直してください。");
-    if(!latestSnapshot.current?.writesEnabled||!(action==="mutateRewards"?latestSnapshot.current.rewardsFeature:latestSnapshot.current.migrationFeature))throw new SheetApiError("READ_ONLY","連携が更新されていないか、現在は閲覧のみです。");
+    if(!sheetExtensionMutationEnabled(action,latestSnapshot.current))throw new SheetApiError("READ_ONLY","連携が更新されていないか、現在は閲覧のみです。");
     if(mutationRunning.current||loginRunning.current)throw new SheetApiError("MUTATION_PENDING","右上の保存結果を確認してから操作してください。");
     await ensureOutbox();if(!isCurrent(teamGeneration)||token.current!==teamToken)throw new SheetApiError("STALE_SESSION","ログイン状態が変わりました。");
     const queued=backgroundQueue.current.find(job=>job.state.operationId===operationId);
@@ -775,7 +805,7 @@ export function useSheetsConnection() {
 }
 
 function saveLabel(action: string) {
-  return ({mutateRewards:"ポイント・特典の保存",stageMigrationBatch:"過去データの原文保管",applyMigrationItem:"過去データの登録",saveCandidateProfile:"候補者の基本情報",saveClient:"取引先の登録・編集",deleteCandidate:"候補者・提案の削除",updateRecord:"候補者の変更",createCandidate:"候補者の登録",cancelAchievement:"成果の取り消し",restoreChange:"変更の復元",saveActivity:"成果の登録",updateProfile:"プロフィール",updateStatus:"進捗の変更",saveManagementRow:"業務管理表",saveInterviewReview:"面談の振り返り"} as Record<string,string>)[action] || "変更";
+  return ({publishIntroductionV2:"紹介文を社内共有",saveMetricGoals:"月別・工程別目標の保存",saveWorkJob:"募集案件の保存",saveProposalPlan:"提案予定の保存",recordProposalSent:"提案送付の記録",saveMatchReport:"マッチング報告の保存",completeMatchEvidence:"合意確認資料の保存",saveIntroductionV2:"候補者の紹介文・確認事項",saveIntroductionSettings:"紹介文の共有設定",mutateRewards:"ポイント・特典の保存",stageMigrationBatch:"過去データの原文保管",applyMigrationItem:"過去データの登録",saveCandidateProfile:"候補者の基本情報",saveClient:"取引先の登録・編集",deleteCandidate:"候補者・提案の削除",updateRecord:"候補者の変更",createCandidate:"候補者の登録",cancelAchievement:"成果の取り消し",restoreChange:"変更の復元",saveActivity:"成果の登録",updateProfile:"プロフィール",updateStatus:"進捗の変更",saveManagementRow:"業務管理表",saveInterviewReview:"面談の振り返り"} as Record<string,string>)[action] || "変更";
 }
 function saveDetails(action: string, owned: unknown, snapshot: SheetSnapshot): string[] {
   const data = owned as Record<string, unknown>, detail: string[] = [];

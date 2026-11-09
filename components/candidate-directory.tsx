@@ -1,5 +1,5 @@
 import { Fragment, useId, useState } from "react";
-import { ArrowRight, CalendarDays, ChevronDown, ChevronRight, MessageCircle, Trash2 } from "lucide-react";
+import { ArrowRight, CalendarDays, ChevronDown, ChevronRight, MessageCircle, BriefcaseBusiness, Trash2 } from "lucide-react";
 import {candidateAppointments,type CandidateGroup} from "@/lib/candidate-groups";
 import { milestoneColumns, statusTone, valueAt } from "@/lib/management-data";
 import { activityInputMetrics } from "@/lib/performance-metrics";
@@ -8,7 +8,7 @@ import "./candidate-directory.css";
 
 type DirectoryProps = {
  groups:CandidateGroup[];players:SheetPlayer[];busy:boolean;intakeEnabled:boolean;canDelete:boolean;
- onEdit:(id:string)=>void;onBasic:(id:string)=>void;onDelete:(id:string)=>void;onChat?:(key:string)=>void;
+ onEdit:(id:string)=>void;onBasic:(id:string)=>void;onDelete:(id:string)=>void;onChat?:(key:string)=>void;onPlanProposal?:(recordId:string)=>void;
 };
 
 const unique = (values:string[]) => [...new Set(values.filter(Boolean))];
@@ -37,7 +37,7 @@ export function candidateFollowUp(record:CandidateRecord) {
 function nextAppointment(records:CandidateRecord[]) { return candidateAppointments(records,businessToday())[0]; }
 
 export function CandidateDirectory(props:DirectoryProps) {
- const {groups,players,busy,intakeEnabled,canDelete,onEdit,onBasic,onDelete,onChat}=props;
+ const {groups,players,busy,intakeEnabled,canDelete,onEdit,onBasic,onDelete,onChat,onPlanProposal}=props;
  const [expanded,setExpanded]=useState<Set<string>>(()=>new Set());
  const id=useId();
  function toggle(key:string){setExpanded(previous=>{const next=new Set(previous);if(next.has(key))next.delete(key);else next.add(key);return next;});}
@@ -62,6 +62,7 @@ export function CandidateDirectory(props:DirectoryProps) {
  }
  function followUp(record:CandidateRecord){const next=candidateFollowUp(record);return <button type="button" className={`candidate-follow-up${next.active?"":" is-complete"}`} disabled={busy} aria-label={`${record.candidateName}の${valueAt(record,2)||"未提案の記録"}：${next.label}`} onClick={()=>onEdit(record.recordId)}><span>{next.label}</span><ArrowRight size={13}/></button>;}
  function expandButton(group:CandidateGroup,controls:string){return <button type="button" className="candidate-history-toggle" aria-label={`${group.name||"氏名未設定"}の提案・履歴 ${group.records.length}件`} aria-expanded={expanded.has(group.key)} aria-controls={controls} onClick={()=>toggle(group.key)}>{expanded.has(group.key)?<ChevronDown size={17}/>:<ChevronRight size={17}/>}提案・履歴 <span>{group.records.length}件</span></button>;}
+ function planButton(group:CandidateGroup){return onPlanProposal&&<button type="button" className="candidate-chat-trigger" disabled={busy} aria-label={`${group.name}の提案先・案件を検討`} onClick={()=>onPlanProposal(group.records[0].recordId)}><BriefcaseBusiness size={15}/><span>提案先を検討</span></button>;}
  function chatButton(group:CandidateGroup){return onChat&&<button type="button" className="candidate-chat-trigger" title={`${group.name||"氏名未設定"}についてAIに相談`} aria-label={`${group.name||"氏名未設定"}についてAIに相談`} onClick={()=>onChat(group.key)}><MessageCircle size={15}/><span>AIに相談</span></button>;}
  function progressTags(progress:string[]){return <div className="candidate-directory-statuses">{progress.slice(0,2).map(status=><span key={status} title={status} className={`stage-tag status-${statusTone(status)}`}>{status}</span>)}{progress.length>2&&<small>ほか{progress.length-2}種類</small>}{!progress.length&&<small>進捗未設定</small>}</div>;}
  return <>
@@ -71,14 +72,14 @@ export function CandidateDirectory(props:DirectoryProps) {
     <td><div className="candidate-name-line"><strong>{group.name||"氏名未設定"}</strong>{intakeEnabled&&group.records.length===1&&basicButton(group.records[0])}</div><small>{info.owner}{!group.playerId&&" · 対応未設定"}</small>{info.interview&&<small>最終面談 {info.interview}</small>}</td>
     <td><div className="candidate-directory-companies">{info.companies.slice(0,2).map(company=><span key={company}>{company}</span>)}{!info.companies.length&&<span>未提案</span>}</div>{info.companies.length>2&&<small>ほか{info.companies.length-2}社</small>}<small>{info.companies.length}社 · {group.records.length}件の記録</small></td>
     <td>{progressTags(info.progress)}</td><td>{info.appointment?<><span className="candidate-appointment-date">{info.appointment.date}</span><small>{info.appointment.label} {info.appointment.time}</small>{info.appointment.overdue&&<small className="candidate-appointment-overdue">予定日経過・要確認</small>}</>:<small>予定なし</small>}{followUp(info.nextRecord)}{group.records.length>1&&<small>{valueAt(info.nextRecord,2)||"未提案の記録"} · ほかは履歴で確認</small>}</td>
-    <td><div className="candidate-directory-actions">{chatButton(group)}{expandButton(group,controls)}</div></td></tr>{open&&<tr className="candidate-directory-detail"><td colSpan={5}><div id={controls}>{history(group)}</div></td></tr>}</Fragment>;
+    <td><div className="candidate-directory-actions">{planButton(group)}{chatButton(group)}{expandButton(group,controls)}</div></td></tr>{open&&<tr className="candidate-directory-detail"><td colSpan={5}><div id={controls}>{history(group)}</div></td></tr>}</Fragment>;
   })}</tbody></table></div>
   <div className="candidate-mobile-list candidate-directory-mobile">{groups.map((group,index)=>{
    const info=summary(group),controls=`${id}-mobile-${index}`,open=expanded.has(group.key);
    return <article className="candidate-mobile-card" key={group.key}><header><div><strong>{group.name||"氏名未設定"}</strong><small>{info.owner}{!group.playerId&&" · 対応未設定"}</small></div><span className="candidate-record-count">{group.records.length}件の記録</span></header>
     <p>{info.companies.slice(0,2).join(" / ")||"未提案"}{info.companies.length>2&&` ほか${info.companies.length-2}社`}{info.interview&&<small>最終面談 {info.interview}</small>}</p>{progressTags(info.progress)}
     <div className="candidate-mobile-next">{info.appointment?<p>次の予定：{info.appointment.date} {info.appointment.time}<small>{info.appointment.label}{info.appointment.company&&` · ${info.appointment.company}`}</small>{info.appointment.overdue&&<small className="candidate-appointment-overdue">予定日経過・要確認</small>}</p>:<small>予定なし</small>}{followUp(info.nextRecord)}{group.records.length>1&&<small>{valueAt(info.nextRecord,2)||"未提案の記録"} · ほかは履歴で確認</small>}</div>
-    {intakeEnabled&&group.records.length===1&&<div>{basicButton(group.records[0])}</div>}<div className="candidate-directory-mobile-actions">{chatButton(group)}{expandButton(group,controls)}</div>
+    {intakeEnabled&&group.records.length===1&&<div>{basicButton(group.records[0])}</div>}<div className="candidate-directory-mobile-actions">{planButton(group)}{chatButton(group)}{expandButton(group,controls)}</div>
     {open&&<div id={controls}>{history(group)}</div>}
    </article>;
   })}</div>

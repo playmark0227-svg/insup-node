@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 // permits inline content. Executable inline scripts/eval remain blocked.
 export const productionCsp = [
   "default-src 'none'", "script-src 'self'", "style-src 'self' 'unsafe-inline'",
-  "img-src 'self' data:", "font-src 'self'", "connect-src 'self' https://script.google.com https://script.googleusercontent.com",
+  "img-src 'self' data:", "font-src 'self'", "connect-src 'self' https://script.google.com https://script.googleusercontent.com https://storage.googleapis.com",
   "base-uri 'none'", "form-action 'none'", "object-src 'none'", "frame-src 'none'", "worker-src 'none'",
   "media-src 'none'", "manifest-src 'self'", "upgrade-insecure-requests",
 ].join("; ");

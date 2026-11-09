@@ -139,8 +139,8 @@ class MockRange {
 }
 
 class MockSheet {
-  constructor(spreadsheet, { id, name, values = [], formulas = [] }) {
-    Object.assign(this, { spreadsheet, id, name, values: clone(values), formulas: clone(formulas), validations: {}, formats: {}, maxRows: Math.max(1000, values.length), protections: [], hidden: false });
+  constructor(spreadsheet, { id, name, values = [], formulas = [], rawCells = {} }) {
+    Object.assign(this, { spreadsheet, id, name, values: clone(values), formulas: clone(formulas), rawCells: clone(rawCells), validations: {}, formats: {}, maxRows: Math.max(1000, values.length), protections: [], hidden: false });
     formulas.forEach((row, r) => row.forEach((formula, c) => {
       if (formula) { this.values[r] ??= []; this.values[r][c] ??= formula; }
     }));
@@ -333,24 +333,28 @@ export function createHarness({ spreadsheetId = "test-spreadsheet", sheets = [],
     Sheets: { Spreadsheets: { get: (id, options) => {
       sheetReads.push({ spreadsheetId: id, options: clone(options) });
       const book = context.SpreadsheetApp.openById(id);
-      if(options.ranges){return {sheets:options.ranges.map(range=>{
+      if(options.ranges){const groups=new Map();for(const range of options.ranges){const item=(()=>{
         const match=range.match(/^'(.+)'!([A-Z]+)(\d+):([A-Z]+)(\d+)$/);assert.ok(match,range);const sheet=book.getSheetByName(match[1].replace(/''/g,"'")),start=Number(match[3]),end=Number(match[5]),width=columnNumber(match[4]);
         return {properties:{sheetId:sheet.id},data:[{startRow:start-1,startColumn:0,rowData:Array.from({length:end-start+1},(_,i)=>({values:Array.from({length:width},(_,j)=>{
           const v=sheet.values[start+i-1]?.[j]??"",f=sheet.formulas[start+i-1]?.[j],key=`${start+i},${j+1}`,fmt=sheet.formats[key];
+          // Explicit CellData fixtures preserve rich chips, notes, formatted and
+          // effective values exactly; ordinary fixtures keep their old behavior.
+          if(Object.hasOwn(sheet.rawCells,key))return clone(sheet.rawCells[key]);
           const raw=f?{formulaValue:f}:v instanceof Date?{numberValue:(v.getTime()+9*3600*1000)/86400000+25569}:typeof v==="number"?{numberValue:v}:typeof v==="boolean"?{boolValue:v}:v!==""?{stringValue:v}:{};
           return {userEnteredValue:raw,formattedValue:String(v),...(sheet.validations[key]?{dataValidation:clone(sheet.validations[key])}:{}),...(fmt?{userEnteredFormat:clone(fmt)}:{})};
         })}))}]};
-      })};}
+      })();const previous=groups.get(item.properties.sheetId);if(previous)previous.data.push(...item.data);else groups.set(item.properties.sheetId,item);}return {sheets:[...groups.values()]};}
       return { sheets: book.getSheets().map(sheet => ({ properties: { sheetId: sheet.id, gridProperties: { rowCount: Math.max(sheet.maxRows, sheet.values.length) } } })) };
     }, DeveloperMetadata: { search: (body, id) => {
       metadataReads.push({ spreadsheetId: id, body: clone(body) });
       const book = context.SpreadsheetApp.openById(id);
       return { matchedDeveloperMetadata: book.metadata.filter(item => body.dataFilters.some(filter => {
         const lookup = filter.developerMetadataLookup;
-        return item.key === lookup.metadataKey && (lookup.locationType !== "ROW" || item.row);
+        const type=item.row?"ROW":item.sheet?"SHEET":"SPREADSHEET";
+        return lookup && (lookup.metadataKey===undefined||item.key===lookup.metadataKey) && (lookup.metadataId===undefined||item.id===lookup.metadataId) && (lookup.visibility===undefined||item.visibility===lookup.visibility) && (lookup.locationType===undefined||lookup.locationType===type);
       })).map(item => ({ developerMetadata: {
-        metadataId: item.id, metadataKey: item.key, metadataValue: item.value, visibility: item.visibility,
-        location: item.row ? { locationType: "ROW", dimensionRange: { sheetId: item.sheet.id, dimension: "ROWS", startIndex: item.row - 1, endIndex: item.row } } : { locationType: "SHEET", sheetId: item.sheet.id },
+        metadataId: item.id, metadataKey: item.key, ...(item.value===null?{}:{metadataValue:item.value}), visibility: item.visibility,
+        location: item.row ? { locationType: "ROW", dimensionRange: { sheetId: item.sheet.id, dimension: "ROWS", startIndex: item.row - 1, endIndex: item.row } } : item.sheet ? { locationType: "SHEET", sheetId: item.sheet.id } : {locationType:"SPREADSHEET",spreadsheet:true},
       } })) };
     } } } },
     UrlFetchApp: { fetch: (url, options) => {
