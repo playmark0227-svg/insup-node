@@ -35,6 +35,37 @@ export type SaveMatchReportInput=Pick<MatchReport,"recordId"|"profileId"|"agent"
 export type SalesWorkflowReadInput={period?:string};
 export type SalesCommand={action:"saveWorkJob";payload:SaveWorkJobInput}|{action:"saveProposalPlan";payload:SaveProposalPlanInput}|{action:"recordProposalSent";payload:RecordProposalSentInput}|{action:"saveMatchReport";payload:SaveMatchReportInput};
 
+/** Filters inspect the job's stated minimum requirements, never a person's
+ * suitability. Null and unknown are distinct from a stated zero. */
+export type WorkJobListFilters={
+ query:string;status:WorkJob["status"]|"";monthlyHoursMax:number|null;monthlyHoursOperator:"lt"|"lte";
+ weeklyDaysMax:number|null;workMode:WorkJob["workMode"]|"";weekendPolicy:WorkJob["weekendPolicy"]|"";includeUnknown:boolean;
+};
+export const blankWorkJobListFilters=():WorkJobListFilters=>({query:"",status:"open",monthlyHoursMax:null,monthlyHoursOperator:"lt",weeklyDaysMax:null,workMode:"",weekendPolicy:"",includeUnknown:false});
+export function workJobFilterErrors(filters:WorkJobListFilters):string[]{
+ const errors:string[]=[];
+ if(filters.monthlyHoursMax!==null&&(!Number.isFinite(filters.monthlyHoursMax)||filters.monthlyHoursMax<0||filters.monthlyHoursMax>744))errors.push("月の時間は0〜744の数値で指定してください。");
+ if(filters.weeklyDaysMax!==null&&(!Number.isFinite(filters.weeklyDaysMax)||filters.weeklyDaysMax<0||filters.weeklyDaysMax>7))errors.push("週の日数は0〜7の数値で指定してください。");
+ return errors;
+}
+/** Only unknown facts in actively selected filters count as review items. */
+export function workJobHasUnknownFilterCondition(job:WorkJob,filters:WorkJobListFilters):boolean{
+ return filters.monthlyHoursMax!==null&&job.minMonthlyHours===null||filters.weeklyDaysMax!==null&&job.minWeeklyDays===null||!!filters.workMode&&filters.workMode!=="unknown"&&job.workMode==="unknown"||!!filters.weekendPolicy&&filters.weekendPolicy!=="unknown"&&job.weekendPolicy==="unknown";
+}
+export function filterWorkJobs(jobs:readonly WorkJob[],filters:WorkJobListFilters):WorkJob[]{
+ if(workJobFilterErrors(filters).length)return [];
+ const normalize=(value:string)=>value.normalize("NFKC").toLocaleLowerCase("ja-JP");
+ const words=normalize(filters.query).trim().split(/\s+/).filter(Boolean);
+ const within=(value:number|null,max:number|null,exclusive=false)=>max===null||value===null?max===null||filters.includeUnknown:exclusive?value<max:value<=max;
+ const selected=(actual:string,expected:string)=>!expected||actual===expected||filters.includeUnknown&&expected!=="unknown"&&actual==="unknown";
+ return jobs.filter(job=>{
+  if(filters.status&&job.status!==filters.status||!within(job.minMonthlyHours,filters.monthlyHoursMax,filters.monthlyHoursOperator==="lt")||!within(job.minWeeklyDays,filters.weeklyDaysMax)||!selected(job.workMode,filters.workMode)||!selected(job.weekendPolicy,filters.weekendPolicy))return false;
+  // Client review notes can contain sensitive requests and are not search or matching criteria.
+  const text=normalize([job.company,job.title,job.product,job.target,job.description,job.requirements,job.requiredIndustries,job.requiredOther,job.preferredIndustries,job.preferredOther,job.pcTools,job.timeWindow,job.workConditions].join(" "));
+  return words.every(word=>text.includes(word));
+ });
+}
+
 const obj=(v:unknown):Record<string,unknown>=>{if(!v||typeof v!=="object"||Array.isArray(v))throw Error("営業管理データの形式を確認できませんでした。");return v as Record<string,unknown>;};
 const str=(v:unknown,max=3000,required=false)=>{if(typeof v!=="string"||v.length>max||required&&!v.trim())throw Error("営業管理データの項目を確認できませんでした。");return v;};
 const id=(v:unknown,empty=false)=>{const s=str(v,128,!empty);if(s&&!/^[A-Za-z0-9_-]{16,128}$/.test(s))throw Error("営業管理IDを確認できませんでした。");return s;};
@@ -62,8 +93,8 @@ export function compareCandidateToJob(fields:InterviewFields|undefined,job:WorkJ
  const quantity=(raw:string|undefined,unit:RegExp)=>{const s=(raw||"").normalize("NFKC").trim().replace(unit,"").trim();return /^(?:\d+(?:\.\d+)?)$/.test(s)?Number(s):null;};
  for(const [field,label,raw,required,unit] of [["monthlyHours","月間稼働時間",fields?.monthlyHours,job.minMonthlyHours,/(?:時間|h)(?:\/月)?$/i],["weeklyDays","週の稼働日数",fields?.daysPerWeek,job.minWeeklyDays,/(?:日)(?:\/週)?$/]] as const){if(required===null)continue;const n=quantity(raw,unit);results.push({field,label,state:n===null?"review":n>=required?"meets":"below",candidate:raw||"未確認",requirement:`${required}${field==="monthlyHours"?"時間/月":"日/週"}以上`});}
  for(const [field,label,raw,required] of [["timeWindow","時間帯",fields?.timeWindow,job.timeWindow],["pcTools","PC・ツール",fields?[fields.pcEnvironment,...fields.crmTools,...fields.chatTools,fields.pcSkills].filter(Boolean).join("・"):"",job.pcTools]] as const){if(required.trim())results.push({field,label,state:"review",candidate:raw||"未確認",requirement:required});}
- if(job.requiredSalesType!=="unknown"||job.requiredIndustries||job.requiredOther||job.requirements||job.inexperiencedAllowed!=="unknown")results.push({field:"experience",label:"必須経験",state:"review",candidate:fields?.workHistory||"未確認",requirement:[job.inexperiencedAllowed==="yes"?"未経験可":job.inexperiencedAllowed==="no"?"経験必須":"",job.requiredSalesType==="unknown"?"":job.requiredSalesType,job.requiredIndustries,job.requiredOther,job.requirements].filter(Boolean).join("・")});
- if(job.workMode!=="unknown"||job.weekendPolicy!=="unknown"||job.contractPeriod||job.workConditions)results.push({field:"workConditions",label:"勤務・契約条件",state:"review",candidate:fields?.workStyle||"未確認",requirement:[job.workMode==="unknown"?"":job.workMode,job.contractPeriod,job.weekendPolicy==="unknown"?"":job.weekendPolicy,job.workConditions].filter(Boolean).join("・")});
+ if(job.requiredSalesType!=="unknown"||job.requiredIndustries||job.requiredOther||job.requirements||job.inexperiencedAllowed!=="unknown")results.push({field:"experience",label:"必須経験",state:"review",candidate:fields?.workHistory||"未確認",requirement:[job.inexperiencedAllowed==="yes"?"未経験可":job.inexperiencedAllowed==="no"?"経験必須":"",job.requiredSalesType==="unknown"?"":({b2b:"法人向け（toB）",b2c:"個人向け（toC）",both:"法人・個人向け"} as const)[job.requiredSalesType],job.requiredIndustries,job.requiredOther,job.requirements].filter(Boolean).join("・")});
+ if(job.workMode!=="unknown"||job.weekendPolicy!=="unknown"||job.contractPeriod||job.workConditions)results.push({field:"workConditions",label:"勤務・契約条件",state:"review",candidate:fields?.workStyle||"未確認",requirement:[job.workMode==="unknown"?"":({remote:"フルリモート",onsite:"出社",remote_after_training:"研修後フルリモート"} as const)[job.workMode],job.contractPeriod,job.weekendPolicy==="unknown"?"":({allowed:"土日可",not_allowed:"土日不可",negotiable:"土日応相談"} as const)[job.weekendPolicy],job.workConditions].filter(Boolean).join("・")});
  return results;
 }
 export function profileForSalesRecord(profiles:readonly CandidateProfile[],record:{recordId:string;playerId:string;profileId?:string}|undefined):CandidateProfile|undefined{

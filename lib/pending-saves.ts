@@ -198,6 +198,7 @@ export function pendingSaveResources(action: string, payload: unknown, snapshot:
   const data = payload as Record<string, unknown>;
   if (["restoreChange","stageMigrationBatch","applyMigrationItem"].includes(action)) return ["*"];
   if(action==="mutateRewards")return ["rewards:ledger"];
+  if(["saveMatchReportComment","deleteMatchReportComment"].includes(action))return typeof data.reportId==="string"?[`match-report:${data.reportId}`]:["*"];
   if (action === "saveManagementRow") return [`management:${data.sheetId}:${data.row}`];
   if (action === "saveClient") return [`client:${data.id || String(data.name || "").trim().toLocaleLowerCase()}`];
   const body = (action === "saveActivity" ? data.activity : action === "updateProfile" ? data.player : data) as Record<string, unknown>;
@@ -205,6 +206,7 @@ export function pendingSaveResources(action: string, payload: unknown, snapshot:
   if (action === "updateProfile") return [`player:${body.id}`];
   const ids = [body.recordId, ...(Array.isArray(data.targets) ? data.targets.map(target => (target as {recordId?:string})?.recordId) : [])].filter((id): id is string => typeof id === "string");
   const resources = ids.map(id => `record:${id}`);
+  if(action==="saveMatchReport"&&typeof data.reportId==="string")resources.push(`match-report:${data.reportId}`);
   for (const id of ids) {
     const record = snapshot.records?.find(record => record.recordId === id);
     if (record) resources.push(`candidate:${record.playerId}:${record.candidateName.replace(/\s/g, "")}`);

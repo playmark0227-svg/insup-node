@@ -56,6 +56,7 @@ export type WorkflowDataExport = {
  feature:true;schemaVersion:1;scope:"all-saved-private-workflows";
  metricGoals:Array<MetricGoal&{actorId:string}>;
  salesWorkflow:{jobs:WorkJob[];plans:ProposalPlan[];reports:MatchReport[]};
+ matchReportComments?:{schemaVersion:1;comments:Array<{commentId:string;reportId:string;parentId:string;authorId:string;body:string;deleted:boolean;version:string;createdAt:string;updatedAt:string}>};
  introductionV2:{drafts:Array<{draftKey:string;playerId:string;profile:IntroductionV2Profile;version:string;updatedAt:string;actorId:string}>;settings:Array<{id:"shared";settings:IntroductionV2Settings;version:string;updatedAt:string;actorId:string}>};
  matchEvidence:{scope:"metadata-only";files:WorkflowEvidenceExport[]};
 };
@@ -69,7 +70,7 @@ export function validateWorkflowDataExport(value:unknown):WorkflowDataExport {
  const id=(item:unknown,empty=false):item is string=>empty&&item===""||typeof item==="string"&&/^[A-Za-z0-9_-]{16,128}$/.test(item);
  const actor=(item:unknown):item is string=>typeof item==="string"&&/^[A-Za-z0-9_-]{1,30}$/.test(item);
  const stamp=(item:unknown,empty=false):item is string=>empty&&item===""||typeof item==="string"&&/^\d{4}-\d{2}-\d{2}T/.test(item)&&Number.isFinite(Date.parse(item));
- const p=exact(value,["feature","schemaVersion","scope","metricGoals","salesWorkflow","introductionV2","matchEvidence"]);
+ const p=exact(value,["feature","schemaVersion","scope","metricGoals","salesWorkflow","introductionV2","matchEvidence",...(object(value)&&Object.hasOwn(value,"matchReportComments")?["matchReportComments"]:[])]);
  if(p.feature!==true||p.schemaVersion!==1||p.scope!=="all-saved-private-workflows")return bad();
  const goalKeys=new Set<string>();
  const metricGoals=rows(p.metricGoals).map(raw=>{
@@ -99,7 +100,15 @@ export function validateWorkflowDataExport(value:unknown):WorkflowDataExport {
   if(e.status==="pending"&&(e.generation!==""||e.completedAt!=="")||e.status==="completed"&&(!/^[1-9][0-9]{0,29}$/.test(e.generation)||!e.completedAt))return bad();
   evidenceIds.add(e.evidenceId);return {...e} as WorkflowEvidenceExport;
  });
- return {feature:true,schemaVersion:1,scope:"all-saved-private-workflows",metricGoals,salesWorkflow,introductionV2:{drafts,settings},matchEvidence:{scope:"metadata-only",files}};
+ let matchReportComments:WorkflowDataExport["matchReportComments"];
+ if(p.matchReportComments!==undefined){
+  const state=exact(p.matchReportComments,["schemaVersion","comments"]),seen=new Set<string>();if(state.schemaVersion!==1)return bad();
+  const comments=rows(state.comments).map(raw=>{const c=exact(raw,["commentId","reportId","parentId","authorId","body","deleted","version","createdAt","updatedAt"]);
+   if(!id(c.commentId)||seen.has(c.commentId)||!id(c.reportId)||!id(c.parentId,true)||c.parentId===c.commentId||!actor(c.authorId)||!string(c.body,2000)||typeof c.deleted!=="boolean"||c.deleted&&c.body!==""||!c.deleted&&!c.body.trim()||/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(c.body)||!id(c.version)||!stamp(c.createdAt)||!stamp(c.updatedAt))return bad();
+   seen.add(c.commentId);return {commentId:c.commentId,reportId:c.reportId,parentId:c.parentId,authorId:c.authorId,body:c.body,deleted:c.deleted,version:c.version,createdAt:c.createdAt,updatedAt:c.updatedAt};});
+  matchReportComments={schemaVersion:1,comments};
+ }
+ return {feature:true,schemaVersion:1,scope:"all-saved-private-workflows",metricGoals,salesWorkflow,...(matchReportComments?{matchReportComments}:{}),introductionV2:{drafts,settings},matchEvidence:{scope:"metadata-only",files}};
 }
 
 /** Export is data for safekeeping, never an executable workbook or credential backup. */

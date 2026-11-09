@@ -36,6 +36,7 @@ export type SheetSnapshot = {
   /** These versioned extensions are advertised only after their backend is ready. */
   metricGoalsFeature?: true;
   salesWorkflowFeature?: true;
+  matchReportCommentsFeature?: true;
   introductionV2Feature?: true;
   storageEvidenceFeature?: true;
   monthlyGoals?: {playerId:string;month:string;target:number;version:string;updatedAt:string}[];
@@ -101,8 +102,8 @@ export function mergeSnapshotUnchanged(value:unknown,current:SheetSnapshot):Shee
   return {...existing,syncedAt:receipt.syncedAt,cacheAccess:access,...(receipt.activityDeferred?{activityDeferred:true}:{})};
 }
 
-export const sheetExtensionReadActions = ["readRewards", "readMigrationArchive", "readMetricGoals", "readSalesWorkflow", "readIntroductionV2", "readMatchEvidence", "beginMatchEvidence"] as const;
-export const sheetExtensionMutationActions = ["mutateRewards", "stageMigrationBatch", "applyMigrationItem", "saveMetricGoals", "saveWorkJob", "saveProposalPlan", "recordProposalSent", "saveMatchReport", "saveIntroductionV2", "saveIntroductionSettings", "publishIntroductionV2", "completeMatchEvidence"] as const;
+export const sheetExtensionReadActions = ["readRewards", "readMigrationArchive", "readMetricGoals", "readSalesWorkflow", "readMatchReportComments", "readIntroductionV2", "readMatchEvidence", "beginMatchEvidence"] as const;
+export const sheetExtensionMutationActions = ["mutateRewards", "stageMigrationBatch", "applyMigrationItem", "saveMetricGoals", "saveWorkJob", "saveProposalPlan", "recordProposalSent", "saveMatchReport", "saveMatchReportComment", "deleteMatchReportComment", "saveIntroductionV2", "saveIntroductionSettings", "publishIntroductionV2", "completeMatchEvidence"] as const;
 export type SheetExtensionReadAction = typeof sheetExtensionReadActions[number];
 export type SheetExtensionMutationAction = typeof sheetExtensionMutationActions[number];
 export type SheetExtensionRead = <T>(action: SheetExtensionReadAction, payload?: unknown) => Promise<T>;
@@ -115,7 +116,7 @@ export function sheetExtensionMutationEnabled(action: string, snapshot: SheetSna
   const features: Record<SheetExtensionMutationAction, keyof SheetSnapshot> = {
     mutateRewards: "rewardsFeature", stageMigrationBatch: "migrationFeature", applyMigrationItem: "migrationFeature",
     saveMetricGoals: "metricGoalsFeature", saveWorkJob: "salesWorkflowFeature", saveProposalPlan: "salesWorkflowFeature",
-    recordProposalSent: "salesWorkflowFeature", saveMatchReport: "salesWorkflowFeature", completeMatchEvidence: "storageEvidenceFeature",
+    recordProposalSent: "salesWorkflowFeature", saveMatchReport: "salesWorkflowFeature", saveMatchReportComment: "matchReportCommentsFeature", deleteMatchReportComment: "matchReportCommentsFeature", completeMatchEvidence: "storageEvidenceFeature",
     saveIntroductionV2: "introductionV2Feature", saveIntroductionSettings: "introductionV2Feature", publishIntroductionV2:"introductionV2Feature",
   };
   return !!snapshot?.writesEnabled && Object.hasOwn(features, action) && snapshot[features[action as SheetExtensionMutationAction]] === true;
@@ -335,7 +336,7 @@ export function assertSnapshot(value: unknown): asserts value is SheetSnapshot {
       !object(value.counts) || typeof value.writesEnabled !== "boolean" ||
       (value.securityFeature !== undefined && typeof value.securityFeature !== "boolean") || (value.workspaceFeature !== undefined && typeof value.workspaceFeature !== "boolean") ||
       ["operationsFeature","monthlyGoalsFeature","teamWorkspaceFeature","candidateRegistrationFeature","migrationFeature","rewardsFeature"].some(key=>value[key]!==undefined&&typeof value[key]!=="boolean") ||
-      ["metricGoalsFeature","salesWorkflowFeature","introductionV2Feature","storageEvidenceFeature"].some(key=>value[key]!==undefined&&value[key]!==true) ||
+      ["metricGoalsFeature","salesWorkflowFeature","matchReportCommentsFeature","introductionV2Feature","storageEvidenceFeature"].some(key=>value[key]!==undefined&&value[key]!==true) ||
       !Array.isArray(value.warnings) || value.warnings.some(w => typeof w !== "string") || typeof value.syncedAt !== "string" ||
       value.players.some(p => !object(p) || !strings(p, ["id", "name"]) || !p.id || !Number.isSafeInteger(p.target) || Number(p.target) < 1 ||
         !optionalStrings(p, ["team", "bio", "color"]) || (p.active!==undefined&&typeof p.active!=="boolean") || (p.sheetNames !== undefined && (!Array.isArray(p.sheetNames) || p.sheetNames.some(n => typeof n !== "string")))) ||

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {blankWorkJob,compareCandidateToJob,parseSalesWorkflow,rediscoveryJobs,profileForSalesRecord,salesCandidatePlans,type WorkJob,type ProposalPlan} from "../lib/sales-workflow.ts";
+import {blankWorkJob,blankWorkJobListFilters,compareCandidateToJob,filterWorkJobs,parseSalesWorkflow,rediscoveryJobs,profileForSalesRecord,salesCandidatePlans,workJobFilterErrors,workJobHasUnknownFilterCondition,type WorkJob,type ProposalPlan} from "../lib/sales-workflow.ts";
 import {blankInterviewFields,type CandidateProfile} from "../lib/candidate-intake.ts";
 const stamp="2026-11-06T00:00:00.000Z",version="version_000000000000001";
 const job=(extra:Partial<WorkJob>={}):WorkJob=>({...blankWorkJob(),jobId:"job_00000000000000001",company:"架空商事",title:"架空の法人営業",version,createdBy:"ADMIN",updatedBy:"ADMIN",createdAt:stamp,updatedAt:stamp,...extra});
@@ -17,3 +17,44 @@ test("rediscovery checks only changed open work conditions and retains unknown f
 test("legacy empty-profile plans remain bound to their exact record when a profile is first created",()=>{const source={recordId:"record_00000000000001",playerId:"ND-001",profileId:"profile_0000000000001"},otherCompany={...source,recordId:"record_00000000000002"},legacy=plan({profileId:""});assert.equal(salesCandidatePlans([legacy],source).length,1);assert.equal(salesCandidatePlans([legacy],otherCompany).length,0);assert.equal(salesCandidatePlans([legacy],otherCompany,[source,otherCompany]).length,1);assert.equal(salesCandidatePlans([legacy],{...otherCompany,profileId:"different_profile_0001"},[source]).length,0);});
 
 test("sales aggregate period is explicit and restricted to a month or all",()=>{assert.equal(parseSalesWorkflow({...payload(),period:"all"}).period,"all");assert.throws(()=>parseSalesWorkflow({...payload(),period:"2026-13"}));assert.throws(()=>parseSalesWorkflow({...payload(),period:undefined}));});
+
+test("job hour filters distinguish less than and at most, preserve zero, and require an explicit unknown choice",()=>{
+ const jobs=[job({jobId:"zero",minMonthlyHours:0}),job({jobId:"below",minMonthlyHours:99.5}),job({jobId:"exact",minMonthlyHours:100}),job({jobId:"above",minMonthlyHours:100.5}),job({jobId:"unknown",minMonthlyHours:null})],filters={...blankWorkJobListFilters(),monthlyHoursMax:100};
+ assert.deepEqual(filterWorkJobs(jobs,filters).map(j=>j.jobId),["zero","below"]);
+ assert.deepEqual(filterWorkJobs(jobs,{...filters,monthlyHoursOperator:"lte"}).map(j=>j.jobId),["zero","below","exact"]);
+ assert.deepEqual(filterWorkJobs(jobs,{...filters,includeUnknown:true}).map(j=>j.jobId),["zero","below","unknown"]);
+ assert.deepEqual(filterWorkJobs(jobs,{...filters,monthlyHoursMax:0}).map(j=>j.jobId),[]);
+ assert.deepEqual(filterWorkJobs(jobs,{...filters,monthlyHoursMax:0,monthlyHoursOperator:"lte"}).map(j=>j.jobId),["zero"]);
+ assert.equal(filterWorkJobs(jobs,blankWorkJobListFilters()).length,5);
+});
+
+test("job filters combine weekly availability, mode, weekends, status and normalized multi-word search",()=>{
+ const matching=job({jobId:"matching",company:"ＡＢＣ 株式会社",title:"SaaS 法人営業",minMonthlyHours:80,minWeeklyDays:2.5,workMode:"remote",weekendPolicy:"allowed"});
+ const jobs=[matching,job({...matching,jobId:"days",minWeeklyDays:3}),job({...matching,jobId:"mode",workMode:"remote_after_training"}),job({...matching,jobId:"weekend",weekendPolicy:"negotiable"}),job({...matching,jobId:"closed",status:"closed"}),job({...matching,jobId:"query",title:"別の商材"})];
+ const filters={...blankWorkJobListFilters(),query:"  abc　ＳＡＡＳ  ",monthlyHoursMax:100,weeklyDaysMax:2.5,workMode:"remote" as const,weekendPolicy:"allowed" as const};
+ assert.deepEqual(filterWorkJobs(jobs,filters).map(j=>j.jobId),["matching"]);
+ assert.deepEqual(filterWorkJobs(jobs,{...filters,status:""}).map(j=>j.jobId),["matching","closed"]);
+ assert.equal(workJobHasUnknownFilterCondition(matching,filters),false);
+});
+
+test("unknown filter facts are included only when selected, with exact unknown-only categories remaining exact",()=>{
+ const known=job({jobId:"known",minMonthlyHours:80,minWeeklyDays:2,workMode:"remote",weekendPolicy:"allowed"}),unknown=job({jobId:"unknown"}),partial=job({...known,jobId:"partial",minWeeklyDays:null}),wrong=job({...known,jobId:"wrong",workMode:"onsite"});
+ const filters={...blankWorkJobListFilters(),monthlyHoursMax:100,weeklyDaysMax:2,workMode:"remote" as const,weekendPolicy:"allowed" as const};
+ assert.deepEqual(filterWorkJobs([known,unknown,partial,wrong],filters).map(j=>j.jobId),["known"]);
+ assert.deepEqual(filterWorkJobs([known,unknown,partial,wrong],{...filters,includeUnknown:true}).map(j=>j.jobId),["known","unknown","partial"]);
+ assert.equal(workJobHasUnknownFilterCondition(unknown,filters),true);
+ assert.equal(workJobHasUnknownFilterCondition(unknown,blankWorkJobListFilters()),false);
+ assert.deepEqual(filterWorkJobs([known,unknown,wrong],{...blankWorkJobListFilters(),workMode:"unknown",includeUnknown:true}).map(j=>j.jobId),["unknown"]);
+});
+
+test("invalid numeric filters fail closed instead of silently broadening the results",()=>{
+ for(const monthlyHoursMax of [-1,745,Infinity,NaN]){const filters={...blankWorkJobListFilters(),monthlyHoursMax};assert.equal(workJobFilterErrors(filters).length,1);assert.deepEqual(filterWorkJobs([job()],filters),[]);}
+ for(const weeklyDaysMax of [-1,8,Infinity,NaN]){const filters={...blankWorkJobListFilters(),weeklyDaysMax};assert.equal(workJobFilterErrors(filters).length,1);assert.deepEqual(filterWorkJobs([job()],filters),[]);}
+ assert.equal(workJobFilterErrors({...blankWorkJobListFilters(),monthlyHoursMax:744,weeklyDaysMax:7}).length,0);
+});
+
+test("manual client review requests never become job search conditions",()=>{
+ const j=job({clientReviewConditions:"要確認の秘密条件",requirements:"法人営業経験",workConditions:"9時から17時"});
+ assert.equal(filterWorkJobs([j],{...blankWorkJobListFilters(),query:"秘密条件"}).length,0);
+ assert.equal(filterWorkJobs([j],{...blankWorkJobListFilters(),query:"法人営業 9時"}).length,1);
+});
