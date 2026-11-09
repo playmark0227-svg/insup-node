@@ -69,6 +69,12 @@ Blazeへの切り替えと請求先の連携は本人が最終操作する。予
 
 以下はApps Scriptエディターの所有者専用関数で、公開APIのactionからは実行できない。各手順の結果が `more:true` の間は、**同じ関数を再実行する**。`more:false` になってから次へ進む。途中の件数は確認済みの範囲だけを示し、完成した総件数とは扱わない。
 
+必要に応じて FirebaseMigrationOwner.gs を追加すると、continueNodePreviewBatch / continueNodePrepareBatch / continueNodeImportBatch / continueNodeVerifyBatch / continueNodeActivateBatch で、同じ工程だけを最大8回・約210秒まで継続できる。既存のロック・署名・確認位置を使い、次の工程へ自動で進まない。完了したプレビューは新しい走査を開始せず、その完了結果を返す。複数の進捗がログへ出るため、最後のJSONを確認する。照合stageが変わった呼び出しの終了後は次のエディター実行に戻す。同一実行内のSpreadsheetAppの先読みキャッシュは残るため、直接編集禁止の条件は変わらない。
+
+エディターのプロパティ一覧は50件を超える設定の追加に対応しない。すべての設定を置き換えたり、認証設定を削除して空きを作ったりしない。画像保管先は configureNodeFirebaseStorageBucket で専用の非公開・東京バケットを確認してから1キーだけ保存し、verifyNodeFirebaseStorageReadOnly で読み戻す。
+
+移行の確認値も1キーずつ管理できる。完了したプレビューのsourceHashを確認してから、補助ファイルの NODE_REVIEWED_MIGRATION_SOURCE_HASH にその43文字だけを明示する（リポジトリの初期値は空で、空のままでは停止する）。confirmNodePrepareReviewedHash、confirmNodeActivateReviewedHash、confirmNodeCancelReviewedHash は、署名済み状態・所有者・専用保存先との一致を確認し、対応する確認値だけ保存する。各関数をエディターで明示的に選び、その後で対応する移行関数を別に実行する。これらはバッチから呼ばれず、取り込み・切替・中止そのものも実行しない。
+
 新しい分割方式は1ページ最大64行・4MiB、1回最大16ページまたは約28秒を目安に処理する。生のセル情報は各表の初回8行でサイズを測り、約256KiBを目安に最大32行まで読み取り範囲を調整する。4MiBを超える応答は範囲を半分にして再取得し、サイズを確認してから値・数式を読む。全行の配列をメモリーへ保持しない。通信1回や準備処理の時間により実行時間は前後する。ページ単位のハッシュ、確認位置、件数だけを8KiB以内の署名付きプロパティへ保存する。氏名・紹介文・セル本文は進捗プロパティへ保存しない。
 
 各ページと表・管理IDの目録を連鎖して作る `rootHashVersion:2` の確認値を使い、保存するFirestore文書の形式は引き続き `schemaVersion:1` とする。旧方式で切替済みの署名も継続して検証する。
