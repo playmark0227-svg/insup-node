@@ -67,6 +67,16 @@ Blazeへの切り替えと請求先の連携は本人が最終操作する。予
 
 ## 所有者が実行する手順
 
+### 本番の保護と日次バックアップ
+
+Firestoreデータベースの削除保護を有効にし、ブラウザのRulesとIAMの公開設定も別に確認する。削除保護はデータベース全体の誤削除対策であり、個別の行の削除・更新を元に戻す機能ではない。
+
+署名済みの保存先切替と実データの読み戻しが完了した後、必要な場合は BackupOwner.gs を追加し、configureNodeDailyBackup を所有者として明示的に実行する。同じINSUP NODE・東京のデータベースに、日次・604800秒（7日）保持のmanaged backupを設定する。既存の同一設定は再利用し、別設定を上書きしない。verifyNodeDailyBackupReadOnly で設定を独立して読み戻せる。既存のdatastore OAuthを使い、認証キーやIAM許可を追加しない。
+
+バックアップは無料枠の対象外で、保存容量と復元に従量料金がかかる。[公式料金](https://cloud.google.com/firestore/pricing)を確認する。スケジュール設定の成功と初回バックアップの実行完了を区別し、実際のbackupリソースが作成されるまでは「バックアップ済み」と説明しない。
+
+Firestoreのmanaged backupには、GCSの画像やApps Scriptの認証プロパティは含まれない。画像のsoft delete保持とGoogle所有者アカウントの保護は別に確認する。復元は新しいデータベースを使うため、アプリを読み取り専用にした上で復元内容を検証し、署名付きの接続先を復旧する手順が別途必要になる。NODE_FIRESTORE_CONFIGや署名を手作業で書き換えて接続先だけ差し替えたり、古いSheetの内容で新しい業務データを上書きしたりしない。[公式バックアップ手順](https://firebase.google.com/docs/firestore/backups)
+
 以下はApps Scriptエディターの所有者専用関数で、公開APIのactionからは実行できない。各手順の結果が `more:true` の間は、**同じ関数を再実行する**。`more:false` になってから次へ進む。途中の件数は確認済みの範囲だけを示し、完成した総件数とは扱わない。
 
 必要に応じて FirebaseMigrationOwner.gs を追加すると、continueNodePreviewBatch / continueNodePrepareBatch / continueNodeImportBatch / continueNodeVerifyBatch / continueNodeActivateBatch で、同じ工程だけを最大8回・約210秒まで継続できる。既存のロック・署名・確認位置を使い、次の工程へ自動で進まない。完了したプレビューは新しい走査を開始せず、その完了結果を返す。複数の進捗がログへ出るため、最後のJSONを確認する。照合stageが変わった呼び出しの終了後は次のエディター実行に戻す。同一実行内のSpreadsheetAppの先読みキャッシュは残るため、直接編集禁止の条件は変わらない。
