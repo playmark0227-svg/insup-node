@@ -574,3 +574,25 @@ test("column header filters share controlled conditions and clear only their own
  find('button','相談・提案履歴のフィルターを開く').props.onClick();tree=h.render();
  find('select','見出しの履歴フィルター').props.onChange({target:{value:'multiple'}});assert.equal(filter.history,'multiple');assert.equal(filter.company,'架空会社A');
 });
+
+test('heading sort toggles both directions and exposes the selected field without changing filters',()=>{
+ let sort={field:'interview',direction:'desc'};const control={sort,onChange:next=>{sort=next;control.sort=next;}};
+ const filter={owner:'all',status:'all',search:'',company:'架空会社A'};
+ const h=harness({columnSort:control,columnFilters:{filter,onChange(){throw Error('sort must not alter filters');},admin:true,companies:['架空会社A'],statuses:[]}});
+ const click=name=>{const button=nodes(h.render()).find(n=>n.type==='button'&&n.props['aria-label']===name);assert.ok(button,name);button.props.onClick();};
+ click('候補者名を昇順に並べ替え');assert.deepEqual(JSON.parse(JSON.stringify(sort)),{field:'name',direction:'asc'});
+ assert.equal(nodes(h.render()).find(n=>n.type==='th'&&n.props['aria-sort']).props['aria-sort'],'ascending');
+ click('候補者名を降順に並べ替え');assert.equal(sort.direction,'desc');
+ click('次の予定を昇順に並べ替え');assert.equal(sort.field,'appointment');click('次の予定を降順に並べ替え');assert.equal(sort.direction,'desc');
+ click('候補者・担当のフィルターを開く');click('最終面談日の昇順を選択');assert.deepEqual(JSON.parse(JSON.stringify(sort)),{field:'interview',direction:'asc'});
+ assert.equal(filter.company,'架空会社A');
+});
+
+test('heading sort updates the shared toolbar sort and resets paging after filtering all candidates',()=>{
+ const records=Array.from({length:40},(_,i)=>record(`header-${i}`,'架空会社A',i+2,'ND-001',`候補者${i+1}`));
+ const h=managerHarness('CandidateManager',{records});h.render();h.click('次へ');
+ const directory=()=>nodes(h.render()).find(n=>n.type==='CandidateDirectory');
+ directory().props.columnSort.onChange({field:'name',direction:'desc'});h.render();
+ assert.match(text(h.render()),/1〜15 \/ 40名/);assert.equal(directory().props.groups[0].name,'候補者40');
+ const controls=nodes(h.render()).find(n=>n.type==='CandidateListControls');assert.equal(controls.props.sort.field,'name');assert.equal(controls.props.sort.direction,'desc');
+});
