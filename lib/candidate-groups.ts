@@ -15,6 +15,7 @@ export type CandidateProfileFilter = "all" | "with" | "without";
 export type CandidateGroupFilter = CandidateConditionFilter & {
   owner: string; status: string; search: string;
   statuses?: string[]; company?: string | null;
+  name?: string; history?: "all" | "single" | "multiple";
   appointment?: CandidateAppointmentFilter; profile?: CandidateProfileFilter;
   pcEnvironment?: string | null; crmTool?: string | null;
   experienceKeyword?: string; availabilityKeyword?: string;
@@ -58,7 +59,7 @@ export function candidateAppointments(records: readonly CandidateRecord[], today
 }
 
 export function candidateFilterCount(filter: CandidateGroupFilter): number {
-  return Number(filter.owner !== "all") + Number(!!filter.statuses?.length || filter.status !== "all")
+  return Number(!!filter.name?.trim()) + Number(!!filter.history && filter.history !== "all") + Number(filter.owner !== "all") + Number(!!filter.statuses?.length || filter.status !== "all")
     + Number(filter.company !== undefined) + Number(!!filter.appointment && filter.appointment !== "all")
     + Number(!!filter.profile && filter.profile !== "all")
     + Number(filter.pcEnvironment !== undefined) + Number(filter.crmTool !== undefined)
@@ -137,6 +138,8 @@ export function filterCandidateGroups(groups: CandidateGroup[], filter: Candidat
       &&matchesCandidateConditions(fields,filter);
   }
   return groups.filter(group =>
+    (!filter.name?.trim() || matchesCandidateWords(group.name, filter.name)) &&
+    (!filter.history || filter.history === "all" || (filter.history === "single" ? group.records.length === 1 : filter.history === "multiple" && group.records.length > 1)) &&
     (filter.owner === "all" || (filter.owner === "unassigned" ? !group.playerId : group.playerId === filter.owner)) &&
     group.records.some(record => {
       const fields=linkedCandidateProfile(profileLinks.get(JSON.stringify([record.playerId,record.recordId]))||[],record)?.fields;

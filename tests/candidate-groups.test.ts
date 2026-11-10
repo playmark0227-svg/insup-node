@@ -212,3 +212,13 @@ test("tomorrow prepares unfinished appointments across year and leap-month bound
  assert.deepEqual(filterCandidateGroups(groups,{...all,appointment:"tomorrow"},"2028-02-28").map(group=>group.name),["leap"]);
  assert.deepEqual(filterCandidateGroups(groups,{...all,appointment:"tomorrow"},"2028-02-29").map(group=>group.name),["march"]);
 });
+
+test('header name and history conditions combine before pagination and retain all matching proposals',()=>{
+ const a=record('head-a','山田太郎'),b=record('head-b','山田太郎'),c=record('head-c','山田花子');a.values[1]='会社A';b.values[1]='会社B';c.values[1]='会社A';
+ const groups=groupCandidates([a,b,c],'registration-desc');
+ const selected=filterCandidateGroups(groups,{...all,name:'山田',history:'multiple',company:'会社A'});
+ assert.equal(selected.length,1);assert.equal(selected[0].name,'山田太郎');assert.equal(selected[0].records.length,2);
+ assert.equal(filterCandidateGroups(groups,{...all,name:'花子',history:'single'}).length,1);
+ assert.equal(filterCandidateGroups(groups,{...all,name:'太郎',history:'single'}).length,0);
+ assert.equal(candidateFilterCount({...all,name:'山田',history:'multiple',company:'会社A'}),3);
+});

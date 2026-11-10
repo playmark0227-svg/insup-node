@@ -560,3 +560,17 @@ test("the full candidate directory can be shown without paging, while keeping th
  assert.equal(directory().props.groups.length,15);choose("50");assert.equal(directory().props.groups.length,50);choose("all");assert.equal(directory().props.groups.length,60);
  const controls=nodes(h.render()).find(node=>node.type==="CandidateListControls");controls.props.onFilterChange({...controls.props.filter,company:"架空会社A"});assert.equal(directory().props.groups.length,30);assert.match(text(h.render()),/1〜30 \/ 30名/);
 });
+
+
+test("column header filters share controlled conditions and clear only their own column",()=>{
+ let filter={owner:"all",status:"all",search:"",company:"架空会社A"};
+ const control={filter,admin:true,companies:["架空会社A","架空会社B"],statuses:["提案候補"],onChange:next=>{filter=next;control.filter=next;}};
+ const h=harness({columnFilters:control});
+ let tree=h.render();const find=(type,name)=>nodes(tree).find(node=>node.type===type&&(node.props['aria-label']===name||text(node)===name));
+ find('button','候補者・担当のフィルターを開く').props.onClick();tree=h.render();
+ find('input','見出しの候補者名フィルター').props.onChange({target:{value:'候補'}});tree=h.render();
+ assert.equal(filter.name,'候補');assert.equal(filter.company,'架空会社A');
+ find('button','この条件を解除').props.onClick();tree=h.render();assert.equal(filter.name,undefined);assert.equal(filter.company,'架空会社A');
+ find('button','相談・提案履歴のフィルターを開く').props.onClick();tree=h.render();
+ find('select','見出しの履歴フィルター').props.onChange({target:{value:'multiple'}});assert.equal(filter.history,'multiple');assert.equal(filter.company,'架空会社A');
+});
