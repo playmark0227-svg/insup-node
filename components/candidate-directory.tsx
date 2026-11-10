@@ -1,12 +1,13 @@
 import { Fragment, useId, useState } from "react";
-import { ArrowRight, CalendarDays, ChevronDown, ChevronRight, MessageCircle, BriefcaseBusiness, Trash2, Filter, X } from "lucide-react";
-import {candidateAppointments,candidateAppointmentFilters,type CandidateGroup,type CandidateGroupFilter} from "@/lib/candidate-groups";
+import { ArrowRight, CalendarDays, ChevronDown, ChevronRight, MessageCircle, BriefcaseBusiness, Trash2, Filter, X, ArrowUp, ArrowDown, ArrowUpDown } from "lucide-react";
+import {candidateAppointments,candidateAppointmentFilters,type CandidateGroup,type CandidateGroupFilter,type CandidateGroupSort} from "@/lib/candidate-groups";
 import { milestoneColumns, statusTone, valueAt } from "@/lib/management-data";
 import { activityInputMetrics } from "@/lib/performance-metrics";
 import { businessToday, type CandidateRecord, type SheetPlayer } from "@/lib/sheets-client";
 import "./candidate-directory.css";
 
 type DirectoryProps = {
+ columnSort?:{sort:CandidateGroupSort;onChange:(sort:CandidateGroupSort)=>void};
  columnFilters?:{filter:CandidateGroupFilter;onChange:(filter:CandidateGroupFilter)=>void;companies:string[];statuses:string[];admin:boolean};
  groups:CandidateGroup[];players:SheetPlayer[];busy:boolean;intakeEnabled:boolean;canDelete:boolean;
  onEdit:(id:string)=>void;onBasic:(id:string)=>void;onDelete:(id:string)=>void;onChat?:(key:string)=>void;onPlanProposal?:(recordId:string)=>void;
@@ -42,7 +43,12 @@ export function CandidateDirectory(props:DirectoryProps) {
  const [expanded,setExpanded]=useState<Set<string>>(()=>new Set());
  const id=useId();
  const [column,setColumn]=useState<number|null>(null);
- const cf=props.columnFilters,filter=cf?.filter;
+ const cf=props.columnFilters,filter=cf?.filter,sorting=props.columnSort;
+ const sortFields=[{field:"name",label:"候補者名",column:0},{field:"interview",label:"最終面談日",column:0},{field:"appointment",label:"次の予定",column:3},{field:"records",label:"提案・記録数",column:4}] as const;
+ const headerSortFields={0:"name",3:"appointment",4:"records"} as const;
+ function sortControl(index:number){const field=headerSortFields[index as keyof typeof headerSortFields];if(!sorting||!field)return null;const current=sorting.sort.field===field,label=sortFields.find(item=>item.field===field)!.label,next=current&&sorting.sort.direction==="asc"?"desc":"asc",Icon=current?(sorting.sort.direction==="asc"?ArrowUp:ArrowDown):ArrowUpDown;return <button type="button" className={`candidate-column-sort${current?" is-active":""}`} aria-label={`${label}を${next==="asc"?"昇順":"降順"}に並べ替え`} title={`${label}：${current?(sorting.sort.direction==="asc"?"昇順 → 降順":"降順 → 昇順"):"クリックで昇順"}`} onClick={()=>sorting.onChange({field,direction:next})}><Icon size={15}/></button>;}
+ function sortPanel(index:number){if(!sorting)return null;const fields=sortFields.filter(item=>item.column===index);return fields.length?<div className="candidate-column-sort-options">{fields.map(item=><div key={item.field}><strong>{item.label}</strong><div role="group" aria-label={`${item.label}の並べ替え`}>{(["asc","desc"] as const).map(direction=><button type="button" key={direction} aria-label={`${item.label}の${direction==="asc"?"昇順":"降順"}を選択`} aria-pressed={sorting.sort.field===item.field&&sorting.sort.direction===direction} onClick={()=>sorting.onChange({field:item.field,direction})}>{direction==="asc"?<ArrowUp size={14}/>:<ArrowDown size={14}/>} {direction==="asc"?"昇順":"降順"}</button>)}</div></div>)}<p>日付が未登録の候補者は、どちらの順番でも最後に表示します。</p></div>:null;}
+
  const labels=["候補者・担当","提案先","企業ごとの進捗","次の予定・確認","相談・提案履歴"];
  const selectedStatuses=filter?.statuses?.length?filter.statuses:filter?.status!=="all"&&filter?.status!==undefined?[filter.status]:[];
  const active=[!!filter?.name?.trim()||!!filter&&filter.owner!=="all",filter?.company!==undefined,!!selectedStatuses.length,!!filter?.appointment&&filter.appointment!=="all",!!filter?.history&&filter.history!=="all"];
@@ -54,7 +60,7 @@ export function CandidateDirectory(props:DirectoryProps) {
  {column===2&&<fieldset><legend>進捗を選択（複数選択可）</legend><div className="candidate-column-statuses">{[...new Set([...cf.statuses,...selectedStatuses])].map(status=><label key={status}><input type="checkbox" checked={selectedStatuses.includes(status)} onChange={e=>patch({status:"all",statuses:e.target.checked?[...selectedStatuses,status]:selectedStatuses.filter(value=>value!==status)})}/>{status||"進捗未設定"}</label>)}</div></fieldset>}
  {column===3&&<label>次の予定<select aria-label="見出しの予定フィルター" value={filter.appointment||"all"} onChange={e=>{const choice=candidateAppointmentFilters.find(item=>item.value===e.target.value);if(choice)patch({appointment:choice.value});}}>{candidateAppointmentFilters.map(item=><option key={item.value} value={item.value}>{item.label}</option>)}</select></label>}
  {column===4&&<label>提案・記録数<select aria-label="見出しの履歴フィルター" value={filter.history||"all"} onChange={e=>patch({history:e.target.value as CandidateGroupFilter["history"]})}><option value="all">すべての候補者</option><option value="single">記録が1件の候補者</option><option value="multiple">記録が複数ある候補者</option></select></label>}
- </div><p>選ぶと一覧にすぐ反映します。他のフィルターと組み合わせて使えます。</p></section></td></tr>;}
+ </div>{sortPanel(column)}<p>選ぶと一覧にすぐ反映します。他のフィルターと組み合わせて使えます。</p></section></td></tr>;}
 
  function toggle(key:string){setExpanded(previous=>{const next=new Set(previous);if(next.has(key))next.delete(key);else next.add(key);return next;});}
  function basicButton(record:CandidateRecord){return <button className="candidate-basic-button" disabled={busy} onClick={()=>onBasic(record.recordId)} aria-label={`${record.candidateName}の${valueAt(record,2)||"未提案の記録"}の基本情報・紹介文`}>基本情報・紹介文</button>;}
@@ -82,7 +88,7 @@ export function CandidateDirectory(props:DirectoryProps) {
  function chatButton(group:CandidateGroup){return onChat&&<button type="button" className="candidate-chat-trigger" title={`${group.name||"氏名未設定"}についてAIに相談`} aria-label={`${group.name||"氏名未設定"}についてAIに相談`} onClick={()=>onChat(group.key)}><MessageCircle size={15}/><span>AIに相談</span></button>;}
  function progressTags(progress:string[]){return <div className="candidate-directory-statuses">{progress.slice(0,2).map(status=><span key={status} title={status} className={`stage-tag status-${statusTone(status)}`}>{status}</span>)}{progress.length>2&&<small>ほか{progress.length-2}種類</small>}{!progress.length&&<small>進捗未設定</small>}</div>;}
  return <>
-  <div className="management-table-scroll candidate-desktop-list"><table className="candidate-table candidate-directory-table"><thead><tr>{labels.map((label,index)=><th scope="col" key={label}>{cf?<button type="button" data-filter-column={index} className={`candidate-column-trigger${active[index]?" is-active":""}`} aria-label={`${label}のフィルターを開く`} aria-expanded={column===index} aria-controls={`${id}-column-filter`} onClick={()=>setColumn(previous=>previous===index?null:index)}>{label}<Filter size={14}/>{active[index]&&<span className="candidate-column-applied">設定中</span>}</button>:label}</th>)}</tr>{columnPanel()}</thead><tbody>{groups.map((group,index)=>{
+  <div className="management-table-scroll candidate-desktop-list"><table className="candidate-table candidate-directory-table"><thead><tr>{labels.map((label,index)=><th scope="col" key={label} aria-sort={sorting&&sortFields.some(item=>item.column===index&&item.field===sorting.sort.field)?sorting.sort.direction==="asc"?"ascending":"descending":undefined}><div className="candidate-column-heading">{cf?<button type="button" data-filter-column={index} className={`candidate-column-trigger${active[index]?" is-active":""}`} aria-label={`${label}のフィルターを開く`} aria-expanded={column===index} aria-controls={`${id}-column-filter`} onClick={()=>setColumn(previous=>previous===index?null:index)}>{label}<Filter size={14}/>{active[index]&&<span className="candidate-column-applied">設定中</span>}</button>:label}{sortControl(index)}</div>{sorting&&sortFields.some(item=>item.column===index&&item.field===sorting.sort.field)&&<small className="candidate-column-sort-caption">{sortFields.find(item=>item.field===sorting.sort.field)?.label} · {sorting.sort.direction==="asc"?"昇順":"降順"}</small>}</th>)}</tr>{columnPanel()}</thead><tbody>{groups.map((group,index)=>{
    const info=summary(group),controls=`${id}-desktop-${index}`,open=expanded.has(group.key);
    return <Fragment key={group.key}><tr className={open?"candidate-directory-row is-open":"candidate-directory-row"}>
     <td><div className="candidate-name-line"><strong>{group.name||"氏名未設定"}</strong>{intakeEnabled&&group.records.length===1&&basicButton(group.records[0])}</div><small>{info.owner}{!group.playerId&&" · 対応未設定"}</small>{info.interview&&<small>最終面談 {info.interview}</small>}</td>
